@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 37: Predictive Scaling — The DBA Handbook</title>
+  <meta name="description" content="The DBA Handbook Chapter 37: Predictive Scaling. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-blue-400 hover:text-blue-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 37 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 37: Predictive Scaling</h2>
+
+<p class="text-gray-300 leading-relaxed">Reactive scaling — waiting until your database is on fire before throwing more resources at it — is a losing strategy in production environments where workloads spike predictably, contracts have SLA teeth, and downtime translates directly to revenue loss. Predictive scaling flips that model by using historical patterns, workload telemetry, and statistical analysis to allocate resources *before* demand arrives. This chapter covers how to instrument your PostgreSQL and SQL Server environments for workload forecasting, how to build and interpret predictive models from database telemetry, how to wire those predictions into automated scaling actions, and how to handle the edge cases that make real-world predictive systems harder than they look on paper.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Reactive Scaling Fails and What Predictive Scaling Replaces It With</h3>
+
+<p class="text-gray-300 leading-relaxed">Every DBA has lived through a variant of the same story. Traffic spikes on Monday morning, the database connection pool exhausts, autovacuum falls behind, query plans start degrading, and the on-call engineer scrambles to add read replicas or increase memory allocations while users hammer the support team. The resources finally arrive ten to fifteen minutes after the spike peaked, which means the scaling happened *after* the damage was done.</p>
+
+<p class="text-gray-300 leading-relaxed">Reactive scaling is built on the assumption that you detect a problem, make a decision, and provision resources — all before users notice. The reality is that detection alone takes minutes if you are relying on threshold-based alerting, decision-making takes more time, and cloud provisioning of a new database node or additional CPU capacity can take anywhere from thirty seconds to several minutes depending on the provider and tier. By the time the new capacity is online, the spike has often passed, leaving you with over-provisioned resources sitting idle until the next event.</p>
+
+<p class="text-gray-300 leading-relaxed">Predictive scaling operates on a different premise entirely. Instead of responding to what is happening *now*, it responds to what the historical record says will happen *next*. A database that receives three times its average load every Friday afternoon between 4:00 PM and 6:00 PM because of end-of-week batch reporting jobs does not need an alert to tell you that Friday afternoon is coming. It needs a system that recognizes the pattern and begins pre-warming read replicas, increasing connection pool limits, or pre-allocating shared buffer space thirty minutes before 4:00 PM Friday.</p>
+
+<p class="text-gray-300 leading-relaxed">The distinction matters at the architecture level too. Reactive systems are tuned for throughput at the moment of pressure. Predictive systems must be tuned to reduce the *time to readiness* — the window between when a scaling decision is made and when the capacity is actually serving queries. In cloud environments, this often means the predictive system must fire its scaling instructions far enough ahead of the load event that the provisioning latency is absorbed invisibly.</p>
+
+<p class="text-gray-300 leading-relaxed">Effective predictive scaling rests on three pillars: historical telemetry that is rich enough to reveal patterns, a forecasting mechanism that can project those patterns forward with reasonable accuracy, and an execution layer that can act on predictions with minimal human involvement. Each of these pillars requires database-side work, and that work begins with instrumentation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Collecting the Telemetry That Makes Forecasting Possible</h3>
+
+<p class="text-gray-300 leading-relaxed">You cannot predict what you have not measured. Most databases expose a surprising amount of operational data through their internal views and statistics tables, but the default retention period for that data is often zero — it exists in memory until the instance restarts, or it gets reset by a maintenance command. Building a predictive scaling system means taking responsibility for collecting and persisting that data at a granularity and retention depth that supports time-series analysis.</p>
+
+<p class="text-gray-300 leading-relaxed">The metrics that matter most for workload prediction fall into several categories: query throughput (transactions per second, queries per second), resource utilization (CPU, memory, I/O), wait events (what queries are waiting for), and connection patterns (how many connections arrive, at what rate, from which application pools). Collecting all of these at one-second granularity into an external time-series store is ideal, but even five-minute samples preserved over several months are enough to reveal weekly and monthly patterns for most OLTP workloads.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a point-in-time workload snapshot for archival
+-- Run this periodically via pg_cron or an external scheduler
+INSERT INTO dba_metrics.workload_snapshots (
+    captured_at,
+    db_name,
+    tps_commit,
+    tps_rollback,
+    blks_read,
+    blks_hit,
+    temp_files,
+    temp_bytes,
+    deadlocks,
+    active_connections,
+    idle_connections,
+    waiting_connections
+)
+SELECT
+    NOW()                                           AS captured_at,
+    d.datname                                       AS db_name,
+    s.xact_commit                                   AS tps_commit,
+    s.xact_rollback                                 AS tps_rollback,
+    s.blks_read,
+    s.blks_hit,
+    s.temp_files,
+    s.temp_bytes,
+    s.deadlocks,
+    COUNT(*) FILTER (WHERE a.state = 'active')      AS active_connections,
+    COUNT(*) FILTER (WHERE a.state = 'idle')        AS idle_connections,
+    COUNT(*) FILTER (WHERE a.wait_event IS NOT NULL) AS waiting_connections
+FROM pg_stat_database s
+JOIN pg_database d ON d.oid = s.datid
+LEFT JOIN pg_stat_activity a ON a.datid = s.datid
+WHERE d.datname = current_database()
+GROUP BY d.datname, s.xact_commit, s.xact_rollback,
+         s.blks_read, s.blks_hit, s.temp_files,
+         s.temp_bytes, s.deadlocks;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a point-in-time workload snapshot for archival
+INSERT INTO dba_metrics.workload_snapshots (
+    captured_at,
+    db_name,
+    batch_requests_sec,
+    sql_compilations_sec,
+    page_reads_sec,
+    page_writes_sec,
+    active_connections,
+    blocked_connections,
+    memory_grants_pending
+)
+SELECT
+    GETUTCDATE()                                        AS captured_at,
+    DB_NAME()                                           AS db_name,
+    (SELECT cntr_value FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Batch Requests/sec'
+       AND object_name LIKE '%SQL Statistics%')         AS batch_requests_sec,
+    (SELECT cntr_value FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'SQL Compilations/sec'
+       AND object_name LIKE '%SQL Statistics%')         AS sql_compilations_sec,
+    (SELECT cntr_value FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Page reads/sec'
+       AND object_name LIKE '%Buffer Manager%')         AS page_reads_sec,
+    (SELECT cntr_value FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Page writes/sec'
+       AND object_name LIKE '%Buffer Manager%')         AS page_writes_sec,
+    (SELECT COUNT(*) FROM sys.dm_exec_sessions
+     WHERE is_user_process = 1 AND status = 'running') AS active_connections,
+    (SELECT COUNT(*) FROM sys.dm_exec_requests
+     WHERE blocking_session_id &gt; 0)                    AS blocked_connections,
+    (SELECT cntr_value FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Memory Grants Pending'
+       AND object_name LIKE '%Memory Manager%')         AS memory_grants_pending;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond raw metrics, wait event data is one of the most underutilized signals for workload prediction. When a database is approaching a resource ceiling, wait events change in predictable ways before latency metrics visibly degrade. CPU contention shows up as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPU</code> waits in SQL Server and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LWLock</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Lock</code> waits in PostgreSQL. I/O pressure shows up in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> waits in SQL Server or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IO</code> wait events in PostgreSQL. Building a history of wait event distributions — not just their existence, but their proportion of total wait time at each hour of the day — gives a much earlier signal than latency alone.</p>
+
+<p class="text-gray-300 leading-relaxed">The telemetry you collect should always be timestamped in UTC, stored in a schema dedicated to operational metrics, and partitioned or retained on a rolling window. Most organizations find that ninety days of five-minute samples provides enough history to capture weekly seasonality and most monthly patterns without creating a storage burden. For workloads with strong quarterly cycles — end-of-quarter financial processing being the canonical example — extending retention to a full year is worth the storage cost.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Modeling Workload Patterns from Historical Data</h3>
+
+<p class="text-gray-300 leading-relaxed">With a solid telemetry foundation in place, the next step is turning raw time-series data into actionable predictions. The good news is that most database workloads are not random — they are highly seasonal. Retail databases peak on weekends and holidays. Financial systems peak at month-end and quarter-end. SaaS platforms tend to peak during business hours in their primary time zone, with a secondary morning peak as European or Asian users come online. These patterns are detectable with relatively straightforward statistical approaches.</p>
+
+<p class="text-gray-300 leading-relaxed">The simplest and often most useful starting point is decomposing your workload time series into its seasonal components. A weekly seasonal model asks: given the same hour and day of week, what does the historical distribution of TPS, connection count, or CPU look like? This does not require machine learning. It requires grouping your telemetry data by day-of-week and hour-of-day and computing percentiles.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build a seasonal workload profile from 90 days of history
+-- Shows P50, P90, P99 TPS by day-of-week and hour
+SELECT
+    EXTRACT(ISODOW FROM captured_at)::INT          AS day_of_week,  -- 1=Mon, 7=Sun
+    EXTRACT(HOUR  FROM captured_at)::INT           AS hour_of_day,
+    ROUND(PERCENTILE_CONT(0.50) WITHIN GROUP
+          (ORDER BY tps_commit)::NUMERIC, 2)       AS p50_tps,
+    ROUND(PERCENTILE_CONT(0.90) WITHIN GROUP
+          (ORDER BY tps_commit)::NUMERIC, 2)       AS p90_tps,
+    ROUND(PERCENTILE_CONT(0.99) WITHIN GROUP
+          (ORDER BY tps_commit)::NUMERIC, 2)       AS p99_tps,
+    COUNT(*)                                       AS sample_count
+FROM dba_metrics.workload_snapshots
+WHERE captured_at &gt;= NOW() - INTERVAL '90 days'
+  AND db_name = 'production_db'
+GROUP BY 1, 2
+ORDER BY 1, 2;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Build a seasonal workload profile from 90 days of history
+-- Shows P50, P90, P99 batch requests by day-of-week and hour
+SELECT
+    DATEPART(WEEKDAY, captured_at)              AS day_of_week,
+    DATEPART(HOUR, captured_at)                 AS hour_of_day,
+    ROUND(PERCENTILE_CONT(0.50)
+          WITHIN GROUP (ORDER BY batch_requests_sec)
+          OVER (PARTITION BY DATEPART(WEEKDAY, captured_at),
+                             DATEPART(HOUR, captured_at)), 2)  AS p50_requests,
+    ROUND(PERCENTILE_CONT(0.90)
+          WITHIN GROUP (ORDER BY batch_requests_sec)
+          OVER (PARTITION BY DATEPART(WEEKDAY, captured_at),
+                             DATEPART(HOUR, captured_at)), 2)  AS p90_requests,
+    ROUND(PERCENTILE_CONT(0.99)
+          WITHIN GROUP (ORDER BY batch_requests_sec)
+          OVER (PARTITION BY DATEPART(WEEKDAY, captured_at),
+                             DATEPART(HOUR, captured_at)), 2)  AS p99_requests,
+    COUNT(*) OVER (PARTITION BY DATEPART(WEEKDAY, captured_at),
+                                DATEPART(HOUR, captured_at))   AS sample_count
+FROM dba_metrics.workload_snapshots
+WHERE captured_at &gt;= DATEADD(DAY, -90, GETUTCDATE())
+  AND db_name = 'production_db'
+ORDER BY day_of_week, hour_of_day;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The seasonal profile you build from this query is your baseline predictive model. For any upcoming hour slot, you now know what the P90 workload looks like based on ninety days of evidence. If the system is currently sized to handle P90 load with comfortable headroom, and the seasonal model says P90 for tomorrow's Friday 4 PM is 4,200 TPS, then you can begin pre-scaling when the incoming measurement crosses some fraction of that threshold — say, 3,000 TPS at 3:30 PM Friday — rather than waiting for a hard CPU or latency threshold to trigger.</p>
+
+<p class="text-gray-300 leading-relaxed">More sophisticated approaches bring in external signals alongside the database telemetry. Application-level events that are known precursors to database load — a batch job submission, a large data import completing, a marketing email send hitting its delivery window — can be emitted as signals that directly trigger a scaling anticipation. This is sometimes called *event-driven predictive scaling*, and it works particularly well in environments where the engineering team has good visibility into the application event calendar.</p>
+
+<p class="text-gray-300 leading-relaxed">For workloads with strong trends in addition to seasonality — a startup whose user base is growing 20% month over month — a pure seasonal model will consistently underestimate future peaks. In these cases, applying a simple linear trend factor to the seasonal baseline prevents the model from anchoring to six-week-old data that no longer represents current capacity needs. The trend factor is computed from the slope of the P90 line over time: if P90 TPS has grown from 3,000 six weeks ago to 3,600 today, the week-over-week growth rate feeds into how aggressively you should pre-provision for next week's peak.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Translating Predictions into Scaling Decisions</h3>
+
+<p class="text-gray-300 leading-relaxed">A forecast is only useful if it connects to an action. The bridge between workload prediction and actual resource allocation is a set of scaling policies: rules that map predicted workload levels to specific resource configurations, along with the timing and sequencing logic that ensures capacity arrives ahead of the predicted peak.</p>
+
+<p class="text-gray-300 leading-relaxed">Scaling policies need to account for what resources are actually scalable in your environment. Cloud-hosted databases have a much richer set of options than on-premises deployments. A PostgreSQL cluster on AWS RDS or Aurora can scale read replicas in and out, and Aurora Serverless v2 can scale ACUs (Aurora Capacity Units) within seconds. On Azure, SQL Managed Instance or Azure SQL Database elastic pools can adjust vCores and DTU/vCore allocations through the Azure API. On GCP, Cloud SQL can add read replicas or resize the primary instance during maintenance windows. On-premises environments are typically limited to connection pool adjustments, shared_buffers changes (with a restart), and pre-warming caches — all of which are still valuable but require different thinking about timing.</p>
+
+<p class="text-gray-300 leading-relaxed">The general structure of a scaling decision rule looks like this: *if the predicted workload for time T exceeds threshold X, initiate resource action Y at time T minus provisioning_lag*. The provisioning lag is measured empirically for each resource type in your environment. Read replica spin-up on Aurora typically takes three to five minutes. A read replica on standard RDS takes eight to fifteen minutes. Adjusting max_connections via a parameter group change on RDS requires a restart, making it unsuitable for reactive or predictive scaling — better handled by a PgBouncer pool configuration change that takes effect immediately.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify upcoming hours where predicted load exceeds current capacity baseline
+-- Assumes dba_metrics.scaling_thresholds holds configured limits
+-- and dba_metrics.seasonal_profile holds the precomputed P90 values
+SELECT
+    sp.day_of_week,
+    sp.hour_of_day,
+    sp.p90_tps                                       AS predicted_p90_tps,
+    st.tps_scale_threshold,
+    sp.p90_tps - st.tps_scale_threshold              AS headroom_deficit,
+    CASE
+        WHEN sp.p90_tps &gt; st.tps_scale_threshold * 1.5 THEN 'SCALE_AGGRESSIVELY'
+        WHEN sp.p90_tps &gt; st.tps_scale_threshold        THEN 'SCALE_STANDARD'
+        WHEN sp.p90_tps &gt; st.tps_scale_threshold * 0.8  THEN 'SCALE_WARM'
+        ELSE                                                  'NO_ACTION'
+    END                                              AS recommended_action
+FROM dba_metrics.seasonal_profile sp
+CROSS JOIN dba_metrics.scaling_thresholds st
+WHERE st.db_name = 'production_db'
+  AND sp.p90_tps &gt; st.tps_scale_threshold * 0.8
+ORDER BY sp.day_of_week, sp.hour_of_day;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify upcoming hours where predicted load exceeds capacity thresholds
+SELECT
+    sp.day_of_week,
+    sp.hour_of_day,
+    sp.p90_requests                                        AS predicted_p90,
+    st.requests_scale_threshold,
+    sp.p90_requests - st.requests_scale_threshold          AS headroom_deficit,
+    CASE
+        WHEN sp.p90_requests &gt; st.requests_scale_threshold * 1.5 THEN 'SCALE_AGGRESSIVELY'
+        WHEN sp.p90_requests &gt; st.requests_scale_threshold       THEN 'SCALE_STANDARD'
+        WHEN sp.p90_requests &gt; st.requests_scale_threshold * 0.8 THEN 'SCALE_WARM'
+        ELSE                                                           'NO_ACTION'
+    END                                                    AS recommended_action
+FROM dba_metrics.seasonal_profile AS sp
+CROSS JOIN dba_metrics.scaling_thresholds AS st
+WHERE st.db_name = 'production_db'
+  AND sp.p90_requests &gt; st.requests_scale_threshold * 0.8
+ORDER BY sp.day_of_week, sp.hour_of_day;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An often-overlooked dimension of scaling policy design is the scale-in decision — when to de-provision resources after a predicted peak passes. Scaling in too aggressively wastes money; scaling in too slowly also wastes money, just over a longer window. A common pattern is to apply hysteresis: require that the live workload measurement has been below some threshold for a sustained period (fifteen to thirty minutes) before triggering a scale-in, rather than firing on a single below-threshold reading. This prevents the system from thrashing between scale-out and scale-in states when workload oscillates near the threshold boundary.</p>
+
+<p class="text-gray-300 leading-relaxed">The execution layer for scaling actions should be external to the database itself. Stored procedures can prepare and queue instructions, but the actual API calls to resize a cloud instance or restart a connection pooler should live in an orchestration layer — a Kubernetes operator, a Lambda function, an Azure Function, a custom daemon — that has the necessary credentials and can track the state of in-flight scaling operations. The database is the thing being scaled; it should not be responsible for scaling itself.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pre-Warming, Cache Priming, and Non-Compute Scaling</h3>
+
+<p class="text-gray-300 leading-relaxed">When most people talk about scaling, they think about adding more compute: more CPUs, more replicas, more memory. But some of the most impactful predictive scaling actions are not about compute at all. They are about ensuring that the compute you already have is in the best possible state to handle the arriving load — a concept sometimes called pre-warming or cache priming.</p>
+
+<p class="text-gray-300 leading-relaxed">The PostgreSQL shared buffer cache and SQL Server buffer pool both operate on the principle that frequently accessed data should be in memory. After a node restart, a new replica spin-up, or a period of low activity where memory pages have been evicted, a database can suffer a "cold start" penalty when high load arrives: a surge of physical reads that would not have occurred if the hot data set were already resident in memory. Predictive scaling can address this by running intentional read queries against the most frequently accessed tables and indexes in the minutes before a predicted peak.</p>
+
+<p class="text-gray-300 leading-relaxed">The tables and indexes worth pre-warming are those that appear in the most frequent query plans during peak periods. In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> show sequential and index scan counts that identify hot objects. In SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> joined back to execution plans identifies the most frequently executed queries and the objects they access.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify top tables and indexes for pre-warming before a predicted peak
+-- Use pg_prewarm extension to load these into shared_buffers
+SELECT
+    schemaname,
+    relname                                     AS table_name,
+    seq_scan + idx_scan                         AS total_access_count,
+    pg_size_pretty(pg_total_relation_size(
+        (schemaname || '.' || relname)::regclass)) AS total_size,
+    -- Pre-warm command to execute ahead of peak
+    'SELECT pg_prewarm(''' || schemaname || '.' || relname || ''');'
+                                                AS prewarm_command
+FROM pg_stat_user_tables
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY total_access_count DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify top objects for buffer pool pre-warming
+-- After identifying, use DBCC DROPCLEANBUFFERS carefully in dev;
+-- in production, pre-warm by running covering queries against the objects
+SELECT TOP 20
+    OBJECT_SCHEMA_NAME(i.object_id)              AS schema_name,
+    OBJECT_NAME(i.object_id)                     AS table_name,
+    i.name                                       AS index_name,
+    qs.execution_count,
+    qs.total_logical_reads / qs.execution_count  AS avg_logical_reads,
+    -- Pre-warm hint: run a covering SELECT against this object
+    'SELECT COUNT(*) FROM ' +
+    QUOTENAME(OBJECT_SCHEMA_NAME(i.object_id)) + '.' +
+    QUOTENAME(OBJECT_NAME(i.object_id)) +
+    ' WITH (INDEX(' + QUOTENAME(i.name) + '), NOLOCK);'
+                                                 AS prewarm_hint
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
+JOIN sys.indexes AS i
+    ON OBJECT_NAME(i.object_id) IN (
+        SELECT OBJECT_NAME(referenced_major_id)
+        FROM sys.sql_expression_dependencies
+        WHERE referencing_id = OBJECT_ID(
+            SUBSTRING(qp.query_plan.value('(//*/@StatementText)[1]',
+                      'NVARCHAR(MAX)'), 1, 128))
+    )
+WHERE qs.execution_count &gt; 1000
+ORDER BY qs.total_logical_reads DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond buffer warming, non-compute scaling also includes connection pool pre-expansion. PgBouncer, the standard PostgreSQL connection pooler, supports a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_pool_size</code> configuration that keeps a minimum number of server connections open even when client demand is low. Increasing this value ahead of a predicted peak means that arriving connections find ready server-side slots rather than waiting for the pool to establish new backend connections. Similarly, SQL Server connection pools managed by application-tier connection pool libraries (ADO.NET, JDBC) can be pre-sized by issuing dummy keep-alive queries that cause the pool to maintain open connections without actually performing work.</p>
+
+<p class="text-gray-300 leading-relaxed">Autovacuum management is another non-compute scaling consideration specific to PostgreSQL. During high-write peaks, tables accumulate dead tuples rapidly, and if autovacuum is not keeping pace, table bloat can degrade performance on its own terms — independently of CPU or memory pressure. Predictive scaling can address this by triggering manual VACUUM operations on the most write-heavy tables in the hour before a predicted write peak, ensuring they enter the high-load window with minimal dead tuple accumulation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Anomalies, Feedback Loops, and Model Drift</h3>
+
+<p class="text-gray-300 leading-relaxed">Predictive scaling based on historical patterns works well until the pattern changes. And patterns change constantly in production environments — new features get deployed, marketing campaigns drive unexpected traffic, user behavior shifts seasonally, and external events create demand spikes that no historical model would have anticipated. A predictive scaling system that cannot recognize when reality has diverged from its model will either consistently under-provision for novel events or, worse, over-provision so aggressively to protect against uncertainty that it becomes too expensive to operate.</p>
+
+<p class="text-gray-300 leading-relaxed">The first line of defense against model drift is a feedback loop that continuously compares actual workload measurements against the model's predictions. If the current TPS is persistently running 40% above the P90 baseline for this time slot, that is a signal that either a new traffic</p>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 flex justify-between text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The DBA Handbook</div>
+  </footer>
+</body>
+</html>
