@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 24: Caching Strategies — The DBA Handbook</title>
+  <meta name="description" content="The DBA Handbook Chapter 24: Caching Strategies. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-blue-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-blue-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
+        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-blue-400 hover:text-blue-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-blue-900/40 border border-blue-800/40 text-blue-300 text-xs rounded-full font-medium">Chapter 24 of 40</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 24: Caching Strategies</h2>
+
+<p class="text-gray-300 leading-relaxed">Database performance is rarely just about writing better queries or adding the right indexes. At a certain scale, the bottleneck shifts from execution logic to how efficiently the system avoids doing work it has already done. Caching sits at the center of that idea. This chapter covers how PostgreSQL and SQL Server approach caching internally, how you as a DBA can observe and influence those mechanisms, and how application-layer and query-result caching strategies complement what the database engine provides. By the end of this chapter, you will have a clear picture of how data moves from disk to buffer to application, where the opportunities for optimization lie, and what can go wrong when caching is mismanaged.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">How Databases Use Memory to Avoid Disk I/O</h3>
+
+<p class="text-gray-300 leading-relaxed">Every modern database engine operates on a fundamental principle: disk access is expensive, and memory access is cheap. When a query needs a page of data — whether a heap page, index page, or internal metadata — the engine first checks whether that page already lives in memory. If it does, the access is served immediately. If it does not, the engine reads it from disk, stores a copy in its in-memory buffer pool, and then serves the query. This buffer pool is the beating heart of database caching.</p>
+
+<p class="text-gray-300 leading-relaxed">In PostgreSQL, this memory region is called <strong class="text-white">shared buffers</strong>. Every backend process that executes a query shares access to this pool. When PostgreSQL reads a page from disk, it writes it into shared buffers, and subsequent requests for the same page find it there. The default size for shared buffers is 128 MB, a conservative value that almost every production deployment should raise significantly. A common starting point for a dedicated database server is 25% of total system RAM, though workload characteristics ultimately determine the right value.</p>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, the equivalent structure is the <strong class="text-white">Buffer Pool</strong>, managed by the Buffer Manager component. SQL Server is more aggressive by default — it claims as much RAM as the operating system allows (up to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code>) and does not readily return it. SQL Server's buffer pool handles not just data pages but also index pages, execution plan caches, and connection memory. The two engines differ meaningfully in how they manage memory pressure and eviction, but the underlying goal is the same: keep frequently needed pages in memory.</p>
+
+<p class="text-gray-300 leading-relaxed">Both engines use variations of the <strong class="text-white">LRU (Least Recently Used)</strong> algorithm to decide which pages to evict when the buffer pool fills up. PostgreSQL uses a clock-sweep algorithm, a practical approximation of LRU that avoids the overhead of maintaining a strict ordered list. SQL Server uses a more sophisticated version that also considers page reference counts and system memory pressure signals. In both systems, hot pages — those accessed frequently — tend to stay in memory, while cold pages get pushed out as new data enters.</p>
+
+<p class="text-gray-300 leading-relaxed">Understanding this behavior matters operationally. When you restart a database server, the buffer pool is cold — empty. Queries that were fast before the restart will suddenly be slow because every page access now requires a disk read. This is called a <strong class="text-white">cold cache</strong>, and it explains why performance benchmarks should never be taken immediately after a server restart, and why production deployments use warm-up scripts or delayed traffic ramp-ups after maintenance windows.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observing Buffer Cache Hit Rates</h3>
+
+<p class="text-gray-300 leading-relaxed">Before you can optimize caching, you need to measure it. Both PostgreSQL and SQL Server expose cache hit rate information through system views, and this metric tells you how often your workload is being served from memory versus disk.</p>
+
+<p class="text-gray-300 leading-relaxed">In PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_statio_user_tables</code> view tracks buffer hits and disk reads per table. A buffer hit means the requested block was found in shared buffers. A block read means the engine had to go to disk (or the OS file system cache, discussed shortly).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cache hit ratio per table
+SELECT
+    schemaname,
+    relname AS table_name,
+    heap_blks_read AS disk_reads,
+    heap_blks_hit  AS buffer_hits,
+    ROUND(
+        heap_blks_hit::numeric /
+        NULLIF(heap_blks_hit + heap_blks_read, 0) * 100,
+        2
+    ) AS hit_ratio_pct
+FROM pg_statio_user_tables
+WHERE heap_blks_hit + heap_blks_read &gt; 0
+ORDER BY disk_reads DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Buffer cache hit ratio from performance counters
+SELECT
+    object_name,
+    counter_name,
+    cntr_value AS hit_ratio
+FROM sys.dm_os_performance_counters
+WHERE counter_name IN (
+    'Buffer cache hit ratio',
+    'Buffer cache hit ratio base'
+)
+AND object_name LIKE '%Buffer Manager%';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A healthy OLTP system typically shows buffer cache hit ratios above 95%, and most well-configured production databases run at 98–99%. If you are seeing ratios significantly below 95%, the first question is whether shared buffers (or SQL Server's max server memory) is sized appropriately for the working set of data your queries access regularly.</p>
+
+<p class="text-gray-300 leading-relaxed">You can also look at which specific tables are generating the most disk reads, which helps prioritize tuning efforts. In PostgreSQL, tables with a persistently low hit ratio may benefit from either a larger shared_buffers value or investigation into whether large sequential scans are polluting the buffer pool with data that is only needed once.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with poor cache hit ratios
+SELECT
+    relname AS table_name,
+    heap_blks_read,
+    heap_blks_hit,
+    ROUND(
+        100.0 * heap_blks_hit /
+        NULLIF(heap_blks_hit + heap_blks_read, 0),
+        1
+    ) AS hit_pct
+FROM pg_statio_user_tables
+WHERE heap_blks_read &gt; 1000
+ORDER BY hit_pct ASC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pages in buffer pool per database
+SELECT
+    DB_NAME(database_id) AS database_name,
+    COUNT(*) AS pages_in_buffer,
+    COUNT(*) * 8 / 1024 AS size_mb
+FROM sys.dm_os_buffer_descriptors
+WHERE database_id &gt; 4  -- exclude system databases
+GROUP BY database_id
+ORDER BY pages_in_buffer DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, examining <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_buffer_descriptors</code> lets you see exactly how much of the buffer pool each database is consuming, which is valuable on shared instances. You can extend that query to the object level by joining through allocation units to find which tables are consuming the most buffer space — a table that holds a large fraction of the buffer pool but serves infrequent queries may be a candidate for moving to a separate filegroup or partitioning strategy.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Operating System Page Cache and Its Role</h3>
+
+<p class="text-gray-300 leading-relaxed">There is a layer of caching that many DBAs overlook: the operating system's own page cache. When PostgreSQL reads a page from disk, the operating system reads it through the file system into its own kernel page cache before PostgreSQL copies it into shared buffers. This means a page may actually be cached in two places: the OS page cache and PostgreSQL's shared buffers.</p>
+
+<p class="text-gray-300 leading-relaxed">This double-buffering is one reason why PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> parameter exists. This parameter does not allocate any memory — it is purely a hint to the query planner indicating how much memory is available for caching across both shared buffers and the OS page cache combined. Setting it accurately helps the planner make better decisions about whether index scans (which benefit from cached pages) or sequential scans are more appropriate for a given query.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server takes a different approach on Windows through its <strong class="text-white">Large Pages</strong> and <strong class="text-white">Lock Pages in Memory</strong> features. When configured, SQL Server can lock its buffer pool pages in physical RAM, preventing the operating system from paging them out under memory pressure. This eliminates OS-level eviction but requires specific Windows privileges and is typically enabled only on dedicated database servers where memory contention with other processes is not a concern.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL does not use direct I/O by default — it goes through the OS page cache. This is deliberate; PostgreSQL benefits from the OS cache as a second tier. SQL Server on Windows can bypass the OS cache for some operations using FILE_FLAG_NO_BUFFERING, but the default behavior also goes through the Windows cache manager. On Linux, SQL Server behaves similarly to PostgreSQL in relying on the OS page cache.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical implication is that tuning a database server means thinking about total memory holistically. On a 64 GB PostgreSQL server, setting shared_buffers to 16 GB and letting the OS use another 20–30 GB as a page cache is a reasonable configuration. The OS cache acts as an overflow layer — data that does not fit in shared buffers but is still needed frequently often gets served from the OS cache rather than actual disk, which is still significantly faster than a true cold disk read.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Query Plan Caching and Prepared Statements</h3>
+
+<p class="text-gray-300 leading-relaxed">Parsing, analyzing, and planning a query takes CPU time. For a simple lookup query that executes thousands of times per second, re-planning the query on every execution is wasteful. Both PostgreSQL and SQL Server maintain a plan cache — an in-memory store of compiled query plans — that allows previously seen queries to skip the planning phase entirely.</p>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, the <strong class="text-white">Procedure Cache</strong> (also called the Plan Cache) stores execution plans for ad-hoc queries, stored procedures, and prepared statements. SQL Server uses parameterization to recognize when two queries differ only in their literal values and can share a plan. You can inspect the plan cache through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_cached_plans</code> and related DMVs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top cached plans by execution count and CPU cost
+SELECT TOP 20
+    qs.execution_count,
+    qs.total_worker_time / 1000 AS total_cpu_ms,
+    qs.total_worker_time / qs.execution_count / 1000 AS avg_cpu_ms,
+    SUBSTRING(st.text, 1, 200) AS query_text,
+    qp.query_plan
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+CROSS APPLY sys.dm_exec_query_plan(qs.plan_handle) AS qp
+ORDER BY qs.execution_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cached plan usage via pg_prepared_statements (session-level)
+SELECT
+    name,
+    statement,
+    prepare_time,
+    calls,
+    total_exec_time,
+    mean_exec_time
+FROM pg_prepared_statements
+ORDER BY calls DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL handles plan caching differently from SQL Server. In PostgreSQL, query plan caching happens primarily through <strong class="text-white">prepared statements</strong>. When a client prepares a statement using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PREPARE</code> or a protocol-level prepare (as most connection poolers and ORMs do), PostgreSQL initially uses a generic plan after enough executions convince it that the generic plan is efficient. For the first five executions of a prepared statement, PostgreSQL creates a custom plan for each execution using the actual parameter values. After five executions, it evaluates whether a generic cached plan would be cheaper on average.</p>
+
+<p class="text-gray-300 leading-relaxed">This behavior — called <strong class="text-white">plan stabilization</strong> — exists because the optimal plan for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE customer_id = 1</code> might differ from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE customer_id = 99999</code> depending on data distribution. A generic plan must work reasonably well for all parameter values. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plan_cache_mode</code> parameter (introduced in PostgreSQL 12) allows DBAs to force either always using custom plans (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">force_custom_plan</code>) or always using generic cached plans (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">force_generic_plan</code>), which is sometimes useful when dealing with parameters that have highly skewed distributions.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's equivalent challenge is <strong class="text-white">parameter sniffing</strong>. When SQL Server first compiles a plan for a stored procedure, it uses the actual parameter values at that moment to estimate cardinality, and the resulting plan is cached. If those initial values were unusual — either very selective or very broad — the cached plan may perform poorly for typical parameter values. This is one of the most common performance problems in SQL Server, and solutions range from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTION (RECOMPILE)</code> on the query, to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OPTIMIZE FOR</code> hints, to breaking procedures into smaller pieces. From PostgreSQL 16 onward, <strong class="text-white">query identifier</strong> tracking through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> makes it easier to identify plan instability patterns without needing to instrument the application layer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Application-Layer Caching Strategies</h3>
+
+<p class="text-gray-300 leading-relaxed">The database buffer pool and plan cache are internal, automatic mechanisms. But at scale, even a perfectly tuned database will struggle if the application sends the same expensive queries repeatedly for data that does not change frequently. This is where application-layer caching strategies enter the picture, and DBAs need to understand them — not necessarily to implement them, but to design the database tier so that caching at higher layers works effectively.</p>
+
+<p class="text-gray-300 leading-relaxed">The most common pattern is a <strong class="text-white">read-through cache</strong> using a system like Redis or Memcached. The application checks the cache first; on a miss, it queries the database, stores the result in the cache with a TTL (time-to-live), and returns the result. Subsequent requests for the same data hit the cache and never reach the database. From the DBA's perspective, this pattern creates a tiered system where the database handles cold reads, initial population, and writes, while the cache handles the bulk of read traffic.</p>
+
+<p class="text-gray-300 leading-relaxed">This has an important implication for schema design. Data that benefits most from application-level caching tends to be read-heavy, relatively stable, and natural to serialize as a whole unit — a product catalog row, a user profile, a configuration setting. Data that changes frequently, or that requires joining many tables to assemble, is harder to cache correctly because cache invalidation becomes complex.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Write-through caching</strong> ensures that every write goes to both the cache and the database simultaneously, keeping the cache consistent. <strong class="text-white">Write-behind caching</strong> (also called write-back) buffers writes in the cache and flushes them to the database asynchronously. Write-behind can significantly reduce database write throughput pressure, but it introduces risk: if the cache layer fails before flushing, those writes are lost. As a DBA, you should be skeptical of write-behind designs for anything that requires durability, and you should ensure that any such design has explicit failure handling and monitoring.</p>
+
+<p class="text-gray-300 leading-relaxed">One pattern that databases themselves support, and that serves as an alternative to external caches for certain workloads, is <strong class="text-white">materialized views</strong>. A materialized view pre-computes the result of a complex query and stores it as a physical table. Queries that would otherwise join several large tables and aggregate millions of rows can instead read from the materialized view in milliseconds.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a materialized view for a complex aggregation
+CREATE MATERIALIZED VIEW monthly_sales_summary AS
+SELECT
+    DATE_TRUNC('month', order_date) AS month,
+    product_category,
+    SUM(order_total) AS total_revenue,
+    COUNT(*) AS order_count,
+    AVG(order_total) AS avg_order_value
+FROM orders
+JOIN products USING (product_id)
+GROUP BY 1, 2
+WITH DATA;
+
+-- Refresh it on a schedule
+REFRESH MATERIALIZED VIEW CONCURRENTLY monthly_sales_summary;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Indexed view (SQL Server's equivalent of a materialized view)
+CREATE VIEW monthly_sales_summary
+WITH SCHEMABINDING
+AS
+SELECT
+    DATEFROMPARTS(YEAR(o.order_date), MONTH(o.order_date), 1) AS month,
+    p.product_category,
+    SUM(o.order_total) AS total_revenue,
+    COUNT_BIG(*) AS order_count
+FROM dbo.orders AS o
+JOIN dbo.products AS p ON o.product_id = p.product_id
+GROUP BY
+    DATEFROMPARTS(YEAR(o.order_date), MONTH(o.order_date), 1),
+    p.product_category;
+
+-- Create a unique clustered index to materialize it
+CREATE UNIQUE CLUSTERED INDEX IX_monthly_sales_summary
+ON monthly_sales_summary (month, product_category);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REFRESH MATERIALIZED VIEW CONCURRENTLY</code> is notable because it allows the view to remain queryable during the refresh — locks are minimal, and readers see the previous version of the data until the new version is ready. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code> option requires a unique index on the materialized view. SQL Server's indexed views are automatically maintained as the underlying data changes, which is both convenient and a source of overhead on write-heavy tables. The DBA must weigh the write overhead against the query performance gain.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cache Eviction, Pollution, and Connection Pooling Interactions</h3>
+
+<p class="text-gray-300 leading-relaxed">Understanding that caching exists is one thing; understanding when it works against you is another. Three specific problems — cache eviction under pressure, cache pollution from large scans, and the interaction between connection poolers and plan caches — represent the production edge cases that experienced DBAs encounter and that are rarely documented clearly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cache eviction under memory pressure</strong> occurs when the buffer pool fills and the eviction algorithm must push out pages. In PostgreSQL, if a large ETL job or reporting query performs sequential scans over many tables, it will load millions of pages into shared buffers, potentially evicting hot pages that the OLTP workload depends on. PostgreSQL partially mitigates this through a mechanism called <strong class="text-white">ring buffers</strong> for sequential scans: large sequential scans use a small, fixed ring of buffer slots rather than populating the full shared buffer pool. This is automatic for scans over tables larger than a certain threshold (roughly 256 KB by default, controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_io_concurrency</code> and internal heuristics). The result is that sequential scans of large tables do not destroy the buffer pool, though they can still contribute to pressure.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server provides the <strong class="text-white">Resource Governor</strong> feature to limit memory grants to specific workloads. By classifying connections into resource pools, you can ensure that a reporting query cannot consume buffer pool space at the expense of OLTP queries. This is one of the most underused features in SQL Server environments where mixed workloads run on the same instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cache pollution</strong> from analytics workloads is a real problem that many teams address by routing analytical queries to a read replica. Both PostgreSQL streaming replication and SQL Server Always On Availability Groups support read-intent replicas. Directing reporting workloads to the replica not only keeps the primary's buffer pool clean but also offloads CPU and I/O from the primary entirely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection poolers and plan cache invalidation</strong> create a subtle problem. Tools like PgBouncer (for PostgreSQL) in session-mode maintain prepared statements across connection reuse, which is efficient. In transaction-mode pooling — where a client gets a backend connection only for the duration of a transaction — prepared statements cannot persist across transactions, because the client might get a different backend each time. This forces applications to use protocol-level prepared statements carefully, or to fall back to non-prepared queries, giving up plan cache benefits. When configuring a connection pooler, the DBA must understand whether the application relies on server-side prepared statements and choose the pooling mode accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, connection pooling is typically handled by the client driver (ADO.NET, JDBC), and the plan cache is server-side and query-keyed rather than connection-keyed. Switching pooling modes is less disruptive to plan caching. However, frequent <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC FREEPROCCACHE</code> calls — sometimes used as a troubleshooting step — clear the entire plan cache, forcing recompilation of everything. This is rarely the right production action; targeted eviction using the plan handle is always preferable.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check for plans that may be causing problems (high planning time)
+SELECT
+    query,
+    calls,
+    ROUND(total_plan_time::numeric / calls, 2) AS avg_plan_ms,
+    ROUND(total_exec_time::numeric / calls, 2) AS avg_exec_ms
+FROM pg_stat_statements
+WHERE calls &gt; 100
+  AND total_plan_time / calls &gt; total_exec_time / calls
+ORDER BY avg_plan_ms DESC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find plans with high recompile counts
+SELECT
+    qs.sql_handle,
+    qs.plan_generation_num,
+    qs.execution_count,
+    qs.total_worker_time / 1000 AS total_cpu_ms,
+    SUBSTRING(st.text, 1, 300) AS query_text
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+WHERE qs.plan_generation_num &gt; 1
+ORDER BY qs.plan_generation_num DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A query with a high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plan_generation_num</code> in SQL Server is being recompiled repeatedly — typically because of statistics changes, schema changes, or explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RECOMPILE</code> hints. Each recompile consumes CPU and represents time where the query is not being executed. If recompiles are frequent and the query is hot, investigate whether the triggering cause (often a statistics update on a large table) can be controlled through manual statistics management or table variable instead of temp table usage.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The buffer pool is the primary cache** in both PostgreSQL (shared buffers) and SQL Server (Buffer Pool). Sizing it appropriately for the working data set is the single most impactful caching configuration decision a DBA makes.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cache hit rate is a key health metric.** Values below 95% warrant investigation into buffer pool sizing, workload patterns, and whether large analytical scans are evicting hot OLTP pages. Both engines expose this data through system views and DMVs.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Plan caching reduces planning overhead**, but each engine has failure modes — parameter sniffing in SQL Server and plan instability with skewed parameters in PostgreSQL. Understanding how to diagnose and address these without blunt tools like cache-clearing is an important production skill.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Application-layer caching through materialized views, Redis, or similar systems** reduces database read pressure for stable data, but requires careful invalidation strategies. Materialized views — whether PostgreSQL's refreshable variant or SQL Server's auto-maintained indexed views — are a powerful database-native option that does not require external infrastructure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cache pollution and memory pressure from mixed workloads** are common in production environments that run OLTP and analytics on the same instance. Read replicas, resource pools, and understanding each engine's sequential scan buffering behavior are the tools for keeping caches effective under these conditions.</li>
+    </div>
+    <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 flex justify-between text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The DBA Handbook</div>
+  </footer>
+</body>
+</html>
