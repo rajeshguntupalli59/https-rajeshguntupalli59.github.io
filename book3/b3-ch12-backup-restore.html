@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 12: Autonomous Backup & Restore Systems — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 12: Autonomous Backup & Restore Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-emerald-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">ADE Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-emerald-400 hover:text-emerald-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-emerald-900/40 border border-emerald-800/40 text-emerald-300 text-xs rounded-full font-medium">Chapter 12 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 12: Autonomous Backup & Restore Systems</h2>
+
+<p class="text-gray-300 leading-relaxed">Backup and restore have traditionally been the most human-dependent operations in database management — schedules set manually, retention policies enforced inconsistently, restore testing performed quarterly at best, and recovery procedures that exist as PDF documents nobody updates. An autonomous backup system inverts this entirely: it observes the database's change rate, transaction patterns, and business criticality in real time; decides what to back up, how frequently, and to which tiers of storage; executes and validates those backups without operator input; and can initiate restore operations — including full environment reconstruction — based on defined policy or detected corruption. This chapter covers the full architecture of autonomous backup systems: decision logic for adaptive scheduling, continuous validation pipelines, policy-driven restore automation, and the operational patterns that make these systems production-safe at scale.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Adaptive Backup Scheduling Based on Change Velocity</h3>
+
+<p class="text-gray-300 leading-relaxed">Static backup schedules are an artifact of the manual era. A database that processes 500 transactions per hour at 2 AM and 50,000 transactions per hour at noon has a fundamentally different RPO risk profile across those windows, yet most organizations apply a uniform schedule to both. An autonomous system observes write velocity continuously and adjusts backup frequency accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed">The core metric is <strong class="text-white">modified page rate</strong> for SQL Server and <strong class="text-white">WAL generation rate</strong> for PostgreSQL. Both serve as proxies for how quickly the database is diverging from its last known-good backup. When the divergence rate is high, the cost of data loss per unit time is proportionally high, and backup frequency should increase. When the database is quiescent, backup frequency can safely decrease to preserve storage and I/O budget.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track WAL generation rate over rolling 5-minute windows
+-- Store in a monitoring schema for the scheduler to query
+CREATE TABLE IF NOT EXISTS backup_monitor.wal_velocity (
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    wal_bytes_delta BIGINT,
+    tps_rate        NUMERIC(12, 2),
+    lsn_current     PG_LSN
+);
+
+-- Called by the scheduler agent every 5 minutes
+INSERT INTO backup_monitor.wal_velocity (wal_bytes_delta, tps_rate, lsn_current)
+SELECT
+    (pg_current_wal_lsn() - wal_lsn_at_last_checkpoint) AS wal_bytes_delta,
+    xact_commit + xact_rollback AS tps_rate,
+    pg_current_wal_lsn()
+FROM pg_stat_bgwriter, pg_control_checkpoint()
+WHERE pg_stat_bgwriter.stats_reset &lt; now() - INTERVAL '5 minutes';
+
+-- Scheduler query: should we trigger an incremental backup?
+SELECT
+    recorded_at,
+    wal_bytes_delta,
+    CASE
+        WHEN wal_bytes_delta &gt; 5368709120  THEN 'HIGH'      -- &gt; 5 GB WAL in 5 min
+        WHEN wal_bytes_delta &gt; 1073741824  THEN 'MEDIUM'    -- &gt; 1 GB
+        WHEN wal_bytes_delta &gt; 104857600   THEN 'LOW'       -- &gt; 100 MB
+        ELSE 'QUIESCENT'
+    END AS velocity_band
+FROM backup_monitor.wal_velocity
+ORDER BY recorded_at DESC
+LIMIT 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track modified extent rate using dm_io_virtual_file_stats
+-- Proxy for change velocity per database
+SELECT
+    DB_NAME(vfs.database_id)                             AS database_name,
+    SUM(vfs.io_stall_write_ms)                           AS write_stall_ms,
+    SUM(vfs.num_of_bytes_written)                        AS bytes_written,
+    SUM(vfs.num_of_writes)                               AS write_ops,
+    CASE
+        WHEN SUM(vfs.num_of_bytes_written) &gt; 5368709120 THEN 'HIGH'
+        WHEN SUM(vfs.num_of_bytes_written) &gt; 1073741824 THEN 'MEDIUM'
+        WHEN SUM(vfs.num_of_bytes_written) &gt; 104857600  THEN 'LOW'
+        ELSE 'QUIESCENT'
+    END                                                   AS velocity_band,
+    GETUTCDATE()                                          AS sampled_at
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+GROUP BY vfs.database_id
+ORDER BY bytes_written DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The scheduler agent consumes this velocity data and maps it to a backup tier decision table:</p>
+
+<p class="text-gray-300 leading-relaxed">| Velocity Band | Full Backup | Incremental / Differential | Log Backup |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| HIGH | Weekly | Every 2 hours | Every 5 minutes |</p>
+<p class="text-gray-300 leading-relaxed">| MEDIUM | Weekly | Every 6 hours | Every 15 minutes |</p>
+<p class="text-gray-300 leading-relaxed">| LOW | Weekly | Daily | Every 30 minutes |</p>
+<p class="text-gray-300 leading-relaxed">| QUIESCENT | Bi-weekly | Weekly | Hourly |</p>
+
+<p class="text-gray-300 leading-relaxed">This table is not static configuration — the scheduler agent recalculates it against observed RPO breach probability. If a HIGH-velocity period has been sustained for more than four hours (suggesting a bulk load or migration rather than a transient spike), the scheduler may promote to a more aggressive log backup cadence or trigger an opportunistic incremental.</p>
+
+<p class="text-gray-300 leading-relaxed">The Python scheduler that drives this loop runs as a Kubernetes CronJob with a 1-minute resolution. It reads the velocity band, compares against the last backup timestamp for each tier, and emits backup jobs to a task queue:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+import redis
+import json
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass, asdict
+from enum import Enum
+
+class VelocityBand(Enum):
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    QUIESCENT = "QUIESCENT"
+
+@dataclass
+class BackupDecision:
+    database: str
+    backup_type: str          # full | incremental | log
+    priority: int             # 1=immediate, 2=scheduled, 3=deferred
+    reason: str
+    triggered_at: str
+
+POLICY = {
+    VelocityBand.HIGH:      {"log_interval_min": 5,  "incr_interval_hr": 2},
+    VelocityBand.MEDIUM:    {"log_interval_min": 15, "incr_interval_hr": 6},
+    VelocityBand.LOW:       {"log_interval_min": 30, "incr_interval_hr": 24},
+    VelocityBand.QUIESCENT: {"log_interval_min": 60, "incr_interval_hr": 168},
+}
+
+def get_velocity_band(conn, database: str) -&gt; VelocityBand:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT velocity_band FROM backup_monitor.wal_velocity
+            WHERE recorded_at &gt; now() - INTERVAL '10 minutes'
+            ORDER BY recorded_at DESC LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        return VelocityBand(row[0]) if row else VelocityBand.QUIESCENT
+
+def get_last_backup_time(redis_client, database: str, backup_type: str) -&gt; datetime:
+    key = f"backup:last:{database}:{backup_type}"
+    val = redis_client.get(key)
+    if val:
+        return datetime.fromisoformat(val.decode())
+    return datetime.min.replace(tzinfo=timezone.utc)
+
+def evaluate_backup_need(
+    database: str,
+    band: VelocityBand,
+    last_log: datetime,
+    last_incr: datetime,
+) -&gt; list[BackupDecision]:
+    decisions = []
+    policy = POLICY[band]
+    now = datetime.now(timezone.utc)
+
+    if (now - last_log) &gt; timedelta(minutes=policy["log_interval_min"]):
+        decisions.append(BackupDecision(
+            database=database,
+            backup_type="log",
+            priority=1 if band == VelocityBand.HIGH else 2,
+            reason=f"Log interval exceeded for band {band.value}",
+            triggered_at=now.isoformat(),
+        ))
+
+    if (now - last_incr) &gt; timedelta(hours=policy["incr_interval_hr"]):
+        decisions.append(BackupDecision(
+            database=database,
+            backup_type="incremental",
+            priority=2,
+            reason=f"Incremental interval exceeded for band {band.value}",
+            triggered_at=now.isoformat(),
+        ))
+
+    return decisions
+
+def run_scheduler(pg_dsn: str, redis_url: str, databases: list[str]):
+    conn = psycopg2.connect(pg_dsn)
+    r = redis.from_url(redis_url)
+    queue = r.pipeline()
+
+    for db in databases:
+        band = get_velocity_band(conn, db)
+        last_log = get_last_backup_time(r, db, "log")
+        last_incr = get_last_backup_time(r, db, "incremental")
+        decisions = evaluate_backup_need(db, band, last_log, last_incr)
+
+        for decision in decisions:
+            queue.rpush("backup:jobs", json.dumps(asdict(decision)))
+
+    queue.execute()
+    conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This loop runs on a 1-minute Kubernetes CronJob schedule. The actual backup execution is decoupled into a separate worker pool, allowing the scheduler to remain lightweight and the backup workers to scale independently under load.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Continuous Backup Validation Without Human Review</h3>
+
+<p class="text-gray-300 leading-relaxed">A backup that has never been tested is not a backup — it is a hope. Most organizations test restore capability infrequently because the process requires human coordination: spin up a test environment, restore, verify, tear down. An autonomous system eliminates that coordination dependency entirely by running a continuous validation pipeline in the background, generating an auditable truth record of every backup's restorability.</p>
+
+<p class="text-gray-300 leading-relaxed">The validation pipeline has three stages:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Structural integrity check</strong> — immediately after backup completion, verify that the backup files are not corrupted and that the catalog metadata is consistent.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Restore smoke test</strong> — periodically, restore the backup to an isolated environment (a throwaway container or VM) and run a lightweight probe query suite to confirm the data is readable and internally consistent.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Application-level consistency check</strong> — run a set of business logic assertions against the restored database to confirm that referential integrity, row counts in key tables, and sequence values are within expected bounds.</p>
+
+<p class="text-gray-300 leading-relaxed">The first stage runs synchronously after every backup. The second and third stages run asynchronously in a dedicated validation namespace in Kubernetes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Immediately after pg_basebackup or pgBackRest backup completes:
+-- Record backup catalog entry with initial validation state
+INSERT INTO backup_catalog.backups (
+    backup_id,
+    database_name,
+    backup_type,
+    started_at,
+    completed_at,
+    backup_size_bytes,
+    wal_start_lsn,
+    wal_stop_lsn,
+    storage_path,
+    validation_state,  -- 'PENDING' | 'INTEGRITY_OK' | 'RESTORE_OK' | 'APP_OK' | 'FAILED'
+    validation_message
+)
+VALUES (
+    gen_random_uuid(),
+    $1, $2, $3, $4, $5, $6::pg_lsn, $7::pg_lsn, $8,
+    'PENDING',
+    NULL
+);
+
+-- Query the validation pipeline uses to find work
+SELECT
+    backup_id,
+    database_name,
+    backup_type,
+    storage_path,
+    completed_at,
+    validation_state
+FROM backup_catalog.backups
+WHERE validation_state IN ('PENDING', 'INTEGRITY_OK')
+  AND completed_at &gt; now() - INTERVAL '48 hours'
+ORDER BY completed_at ASC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server backup validation catalog
+-- Track RESTORE VERIFYONLY results and restore smoke test outcomes
+CREATE TABLE backup_catalog.BackupValidations (
+    ValidationId    UNIQUEIDENTIFIER DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
+    BackupSetId     INT              NOT NULL,   -- from msdb.dbo.backupset
+    DatabaseName    SYSNAME          NOT NULL,
+    BackupType      VARCHAR(20)      NOT NULL,   -- Full | Differential | Log
+    BackupStartDate DATETIME2        NOT NULL,
+    BackupFinishDate DATETIME2       NOT NULL,
+    PhysicalDeviceName NVARCHAR(512) NOT NULL,
+    ValidationState VARCHAR(20)      NOT NULL DEFAULT 'PENDING',
+    VerifyOnly_Passed BIT            NULL,
+    RestoreSmoke_Passed BIT          NULL,
+    AppConsistency_Passed BIT        NULL,
+    ValidatedAt     DATETIME2        NULL,
+    ValidationMessage NVARCHAR(MAX)  NULL
+);
+
+-- Populate from msdb on backup completion (called by SQL Agent job)
+INSERT INTO backup_catalog.BackupValidations (
+    BackupSetId, DatabaseName, BackupType,
+    BackupStartDate, BackupFinishDate, PhysicalDeviceName
+)
+SELECT
+    bs.backup_set_id,
+    bs.database_name,
+    CASE bs.type
+        WHEN 'D' THEN 'Full'
+        WHEN 'I' THEN 'Differential'
+        WHEN 'L' THEN 'Log'
+    END,
+    bs.backup_start_date,
+    bs.backup_finish_date,
+    bmf.physical_device_name
+FROM msdb.dbo.backupset bs
+JOIN msdb.dbo.backupmediafamily bmf
+    ON bs.media_set_id = bmf.media_set_id
+WHERE bs.backup_finish_date &gt; DATEADD(MINUTE, -5, GETUTCDATE())
+  AND bs.database_name = @DatabaseName;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The restore smoke test uses ephemeral containers managed by a Kubernetes operator. The operator watches the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">backup_catalog.backups</code> table (or its SQL Server equivalent) for entries in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INTEGRITY_OK</code> state and schedules a restore pod:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import subprocess
+import psycopg2
+import logging
+from pathlib import Path
+
+logger = logging.getLogger("backup_validator")
+
+SMOKE_TEST_QUERIES = [
+    # Verify pg_catalog is readable
+    "SELECT count(*) FROM pg_catalog.pg_class WHERE relkind = 'r';",
+    # Verify no bloat in pg_attribute that suggests corruption
+    "SELECT count(*) FROM pg_catalog.pg_attribute WHERE attnum &gt; 0;",
+    # Verify sequences are consistent
+    "SELECT count(*) FROM information_schema.sequences;",
+]
+
+def restore_to_ephemeral(backup_path: str, restore_port: int) -&gt; bool:
+    """Restore a pgBackRest backup to an ephemeral PostgreSQL instance."""
+    restore_data_dir = f"/tmp/restore_{restore_port}"
+    Path(restore_data_dir).mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run(
+        [
+            "pgbackrest",
+            f"--stanza=main",
+            f"--pg1-path={restore_data_dir}",
+            f"--recovery-option=recovery_target=immediate",
+            f"--recovery-option=recovery_target_action=promote",
+            "--type=immediate",
+            "restore",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+
+    if result.returncode != 0:
+        logger.error("Restore failed: %s", result.stderr)
+        return False
+
+    # Start ephemeral postgres instance
+    pg_start = subprocess.run(
+        ["pg_ctl", "-D", restore_data_dir, "-o", f"-p {restore_port}", "start"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return pg_start.returncode == 0
+
+def run_smoke_tests(restore_port: int, database: str) -&gt; tuple[bool, str]:
+    """Execute smoke test queries against the restored instance."""
+    try:
+        conn = psycopg2.connect(
+            host="localhost",
+            port=restore_port,
+            dbname=database,
+            user="validator",
+            connect_timeout=10,
+        )
+        with conn.cursor() as cur:
+            for query in SMOKE_TEST_QUERIES:
+                cur.execute(query)
+                result = cur.fetchone()
+                if result is None or result[0] == 0:
+                    return False, f"Smoke test failed: zero rows from [{query}]"
+        conn.close()
+        return True, "All smoke tests passed"
+    except Exception as e:
+        return False, f"Connection or query error: {e}"
+
+def validate_backup(backup_id: str, backup_path: str, database: str,
+                    catalog_dsn: str):
+    restore_port = 55432  # ephemeral port range managed by port allocator
+    try:
+        restored = restore_to_ephemeral(backup_path, restore_port)
+        if not restored:
+            _update_catalog(catalog_dsn, backup_id, "FAILED", "Restore failed")
+            return
+
+        passed, message = run_smoke_tests(restore_port, database)
+        state = "RESTORE_OK" if passed else "FAILED"
+        _update_catalog(catalog_dsn, backup_id, state, message)
+    finally:
+        subprocess.run(["pg_ctl", "-D", f"/tmp/restore_{restore_port}", "stop"],
+                       capture_output=True)
+
+def _update_catalog(dsn: str, backup_id: str, state: str, message: str):
+    conn = psycopg2.connect(dsn)
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE backup_catalog.backups
+            SET validation_state = %s,
+                validation_message = %s,
+                validated_at = now()
+            WHERE backup_id = %s
+            """,
+            (state, message, backup_id),
+        )
+    conn.commit()
+    conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When a backup fails validation, the system does not simply log the failure. It immediately triggers a fresh backup of the same type, alerts the on-call channel through PagerDuty or Alertmanager, and suppresses all automated restore operations that would have consumed the failed backup. The decision tree is: <strong class="text-white">if validation_state = 'FAILED' and backup_type = 'full', trigger emergency full backup and page; if backup_type = 'log', trigger log backup retry and record the gap in the catalog for PITR range invalidation.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Policy-Driven Retention and Tiered Storage Lifecycle</h3>
+
+<p class="text-gray-300 leading-relaxed">Retention management is where backup systems accumulate the most hidden cost and compliance risk simultaneously. Organizations over-retain backups on expensive primary storage because the rules for deletion are unclear or the deletion process requires human approval. An autonomous system encodes retention policy as machine-executable rules and enforces them on a continuous basis.</p>
+
+<p class="text-gray-300 leading-relaxed">Retention policy in an autonomous system has four dimensions:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Time-based retention**: Keep backups for N days regardless of count</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Count-based retention**: Keep the last N full backups regardless of age</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RPO-coverage retention**: Keep enough logs to satisfy any point-in-time restore within the defined RPO window</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Compliance anchor retention**: Certain backups (e.g., end-of-month full backups) are locked and exempt from normal expiry rules</li>
+
+<p class="text-gray-300 leading-relaxed">The storage lifecycle manager evaluates each backup against all four dimensions. A backup is eligible for deletion only when it fails all four retention tests. The tier migration logic runs separately: backups older than 7 days move from NVMe-backed primary storage to object storage (S3, Azure Blob, or GCS); backups older than 30 days move to archive storage classes (Glacier, Archive).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retention policy table — per database, per environment
+CREATE TABLE backup_catalog.retention_policies (
+    policy_id           SERIAL PRIMARY KEY,
+    database_name       TEXT NOT NULL,
+    environment         TEXT NOT NULL,  -- prod | staging | dev
+    retain_days         INT  NOT NULL DEFAULT 30,
+    retain_full_count   INT  NOT NULL DEFAULT 4,
+    pitr_window_hours   INT  NOT NULL DEFAULT 72,
+    compliance_anchor   TEXT NULL,      -- '{"day": "last", "month_end": true}'
+    storage_tier_rules  JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Query: identify backups eligible for deletion
+-- A backup is NOT deleted if ANY retention rule still covers it
+WITH policy AS (
+    SELECT * FROM backup_catalog.retention_policies
+    WHERE database_name = $1
+      AND environment = $2
+),
+retention_counts AS (
+    SELECT
+        backup_id,
+        completed_at,
+        backup_type,
+        ROW_NUMBER() OVER (
+            PARTITION BY backup_type
+            ORDER BY completed_at DESC
+        ) AS recency_rank
+    FROM backup_catalog.backups
+    WHERE database_name = $1
+      AND validation_state NOT IN ('FAILED', 'PENDING')
+)
+SELECT
+    rc.backup_id,
+    rc.completed_at,
+    rc.backup_type,
+    CASE
+        WHEN rc.completed_at &gt; now() - (p.retain_days || ' days')::INTERVAL
+            THEN 'RETAINED_TIME'
+        WHEN rc.recency_rank &lt;= p.retain_full_count
+            THEN 'RETAINED_COUNT'
+        WHEN rc.backup_type = 'log'
+         AND rc.completed_at &gt; now() - (p.pitr_window_hours || ' hours')::INTERVAL
+            THEN 'RETAINED_PITR'
+        ELSE 'ELIGIBLE_FOR_DELETION'
+    END AS retention_decision
+FROM retention_counts rc
+CROSS JOIN policy p
+WHERE retention_decision = 'ELIGIBLE_FOR_DELETION';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+    </div>
+    <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+        Learn More →
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The ADE Handbook</div>
+  </footer>
+</body>
+</html>
