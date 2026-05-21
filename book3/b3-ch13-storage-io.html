@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 13: Self-Optimizing Storage and I/O — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 13: Self-Optimizing Storage and I/O. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-emerald-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">ADE Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-emerald-400 hover:text-emerald-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-emerald-900/40 border border-emerald-800/40 text-emerald-300 text-xs rounded-full font-medium">Chapter 13 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 13: Self-Optimizing Storage and I/O</h2>
+
+<p class="text-gray-300 leading-relaxed">Storage is where autonomous database engineering gets physical. Query optimizers, connection poolers, and caching layers all operate in memory and CPU — but eventually, every read and write touches a storage medium, and the behavior of that medium under load determines whether your system survives a crisis or collapses under it. The systems examined in this chapter don't wait for a storage bottleneck to appear on a dashboard. They continuously monitor I/O saturation, file system layout, tablespace utilization, buffer hit ratios, and write amplification — then act. They move hot data closer to compute, tier cold data to cheaper media, rebalance writes across devices, and restructure on-disk layout without a human ever opening a terminal. This is autonomous storage management: a discipline that sits at the intersection of operating system I/O scheduling, database internals, and feedback-driven automation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Instrumentation Architecture: Building the I/O Observability Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">No autonomous action is sound without high-fidelity data. Before a system can self-optimize storage, it must build a complete picture of where I/O time is actually going — across PostgreSQL's background writer, checkpointer, and WAL writer, or SQL Server's I/O completion ports, VDI subsystem, and filegroup allocation patterns.</p>
+
+<p class="text-gray-300 leading-relaxed">The observability layer must collect at three levels simultaneously: the OS block device level, the database engine level, and the logical object level. Conflating these three creates misleading signals. A table with poor sequential scan performance might be fine at the block device level but suffering from heap fragmentation. A WAL device might show 95% utilization while the data device sits idle — indicating checkpoint tuning as the correct intervention, not storage provisioning.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a point-in-time I/O snapshot per relation, tracking heap vs. index read/hit ratios
+SELECT
+    schemaname,
+    relname,
+    heap_blks_read,
+    heap_blks_hit,
+    ROUND(
+        heap_blks_hit::numeric /
+        NULLIF(heap_blks_hit + heap_blks_read, 0) * 100, 2
+    ) AS heap_hit_ratio,
+    idx_blks_read,
+    idx_blks_hit,
+    ROUND(
+        idx_blks_hit::numeric /
+        NULLIF(idx_blks_hit + idx_blks_read, 0) * 100, 2
+    ) AS idx_hit_ratio,
+    toast_blks_read,
+    tidx_blks_read
+FROM pg_statio_user_tables
+WHERE heap_blks_read + heap_blks_hit &gt; 10000
+ORDER BY heap_blks_read DESC
+LIMIT 50;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture I/O stall distribution per file to identify hot files vs. idle files
+SELECT
+    DB_NAME(vfs.database_id)         AS database_name,
+    mf.physical_name,
+    mf.type_desc,
+    vfs.io_stall_read_ms,
+    vfs.io_stall_write_ms,
+    vfs.io_stall,
+    vfs.num_of_reads,
+    vfs.num_of_writes,
+    CASE
+        WHEN vfs.num_of_reads = 0 THEN 0
+        ELSE ROUND(vfs.io_stall_read_ms * 1.0 / vfs.num_of_reads, 2)
+    END AS avg_read_ms,
+    CASE
+        WHEN vfs.num_of_writes = 0 THEN 0
+        ELSE ROUND(vfs.io_stall_write_ms * 1.0 / vfs.num_of_writes, 2)
+    END AS avg_write_ms
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) vfs
+JOIN sys.master_files mf
+    ON vfs.database_id = mf.database_id
+    AND vfs.file_id = mf.file_id
+ORDER BY vfs.io_stall DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These queries feed a time-series collection loop. In production, a Python agent runs on each database host at 15-second intervals, writing delta values (not cumulative totals) to a Prometheus Pushgateway. The delta calculation is important — raw cumulative counters are useless for detecting transient I/O spikes that resolve within a scrape window.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+import time
+import requests
+from datetime import datetime
+
+PUSHGATEWAY_URL = "http://prometheus-pushgateway:9091"
+SCRAPE_INTERVAL = 15  # seconds
+
+def collect_io_deltas(conn, prev_snapshot):
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT relid, relname, heap_blks_read, heap_blks_hit,
+               idx_blks_read, idx_blks_hit
+        FROM pg_statio_user_tables
+    """)
+    current = {row[0]: row for row in cursor.fetchall()}
+
+    metrics = []
+    for relid, row in current.items():
+        if relid in prev_snapshot:
+            prev = prev_snapshot[relid]
+            delta_reads = row[2] - prev[2]
+            delta_hits  = row[3] - prev[3]
+            if delta_reads + delta_hits &gt; 0:
+                hit_ratio = delta_hits / (delta_reads + delta_hits)
+                metrics.append(
+                    f'pg_table_buffer_hit_ratio{{relation="{row[1]}"}} {hit_ratio:.4f}'
+                )
+                metrics.append(
+                    f'pg_table_blks_read_delta{{relation="{row[1]}"}} {delta_reads}'
+                )
+
+    push_metrics(metrics)
+    return current
+
+def push_metrics(metrics):
+    payload = "\n".join(metrics) + "\n"
+    requests.post(
+        f"{PUSHGATEWAY_URL}/metrics/job/pg_io_agent",
+        data=payload,
+        headers={"Content-Type": "text/plain"}
+    )
+
+def run_collector():
+    conn = psycopg2.connect("dbname=postgres user=monitor")
+    snapshot = {}
+    while True:
+        snapshot = collect_io_deltas(conn, snapshot)
+        time.sleep(SCRAPE_INTERVAL)
+
+if __name__ == "__main__":
+    run_collector()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">At the OS level, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">iostat -x</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">blktrace</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nvme smart-log</code> provide device-level saturation metrics. These are collected separately and joined to database-level metrics in Grafana using host labels. The full picture — object-level, engine-level, and device-level — is what allows the autonomous decision engine to distinguish between a bad query plan, a full checkpoint storm, and a failing NVMe drive.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Tablespace and Filegroup Rebalancing</h3>
+
+<p class="text-gray-300 leading-relaxed">Once instrumentation is in place, the first class of autonomous action involves routing data to the right storage tier. Production environments routinely have heterogeneous storage: a fast NVMe tier for active working data, a mid-tier SAS or network-attached volume for warm data, and object storage or compressed block storage for cold or archival data. Manual tiering policies degrade over time because access patterns shift — yesterday's cold archive becomes today's compliance reporting target. Autonomous tiering systems react to this drift continuously.</p>
+
+<p class="text-gray-300 leading-relaxed">In PostgreSQL, tablespace-based tiering is the mechanism. Each tablespace maps to a directory on a specific mount point. Tables and indexes can be moved between tablespaces online using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET TABLESPACE</code>, which PostgreSQL executes with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ACCESS EXCLUSIVE</code> lock — a hard constraint that autonomous systems must work around using maintenance windows or live partition swapping.</p>
+
+<p class="text-gray-300 leading-relaxed">The tiering decision logic follows a straightforward heat score model. For each relation, the system computes a heat score based on recent access frequency, write volume, and age of last modification:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>heat_score = (reads_per_hour * 0.4) + (writes_per_hour * 0.5) + (1 / days_since_modified * 0.1)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Relations scoring below a configured cold threshold for seven consecutive measurement periods become candidates for demotion. Relations scoring above a hot threshold that currently reside on a slower tablespace become candidates for promotion.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables eligible for cold-tier demotion based on statio deltas logged to a metrics table
+WITH recent_io AS (
+    SELECT
+        relation_name,
+        AVG(heap_blks_read_delta)  AS avg_reads,
+        AVG(heap_blks_write_delta) AS avg_writes,
+        MAX(collected_at)          AS last_seen
+    FROM io_metrics_history
+    WHERE collected_at &gt;= NOW() - INTERVAL '7 days'
+    GROUP BY relation_name
+),
+current_placement AS (
+    SELECT
+        c.relname AS relation_name,
+        t.spcname AS tablespace_name,
+        pg_total_relation_size(c.oid) AS total_bytes
+    FROM pg_class c
+    LEFT JOIN pg_tablespace t ON t.oid = c.reltablespace
+    WHERE c.relkind = 'r'
+      AND c.relnamespace NOT IN (
+          SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema')
+      )
+)
+SELECT
+    cp.relation_name,
+    cp.tablespace_name,
+    cp.total_bytes / (1024*1024) AS size_mb,
+    COALESCE(ri.avg_reads, 0)   AS avg_reads_per_interval,
+    COALESCE(ri.avg_writes, 0)  AS avg_writes_per_interval
+FROM current_placement cp
+LEFT JOIN recent_io ri ON ri.relation_name = cp.relation_name
+WHERE COALESCE(ri.avg_reads, 0) + COALESCE(ri.avg_writes, 0) &lt; 50
+  AND cp.tablespace_name = 'hot_nvme'
+ORDER BY avg_reads_per_interval ASC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify filegroups with disproportionate I/O load relative to data volume
+SELECT
+    fg.name                          AS filegroup_name,
+    fg.type_desc,
+    SUM(mf.size) * 8 / 1024         AS total_size_mb,
+    SUM(vfs.num_of_reads)            AS total_reads,
+    SUM(vfs.num_of_writes)           AS total_writes,
+    SUM(vfs.io_stall)                AS total_stall_ms,
+    ROUND(
+        SUM(vfs.io_stall) * 1.0 /
+        NULLIF(SUM(vfs.num_of_reads + vfs.num_of_writes), 0),
+    2)                               AS avg_stall_ms_per_op
+FROM sys.filegroups fg
+JOIN sys.database_files mf ON mf.data_space_id = fg.data_space_id
+JOIN sys.dm_io_virtual_file_stats(DB_ID(), NULL) vfs
+    ON vfs.file_id = mf.file_id
+GROUP BY fg.name, fg.type_desc
+ORDER BY avg_stall_ms_per_op DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, the equivalent of tablespace tiering is filegroup migration. Tables can be moved between filegroups by rebuilding their clustered index on the target filegroup: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE CLUSTERED INDEX ... ON table(col) WITH (DROP_EXISTING = ON) ON new_filegroup</code>. This operation can be performed online in Enterprise Edition, making it appropriate for autonomous execution during low-traffic windows. The autonomous agent identifies candidate objects, schedules the rebuild during a detected low-traffic window (typically identified by a rolling average of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@@CPU_BUSY</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dm_os_wait_stats</code> for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_*</code> waits), and executes the move.</p>
+
+<p class="text-gray-300 leading-relaxed">The rebalancing agent runs as a Kubernetes CronJob with a configurable schedule. It pulls the heat score analysis from the metrics database, generates a list of recommended moves, applies a safety budget (maximum N GB of data movement per execution window), and issues the appropriate DDL. Completion is logged to an audit table, and the metrics pipeline recalculates heat scores in the next collection cycle.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Checkpoint and Write Amplification Control in PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's write path is dominated by three background processes: the WAL writer, the background writer (bgwriter), and the checkpointer. Each of these has tunable parameters that, when set incorrectly, produce write amplification — the same data being written to disk multiple times unnecessarily — or checkpoint storms: sudden bursts of dirty page flushes that saturate the I/O subsystem and spike latency for every concurrent query.</p>
+
+<p class="text-gray-300 leading-relaxed">An autonomous checkpoint controller observes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code> continuously and adjusts <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_lru_maxpages</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_delay</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> based on current write load and observed checkpoint duration. The key signal is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_write_time</code> versus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_sync_time</code>. When sync time dominates, the checkpoint is being forced to fsync pages too quickly — the I/O subsystem is being asked to flush dirty buffers faster than it can. The correct autonomous response is to increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code> (spread the writes over more of the checkpoint interval) and increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> (allow more WAL to accumulate before forcing a checkpoint).</p>
+
+<p class="text-gray-300 leading-relaxed">When write time dominates but sync time is low, the shared_buffers pool contains too many dirty pages and the bgwriter is not proactively cleaning them. The correct response is to increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_lru_maxpages</code> and decrease <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_delay</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+import logging
+
+THRESHOLDS = {
+    "checkpoint_sync_dominance_ratio": 0.70,  # sync_time / total_time
+    "buffers_checkpoint_rate": 500,           # buffers written per checkpoint on average
+    "checkpoint_too_frequent_secs": 180,      # checkpoint interval below this is risky
+}
+
+ADJUSTMENTS = {
+    "checkpoint_completion_target": {"min": 0.5, "max": 0.95, "step": 0.05},
+    "max_wal_size":                 {"min": "1GB", "max": "16GB", "step_gb": 1},
+    "bgwriter_lru_maxpages":        {"min": 100, "max": 1000, "step": 100},
+    "bgwriter_delay":               {"min": 50, "max": 500, "step": 50},
+}
+
+def analyze_bgwriter(conn):
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            checkpoints_timed,
+            checkpoints_req,
+            checkpoint_write_time,
+            checkpoint_sync_time,
+            buffers_checkpoint,
+            buffers_clean,
+            maxwritten_clean,
+            buffers_backend,
+            stats_reset
+        FROM pg_stat_bgwriter
+    """)
+    return dict(zip([d[0] for d in cur.description], cur.fetchone()))
+
+def recommend_adjustments(stats):
+    recommendations = []
+    total_checkpoints = stats["checkpoints_timed"] + stats["checkpoints_req"]
+    if total_checkpoints == 0:
+        return recommendations
+
+    total_cp_time = stats["checkpoint_write_time"] + stats["checkpoint_sync_time"]
+    if total_cp_time &gt; 0:
+        sync_ratio = stats["checkpoint_sync_time"] / total_cp_time
+        if sync_ratio &gt; THRESHOLDS["checkpoint_sync_dominance_ratio"]:
+            recommendations.append({
+                "parameter": "checkpoint_completion_target",
+                "direction": "increase",
+                "reason": f"sync_ratio={sync_ratio:.2f} exceeds threshold"
+            })
+            recommendations.append({
+                "parameter": "max_wal_size",
+                "direction": "increase",
+                "reason": "Reduce checkpoint frequency to lower sync pressure"
+            })
+
+    avg_buffers_per_checkpoint = stats["buffers_checkpoint"] / total_checkpoints
+    if avg_buffers_per_checkpoint &gt; THRESHOLDS["buffers_checkpoint_rate"]:
+        recommendations.append({
+            "parameter": "bgwriter_lru_maxpages",
+            "direction": "increase",
+            "reason": f"avg_buffers_per_cp={avg_buffers_per_checkpoint:.0f}, bgwriter not cleaning proactively"
+        })
+
+    if stats["maxwritten_clean"] &gt; 0:
+        recommendations.append({
+            "parameter": "bgwriter_delay",
+            "direction": "decrease",
+            "reason": "maxwritten_clean hits suggest bgwriter is throttled — run more frequently"
+        })
+
+    return recommendations
+
+def apply_adjustment(conn, parameter, direction, current_values):
+    cfg = ADJUSTMENTS.get(parameter)
+    if not cfg:
+        logging.warning(f"No adjustment config for {parameter}")
+        return
+
+    cur = conn.cursor()
+    cur.execute(f"SHOW {parameter}")
+    current_raw = cur.fetchone()[0]
+    logging.info(f"Adjusting {parameter}: current={current_raw}, direction={direction}")
+    # In production: parse current value, apply step in correct direction,
+    # clamp to min/max, then issue ALTER SYSTEM SET ... and pg_reload_conf()
+    # Omitted here for brevity — see the configuration management module.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomous controller does not apply all recommendations simultaneously. It implements a one-parameter-per-cycle rule: change one variable, wait two checkpoint cycles, observe the new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_sync_time</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_write_time</code> ratio, and decide whether to apply the next recommendation. This is a primitive form of causal isolation — changing one parameter at a time and waiting for the system to reach steady state before making another change. Violating this principle produces configuration drift where the cause of a performance improvement or regression is impossible to identify.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Index Storage Reorganization and Bloat Remediation</h3>
+
+<p class="text-gray-300 leading-relaxed">Index and table bloat is one of the most predictable sources of I/O waste in long-running PostgreSQL and SQL Server deployments. Deleted and updated rows leave dead space in heap pages. Index entries accumulate for rows that no longer exist. Over time, a table that logically contains 10 million rows may span pages containing 40 million row slots — 75% of every I/O operation retrieves garbage that the visibility map has marked as dead.</p>
+
+<p class="text-gray-300 leading-relaxed">Autonomous bloat remediation differs from scheduled VACUUM in a critical way: it is reactive to measured waste, not a calendar. The system continuously estimates bloat using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code> extension in PostgreSQL or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> DMV in SQL Server, and it acts when waste crosses a defined threshold relative to the cost of remediation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate table bloat using pgstattuple; requires extension installed
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
+    ROUND((dead_tuple_percent)::numeric, 2) AS dead_pct,
+    ROUND((free_percent)::numeric, 2)       AS free_space_pct,
+    approx_tuple_count,
+    dead_tuple_count
+FROM (
+    SELECT
+        n.nspname                             AS schemaname,
+        c.relname                             AS tablename,
+        (pgstattuple(c.oid)).dead_tuple_percent,
+        (pgstattuple(c.oid)).free_percent,
+        (pgstattuple(c.oid)).approx_tuple_count,
+        (pgstattuple(c.oid)).dead_tuple_count
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relkind = 'r'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+      AND pg_total_relation_size(c.oid) &gt; 10 * 1024 * 1024  -- skip tables &lt; 10MB
+) bloat_stats
+WHERE dead_tuple_percent &gt; 20
+   OR free_percent &gt; 30
+ORDER BY dead_tuple_percent DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify indexes with significant fragmentation eligible for autonomous rebuild or reorganize
+SELECT
+    OBJECT_NAME(ips.object_id)           AS table_name,
+    i.name                               AS index_name,
+    ips.index_type_desc,
+    ips.avg_fragmentation_in_percent,
+    ips.page_count,
+    ips.avg_page_space_used_in_percent,
+    ips.record_count,
+    ips.ghost_record_count,
+    CASE
+        WHEN ips.avg_fragmentation_in_percent &gt; 30 THEN 'REBUILD'
+        WHEN ips.avg_fragmentation_in_percent &gt; 10 THEN 'REORGANIZE'
+        ELSE 'NONE'
+    END AS recommended_action
+FROM sys.dm_db_index_physical_stats(
+    DB_ID(), NULL, NULL, NULL, 'SAMPLED'
+) ips
+JOIN sys.indexes i
+    ON i.object_id = ips.object_id
+    AND i.index_id = ips.index_id
+WHERE ips.page_count &gt; 1000
+  AND ips.avg_fragmentation_in_percent &gt; 10
+ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The remediation decision tree is more nuanced than fragmentation percentage alone. For PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> is the first-line response — it recovers dead tuple space for reuse without requiring a table lock. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> (which reorganizes without an exclusive lock) are second-line responses reserved for cases where bloat has grown so severe that page count has expanded significantly beyond the logical data size. The autonomous agent calculates a bloat ratio: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(total_pages * block_size) / (live_tuple_count * avg_tuple_width)</code>. When this ratio exceeds 2.0 and standard autovacuum has not reduced it within a configured window, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> is scheduled.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REORGANIZE</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REBUILD</code> decision is made per-index based on fragmentation percentage and whether the index supports online rebuild. The autonomous agent constructs and executes the appropriate DDL, wrapped in a resource governor classification that limits I/O to a configurable percentage of device throughput during execution, preventing remediation from becoming its own source of I/O saturation.</p>
+
+<p class="text-gray-300 leading-relaxed">A safety interlock prevents the autonomous bloat remediation system from executing during periods of high I/O utilization. The agent checks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">iostat</code> device utilization and waits if any data device exceeds 70% utilization — using an exponential backoff with a maximum wait of 4 hours before escalating to an alert.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Partition-Based I/O Shaping and Autonomous Data Lifecycle Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Partitioning is the most powerful tool available for shaping I/O patterns at the schema level. When a time-series table is partitioned by date, queries that filter on recent dates touch only the most recent partitions — the working set fits in buffer pool, sequential scan performance is predictable, and I/O pressure on older partitions drops to zero unless explicitly accessed. Autonomous data lifecycle management takes this further: it creates new partitions before they are needed, migrates aging partitions to cold storage, compresses or archives them on a schedule derived from observed access patterns, and detaches them from the parent table when they become permanently dormant.</p>
+
+<p class="text-gray-300 leading-relaxed">The lifecycle engine manages five partition states: <strong class="text-white">active</strong> (receiving writes and serving reads), <strong class="text-white">warm</strong> (serving reads, no writes), <strong class="text-white">cold</strong> (rarely accessed, eligible for compression), <strong class="text-white">archived</strong> (moved to cold tablespace or object storage), and <strong class="text-white">detached</strong> (removed from the partition tree, accessible only via direct query).</p>
+
+<p class="text-gray-300 leading-relaxed">Autonomous partition creation is the most time-sensitive operation. A system that allows a partition to be missing during a high-write period will route all writes to the default partition (PostgreSQL) or fail (SQL Server with partition scheme exhaustion). The creation agent runs hourly and ensures partitions exist for the current period plus two future periods.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+    </div>
+    <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+        Learn More →
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The ADE Handbook</div>
+  </footer>
+</body>
+</html>
