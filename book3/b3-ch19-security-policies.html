@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 19: Self-Tuning Security Policies — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 19: Self-Tuning Security Policies. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-emerald-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">ADE Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-emerald-400 hover:text-emerald-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-emerald-900/40 border border-emerald-800/40 text-emerald-300 text-xs rounded-full font-medium">Chapter 19 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 19: Self-Tuning Security Policies</h2>
+
+<p class="text-gray-300 leading-relaxed">Security policy management in traditional database operations is a human-gated process: a developer requests access, a DBA reviews it, a security officer approves it, and the permission is provisioned—sometimes days later. At the ADE level, that model is untenable. Schemas evolve hourly, microservices spin up and down on Kubernetes, and threat surfaces shift in real time. This chapter builds the architecture for security systems that observe access patterns, detect policy drift, enforce least-privilege dynamically, and respond to anomalies without waiting for a human in the loop. The goal is a security posture that tightens itself—one that becomes more precise over time rather than accumulating stale grants and dormant superusers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.1 The Policy Drift Problem: Why Static Security Decays</h3>
+
+<p class="text-gray-300 leading-relaxed">Every production database accumulates security debt. A developer gets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_owner</code> during an incident, the emergency never gets cleaned up. A service account that once owned a batch job retains <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT</code> on 40 tables after the job was decommissioned. An application team migrates off a schema but its grants remain for three years. This is policy drift—the divergence between the access your security posture intends and the access that actually exists.</p>
+
+<p class="text-gray-300 leading-relaxed">Static security audits catch drift episodically. The autonomous approach catches it continuously by maintaining a <strong class="text-white">desired-state security manifest</strong> and reconciling reality against it on a scheduled cadence, the same way Kubernetes reconciles pod specs against running containers.</p>
+
+<p class="text-gray-300 leading-relaxed">The desired-state manifest is not a text document. It is a machine-readable specification—stored in a configuration repository, versioned in Git, and enforced by an automation layer. Each entry describes an entity (a role, a login, a service account), the objects it should have access to, the privilege level, and the expiry conditions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># security-manifest.yaml (excerpt)
+roles:
+  - name: reporting_svc
+    type: application
+    grants:
+      - object: analytics.fact_sales
+        privilege: SELECT
+        valid_until: null          # permanent, reviewed quarterly
+      - object: analytics.dim_customer
+        privilege: SELECT
+        valid_until: null
+    deny:
+      - privilege: INSERT
+      - privilege: UPDATE
+      - privilege: DELETE
+    max_connection_limit: 10
+    row_security_enabled: true
+    policy: reporting_rls_v2
+
+  - name: etl_loader
+    type: service
+    grants:
+      - object: staging.*
+        privilege: INSERT, SELECT, TRUNCATE
+        valid_until: "2025-06-30"
+    superuser: false
+    connection_limit: 5</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The reconciliation engine reads this manifest, queries the live catalog, computes the delta, and emits either a remediation script or executes changes directly depending on the confidence level of the operation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Drift detection: find grants that exist in the catalog but not in the manifest
+-- (Replace the VALUES list with manifest data injected by the automation layer)
+
+WITH manifest_grants AS (
+    SELECT *
+    FROM (VALUES
+        ('reporting_svc', 'analytics', 'fact_sales', 'SELECT'),
+        ('reporting_svc', 'analytics', 'dim_customer', 'SELECT'),
+        ('etl_loader',    'staging',   'orders_stg',  'INSERT')
+    ) AS t(role_name, schema_name, table_name, privilege_type)
+),
+live_grants AS (
+    SELECT
+        grantee                          AS role_name,
+        table_schema                     AS schema_name,
+        table_name,
+        privilege_type
+    FROM information_schema.role_table_grants
+    WHERE grantee NOT IN ('postgres', 'pg_monitor')  -- exclude system roles
+),
+drift AS (
+    SELECT
+        l.role_name,
+        l.schema_name,
+        l.table_name,
+        l.privilege_type,
+        'REVOKE_CANDIDATE' AS action
+    FROM live_grants l
+    LEFT JOIN manifest_grants m
+        ON  l.role_name      = m.role_name
+        AND l.schema_name    = m.schema_name
+        AND l.table_name     = m.table_name
+        AND l.privilege_type = m.privilege_type
+    WHERE m.role_name IS NULL
+
+    UNION ALL
+
+    SELECT
+        m.role_name,
+        m.schema_name,
+        m.table_name,
+        m.privilege_type,
+        'GRANT_MISSING' AS action
+    FROM manifest_grants m
+    LEFT JOIN live_grants l
+        ON  l.role_name      = m.role_name
+        AND l.schema_name    = m.schema_name
+        AND l.table_name     = m.table_name
+        AND l.privilege_type = m.privilege_type
+    WHERE l.role_name IS NULL
+)
+SELECT * FROM drift ORDER BY action, role_name, schema_name, table_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Drift detection against desired-state manifest
+-- Manifest data is injected via a staging table populated by the automation layer
+
+CREATE TABLE #manifest_grants (
+    principal_name  SYSNAME,
+    schema_name     SYSNAME,
+    object_name     SYSNAME,
+    permission_name SYSNAME
+);
+
+INSERT INTO #manifest_grants VALUES
+    ('reporting_svc', 'analytics', 'fact_sales',    'SELECT'),
+    ('reporting_svc', 'analytics', 'dim_customer',  'SELECT'),
+    ('etl_loader',    'staging',   'orders_stg',    'INSERT');
+
+WITH live_grants AS (
+    SELECT
+        dp.name                           AS principal_name,
+        OBJECT_SCHEMA_NAME(p.major_id)    AS schema_name,
+        OBJECT_NAME(p.major_id)           AS object_name,
+        p.permission_name
+    FROM sys.database_permissions p
+    JOIN sys.database_principals dp
+        ON p.grantee_principal_id = dp.principal_id
+    WHERE p.class = 1   -- object-level permissions
+      AND dp.type IN ('S', 'U', 'R')  -- SQL users, Windows users, roles
+      AND dp.name NOT IN ('dbo', 'guest', 'INFORMATION_SCHEMA', 'sys')
+),
+drift AS (
+    SELECT
+        l.principal_name,
+        l.schema_name,
+        l.object_name,
+        l.permission_name,
+        'REVOKE_CANDIDATE' AS action
+    FROM live_grants l
+    LEFT JOIN #manifest_grants m
+        ON  l.principal_name  = m.principal_name
+        AND l.schema_name     = m.schema_name
+        AND l.object_name     = m.object_name
+        AND l.permission_name = m.permission_name
+    WHERE m.principal_name IS NULL
+
+    UNION ALL
+
+    SELECT
+        m.principal_name,
+        m.schema_name,
+        m.object_name,
+        m.permission_name,
+        'GRANT_MISSING' AS action
+    FROM #manifest_grants m
+    LEFT JOIN live_grants l
+        ON  l.principal_name  = m.principal_name
+        AND l.schema_name     = m.schema_name
+        AND l.object_name     = m.object_name
+        AND l.permission_name = m.permission_name
+    WHERE l.principal_name IS NULL
+)
+SELECT * FROM drift ORDER BY action, principal_name, schema_name, object_name;
+
+DROP TABLE #manifest_grants;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The reconciliation loop runs on a configurable interval—typically every 15 minutes for high-churn environments and every 4 hours for stable production systems. Findings are classified into three categories:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Auto-remediate**: Revocation of a privilege not in the manifest for a service account with no active connections in the last 72 hours. Risk is low; the system executes the `REVOKE` and logs it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Stage for review**: New grants found that weren't in the manifest. The system opens a GitOps pull request against the manifest repository, tagging the security team.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Alert immediately**: Superuser or `sysadmin` elevation detected on any account not explicitly designated as a DBA principal. Pages on-call regardless of time.</li>
+
+<p class="text-gray-300 leading-relaxed">This three-tier decision model is the foundation of autonomous security: not everything is automated equally. The confidence threshold for automated action scales inversely with the blast radius of the change.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.2 Dynamic Row-Level Security: Policies That Adapt to Context</h3>
+
+<p class="text-gray-300 leading-relaxed">Row-Level Security (RLS) in its basic form is a static filter: a policy is written once, attached to a table, and applied uniformly. At the ADE level, RLS becomes a dynamic control surface that adapts based on runtime context—the application role, the time of day, the sensitivity classification of the data being touched, and the geographic origin of the connection.</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture has three layers:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">A sensitivity classification store</strong> — a metadata table that records per-column data classifications (PII, PHI, financial, internal, public).</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">A context propagation mechanism</strong> — session variables or application-name conventions that carry runtime claims (tenant ID, clearance level, access reason) into the policy evaluation.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">A policy generation engine</strong> — automation that reads classification metadata and emits or updates RLS policies when classifications change.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Sensitivity classification store
+CREATE TABLE security.column_classifications (
+    schema_name         TEXT NOT NULL,
+    table_name          TEXT NOT NULL,
+    column_name         TEXT NOT NULL,
+    classification      TEXT NOT NULL  -- 'PII', 'PHI', 'FINANCIAL', 'INTERNAL', 'PUBLIC'
+                        CHECK (classification IN ('PII','PHI','FINANCIAL','INTERNAL','PUBLIC')),
+    masking_policy      TEXT,          -- 'hash', 'redact', 'truncate', 'none'
+    rls_required        BOOLEAN NOT NULL DEFAULT FALSE,
+    last_reviewed_at    TIMESTAMPTZ,
+    reviewed_by         TEXT,
+    PRIMARY KEY (schema_name, table_name, column_name)
+);
+
+-- Context propagation: application sets claims at session start
+-- The policy reads these via current_setting()
+CREATE OR REPLACE FUNCTION security.current_tenant_id()
+RETURNS TEXT
+LANGUAGE sql STABLE SECURITY DEFINER
+AS $$
+    SELECT COALESCE(current_setting('app.tenant_id', TRUE), 'NONE');
+$$;
+
+CREATE OR REPLACE FUNCTION security.current_clearance_level()
+RETURNS INT
+LANGUAGE sql STABLE SECURITY DEFINER
+AS $$
+    SELECT COALESCE(
+        current_setting('app.clearance_level', TRUE)::INT,
+        0
+    );
+$$;
+
+-- Multi-dimensional RLS policy on a customer table
+-- Enforces tenant isolation AND clearance-based row visibility
+ALTER TABLE customer.accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE customer.accounts FORCE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_clearance_policy ON customer.accounts
+    AS RESTRICTIVE
+    FOR ALL
+    TO application_role
+    USING (
+        tenant_id = security.current_tenant_id()
+        AND sensitivity_tier &lt;= security.current_clearance_level()
+    );</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The policy generation engine monitors <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">security.column_classifications</code> for changes and re-emits policies when the classification of a table's columns shifts. This is particularly important after schema migrations: a developer adds a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssn</code> column to an existing table, the classification scanner (discussed in section 19.3) detects it, marks it <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PII</code>, and the policy engine automatically appends a masking layer to any existing SELECT policies for that table without manual intervention.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server RLS with context-aware predicates
+-- Uses SESSION_CONTEXT() for runtime claim propagation
+
+CREATE SCHEMA security;
+GO
+
+-- Security predicate function reading tenant and clearance from session context
+CREATE OR REPLACE FUNCTION security.fn_tenant_clearance_predicate
+(
+    @tenant_id      NVARCHAR(50),
+    @sensitivity    INT
+)
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN
+    SELECT 1 AS predicate_result
+    WHERE
+        @tenant_id = CAST(SESSION_CONTEXT(N'app_tenant_id') AS NVARCHAR(50))
+        AND @sensitivity &lt;= CAST(
+            ISNULL(SESSION_CONTEXT(N'app_clearance_level'), 0)
+            AS INT
+        );
+GO
+
+-- Apply to accounts table
+CREATE SECURITY POLICY security.accounts_tenant_policy
+    ADD FILTER PREDICATE
+        security.fn_tenant_clearance_predicate(tenant_id, sensitivity_tier)
+    ON customer.accounts,
+    ADD BLOCK PREDICATE
+        security.fn_tenant_clearance_predicate(tenant_id, sensitivity_tier)
+    ON customer.accounts AFTER INSERT
+WITH (STATE = ON, SCHEMABINDING = ON);
+GO
+
+-- Application sets context at connection time via the connection wrapper
+-- EXEC sp_set_session_context N'app_tenant_id', N'tenant_42';
+-- EXEC sp_set_session_context N'app_clearance_level', 3;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The dynamic element comes from the policy versioning system. Each policy carries a version hash. When the policy generator computes a new policy body (because a classification changed or a new column was added), it compares hashes. If they diverge, it executes the policy replacement atomically within a transaction, logs the change to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">security.policy_audit_log</code> table, and pushes a notification to the security team's Slack channel via webhook.</p>
+
+<p class="text-gray-300 leading-relaxed">This pattern eliminates the class of incident where a developer migrates a table, adds a sensitive column, and it is inadvertently exposed to roles that should not see it—because the system closes that gap automatically within the next reconciliation cycle.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.3 Automated Privilege Escalation Detection and Response</h3>
+
+<p class="text-gray-300 leading-relaxed">Privilege escalation is the database attacker's primary goal and the defender's most time-sensitive concern. In autonomous security architecture, detection and response must operate on a timeline measured in seconds, not the hours that human-in-the-loop processes require.</p>
+
+<p class="text-gray-300 leading-relaxed">The detection pipeline has four components operating as a continuous stream:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Signal collection</strong>: The database audit log, pg_stat_activity, SQL Server's Extended Events session, and connection metadata are consumed in real time. In PostgreSQL deployments using pgAudit, every DDL and privilege-related statement is captured. In SQL Server, an Extended Events session targeting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_statement_completed</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">error_reported</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">security_error</code> provides the raw stream.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Behavioral baseline</strong>: For each principal, a rolling 30-day baseline tracks: typical connection hours, typical source IPs, typical object access patterns, typical statement mix (% SELECT vs. DML vs. DDL). Deviation from baseline is the primary signal—not raw behavior in isolation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Escalation fingerprints</strong>: A set of hard patterns that bypass the baseline and trigger immediate response. These include: any session executing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE ROLE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER ROLE ... SUPERUSER</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_addsrvrolemember</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GRANT CONTROL</code> from an account not in the designated DBA principal list; any bulk extraction event (single query returning more than N rows from a classified table); any login from an IP not in the allowlist for a privileged account.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Response executor</strong>: Tiered automated response that acts proportionally—soft actions (session kill, lock account) for moderate signals; hard actions (revoke privileges, force password reset, network ACL block) for confirmed escalation events.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># escalation_detector.py
+# Autonomous privilege escalation detection and response
+# Runs as a Kubernetes sidecar alongside pgBouncer or the SQL Server proxy
+
+import psycopg2
+import pyodbc
+import time
+import json
+import requests
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from enum import Enum
+from collections import defaultdict
+
+class ThreatLevel(Enum):
+    LOW      = 1
+    MODERATE = 2
+    HIGH     = 3
+    CRITICAL = 4
+
+@dataclass
+class EscalationEvent:
+    principal:      str
+    source_ip:      str
+    statement:      str
+    database:       str
+    detected_at:    datetime
+    threat_level:   ThreatLevel
+    signals:        list[str] = field(default_factory=list)
+    response_taken: str = ""
+
+# Hard-pattern fingerprints: matched against normalized statement text
+ESCALATION_PATTERNS = [
+    ("SUPERUSER_GRANT",  ThreatLevel.CRITICAL,
+     ["alter role", "superuser", "createdb", "createrole"]),
+    ("CONTROL_GRANT",    ThreatLevel.CRITICAL,
+     ["grant control"]),
+    ("SYSADMIN_ADD",     ThreatLevel.CRITICAL,
+     ["sp_addsrvrolemember", "sysadmin"]),
+    ("BULK_EXTRACT",     ThreatLevel.HIGH,
+     ["select", "into outfile", "copy to", "bulk"]),
+    ("ROLE_CREATION",    ThreatLevel.MODERATE,
+     ["create role", "create user", "create login"]),
+    ("PERMISSION_GRANT", ThreatLevel.MODERATE,
+     ["grant", "all privileges", "with grant option"]),
+]
+
+DESIGNATED_DBA_PRINCIPALS = {"postgres", "sa_dba", "platform_admin"}
+
+class EscalationDetector:
+    def __init__(self, pg_dsn: str, mssql_dsn: str,
+                 alert_webhook: str, auto_respond: bool = True):
+        self.pg_dsn         = pg_dsn
+        self.mssql_dsn      = mssql_dsn
+        self.alert_webhook  = alert_webhook
+        self.auto_respond   = auto_respond
+        self.baseline       = defaultdict(lambda: {
+            "typical_hours": set(range(8, 19)),  # seeded; updated from 30-day stats
+            "trusted_ips":   set(),
+            "max_rows_threshold": 50_000,
+        })
+        self.event_log: list[EscalationEvent] = []
+
+    def analyze_statement(self, principal: str, source_ip: str,
+                           statement: str, database: str) -&gt; EscalationEvent | None:
+        normalized = statement.lower().strip()
+        signals    = []
+        max_level  = ThreatLevel.LOW
+
+        # Hard-pattern matching
+        for pattern_name, level, tokens in ESCALATION_PATTERNS:
+            if all(t in normalized for t in tokens):
+                if principal not in DESIGNATED_DBA_PRINCIPALS:
+                    signals.append(f"PATTERN:{pattern_name}")
+                    if level.value &gt; max_level.value:
+                        max_level = level
+
+        # Behavioral anomaly: off-hours access
+        current_hour = datetime.utcnow().hour
+        user_baseline = self.baseline[principal]
+        if current_hour not in user_baseline["typical_hours"]:
+            signals.append("OFF_HOURS_ACCESS")
+            if max_level.value &lt; ThreatLevel.MODERATE.value:
+                max_level = ThreatLevel.MODERATE
+
+        # IP anomaly
+        if (user_baseline["trusted_ips"]
+                and source_ip not in user_baseline["trusted_ips"]):
+            signals.append(f"UNTRUSTED_IP:{source_ip}")
+            if max_level.value &lt; ThreatLevel.MODERATE.value:
+                max_level = ThreatLevel.MODERATE
+
+        if not signals:
+            return None
+
+        return EscalationEvent(
+            principal    = principal,
+            source_ip    = source_ip,
+            statement    = statement[:500],  # truncate for storage
+            database     = database,
+            detected_at  = datetime.utcnow(),
+            threat_level = max_level,
+            signals      = signals,
+        )
+
+    def respond(self, event: EscalationEvent, pg_conn, mssql_conn):
+        """Execute tiered automated response proportional to threat level."""
+        if event.threat_level == ThreatLevel.CRITICAL:
+            # Terminate all sessions for principal immediately
+            self._terminate_pg_sessions(event.principal, pg_conn)
+            self._terminate_mssql_sessions(event.principal, mssql_conn)
+            # Disable login
+            self._disable_pg_login(event.principal, pg_conn)
+            self._disable_mssql_login(event.principal, mssql_conn)
+            event.response_taken = "SESSION_TERMINATED|LOGIN_DISABLED"
+
+        elif event.threat_level == ThreatLevel.HIGH:
+            # Terminate active sessions but leave account enabled for investigation
+            self._terminate_pg_sessions(event.principal, pg_conn)
+            self._terminate_mssql_sessions(event.principal, mssql_conn)
+            event.response_taken = "SESSION_TERMINATED"
+
+        elif event.threat_level == ThreatLevel.MODERATE:
+            # Log and alert; no automated kill unless pattern repeats
+            event.response_taken = "ALERT_ONLY"
+
+        self._send_alert(event)
+        self.event_log.append(event)
+
+    def _terminate_pg_sessions(self, principal: str, conn):
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT pg_terminate_backend(pid)
+                FROM   pg_stat_activity
+                WHERE  usename = %s
+                  AND  pid &lt;&gt; pg_backend_pid()
+            """, (principal,))
+            conn.commit()
+
+    def _disable_pg_login(self, principal: str, conn):
+        with conn.cursor() as cur:
+            # Parameterized DDL: use AsIs for identifier safety after validation
+            cur.execute(
+                "ALTER ROLE %s NOLOGIN",
+                (psycopg2.extensions.AsIs(principal),)
+            )
+            conn.commit()
+
+    def _terminate_mssql_sessions(self, principal: str, conn):
+        cursor = conn.cursor()
+        cursor.execute("""
+            DECLARE @spid INT;
+            DECLARE kill_cursor CURSOR FOR
+                SELECT session_id FROM sys.dm_exec_sessions
+                WHERE login_name = ? AND is_user_process = 1;
+            OPEN kill_cursor;
+            FETCH NEXT FROM kill_cursor INTO @spid;
+            WHILE @@FETCH_STATUS = 0 BEGIN
+                EXEC('KILL ' + @spid);
+                FETCH NEXT FROM kill_cursor INTO @spid;
+            END;
+            CLOSE kill_cursor;
+            DEALLOCATE kill_cursor;
+        """, principal)
+        conn.commit()
+
+    def _disable_mssql_login(self, principal: str, conn):
+        cursor = conn.cursor()
+        cursor.execute("ALTER LOGIN [?] DISABLE", principal)
+        conn.commit()
+
+    def _send_alert(self, event: EscalationEvent):
+        payload = {
+            "text": (
+                f"🚨 *Security Alert* [{event.threat_level.name}]\n"
+                f"Principal: `{event.principal}` | IP: `{event.source_ip}`\n"
+                f"Database: `{event.database}` | Time: {event.detected_at.isoformat()}\n"
+                f"Signals: {', '.join(event.signals)}\n"
+                f"Response: `{event.response_taken}`\n"
+                f"Statement: ```{event.statement[:200]}```"
+            )
+        }
+        try:
+            requests.post(self.alert_webhook, json=payload, timeout=5)
+        except requests.RequestException:
+            pass  # Alert delivery failure must not block the response pipeline</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The detector runs as a long-polling loop against the audit log tables, consuming new rows since its last checkpoint. In high-throughput environments, it runs as a Kafka consumer reading from a topic that the database audit plugin writes to directly—removing the polling latency and enabling sub-second response times.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.4 Temporal Access Grants and Just-in-Time Privilege Provisioning</h3>
+
+<p class="text-gray-300 leading-relaxed">Permanent privilege grants are a security liability. An account that has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT</code> on a financial table for an ad-hoc query from six months ago still holds that privilege today, long after the need expired. Just-in-Time (JIT) privilege provisioning eliminates standing privileges: access is granted for a specific duration tied to a specific work item, and it is revoked automatically when the window closes.</p>
+
+<p class="text-gray-300 leading-relaxed">The JIT system has four components:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Access request API</strong> — service accounts or humans request access, specifying purpose, duration, and required privileges. Requests are evaluated against policy;</p>
+    </div>
+    <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+        Learn More →
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The ADE Handbook</div>
+  </footer>
+</body>
+</html>
