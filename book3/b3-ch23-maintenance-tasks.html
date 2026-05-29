@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 23: Self-Managing Maintenance Tasks — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 23: Self-Managing Maintenance Tasks. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-emerald-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">ADE Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-emerald-400 hover:text-emerald-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-emerald-900/40 border border-emerald-800/40 text-emerald-300 text-xs rounded-full font-medium">Chapter 23 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 23: Self-Managing Maintenance Tasks</h2>
+
+<p class="text-gray-300 leading-relaxed">Maintenance is where autonomous systems prove their worth most visibly. VACUUM cycles, index rebuilds, statistics refreshes, log archival, partition management — these are tasks that senior DBAs have spent decades scheduling manually, tuning reactively, and debugging at 2 a.m. when they collide with peak workload. An autonomous maintenance engine eliminates that pattern entirely: it observes the state of every object in the catalog, models the cost of action against the cost of inaction, and executes maintenance at the optimal moment with zero human scheduling overhead. This chapter builds that engine — from the feedback loops that drive autonomous VACUUM and index management, to the partition lifecycle systems that provision and retire data without operator involvement, to the production-grade governance layer that keeps autonomous actions auditable and reversible.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.1 The Maintenance Decision Loop: Observation, Costing, and Scheduling</h3>
+
+<p class="text-gray-300 leading-relaxed">Before any autonomous system can manage maintenance, it needs a principled model for when maintenance is *worth doing* — not just whether it is overdue. Scheduled maintenance (cron-based VACUUM, weekly index rebuilds) fails in high-throughput environments because it ignores current workload, lock contention probability, and the actual degradation rate of the objects it targets. The autonomous alternative is a continuous decision loop: measure object health, estimate the cost of immediate action, compare it against projected degradation cost, and schedule or defer accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed">The loop runs on a tight polling cycle (typically 60–300 seconds) and feeds a priority queue. Each candidate maintenance action carries three attributes: <strong class="text-white">urgency score</strong> (how degraded is the object now), <strong class="text-white">execution cost</strong> (estimated I/O, lock wait, duration), and <strong class="text-white">opportunity window</strong> (how clear is the current workload). The system acts when urgency × opportunity exceeds execution cost. This is not metaphor — it translates directly into evaluable expressions over catalog metrics.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> — Reading table-level bloat and activity signals for the decision loop:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: maintenance candidate scoring view
+-- Combines bloat estimate, dead tuple ratio, and current autovacuum state
+SELECT
+    schemaname,
+    relname,
+    n_dead_tup,
+    n_live_tup,
+    ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2)
+        AS dead_tuple_pct,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+    -- Urgency score: dead tuple ratio weighted by table size
+    ROUND(
+        (n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0))
+        * pg_relation_size(relid) / (1024 * 1024.0), 2
+    ) AS urgency_mb,
+    -- Is autovacuum currently running on this table?
+    EXISTS (
+        SELECT 1 FROM pg_stat_activity
+        WHERE query ILIKE '%autovacuum%' AND query ILIKE '%' || relname || '%'
+    ) AS av_active
+FROM pg_stat_user_tables
+WHERE n_live_tup + n_dead_tup &gt; 10000
+ORDER BY urgency_mb DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> — Equivalent maintenance candidate scoring using index fragmentation and page density:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: maintenance candidate scoring
+-- Combines index fragmentation, page density, and recent rebuild history
+SELECT
+    OBJECT_SCHEMA_NAME(i.object_id)    AS schema_name,
+    OBJECT_NAME(i.object_id)           AS table_name,
+    i.name                             AS index_name,
+    ips.avg_fragmentation_in_percent,
+    ips.avg_page_space_used_in_percent,
+    ips.page_count,
+    -- Urgency score: fragmentation weighted by page count
+    ROUND(
+        ips.avg_fragmentation_in_percent
+        * ips.page_count / 1000.0, 2
+    )                                  AS urgency_score,
+    -- Last maintenance from job history proxy
+    maint.last_run_datetime            AS last_rebuilt
+FROM sys.indexes i
+CROSS APPLY sys.dm_db_index_physical_stats(
+    DB_ID(), i.object_id, i.index_id, NULL, 'LIMITED'
+) ips
+LEFT JOIN (
+    SELECT
+        j.name,
+        MAX(CAST(h.run_date AS CHAR(8)) + ' ' +
+            STUFF(STUFF(RIGHT('000000' + CAST(h.run_time AS VARCHAR), 6),
+            5, 0, ':'), 3, 0, ':')) AS last_run_datetime
+    FROM msdb.dbo.sysjobs j
+    JOIN msdb.dbo.sysjobhistory h ON j.job_id = h.job_id
+    WHERE h.step_id = 0 AND h.run_status = 1
+    GROUP BY j.name
+) maint ON maint.name LIKE '%' + OBJECT_NAME(i.object_id) + '%'
+WHERE i.type &gt; 0
+  AND ips.page_count &gt; 500
+  AND ips.avg_fragmentation_in_percent &gt; 5
+ORDER BY urgency_score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The output from these views feeds a Python scheduler that maintains the priority queue. The scheduler enforces two constraints before acting: a <strong class="text-white">workload gate</strong> (active sessions below threshold, no long-running transactions older than N minutes) and a <strong class="text-white">maintenance budget</strong> (maximum concurrent maintenance operations, rolling I/O ceiling). When both constraints pass and the top-priority candidate clears the cost threshold, the action fires.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.2 Autonomous VACUUM and Statistics Management in PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's autovacuum is often misunderstood as autonomous maintenance — it is actually a *reactive threshold daemon* that fires when dead tuple counts exceed static percentages. On high-write tables with variable workload, it perpetually lags behind. A truly autonomous VACUUM engine replaces autovacuum's static configuration with dynamic tuning driven by real-time workload state.</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture has two layers. The first layer is a <strong class="text-white">catalog monitor</strong> that tracks per-table bloat velocity: the rate at which dead tuples accumulate per minute of wall clock time. Tables with high velocity need different thresholds than stable reference tables. The second layer is a <strong class="text-white">VACUUM dispatcher</strong> that issues explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code>) commands on a computed schedule, ahead of autovacuum's trigger — effectively making autovacuum the fallback rather than the primary mechanism.</p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous dispatcher can also manage autovacuum configuration at the per-table level using storage parameters, avoiding cluster-wide tuning that over-services small tables to handle large ones:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> — Dynamic per-table autovacuum tuning based on observed dead tuple velocity:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: apply tighter autovacuum thresholds to high-churn tables
+-- Run by the autonomous maintenance engine after velocity analysis
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT
+            schemaname,
+            relname,
+            -- Compute a velocity-based scale factor
+            CASE
+                WHEN n_dead_tup::numeric /
+                     NULLIF(EXTRACT(EPOCH FROM (now() - last_autovacuum)), 0)
+                     &gt; 500  THEN 0.01   -- very high churn: 1% threshold
+                WHEN n_dead_tup::numeric /
+                     NULLIF(EXTRACT(EPOCH FROM (now() - last_autovacuum)), 0)
+                     &gt; 100  THEN 0.05   -- moderate churn: 5% threshold
+                ELSE 0.10               -- low churn: 10% (PostgreSQL default)
+            END AS computed_scale_factor
+        FROM pg_stat_user_tables
+        WHERE last_autovacuum IS NOT NULL
+          AND n_live_tup &gt; 50000
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %I.%I SET (
+                autovacuum_vacuum_scale_factor = %s,
+                autovacuum_analyze_scale_factor = %s,
+                autovacuum_vacuum_cost_delay = 2
+            )',
+            r.schemaname,
+            r.relname,
+            r.computed_scale_factor,
+            r.computed_scale_factor / 2.0
+        );
+
+        RAISE NOTICE 'Tuned autovacuum on %.%: scale_factor=%',
+            r.schemaname, r.relname, r.computed_scale_factor;
+    END LOOP;
+END $$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond tuning, the autonomous engine must also decide when to escalate from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> — a table rewrite that reclaims bloat but holds an exclusive lock. This is the most consequential maintenance decision in PostgreSQL. The rule is: never escalate to VACUUM FULL during business hours, never on tables that appear in queries averaging more than 100 concurrent sessions, and only when bloat exceeds a size threshold that makes reorganization economically justified (typically >30% dead space and >1 GB wasted).</p>
+
+<p class="text-gray-300 leading-relaxed">The Python component that implements this escalation gate integrates with Prometheus to query active connection counts before firing:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Autonomous VACUUM escalation engine
+# Checks Prometheus for workload gate before issuing VACUUM FULL
+
+import psycopg2
+import requests
+from datetime import datetime, time as dt_time
+
+PROMETHEUS_URL = "http://prometheus:9090/api/v1/query"
+PG_DSN = "host=pgprimary dbname=appdb user=maintenance_role"
+
+BLOAT_THRESHOLD_BYTES = 1_073_741_824   # 1 GB
+BLOAT_PCT_THRESHOLD   = 30.0
+MAX_ACTIVE_SESSIONS   = 20
+MAINTENANCE_WINDOW    = (dt_time(1, 0), dt_time(5, 0))  # 01:00–05:00 UTC
+
+def within_maintenance_window():
+    now = datetime.utcnow().time()
+    return MAINTENANCE_WINDOW[0] &lt;= now &lt;= MAINTENANCE_WINDOW[1]
+
+def get_active_session_count():
+    resp = requests.get(PROMETHEUS_URL, params={
+        "query": 'pg_stat_activity_count{state="active",datname="appdb"}'
+    }, timeout=5)
+    result = resp.json()["data"]["result"]
+    return int(result[0]["value"][1]) if result else 0
+
+def get_vacuum_full_candidates(conn):
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT schemaname, relname,
+                   pg_relation_size(relid)      AS live_bytes,
+                   (pg_total_relation_size(relid)
+                    - pg_relation_size(relid))  AS bloat_estimate,
+                   ROUND(
+                       n_dead_tup::numeric
+                       / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 2
+                   ) AS dead_pct
+            FROM pg_stat_user_tables
+            WHERE pg_relation_size(relid) &gt; %s
+              AND n_dead_tup::numeric
+                  / NULLIF(n_live_tup + n_dead_tup, 0) * 100 &gt; %s
+            ORDER BY bloat_estimate DESC
+        """, (BLOAT_THRESHOLD_BYTES, BLOAT_PCT_THRESHOLD))
+        return cur.fetchall()
+
+def run_vacuum_full(conn, schema, table):
+    conn.autocommit = True
+    with conn.cursor() as cur:
+        cur.execute(f"VACUUM (FULL, ANALYZE, VERBOSE) {schema}.{table}")
+    print(f"[{datetime.utcnow().isoformat()}] VACUUM FULL completed: {schema}.{table}")
+
+def main():
+    if not within_maintenance_window():
+        print("Outside maintenance window — skipping escalation check.")
+        return
+
+    active = get_active_session_count()
+    if active &gt; MAX_ACTIVE_SESSIONS:
+        print(f"Active sessions={active} exceeds gate={MAX_ACTIVE_SESSIONS} — deferring.")
+        return
+
+    conn = psycopg2.connect(PG_DSN)
+    candidates = get_vacuum_full_candidates(conn)
+
+    for schema, table, live_bytes, bloat_bytes, dead_pct in candidates:
+        print(f"Escalating to VACUUM FULL: {schema}.{table} "
+              f"({dead_pct}% dead, {bloat_bytes // 1048576} MB bloat)")
+        run_vacuum_full(conn, schema, table)
+
+    conn.close()
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The same autonomous statistics management pattern applies to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code>. High-throughput OLTP tables should receive analyze passes independently from vacuum passes — particularly when query plan regressions are detected. The integration point here is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>: a spike in mean execution time on a query that previously was stable indicates stale statistics before any system alert fires. The maintenance engine monitors this signal and issues targeted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on the tables involved in those queries.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.3 Autonomous Index Lifecycle Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Index management is the maintenance task most likely to accumulate technical debt in manual operations. DBAs add indexes reactively (fixing a slow query), never audit whether the index is still used, and rarely rebuild fragmented ones on a principled schedule. The autonomous index lifecycle engine handles all three phases — creation, fragmentation remediation, and retirement — without human initiation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index creation</strong> is covered in detail in the query optimization chapter, but the maintenance layer adds a constraint: any autonomously created index must be tracked in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_autonomous_indexes</code> registry table, stamped with the query pattern that justified it, and subject to a 30-day usage review. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes.idx_scan</code> shows zero scans in 30 days, the index is a retirement candidate.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Fragmentation remediation</strong> is where the maintenance engine makes daily decisions. The threshold logic is explicit:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Fragmentation < 10%: no action</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Fragmentation 10–30%: REORGANIZE (SQL Server) or `REINDEX CONCURRENTLY` on a background schedule</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Fragmentation > 30%: REBUILD (SQL Server) or `REINDEX CONCURRENTLY` (PostgreSQL), subject to the workload gate</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> — Autonomous index maintenance with REINDEX CONCURRENTLY:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: generate REINDEX CONCURRENTLY statements for fragmented indexes
+-- Fragmentation estimated via pgstattuple extension
+SELECT
+    schemaname,
+    indexname,
+    relname                                         AS table_name,
+    idx_scan,
+    pg_size_pretty(pg_relation_size(indexrelid))    AS index_size,
+    -- pgstattuple gives real bloat; use pg_stat_user_indexes for access proxy
+    ROUND(
+        (1 - idx_tup_read::numeric / NULLIF(idx_scan * 10, 0)) * 100, 2
+    )                                               AS estimated_bloat_pct,
+    format(
+        'REINDEX INDEX CONCURRENTLY %I.%I;',
+        schemaname,
+        indexname
+    )                                               AS reindex_command
+FROM pg_stat_user_indexes
+JOIN pg_indexes USING (schemaname, indexname)
+WHERE idx_scan &gt; 0
+  AND pg_relation_size(indexrelid) &gt; 10 * 1024 * 1024  -- only indexes &gt; 10 MB
+ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> — Autonomous index remediation with REORGANIZE/REBUILD decision:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: autonomous index maintenance decision
+-- Emits the correct action (REORGANIZE vs REBUILD) per fragmentation band
+SELECT
+    OBJECT_SCHEMA_NAME(ips.object_id)           AS schema_name,
+    OBJECT_NAME(ips.object_id)                  AS table_name,
+    i.name                                      AS index_name,
+    ips.avg_fragmentation_in_percent,
+    ips.page_count,
+    CASE
+        WHEN ips.avg_fragmentation_in_percent BETWEEN 10 AND 30
+            THEN
+                'ALTER INDEX ' + QUOTENAME(i.name)
+                + ' ON ' + QUOTENAME(OBJECT_SCHEMA_NAME(ips.object_id))
+                + '.' + QUOTENAME(OBJECT_NAME(ips.object_id))
+                + ' REORGANIZE;'
+        WHEN ips.avg_fragmentation_in_percent &gt; 30
+            THEN
+                'ALTER INDEX ' + QUOTENAME(i.name)
+                + ' ON ' + QUOTENAME(OBJECT_SCHEMA_NAME(ips.object_id))
+                + '.' + QUOTENAME(OBJECT_NAME(ips.object_id))
+                + ' REBUILD WITH (ONLINE = ON, RESUMABLE = ON,'
+                + ' MAX_DURATION = 120 MINUTES);'
+        ELSE 'No action required.'
+    END                                         AS maintenance_action
+FROM sys.dm_db_index_physical_stats(
+    DB_ID(), NULL, NULL, NULL, 'LIMITED'
+) ips
+JOIN sys.indexes i
+    ON ips.object_id = i.object_id
+   AND ips.index_id  = i.index_id
+WHERE i.type &gt; 0
+  AND ips.page_count &gt; 200
+  AND ips.avg_fragmentation_in_percent &gt; 10
+ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESUMABLE = ON</code> clause on SQL Server rebuilds is a requirement, not a nicety, in autonomous systems. A resumable rebuild that gets interrupted by a workload spike or failover does not lose its progress — it pauses and resumes at next opportunity. The autonomous scheduler checks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.index_resumable_operations</code> on each maintenance cycle and resumes any paused operations if the workload gate passes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index retirement</strong> follows a conservative pattern: the engine marks unused indexes as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DEFERRED_DROP</code> in the registry, disables (rather than drops) them for a 14-day observation window, verifies no plan regressions appear (via plan cache monitoring), and only then executes the drop. This staged approach means no autonomously managed index drop can produce an irreversible performance regression.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.4 Automated Partition Lifecycle: Provisioning, Migrating, and Retiring Partitions</h3>
+
+<p class="text-gray-300 leading-relaxed">Partition management is one of the most operationally demanding maintenance tasks in large-scale databases — and one of the most amenable to full automation. A time-partitioned table growing at 50 GB/day needs new partitions created before the current period ends, old partitions detached and archived on retention schedule, and tablespace placement managed as storage tiers change. Done manually across dozens of tables, this is a multi-hour weekly DBA task. Done autonomously, it is a background process that requires no human attention until an exception condition fires.</p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous partition manager has four responsibilities:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Provisioning</strong>: Create future partitions ahead of the current period (typically 3–7 days ahead for daily partitions, 2 months ahead for monthly).</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Attachment validation</strong>: Verify new partitions pass constraint checks before the period goes live.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Archival offload</strong>: Detach expired partitions, pg_dump/export them to cold storage, and verify integrity before dropping.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Tablespace migration</strong>: Move warm partitions to compressed or lower-cost tablespaces based on age rules.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> — Autonomous daily partition provisioning for a time-series table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: provision next 7 days of partitions for an event log table
+-- Designed to run idempotently — safe to call on every maintenance cycle
+DO $$
+DECLARE
+    partition_date  DATE;
+    partition_name  TEXT;
+    start_val       TEXT;
+    end_val         TEXT;
+BEGIN
+    FOR i IN 0..6 LOOP
+        partition_date := CURRENT_DATE + i;
+        partition_name := 'event_log_' || TO_CHAR(partition_date, 'YYYY_MM_DD');
+        start_val      := partition_date::TEXT;
+        end_val        := (partition_date + 1)::TEXT;
+
+        -- Idempotent: skip if partition already exists
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = partition_name
+              AND n.nspname = 'public'
+        ) THEN
+            EXECUTE format(
+                'CREATE TABLE public.%I
+                 PARTITION OF public.event_log
+                 FOR VALUES FROM (%L) TO (%L)
+                 TABLESPACE pg_default',
+                partition_name, start_val, end_val
+            );
+
+            -- Create supporting indexes on the new partition immediately
+            EXECUTE format(
+                'CREATE INDEX %I ON public.%I (tenant_id, created_at)',
+                'idx_' || partition_name || '_tenant',
+                partition_name
+            );
+
+            RAISE NOTICE 'Provisioned partition: %', partition_name;
+
+            -- Log provisioning event to audit table
+            INSERT INTO dba_maintenance_log
+                (action, object_name, executed_at, details)
+            VALUES
+                ('PARTITION_CREATE', partition_name, NOW(),
+                 format('Range: [%s, %s)', start_val, end_val));
+        END IF;
+    END LOOP;
+END $$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For partition archival on SQL Server, the autonomous engine uses partition switching — a metadata-only operation that detaches a partition into a staging table without data movement, then exports and drops the staging table. This is the correct production pattern because <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SWITCH</code> is near-instantaneous and does not hold locks on the main table during export:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> — Autonomous partition archival via partition switching:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: autonomous partition archival for a monthly partitioned table
+-- Step 1: identify the oldest partition eligible for archival
+DECLARE @oldest_boundary  DATE;
+DECLARE @partition_number INT;
+DECLARE @staging_table    NVARCHAR(128);
+DECLARE @sql              NVARCHAR(MAX);
+
+-- Find the oldest partition boundary older than retention threshold (24 months)
+SELECT TOP 1
+    @oldest_boundary  = CAST(prv.value AS DATE),
+    @partition_number = p.partition_number
+FROM sys.partitions p
+JOIN sys.partition_range_values prv
+    ON prv.function_id = (
+        SELECT pf.function_id
+        FROM sys.partition_functions pf
+        WHERE pf.name = 'pf_monthly_events'
+    )
+   AND prv.boundary_id = p.partition_number - 1
+WHERE p.object_id = OBJECT_ID('dbo.event_log')
+  AND CAST(prv.value AS DATE) &lt; DATEADD(MONTH, -24, GETDATE())
+ORDER BY prv.value ASC;
+
+IF @oldest_boundary IS NOT NULL
+BEGIN
+    SET @staging_table = 'dbo.event_log_archive_'
+        + FORMAT(@oldest_boundary, 'yyyyMM');
+
+    -- Create staging table with same schema
+    SET @sql = '
+        SELECT TOP 0 * INTO ' + @staging_table + '
+        FROM dbo.event_log;
+    ';
+    EXEC sp_executesql @sql;
+
+    -- Switch partition to staging table (metadata-only, instant)
+    SET @sql = '
+        ALTER TABLE dbo.event_log
+        SWITCH PARTITION ' + CAST(@partition_number AS NVARCHAR)
+        + ' TO ' + @staging_table + ';
+    ';
+    EXEC sp_executesql @sql;
+
+    -- Log the archival event
+    INSERT INTO dba_maintenance_log
+        (action, object_name, executed_at, details)
+    VALUES
+        ('PARTITION_SWITCH', @staging_table, GETUTCDATE(),
+         'Switched partition ' + CAST(@partition_number AS NVARCHAR)
+         + ' boundary ' + CAST(@oldest_boundary AS NVARCHAR(20)));
+
+    -- At this point, the staging table is handed off to the
+    -- async export job (bcp/BACPAC/Azure Blob) before DROP
+    PRINT 'Partition switched to staging: ' + @staging_table;
+END</code></pre>
+    </div>
+    <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+        Learn More →
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The ADE Handbook</div>
+  </footer>
+</body>
+</html>
