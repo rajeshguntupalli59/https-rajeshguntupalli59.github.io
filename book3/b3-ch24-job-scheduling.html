@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 24: Autonomous Job Scheduling — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 24: Autonomous Job Scheduling. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-emerald-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">ADE Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-emerald-400 hover:text-emerald-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-emerald-900/40 border border-emerald-800/40 text-emerald-300 text-xs rounded-full font-medium">Chapter 24 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 24: Autonomous Job Scheduling</h2>
+
+<p class="text-gray-300 leading-relaxed">Databases have always needed scheduled work — VACUUM runs, index rebuilds, statistics refreshes, partition rotations, archival jobs, ETL pipelines. Traditional schedulers treat these as fixed calendar entries: run at 2 AM, repeat nightly, alert a human when something fails. Autonomous job scheduling inverts this model entirely. Instead of humans deciding when and what to run, the system observes its own internal state, external load signals, and historical execution patterns to decide dynamically — not just *when* to run a job, but *whether* to run it at all, *which version* of it to execute, and *how to react* when conditions change mid-execution. This chapter builds that system from first principles through production-hardened implementation on both PostgreSQL and SQL Server.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">From Cron to Intent: Rethinking What a Job Schedule Actually Is</h3>
+
+<p class="text-gray-300 leading-relaxed">The cron model encodes a decision made by a human at a point in time: "I think Tuesday at 3 AM will be quiet." That assumption decays. Load patterns shift, data volumes grow, maintenance windows disappear as systems go global. The autonomous alternative is to encode *intent* rather than timing: "Rebuild bloated indexes whenever write throughput drops below a threshold and no active transactions exceed 30 seconds."</p>
+
+<p class="text-gray-300 leading-relaxed">Intent-based scheduling requires three things the cron model lacks: a real-time signal source, a policy engine that converts signals into scheduling decisions, and a job executor that can be interrupted, retried, or throttled based on changing conditions mid-run.</p>
+
+<p class="text-gray-300 leading-relaxed">Before building the scheduler, you need to formalize what a job definition looks like in this model. A job is no longer a command plus a cron expression. It is a tuple:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Job = (work_unit, preconditions, constraints, priority, estimated_cost)</code></pre>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **work_unit**: the actual SQL or procedure to execute</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **preconditions**: signals that must be true before execution begins</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **constraints**: conditions that, if violated during execution, trigger suspension or abort</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **priority**: relative weight when multiple jobs compete for execution windows</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **estimated_cost**: predicted impact on I/O, CPU, and lock contention</li>
+
+<p class="text-gray-300 leading-relaxed">This formalization matters because the scheduler needs to make decisions that balance multiple jobs against each other and against live workload — a problem that cron cannot even represent, let alone solve.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Job definition table for intent-based scheduling
+CREATE TABLE autonomous_jobs (
+    job_id          SERIAL PRIMARY KEY,
+    job_name        TEXT NOT NULL UNIQUE,
+    work_unit       TEXT NOT NULL,           -- SQL or function call
+    preconditions   JSONB NOT NULL DEFAULT '[]',
+    constraints     JSONB NOT NULL DEFAULT '[]',
+    priority        INT NOT NULL DEFAULT 50, -- 1 (highest) to 100 (lowest)
+    estimated_io_mb INT,
+    estimated_cpu_pct NUMERIC(5,2),
+    max_duration_sec INT DEFAULT 3600,
+    enabled         BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    last_modified   TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Example: index rebuild job with intent-based preconditions
+INSERT INTO autonomous_jobs (
+    job_name, work_unit, preconditions, constraints, priority, estimated_io_mb
+) VALUES (
+    'rebuild_bloated_indexes',
+    'CALL maintenance.rebuild_indexes_auto()',
+    '[
+        {"signal": "active_connections_pct", "operator": "&lt;", "threshold": 40},
+        {"signal": "replication_lag_seconds", "operator": "&lt;", "threshold": 30},
+        {"signal": "bloated_index_count", "operator": "&gt;", "threshold": 5}
+    ]',
+    '[
+        {"signal": "active_connections_pct", "operator": "&lt;", "threshold": 70},
+        {"signal": "longest_txn_seconds", "operator": "&lt;", "threshold": 60}
+    ]',
+    20,
+    2048
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Intent-based job registry in SQL Server
+CREATE TABLE dbo.autonomous_jobs (
+    job_id          INT IDENTITY(1,1) PRIMARY KEY,
+    job_name        NVARCHAR(256) NOT NULL,
+    work_unit       NVARCHAR(MAX) NOT NULL,    -- T-SQL batch or EXEC call
+    preconditions   NVARCHAR(MAX) NOT NULL     -- JSON array
+                    CONSTRAINT chk_pre CHECK (ISJSON(preconditions) = 1),
+    constraints_def NVARCHAR(MAX) NOT NULL
+                    CONSTRAINT chk_con CHECK (ISJSON(constraints_def) = 1),
+    priority        INT NOT NULL DEFAULT 50,
+    estimated_io_mb INT NULL,
+    estimated_cpu_pct DECIMAL(5,2) NULL,
+    max_duration_sec INT DEFAULT 3600,
+    enabled         BIT DEFAULT 1,
+    created_at      DATETIME2 DEFAULT SYSUTCDATETIME(),
+    last_modified   DATETIME2 DEFAULT SYSUTCDATETIME()
+);
+
+-- Register an autonomous statistics update job
+INSERT INTO dbo.autonomous_jobs (
+    job_name, work_unit, preconditions, constraints_def, priority, estimated_cpu_pct
+) VALUES (
+    'auto_update_statistics',
+    'EXEC maintenance.UpdateStaleStatistics',
+    N'[
+        {"signal": "cpu_utilization_pct", "operator": "&lt;", "threshold": 35},
+        {"signal": "stale_stats_object_count", "operator": "&gt;", "threshold": 10}
+    ]',
+    N'[
+        {"signal": "cpu_utilization_pct", "operator": "&lt;", "threshold": 75},
+        {"signal": "blocking_chain_depth", "operator": "&lt;", "threshold": 3}
+    ]',
+    30,
+    15.0
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The precondition system means a job that has nothing meaningful to do tonight — because bloat hasn't accumulated or statistics are current — simply doesn't run. This is different from skipping: the system evaluated the state, found the precondition unmet, and logged a deferred decision. That log entry feeds back into the system's learning loop.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Signal Pipeline: Real-Time State Collection for Scheduling Decisions</h3>
+
+<p class="text-gray-300 leading-relaxed">The scheduler is only as intelligent as its signal inputs. A signal pipeline continuously collects, normalizes, and stores database health metrics that precondition and constraint evaluators query at decision time. Building this pipeline correctly is where most autonomous scheduling implementations fail — they either query too slowly (stale signals lead to bad decisions) or query too aggressively (the monitoring overhead becomes its own workload problem).</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture uses a tiered collection model. High-frequency signals — active connections, CPU utilization, query duration — are sampled every 10–15 seconds and stored in a fixed-size ring buffer. Lower-frequency signals — replication lag, bloat estimates, stale statistics counts — are collected every 1–5 minutes. Expensive signals — actual bloat calculations requiring <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code>, or SQL Server's fragmentation analysis — are collected on-demand or once per hour and cached.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Signal ring buffer: fixed retention, high-speed insert path
+CREATE TABLE scheduler_signals (
+    signal_id     BIGSERIAL PRIMARY KEY,
+    signal_name   TEXT NOT NULL,
+    signal_value  NUMERIC NOT NULL,
+    collected_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (collected_at);
+
+-- Automatically create partitions (handled by pg_partman or similar)
+-- Retain only 24 hours of signal history for scheduling decisions
+CREATE INDEX ON scheduler_signals (signal_name, collected_at DESC);
+
+-- Signal collection function — called by pg_cron every 15 seconds
+-- (pg_cron is the bootstrap; it runs the collector, not the jobs themselves)
+CREATE OR REPLACE FUNCTION collect_scheduler_signals()
+RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE
+    v_conn_pct     NUMERIC;
+    v_longest_txn  NUMERIC;
+    v_repl_lag     NUMERIC;
+BEGIN
+    -- Active connection percentage
+    SELECT ROUND(100.0 * count(*) / current_setting('max_connections')::INT, 2)
+    INTO v_conn_pct
+    FROM pg_stat_activity
+    WHERE state != 'idle';
+
+    -- Longest running transaction in seconds
+    SELECT COALESCE(
+        EXTRACT(EPOCH FROM MAX(NOW() - xact_start)), 0
+    )
+    INTO v_longest_txn
+    FROM pg_stat_activity
+    WHERE xact_start IS NOT NULL AND state != 'idle';
+
+    -- Replication lag (max across all standbys)
+    SELECT COALESCE(MAX(EXTRACT(EPOCH FROM write_lag)), 0)
+    INTO v_repl_lag
+    FROM pg_stat_replication;
+
+    INSERT INTO scheduler_signals (signal_name, signal_value) VALUES
+        ('active_connections_pct',  v_conn_pct),
+        ('longest_txn_seconds',     v_longest_txn),
+        ('replication_lag_seconds', v_repl_lag);
+
+    -- Purge signals older than 24 hours
+    DELETE FROM scheduler_signals
+    WHERE collected_at &lt; NOW() - INTERVAL '24 hours';
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, the equivalent pipeline integrates with existing DMV infrastructure and can feed into a dedicated monitoring database or an external time-series store:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Signal collection stored procedure for SQL Server autonomous scheduler
+CREATE OR ALTER PROCEDURE monitoring.CollectSchedulerSignals
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @cpu_pct        DECIMAL(5,2),
+            @longest_txn    INT,
+            @blocking_depth INT;
+
+    -- CPU utilization from ring buffer (last 30-second average)
+    SELECT @cpu_pct = AVG(CAST(100 - record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]','int') AS DECIMAL(5,2)))
+    FROM (
+        SELECT CAST(record AS XML) AS record
+        FROM sys.dm_os_ring_buffers
+        WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+          AND DATEADD(ms, -1 * (SELECT cpu_ticks / (cpu_ticks/ms_ticks) FROM sys.dm_os_sys_info), GETDATE()) &lt; GETDATE()
+    ) AS ring_data;
+
+    -- Longest active transaction
+    SELECT @longest_txn = ISNULL(MAX(DATEDIFF(SECOND, at2.transaction_begin_time, GETDATE())), 0)
+    FROM sys.dm_tran_active_transactions at2
+    WHERE at2.transaction_type != 2;  -- exclude system transactions
+
+    -- Blocking chain depth
+    SELECT @blocking_depth = ISNULL(MAX(blocking_depth.depth), 0)
+    FROM (
+        SELECT COUNT(*) AS depth
+        FROM sys.dm_exec_requests r
+        WHERE r.blocking_session_id &gt; 0
+        GROUP BY r.blocking_session_id
+    ) AS blocking_depth;
+
+    INSERT INTO monitoring.scheduler_signals (signal_name, signal_value, collected_at)
+    VALUES
+        ('cpu_utilization_pct',  @cpu_pct,        SYSUTCDATETIME()),
+        ('longest_txn_seconds',  @longest_txn,    SYSUTCDATETIME()),
+        ('blocking_chain_depth', @blocking_depth, SYSUTCDATETIME());
+
+    -- Purge signals older than 24 hours
+    DELETE FROM monitoring.scheduler_signals
+    WHERE collected_at &lt; DATEADD(HOUR, -24, SYSUTCDATETIME());
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The signal pipeline also needs to collect *semantic* signals — database-level facts like bloat ratios, partition aging, statistics staleness — that are not directly observable from DMVs. These are computed by separate collector jobs on longer intervals, stored in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">semantic_signals</code> table with explicit TTLs, and consumed by the precondition evaluator the same way as real-time metrics. The separation matters: real-time and semantic signals have different freshness requirements and different collection costs, and conflating them creates either over-expensive polling or dangerously stale state.</p>
+
+<p class="text-gray-300 leading-relaxed">Externally, the signal pipeline integrates with Prometheus for cluster-level signals. When the scheduler needs to know whether a Patroni cluster is in the middle of a leader election, or whether pgBouncer has maxed out its pool, it queries Prometheus metrics via the HTTP API rather than trying to infer this from DMV data alone. A Python signal bridge handles this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+import psycopg2
+from datetime import datetime, timezone
+
+PROMETHEUS_URL = "http://prometheus:9090/api/v1/query"
+PG_DSN = "host=localhost dbname=scheduler user=scheduler_svc"
+
+PROMETHEUS_SIGNALS = {
+    "patroni_master_running":
+        'patroni_master_running{scope="prod-cluster"}',
+    "pgbouncer_pool_saturation_pct":
+        '100 * pgbouncer_pools_server_active_connections / '
+        'pgbouncer_pools_server_login_retry{database="app"}',
+    "pg_replication_lag_bytes":
+        'pg_replication_lag{instance="primary:5432"}',
+}
+
+def collect_external_signals(conn):
+    cursor = conn.cursor()
+    for signal_name, query in PROMETHEUS_SIGNALS.items():
+        try:
+            resp = requests.get(
+                PROMETHEUS_URL,
+                params={"query": query},
+                timeout=5
+            )
+            result = resp.json()["data"]["result"]
+            if result:
+                value = float(result[0]["value"][1])
+                cursor.execute(
+                    """
+                    INSERT INTO scheduler_signals (signal_name, signal_value, collected_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (signal_name, value, datetime.now(timezone.utc))
+                )
+        except Exception as e:
+            print(f"Signal collection failed for {signal_name}: {e}")
+    conn.commit()
+
+if __name__ == "__main__":
+    with psycopg2.connect(PG_DSN) as conn:
+        collect_external_signals(conn)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This bridge runs as a Kubernetes CronJob every 30 seconds, feeding cluster-level state into the same signal table that the database-internal collector populates. The scheduler has a unified signal query path regardless of whether a signal originated from a DMV, a PostgreSQL function, or a Prometheus query.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Scheduling Engine: Decision Logic, Job Queuing, and Conflict Resolution</h3>
+
+<p class="text-gray-300 leading-relaxed">With a rich signal pipeline in place, the scheduling engine is the decision layer that sits between signals and execution. Its core loop runs on a tight interval — every 30 to 60 seconds — and performs four operations: evaluate all enabled jobs against their preconditions, score eligible jobs by priority and resource cost, resolve conflicts between competing jobs, and dispatch the winner to the execution layer.</p>
+
+<p class="text-gray-300 leading-relaxed">The precondition evaluator is a signal-query function that reads the most recent values for each signal referenced in a job's precondition array and applies the operator-threshold comparison:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Evaluate whether all preconditions for a job are satisfied
+CREATE OR REPLACE FUNCTION evaluate_job_preconditions(p_job_id INT)
+RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+DECLARE
+    v_preconditions  JSONB;
+    v_condition      JSONB;
+    v_signal_value   NUMERIC;
+    v_threshold      NUMERIC;
+    v_operator       TEXT;
+    v_satisfied      BOOLEAN := TRUE;
+BEGIN
+    SELECT preconditions INTO v_preconditions
+    FROM autonomous_jobs WHERE job_id = p_job_id;
+
+    FOR v_condition IN SELECT jsonb_array_elements(v_preconditions)
+    LOOP
+        v_operator  := v_condition-&gt;&gt;'operator';
+        v_threshold := (v_condition-&gt;&gt;'threshold')::NUMERIC;
+
+        -- Get most recent signal value (within last 2 minutes)
+        SELECT signal_value INTO v_signal_value
+        FROM scheduler_signals
+        WHERE signal_name = v_condition-&gt;&gt;'signal'
+          AND collected_at &gt; NOW() - INTERVAL '2 minutes'
+        ORDER BY collected_at DESC
+        LIMIT 1;
+
+        IF v_signal_value IS NULL THEN
+            -- Signal too stale or missing: fail safe, do not schedule
+            v_satisfied := FALSE;
+            EXIT;
+        END IF;
+
+        v_satisfied := v_satisfied AND CASE v_operator
+            WHEN '&lt;'  THEN v_signal_value &lt; v_threshold
+            WHEN '&lt;=' THEN v_signal_value &lt;= v_threshold
+            WHEN '&gt;'  THEN v_signal_value &gt; v_threshold
+            WHEN '&gt;=' THEN v_signal_value &gt;= v_threshold
+            WHEN '='  THEN v_signal_value = v_threshold
+            ELSE FALSE
+        END;
+
+        IF NOT v_satisfied THEN EXIT; END IF;
+    END LOOP;
+
+    RETURN v_satisfied;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The conflict resolver handles a scenario the cron model cannot: two jobs are both eligible to run, but running both simultaneously would collectively breach a resource constraint. The resolver calculates the *combined estimated cost* of all eligible jobs sorted by priority, then selects a maximal subset whose aggregate I/O and CPU estimates stay within configurable limits. Lower-priority jobs that cannot fit into the current window are deferred with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deferred_reason</code> log entry.</p>
+
+<p class="text-gray-300 leading-relaxed">This approach has a secondary benefit: when a high-priority job finishes early and releases its resource reservation, the scheduler's next tick can immediately promote a previously deferred job without waiting for the next calendar window. The system fills available capacity continuously rather than wasting it.</p>
+
+<p class="text-gray-300 leading-relaxed">Job execution state is tracked in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">job_runs</code> table, which the constraint evaluator monitors throughout execution. If a job is running and a constraint signal breaches its threshold — for example, active connection percentage spikes above 70% during an index rebuild — the executor receives a soft-stop signal. The job is given a grace period (configurable per job, default 60 seconds) to reach a safe checkpoint before being terminated. The interrupted run is logged with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'suspended'</code> and rescheduled for the next eligible window, not silently dropped.</p>
+
+<p class="text-gray-300 leading-relaxed">The suspension-and-resume pattern requires jobs themselves to be written with interruption awareness. Index rebuilds in PostgreSQL can be interrupted and restarted safely. VACUUM is inherently interruptible. For multi-step ETL pipelines, the work unit should be a stored procedure that implements checkpoint-based progress tracking, resuming from the last committed batch rather than restarting from scratch.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Workload-Aware Execution Windows and Load Forecasting</h3>
+
+<p class="text-gray-300 leading-relaxed">Static scheduling knows nothing about the future. Autonomous scheduling learns it. The system builds a rolling forecast of expected workload by analyzing historical signal data, identifying time-of-day and day-of-week patterns, and predicting when execution windows — periods of low contention — are likely to occur. This allows the scheduler to not just react to current conditions but to *anticipate* them.</p>
+
+<p class="text-gray-300 leading-relaxed">The forecasting layer uses a straightforward but effective approach: for each hour-of-week combination (168 buckets), it calculates the 75th percentile of historical connection percentage and CPU utilization from the signal history. These percentile values become soft thresholds that shift the precondition evaluator's effective baselines. At 3 AM on a Tuesday that historically shows 12% connection utilization, the scheduler applies more lenient preconditions and accepts more concurrent jobs. At 9 AM on a Monday that historically shows 78% utilization, the scheduler suppresses all non-critical maintenance regardless of current signals, because the forecast says the window will close within minutes even if it looks clear right now.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+import pandas as pd
+from scipy import stats
+
+PG_DSN = "host=localhost dbname=scheduler user=scheduler_svc"
+
+def build_workload_forecast():
+    """
+    Compute 75th percentile baselines per hour-of-week bucket
+    from 30 days of signal history. Outputs a forecast table
+    used by the scheduler's precondition evaluator.
+    """
+    with psycopg2.connect(PG_DSN) as conn:
+        df = pd.read_sql("""
+            SELECT
+                EXTRACT(DOW FROM collected_at)::INT  AS dow,
+                EXTRACT(HOUR FROM collected_at)::INT AS hour_of_day,
+                signal_name,
+                signal_value
+            FROM scheduler_signals
+            WHERE collected_at &gt; NOW() - INTERVAL '30 days'
+              AND signal_name IN (
+                  'active_connections_pct',
+                  'cpu_utilization_pct'
+              )
+        """, conn)
+
+        forecast = (
+            df.groupby(['dow', 'hour_of_day', 'signal_name'])['signal_value']
+              .quantile(0.75)
+              .reset_index()
+              .rename(columns={'signal_value': 'p75_value'})
+        )
+
+        cursor = conn.cursor()
+        cursor.execute("TRUNCATE TABLE scheduler_workload_forecast")
+        for _, row in forecast.iterrows():
+            cursor.execute("""
+                INSERT INTO scheduler_workload_forecast
+                    (dow, hour_of_day, signal_name, p75_value, computed_at)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (int(row.dow), int(row.hour_of_day),
+                  row.signal_name, float(row.p75_value)))
+        conn.commit()
+        print(f"Forecast updated: {len(forecast)} hour-of-week buckets written")
+
+if __name__ == "__main__":
+    build_workload_forecast()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This forecast rebuilds nightly, using the last 30 days of signal history. The rolling window means the forecast adapts automatically to workload shifts — a new ETL pipeline that starts hammering the database at 11 PM will, within a few days, be reflected in the forecast and cause the scheduler to shift maintenance windows away from that slot without any human intervention.</p>
+
+<p class="text-gray-300 leading-relaxed">The forecast integrates into the precondition evaluator as an *additive strictness modifier*. When the forecast for the current hour predicts high load (above configurable quantile), precondition thresholds are tightened by a multiplier (e.g., require connections below 30% instead of 40%). When the forecast predicts low load, thresholds are relaxed and the scheduler becomes more aggressive about batching eligible jobs together.</p>
+
+<p class="text-gray-300 leading-relaxed">Seasonal patterns — month-end reporting, quarterly data loads — are handled by a separate calendar-annotation table where teams can mark known high-load periods. The scheduler combines statistical forecasting with explicit annotations, treating calendar annotations as hard overrides that suppress non-critical maintenance regardless of what the signal or forecast says. This gives the autonomous system a safety valve: it can be overridden by intentional human input without breaking the automated decision path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Failure Handling, Retry Intelligence, and Job Dependency Graphs</h3>
+
+<p class="text-gray-300 leading-relaxed">A scheduler that cannot handle failure autonomously is just cron with extra steps. Autonomous failure handling requires the system to distinguish between different failure classes, apply class-appropriate retry strategies, and propagate failure state through job dependency chains without human intervention.</p>
+
+<p class="text-gray-300 leading-relaxed">Failure classification happens at execution time. When a job's work unit raises an exception, the scheduler catches it and assigns a failure class:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Transient failures**: deadlocks, lock timeouts, connection pool exhaustion — retry with backoff after a short delay</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Resource failures**: out-of-disk during an index rebuild, query cancelled due to statement timeout — retry after the constraint that caused the failure resolves</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Logic failures**: division by zero in a statistics query, a missing table — do not retry, alert, suspend the job pending human review</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partial failures**: a multi-step procedure that committed some batches before failing — resume from checkpoint, not full restart</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+    </div>
+    <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+        Learn More →
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The ADE Handbook</div>
+  </footer>
+</body>
+</html>
