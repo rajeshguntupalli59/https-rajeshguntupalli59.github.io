@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 35: Autonomous Cost Optimization — The ADE Handbook</title>
+  <meta name="description" content="The ADE Handbook Chapter 35: Autonomous Cost Optimization. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-emerald-500 to-emerald-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-emerald-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">ADE Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-emerald-400 hover:text-emerald-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-emerald-900/40 border border-emerald-800/40 text-emerald-300 text-xs rounded-full font-medium">Chapter 35 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The ADE Handbook</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 35: Autonomous Cost Optimization</h2>
+
+<p class="text-gray-300 leading-relaxed">Cost is the boundary condition that shapes every other autonomous decision. A system that auto-scales without cost awareness will optimize itself into a cloud bill that ends careers. A system that freezes capacity to control spend will fail SLAs under load. Autonomous cost optimization is the discipline of building control loops that balance performance, availability, and expenditure continuously — without a human approving each tradeoff. This chapter covers the full architecture: how autonomous systems model infrastructure cost in real time, how they make provisioning and rightsizing decisions without human intervention, how query-level spend attribution works at scale, and how to implement feedback loops that keep cost within envelope while preserving SLA guarantees.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.1 Cost Modeling as a First-Class Metric: Tagging, Attribution, and Real-Time Spend Signals</h3>
+
+<p class="text-gray-300 leading-relaxed">Before any autonomous system can optimize cost, it needs a continuously updated model of what things cost and who is responsible for that cost. Most teams treat cost as a billing artifact — something discovered monthly when the cloud invoice arrives. Autonomous systems treat cost as a runtime metric, sampled at the same frequency as CPU and I/O.</p>
+
+<p class="text-gray-300 leading-relaxed">The foundation is <strong class="text-white">dimensional cost attribution</strong>: every resource consumption event (query execution, storage write, network egress, index maintenance job) is tagged with an ownership dimension before it hits the billing system. In practice, this means building a cost metadata layer that maps database objects to cost centers.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a cost attribution registry that maps schemas/roles to cost centers
+CREATE TABLE cost_attribution.ownership (
+    id              SERIAL PRIMARY KEY,
+    schema_name     TEXT NOT NULL,
+    role_name       TEXT,
+    application_tag TEXT,
+    cost_center     TEXT NOT NULL,
+    team_name       TEXT NOT NULL,
+    monthly_budget_usd NUMERIC(12,2),
+    alert_threshold_pct NUMERIC(5,2) DEFAULT 80.0,
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- View that joins pg_stat_statements with cost attribution
+-- Assumes shared_preload_libraries includes pg_stat_statements
+CREATE OR REPLACE VIEW cost_attribution.query_cost_estimate AS
+SELECT
+    pss.queryid,
+    pss.query,
+    ca.cost_center,
+    ca.team_name,
+    pss.calls,
+    pss.total_exec_time,
+    pss.rows,
+    -- Estimate compute cost: $0.048/vCPU-hour on a typical 8-vCPU instance
+    -- total_exec_time is in milliseconds
+    ROUND(
+        (pss.total_exec_time / 1000.0 / 3600.0)  -- convert to hours
+        * 0.048                                    -- cost per vCPU-hour
+        * (SELECT current_setting('max_parallel_workers_per_gather')::int + 1)
+    , 6) AS estimated_compute_cost_usd,
+    pss.shared_blks_read + pss.shared_blks_hit AS total_blocks_accessed,
+    -- I/O cost estimate: $0.10 per 1M block reads (approximate EBS pricing)
+    ROUND((pss.shared_blks_read * 8192.0 / 1e9) * 0.10, 6) AS estimated_io_cost_usd
+FROM pg_stat_statements pss
+LEFT JOIN cost_attribution.ownership ca
+    ON pss.query ILIKE '%' || ca.schema_name || '%'
+WHERE pss.calls &gt; 0
+ORDER BY estimated_compute_cost_usd + estimated_io_cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cost attribution registry
+CREATE TABLE CostAttribution.Ownership (
+    OwnershipID        INT IDENTITY(1,1) PRIMARY KEY,
+    SchemaName         NVARCHAR(128)  NOT NULL,
+    ApplicationTag     NVARCHAR(256),
+    CostCenter         NVARCHAR(128)  NOT NULL,
+    TeamName           NVARCHAR(128)  NOT NULL,
+    MonthlyBudgetUSD   DECIMAL(12,2),
+    AlertThresholdPct  DECIMAL(5,2)   DEFAULT 80.0,
+    CreatedAt          DATETIME2      DEFAULT SYSUTCDATETIME(),
+    UpdatedAt          DATETIME2      DEFAULT SYSUTCDATETIME()
+);
+
+-- Real-time query cost estimate from Query Store
+CREATE OR REPLACE VIEW CostAttribution.QueryCostEstimate AS
+SELECT
+    qsq.query_id,
+    qsq.query_hash,
+    SUBSTRING(qt.query_sql_text, 1, 500)   AS query_sample,
+    ca.CostCenter,
+    ca.TeamName,
+    qsrs.count_executions,
+    qsrs.avg_duration / 1000.0             AS avg_duration_ms,
+    qsrs.avg_cpu_time / 1000.0             AS avg_cpu_ms,
+    -- Compute cost estimate: $0.048/vCPU-hour
+    ROUND(
+        (qsrs.avg_cpu_time / 1e6 / 3600.0) -- microseconds → hours
+        * qsrs.count_executions
+        * 0.048
+    , 6)                                   AS estimated_compute_cost_usd,
+    qsrs.avg_logical_io_reads,
+    -- I/O cost estimate
+    ROUND(
+        (qsrs.avg_logical_io_reads * 8192.0 / 1e9)
+        * qsrs.count_executions
+        * 0.10
+    , 6)                                   AS estimated_io_cost_usd
+FROM sys.query_store_query          qsq
+JOIN sys.query_store_query_text     qt   ON qt.query_text_id = qsq.last_query_text_id
+JOIN sys.query_store_runtime_stats  qsrs ON qsrs.plan_id IN (
+    SELECT plan_id FROM sys.query_store_plan WHERE query_id = qsq.query_id
+)
+LEFT JOIN CostAttribution.Ownership ca
+    ON qsq.object_id IN (
+        SELECT object_id FROM sys.objects WHERE schema_id = SCHEMA_ID(ca.SchemaName)
+    )
+WHERE qsrs.last_execution_time &gt;= DATEADD(HOUR, -1, SYSUTCDATETIME());</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The real-time signal layer pulls from cloud pricing APIs — AWS Cost Explorer, Azure Cost Management, or GCP Billing — and correlates resource-level line items with database-level metrics. The autonomous system needs this correlation to know that a spike in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_blks_read</code> on a PostgreSQL replica translates into a measurable EBS cost increase, not just a performance concern.</p>
+
+<p class="text-gray-300 leading-relaxed">The Python daemon below polls cloud cost APIs every 15 minutes and writes normalized cost signals into a time-series store (Prometheus pushgateway or InfluxDB) alongside database metrics:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import psycopg2
+import requests
+import json
+from datetime import datetime, timedelta
+from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+
+PUSHGATEWAY_URL = "http://prometheus-pushgateway:9091"
+DB_CONN = "host=localhost dbname=platform user=cost_agent password=secret"
+
+def fetch_rds_cost(account_id: str, cluster_id: str) -&gt; float:
+    """Pull last 24h spend for a specific RDS cluster from Cost Explorer."""
+    client = boto3.client("ce", region_name="us-east-1")
+    end = datetime.utcnow().date()
+    start = end - timedelta(days=1)
+    response = client.get_cost_and_usage(
+        TimePeriod={"Start": str(start), "End": str(end)},
+        Granularity="DAILY",
+        Filter={
+            "And": [
+                {"Dimensions": {"Key": "SERVICE", "Values": ["Amazon Relational Database Service"]}},
+                {"Tags": {"Key": "ClusterID", "Values": [cluster_id]}}
+            ]
+        },
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "TAG", "Key": "CostCenter"}]
+    )
+    total = 0.0
+    for result in response.get("ResultsByTime", []):
+        for group in result.get("Groups", []):
+            total += float(group["Metrics"]["UnblendedCost"]["Amount"])
+    return total
+
+def push_cost_metrics(cluster_id: str, cost_usd: float, cost_center: str):
+    registry = CollectorRegistry()
+    g = Gauge(
+        "db_cluster_daily_cost_usd",
+        "Estimated daily cost for database cluster",
+        ["cluster_id", "cost_center"],
+        registry=registry
+    )
+    g.labels(cluster_id=cluster_id, cost_center=cost_center).set(cost_usd)
+    push_to_gateway(PUSHGATEWAY_URL, job="cost_optimizer", registry=registry)
+
+def record_cost_signal(cluster_id: str, cost_usd: float, cost_center: str):
+    """Write cost signal to local PostgreSQL cost tracking table."""
+    conn = psycopg2.connect(DB_CONN)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cost_attribution.daily_spend
+                (cluster_id, cost_center, spend_date, cost_usd, recorded_at)
+            VALUES (%s, %s, CURRENT_DATE, %s, NOW())
+            ON CONFLICT (cluster_id, cost_center, spend_date)
+            DO UPDATE SET cost_usd = EXCLUDED.cost_usd, recorded_at = NOW()
+        """, (cluster_id, cost_center, cost_usd))
+    conn.commit()
+    conn.close()
+
+if __name__ == "__main__":
+    clusters = [
+        {"id": "prod-pg-cluster-01", "cost_center": "platform-eng"},
+        {"id": "prod-pg-cluster-02", "cost_center": "data-science"},
+    ]
+    for c in clusters:
+        cost = fetch_rds_cost("123456789012", c["id"])
+        push_cost_metrics(c["id"], cost, c["cost_center"])
+        record_cost_signal(c["id"], cost, c["cost_center"])
+        print(f"Recorded ${cost:.4f} for {c['id']} ({c['cost_center']})")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With cost flowing as a real-time metric, the system now has the signal quality needed to make autonomous decisions — not just report on what was spent.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.2 Autonomous Rightsizing: Instance, Storage, and Replica Count Control Loops</h3>
+
+<p class="text-gray-300 leading-relaxed">Rightsizing without autonomy is a quarterly meeting. Rightsizing with autonomy is a continuous control loop that evaluates provisioned capacity against actual utilization and executes changes within pre-approved envelopes. The key architectural distinction is between <strong class="text-white">reactive rightsizing</strong> (respond to a threshold breach) and <strong class="text-white">predictive rightsizing</strong> (anticipate tomorrow's workload shape and pre-position capacity at the right tier before the cost is incurred).</p>
+
+<p class="text-gray-300 leading-relaxed">The control loop for autonomous rightsizing operates on three independent axes:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Compute tier</strong> — instance size (vCPU/RAM). Scale up when P95 CPU exceeds 75% for 30 consecutive minutes during business hours. Scale down when P95 CPU stays below 20% for 4 consecutive hours outside a peak window.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Storage tier</strong> — provisioned IOPS versus actual IOPS. On AWS RDS, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gp3</code> volumes allow independent IOPS and throughput provisioning. When consumed IOPS consistently runs below 40% of provisioned, the system reduces provisioned IOPS to the next tier down.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Replica count</strong> — read replicas are the largest cost lever in most PostgreSQL and SQL Server architectures. Each read replica is a full instance cost. The system tracks replica load in 5-minute windows and decommissions idle replicas using a golden signal model: if a replica's active connections drop below 5 and its CPU stays under 10% for 20 consecutive minutes, it is a candidate for removal.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rightsizing evaluation: replica idle detection
+-- Runs every 5 minutes via pg_cron or external scheduler
+CREATE OR REPLACE FUNCTION cost_optimization.evaluate_replica_rightsizing()
+RETURNS TABLE (
+    replica_host        TEXT,
+    action_recommended  TEXT,
+    avg_connections     NUMERIC,
+    avg_cpu_pct         NUMERIC,
+    idle_duration_min   INT,
+    estimated_savings_usd_mo NUMERIC
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        rm.replica_host,
+        CASE
+            WHEN rm.avg_active_connections &lt; 5
+             AND rm.avg_cpu_pct &lt; 10
+             AND rm.consecutive_idle_windows &gt;= 4   -- 4 × 5min = 20min
+            THEN 'DECOMMISSION'
+            WHEN rm.avg_active_connections &lt; 10
+             AND rm.avg_cpu_pct &lt; 25
+             AND rm.consecutive_idle_windows &gt;= 12  -- 60min
+            THEN 'SCALE_DOWN_TIER'
+            ELSE 'NO_ACTION'
+        END                                          AS action_recommended,
+        rm.avg_active_connections,
+        rm.avg_cpu_pct,
+        rm.consecutive_idle_windows * 5             AS idle_duration_min,
+        -- Approximate: db.r6g.large = $0.24/hr = ~$175/mo
+        CASE WHEN rm.consecutive_idle_windows &gt;= 4
+             THEN 175.00
+             ELSE 0.00
+        END                                          AS estimated_savings_usd_mo
+    FROM cost_optimization.replica_metrics_rollup rm
+    WHERE rm.window_end &gt;= NOW() - INTERVAL '1 hour';
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rightsizing evaluation for Always On secondaries
+CREATE OR REPLACE PROCEDURE CostOptimization.EvaluateReplicaRightsizing
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT
+        rm.ReplicaHost,
+        CASE
+            WHEN rm.AvgActiveConnections &lt; 5
+             AND rm.AvgCPUPct &lt; 10
+             AND rm.ConsecutiveIdleWindows &gt;= 4
+            THEN 'DECOMMISSION'
+            WHEN rm.AvgActiveConnections &lt; 10
+             AND rm.AvgCPUPct &lt; 25
+             AND rm.ConsecutiveIdleWindows &gt;= 12
+            THEN 'SCALE_DOWN_TIER'
+            ELSE 'NO_ACTION'
+        END                                    AS ActionRecommended,
+        rm.AvgActiveConnections,
+        rm.AvgCPUPct,
+        rm.ConsecutiveIdleWindows * 5          AS IdleDurationMin,
+        -- SQL Server Business Critical: ~$0.55/vCore-hour × 8 vCores × 730hr
+        CASE
+            WHEN rm.ConsecutiveIdleWindows &gt;= 4
+            THEN CAST(0.55 * 8 * 730 AS DECIMAL(10,2))
+            ELSE 0.00
+        END                                    AS EstimatedSavingsUSDMonth
+    FROM CostOptimization.ReplicaMetricsRollup rm
+    WHERE rm.WindowEnd &gt;= DATEADD(HOUR, -1, SYSUTCDATETIME())
+    ORDER BY EstimatedSavingsUSDMonth DESC;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The action layer for autonomous decommissioning requires three safeguards: a <strong class="text-white">change freeze window</strong> (no decommissions during peak hours 08:00–22:00 local business timezone), a <strong class="text-white">quorum check</strong> (never drop below minimum replica count defined in the DR policy, typically 2), and a <strong class="text-white">cost approval gate</strong> — actions with savings above a threshold require an async approval signal from a human or a CI/CD pipeline before execution. Below the threshold, they execute immediately.</p>
+
+<p class="text-gray-300 leading-relaxed">The Python controller that acts on these recommendations connects the evaluation SQL above to the cloud provider API:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import psycopg2
+from datetime import datetime, time
+import pytz
+
+RDS_CLIENT = boto3.client("rds", region_name="us-east-1")
+DB_CONN = "host=localhost dbname=platform user=cost_agent"
+MIN_REPLICA_COUNT = 2
+AUTO_APPROVE_SAVINGS_THRESHOLD = 50.0   # USD/month
+PEAK_HOURS_TZ = pytz.timezone("America/New_York")
+PEAK_START = time(8, 0)
+PEAK_END   = time(22, 0)
+
+def is_peak_window() -&gt; bool:
+    now_local = datetime.now(PEAK_HOURS_TZ).time()
+    return PEAK_START &lt;= now_local &lt;= PEAK_END
+
+def get_current_replica_count(cluster_id: str) -&gt; int:
+    resp = RDS_CLIENT.describe_db_clusters(DBClusterIdentifier=cluster_id)
+    return len(resp["DBClusters"][0]["DBClusterMembers"]) - 1  # subtract writer
+
+def execute_rightsizing_actions(cluster_id: str):
+    if is_peak_window():
+        print("In peak window — skipping autonomous rightsizing.")
+        return
+
+    conn = psycopg2.connect(DB_CONN)
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT replica_host, action_recommended, estimated_savings_usd_mo
+            FROM cost_optimization.evaluate_replica_rightsizing()
+            WHERE action_recommended != 'NO_ACTION'
+        """)
+        actions = cur.fetchall()
+    conn.close()
+
+    current_replicas = get_current_replica_count(cluster_id)
+
+    for replica_host, action, savings in actions:
+        if action == "DECOMMISSION":
+            if current_replicas &lt;= MIN_REPLICA_COUNT:
+                print(f"Skipping {replica_host} — at minimum replica floor.")
+                continue
+            if savings &gt;= AUTO_APPROVE_SAVINGS_THRESHOLD:
+                # Auto-approve: execute immediately
+                print(f"Auto-decommissioning {replica_host} (saves ${savings:.2f}/mo)")
+                RDS_CLIENT.delete_db_instance(
+                    DBInstanceIdentifier=replica_host,
+                    SkipFinalSnapshot=True
+                )
+                current_replicas -= 1
+            else:
+                # Queue for async human approval
+                queue_for_approval(replica_host, action, savings)
+
+def queue_for_approval(replica_host: str, action: str, savings: float):
+    """Write to approval queue — picked up by async approval service."""
+    conn = psycopg2.connect(DB_CONN)
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO cost_optimization.pending_approvals
+                (resource_id, action, estimated_savings_usd_mo, requested_at, status)
+            VALUES (%s, %s, %s, NOW(), 'PENDING')
+        """, (replica_host, action, savings))
+    conn.commit()
+    conn.close()
+
+if __name__ == "__main__":
+    execute_rightsizing_actions("prod-aurora-cluster-01")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Storage rightsizing follows a similar pattern but operates on provisioned IOPS metrics from CloudWatch or Azure Monitor rather than connection counts. The signal is: when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VolumeReadIOPs + VolumeWriteIOPs</code> averaged over a 7-day rolling window is below 40% of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ProvisionedIOPS</code>, reduce provisioned IOPS by one step (typically 1000 IOPS increments on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gp3</code>). Each reduction step saves approximately $0.10/hour on AWS.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.3 Query-Level Cost Governance: Spend Limits, Query Killing, and Workload Shaping</h3>
+
+<p class="text-gray-300 leading-relaxed">Compute infrastructure rightsizing addresses the supply side of cost. Query-level governance addresses the demand side — it ensures that individual queries or workloads do not consume disproportionate resources relative to their business value. This is where autonomous cost optimization becomes genuinely operational rather than just architectural.</p>
+
+<p class="text-gray-300 leading-relaxed">The discipline has three tiers:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Statement Timeout Enforcement by Cost Center.</strong> Each cost center gets a configurable statement timeout. Data science workloads doing exploratory analysis against production replicas are limited to 30-second queries by default. OLTP application roles get 5-second timeouts. The mapping is maintained in the cost attribution registry and applied dynamically via connection pooler configuration (PgBouncer) or resource governor (SQL Server).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Apply per-role statement timeouts dynamically
+-- Called by PgBouncer connect_query or a session-level initialization function
+CREATE OR REPLACE FUNCTION cost_optimization.apply_role_cost_policy()
+RETURNS void AS $$
+DECLARE
+    v_role          TEXT := current_user;
+    v_timeout_ms    INT;
+    v_work_mem_mb   INT;
+BEGIN
+    SELECT
+        cp.statement_timeout_ms,
+        cp.work_mem_mb
+    INTO v_timeout_ms, v_work_mem_mb
+    FROM cost_optimization.role_cost_policy cp
+    WHERE cp.role_name = v_role
+      AND cp.is_active = TRUE;
+
+    IF FOUND THEN
+        EXECUTE format('SET statement_timeout = %L', v_timeout_ms || 'ms');
+        EXECUTE format('SET work_mem = %L', v_work_mem_mb || 'MB');
+        -- Log policy application for audit trail
+        INSERT INTO cost_optimization.policy_application_log
+            (role_name, timeout_ms, work_mem_mb, applied_at)
+        VALUES (v_role, v_timeout_ms, v_work_mem_mb, NOW());
+    END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Autonomous kill of long-running queries beyond cost threshold
+-- Runs every 60 seconds via pg_cron
+SELECT cron.schedule(
+    'autonomous-query-kill',
+    '* * * * *',
+    $$
+    SELECT pg_terminate_backend(pid)
+    FROM pg_stat_activity psa
+    JOIN cost_optimization.role_cost_policy rcp ON rcp.role_name = psa.usename
+    WHERE state = 'active'
+      AND query_start &lt; NOW() - (rcp.hard_kill_timeout_ms || 'milliseconds')::INTERVAL
+      AND query NOT ILIKE '%pg_terminate_backend%'
+      AND pid &lt;&gt; pg_backend_pid();
+    $$
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+    </div>
+    <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html"
+         class="shrink-0 px-6 py-3 bg-emerald-600 hover:bg-emerald-500 text-white font-semibold rounded-xl text-sm transition">
+        Learn More →
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The ADE Handbook</div>
+  </footer>
+</body>
+</html>
