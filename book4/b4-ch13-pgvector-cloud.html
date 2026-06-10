@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 13: pgvector on RDS, Aurora, AlloyDB, and Supabase — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 13: pgvector on RDS, Aurora, AlloyDB, and Supabase. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 13 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 13: pgvector on RDS, Aurora, AlloyDB, and Supabase</h2>
+
+<p class="text-gray-300 leading-relaxed">Running pgvector in production rarely means spinning up a raw EC2 instance and compiling the extension by hand. Most teams arrive at vector search through the managed PostgreSQL services they already operate—Amazon RDS, Amazon Aurora, Google AlloyDB, or Supabase—and they need to know exactly what each platform delivers, what it costs, and where the walls are. This chapter maps pgvector's behavior across all four environments: how to enable it, how to tune it, where each platform diverges from vanilla PostgreSQL, and how to architect a production embedding pipeline that survives traffic spikes, schema migrations, and the cost pressure that follows any successful AI feature launch.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.1 Platform Landscape: What You're Actually Getting</h3>
+
+<p class="text-gray-300 leading-relaxed">Before touching a single SQL statement, understand what managed pgvector actually means across these four providers.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Amazon RDS for PostgreSQL</strong> added pgvector support in October 2023 for PostgreSQL 15.x and later, and backported it to 14.x and 13.x shortly after. You get the standard pgvector extension installed by the engine—no custom builds, no OS-level access. The version you get is whatever RDS has packaged; you cannot upgrade the extension independently of the engine minor version. As of mid-2024, RDS ships pgvector 0.6.x on PostgreSQL 15 and 0.7.x on PostgreSQL 16. This matters because HNSW index support landed in pgvector 0.5.0, and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">halfvec</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bit</code> types for memory-efficient storage arrived in 0.7.0.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Amazon Aurora PostgreSQL-Compatible</strong> shares the same extension packaging as RDS but adds Aurora-specific behavior: storage auto-scaling, the Aurora parallel query engine, and Global Database replication. Vector data lives in Aurora's distributed storage layer, which means your HNSW index pages are stored across the distributed volume rather than local disk—a meaningful difference when reasoning about index build I/O and buffer pool pressure.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google AlloyDB</strong> is Google's PostgreSQL-compatible managed service with a disaggregated storage architecture and a built-in columnar engine. AlloyDB added pgvector support in 2023 and additionally offers <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">google_ml_integration</code>, which lets you call Vertex AI embedding models directly from SQL. The columnar engine can accelerate certain vector workload patterns—specifically full-table scans during exact KNN searches on small-to-medium datasets—in ways that standard PostgreSQL storage cannot.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Supabase</strong> is a developer-focused platform built on PostgreSQL with pgvector pre-enabled on every project. Supabase wraps the database with a REST API layer (PostgREST), a real-time subscription engine, and a JavaScript/Python SDK that integrates directly with vector operations. This makes Supabase the fastest path from zero to a working vector search endpoint, but the tradeoff is reduced control over low-level PostgreSQL configuration parameters that matter at scale—<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code> are not directly tunable on the free and Pro tiers.</p>
+
+<p class="text-gray-300 leading-relaxed">The following table summarizes the key operational differences:</p>
+
+<p class="text-gray-300 leading-relaxed">| Feature | RDS PostgreSQL | Aurora PostgreSQL | AlloyDB | Supabase |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| pgvector version control | Engine-tied | Engine-tied | Engine-tied | Engine-tied |</p>
+<p class="text-gray-300 leading-relaxed">| HNSW support | ✓ (PG 15+) | ✓ (PG 15+) | ✓ | ✓ |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">halfvec</code> type | ✓ (PG 16+) | ✓ (PG 16+) | ✓ | ✓ |</p>
+<p class="text-gray-300 leading-relaxed">| Max dimensions | 16,000 | 16,000 | 16,000 | 16,000 |</p>
+<p class="text-gray-300 leading-relaxed">| Direct ML integration | ❌ | ❌ | Vertex AI | ❌ |</p>
+<p class="text-gray-300 leading-relaxed">| PostgREST API | ❌ | ❌ | ❌ | ✓ |</p>
+<p class="text-gray-300 leading-relaxed">| Custom GUC tuning | Full | Full | Partial | Limited |</p>
+<p class="text-gray-300 leading-relaxed">| Read replicas for search | ✓ | ✓ (serverless optional) | ✓ | ✓ (paid tiers) |</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.2 Enabling pgvector and Schema Design on Managed Services</h3>
+
+<p class="text-gray-300 leading-relaxed">Enabling the extension follows the same SQL command on all four platforms, but the prerequisites differ.</p>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">RDS and Aurora</strong>, you need to be connected as the master user or a user with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_superuser</code> role:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Run as master user (e.g., postgres or your RDS master username)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Verify version
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+-- Returns: 0.7.0 (or whatever RDS has packaged)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">AlloyDB</strong>, the extension is pre-loaded in the shared library. Enable it the same way, but note that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">google_ml_integration</code> must also be enabled to use the ML embedding functions:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector (AlloyDB)
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS google_ml_integration;
+
+-- Grant the AlloyDB service account access to Vertex AI
+-- (Done in GCP IAM, not SQL — the AlloyDB instance's service account
+--  needs roles/aiplatform.user on the project)
+
+-- Test a Vertex AI embedding call directly from SQL
+SELECT google_ml.embedding(
+    'textembedding-gecko@003',
+    'What is the boiling point of water?'
+)::vector(768);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">Supabase</strong>, the extension is already enabled. Connect via the Supabase dashboard's SQL editor or any PostgreSQL client using the connection string from your project settings:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector (Supabase — extension already active)
+-- Verify it's available
+SELECT extversion FROM pg_extension WHERE extname = 'vector';
+
+-- Create a table for document embeddings
+CREATE TABLE documents (
+    id          BIGSERIAL PRIMARY KEY,
+    content     TEXT NOT NULL,
+    metadata    JSONB,
+    embedding   VECTOR(1536),  -- OpenAI text-embedding-ada-002 dimensions
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design decisions</strong> that matter at production scale:</p>
+
+<p class="text-gray-300 leading-relaxed">The dimension count is fixed at column definition time. If you switch embedding models—which happens more often than teams expect—you need to add a new column or rebuild the table. Design for this from the start by keeping the embedding model name in metadata:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+CREATE TABLE document_embeddings (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    model_name      TEXT NOT NULL,           -- 'text-embedding-ada-002', 'embed-english-v3.0', etc.
+    model_version   TEXT NOT NULL,           -- track model versions explicitly
+    embedding       VECTOR(1536),
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (document_id, model_name, model_version)
+);
+
+-- Partial index to serve only the current production model
+-- without filtering overhead on every query
+CREATE INDEX ON document_embeddings (model_name, model_version)
+    WHERE model_name = 'text-embedding-ada-002' AND model_version = '002';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For large tables where you want memory efficiency, use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">halfvec</code> (available in pgvector 0.7.0+) to halve the storage footprint at the cost of marginally reduced precision—typically less than 0.5% recall loss on standard benchmarks:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- halfvec uses 2 bytes per dimension vs 4 bytes for vector
+ALTER TABLE document_embeddings
+    ADD COLUMN embedding_half halfvec(1536);
+
+-- Cast from full precision if migrating
+UPDATE document_embeddings
+    SET embedding_half = embedding::halfvec(1536)
+    WHERE model_name = 'text-embedding-ada-002';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.3 Index Strategy: HNSW vs. IVFFlat on Managed Infrastructure</h3>
+
+<p class="text-gray-300 leading-relaxed">Managed PostgreSQL adds constraints that change the optimal index choice compared to self-hosted deployments. You cannot tune kernel memory parameters, cannot pin HNSW graphs in OS-level hugepages, and you're competing with the rest of your workload for shared buffer space.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">IVFFlat</strong> builds faster and consumes less memory during construction, but requires a training step (clustering) that scans the entire table. On Aurora, this clustering scan goes through the distributed storage layer and generates significant I/O that competes with OLTP traffic. On a 10M-row embeddings table, an IVFFlat build with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists = 1000</code> can run 2–4 hours on a db.r6g.2xlarge and consume the majority of I/O throughput during that window.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">HNSW</strong> builds more slowly in wall-clock time and requires substantial <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code> during construction (plan for 4–8 GB for a million 1536-dimensional vectors), but it requires no training data and delivers better recall at equivalent query latency. It's the right default for production on managed services unless you're constrained on build-time memory.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- HNSW index for cosine similarity (typical for OpenAI and Cohere embeddings)
+-- Set maintenance_work_mem high before building
+SET maintenance_work_mem = '8GB';
+
+CREATE INDEX CONCURRENTLY idx_embeddings_hnsw
+    ON document_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 128);
+
+-- m = 16: connections per node in the graph (higher = better recall, more memory)
+-- ef_construction = 128: candidate list size during build
+--   (higher = better recall, slower build)
+
+-- For query time, set ef_search on the session or transaction:
+SET hnsw.ef_search = 100;  -- default is 40; increase for better recall at cost of latency
+
+-- Verify index is being used
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, content, 1 - (embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector) AS similarity
+FROM document_embeddings
+WHERE model_name = 'text-embedding-ada-002'
+ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">RDS Multi-AZ</strong> and <strong class="text-white">Aurora</strong>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> is strongly preferred over a blocking index build—the index can be built without holding an exclusive lock on the table, which matters when your embeddings table is being written to by an ingestion pipeline. The concurrency trade-off is a longer build time (typically 20–40% more wall clock) and the requirement that no transaction runs for the duration of the build.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AlloyDB columnar engine</strong> deserves a specific note here. For exact KNN search (no approximate index, full table scan with ORDER BY distance LIMIT k), AlloyDB's columnar engine can execute the distance computation in vectorized batches that outperform row-by-row execution by 3–10x on tables up to roughly 500K rows. Beyond that threshold, approximate index search with HNSW will consistently beat even the columnar engine, so treat the columnar path as an optimization for smaller "hot" tables, not a replacement for index design:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector (AlloyDB specific)
+-- Enable columnar scan hint for a specific query
+-- AlloyDB uses its columnar engine automatically for eligible scans,
+-- but you can check with EXPLAIN
+
+EXPLAIN (ANALYZE, FORMAT TEXT)
+SELECT id, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
+FROM document_embeddings
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 20;
+-- Look for "Columnar Scan" in the plan output — indicates AlloyDB's engine
+-- is handling the distance computation in vectorized form</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.4 Ingestion Pipelines: Embedding Generation and Bulk Loading</h3>
+
+<p class="text-gray-300 leading-relaxed">The vector search index is only as good as the embeddings feeding it. On managed services, the ingestion pipeline sits outside the database and must handle embedding API rate limits, model versioning, failure recovery, and bulk insert efficiency.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Python pipeline handles document ingestion against a Supabase or RDS/Aurora backend, using the OpenAI Embeddings API and batch-aware upsert logic:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import time
+import psycopg2
+import psycopg2.extras
+from openai import OpenAI
+from typing import Generator
+
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+# Connection string from environment — works for RDS, Aurora, AlloyDB, or Supabase
+# For Supabase, use the "direct connection" string (port 5432), not the connection pooler,
+# for bulk inserts to avoid pgBouncer transaction-mode limitations with COPY
+DB_DSN = os.environ["DATABASE_URL"]
+
+def chunk_documents(documents: list[dict], chunk_size: int = 500) -&gt; Generator:
+    """Yield successive chunks of documents with basic token-aware splitting."""
+    for doc in documents:
+        text = doc["content"]
+        # Simple word-count chunking — replace with tiktoken-aware chunking in production
+        words = text.split()
+        for i in range(0, len(words), chunk_size):
+            chunk_text = " ".join(words[i:i + chunk_size])
+            yield {
+                "document_id": doc["id"],
+                "content": chunk_text,
+                "chunk_index": i // chunk_size,
+                "metadata": doc.get("metadata", {}),
+            }
+
+def generate_embeddings_batch(
+    texts: list[str],
+    model: str = "text-embedding-3-small",
+    max_retries: int = 3
+) -&gt; list[list[float]]:
+    """
+    Call OpenAI Embeddings API with exponential backoff.
+    text-embedding-3-small: 1536 dims, $0.02/1M tokens
+    text-embedding-3-large: 3072 dims, $0.13/1M tokens
+    text-embedding-ada-002: 1536 dims, $0.10/1M tokens (legacy)
+    """
+    for attempt in range(max_retries):
+        try:
+            response = openai_client.embeddings.create(
+                input=texts,
+                model=model,
+                encoding_format="float"
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"Embedding API error (attempt {attempt + 1}): {e}. Retrying in {wait}s.")
+            time.sleep(wait)
+
+def ingest_documents(documents: list[dict], batch_size: int = 100) -&gt; int:
+    """
+    Ingest documents into pgvector with batch embedding and upsert.
+    Returns count of rows inserted/updated.
+    """
+    conn = psycopg2.connect(DB_DSN)
+    conn.autocommit = False
+
+    upsert_sql = """
+        INSERT INTO document_embeddings
+            (document_id, model_name, model_version, embedding, chunk_index, chunk_text)
+        VALUES %s
+        ON CONFLICT (document_id, model_name, model_version, chunk_index)
+        DO UPDATE SET
+            embedding = EXCLUDED.embedding,
+            chunk_text = EXCLUDED.chunk_text,
+            updated_at = NOW()
+    """
+
+    total_inserted = 0
+    batch: list[dict] = []
+
+    try:
+        with conn.cursor() as cur:
+            for chunk in chunk_documents(documents):
+                batch.append(chunk)
+
+                if len(batch) &gt;= batch_size:
+                    texts = [c["content"] for c in batch]
+                    embeddings = generate_embeddings_batch(texts)
+
+                    rows = [
+                        (
+                            c["document_id"],
+                            "text-embedding-3-small",
+                            "3-small-v1",
+                            embedding,  # psycopg2 will serialize list to vector literal
+                            c["chunk_index"],
+                            c["content"],
+                        )
+                        for c, embedding in zip(batch, embeddings)
+                    ]
+
+                    psycopg2.extras.execute_values(
+                        cur, upsert_sql, rows, page_size=batch_size
+                    )
+                    total_inserted += len(rows)
+                    conn.commit()
+                    print(f"Committed batch of {len(rows)} rows. Total: {total_inserted}")
+                    batch = []
+
+            # Flush remaining
+            if batch:
+                texts = [c["content"] for c in batch]
+                embeddings = generate_embeddings_batch(texts)
+                rows = [
+                    (c["document_id"], "text-embedding-3-small", "3-small-v1",
+                     embedding, c["chunk_index"], c["content"])
+                    for c, embedding in zip(batch, embeddings)
+                ]
+                psycopg2.extras.execute_values(cur, upsert_sql, rows)
+                total_inserted += len(rows)
+                conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    return total_inserted</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One pattern worth calling out explicitly: <strong class="text-white">never embed inside a database transaction that also holds row locks</strong>. If the OpenAI API call takes 800ms and you're holding a lock on a row you just inserted, you've introduced an 800ms lock wait for any concurrent writer touching the same document. Always generate embeddings before opening the transaction, then insert or upsert atomically.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.5 Query Patterns, Connection Pooling, and Performance Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector similarity queries have a shape that differs from typical OLTP queries: they're read-heavy, they frequently run against large tables with selective WHERE clauses, and they benefit significantly from connection routing to read replicas. This section covers the tuning knobs that actually move the needle on managed services.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query structure for hybrid search</strong> — combining vector similarity with metadata filters—is one of the most common production patterns:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Hybrid search: semantic similarity + metadata filter + recency boost
+-- This is the pattern used in most production RAG pipelines
+
+SET hnsw.ef_search = 80;  -- tune per-query based on latency/recall requirements
+
+SELECT
+    de.id,
+    de.chunk_text,
+    d.title,
+    d.source_url,
+    d.published_at,
+    1 - (de.embedding &lt;=&gt; $1::vector(1536)) AS semantic_score,
+    -- Recency boost: decays over 90 days
+    EXP(-EXTRACT(EPOCH FROM (NOW() - d.published_at)) / (90 * 86400)) AS recency_score,
+    -- Combined score
+    (0.7 * (1 - (de.embedding &lt;=&gt; $1::vector(1536))))
+    + (0.3 * EXP(-EXTRACT(EPOCH FROM (NOW() - d.published_at)) / (90 * 86400)))
+    AS combined_score
+FROM document_embeddings de
+JOIN documents d ON d.id = de.document_id
+WHERE
+    de.model_name = 'text-embedding-3-small'
+    AND de.model_version = '3-small-v1'
+    AND d.tenant_id = $2          -- partition by tenant for SaaS architectures
+    AND d.category = ANY($3)      -- optional category filter passed as text[]
+ORDER BY combined_score DESC
+LIMIT 10;
+
+-- Index to support the metadata filters efficiently
+-- Create this before the HNSW index — the planner will use it for filter pushdown
+CREATE INDEX idx_docs_tenant_category ON documents (tenant_id, category);
+CREATE INDEX idx_embeddings_model ON document_embeddings (model_name, model_version);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling considerations</strong> on managed services:</p>
+
+<p class="text-gray-300 leading-relaxed">RDS and Aurora benefit from RDS Proxy for connection pooling at the infrastructure level. RDS Proxy uses connection multiplexing but switches to session mode when prepared statements are used—pgvector queries typically use parameterized queries with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$1::vector</code>, which counts as a prepared statement pattern. This can inadvertently increase actual backend connection counts. Monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> in CloudWatch alongside <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBConnectionsCurrentlyBorrowed</code> on the proxy to detect this.</p>
+
+<p class="text-gray-300 leading-relaxed">Supabase exposes two connection strings: one through Supavisor (their connection pooler, transaction mode) and one direct to PostgreSQL. For vector ingestion pipelines using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COPY</code> or multi-statement transactions, always use the direct connection string on port 5432, not the pooler on port 6543. Transaction-mode poolers will fail or misbehave on COPY and explicit transaction blocks.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Partition strategy for large embedding tables</strong>: On Aurora and RDS, if your embeddings table exceeds ~50M rows, partitioning by a hash of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_id</code> improves HNSW index build parallelism (each partition builds its own index) and makes individual partition vacuums faster:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Range partition by creation date for time-series workloads,
+-- or hash partition for even distribution across tenants
+
+CREATE TABLE document_embeddings (
+    id              BIGSERIAL,
+    document_id     BIGINT NOT NULL,
+    model_name      TEXT NOT NULL,
+    model_version   TEXT NOT NULL,
+    embedding       VECTOR(1536),
+    chunk_text      TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Create monthly partitions
+CREATE TABLE document_embeddings_2024_01
+    PARTITION OF document_embeddings
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE document_embeddings_2024_02
+    PARTITION OF document_embeddings
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- Each partition gets its own HNSW index
+CREATE INDEX ON document_embeddings_2024_01
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX ON document_embeddings_2024_02
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Autovacuum and bloat</strong> are significant concerns with high-ingestion embedding tables. Each new embedding is an INSERT, not an UPDATE, which keeps bloat lower than update-heavy workloads—but re-embedding existing documents (when you switch models) generates dead tuples at the rate of your ingestion pipeline. Set aggressive autovacuum parameters on the embeddings table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+ALTER TABLE document_embeddings SET (
+    autovacuum_vacuum_scale_factor = 0.01,   -- vacuum when 1% of rows are dead (default: 20%)
+    autovacuum_analyze_scale_factor = 0.005, -- analyze when 0.5% of rows change
+    autovacuum_vacuum_cost_delay = 2         -- reduce cost delay for this table
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Supabase-specific query path via PostgREST</strong>: For applications using the Supabase client library, vector search runs through a PostgreSQL function exposed via PostgREST:</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>
