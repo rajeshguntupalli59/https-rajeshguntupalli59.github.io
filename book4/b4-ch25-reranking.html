@@ -1,0 +1,526 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 25: Re-ranking Results for Accuracy — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 25: Re-ranking Results for Accuracy. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 25 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 25: Re-ranking Results for Accuracy</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector search is fast, but it is not always right. When you query a vector index for the top-10 nearest neighbors, you are asking a mathematical distance function to approximate semantic relevance — and that approximation has real limits. A document retrieved at rank 3 may be far more relevant to the user's intent than the document at rank 1, but the embedding space collapses enough meaning that the raw cosine scores cannot distinguish them. Re-ranking is the step that fixes this: a second-stage model reads the actual text of the query and each candidate document, computes a deeper cross-attention relevance score, and reorders the results before they are shown to the user or passed to an LLM. This chapter covers how re-ranking works, why it belongs in every production RAG pipeline, and how to implement it with Cohere, sentence-transformers, and LLM-based scoring — with full attention to latency, cost, and accuracy tradeoffs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.1 Why Vector Search Alone Is Not Enough</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector embeddings are trained to map semantically similar text to nearby points in a high-dimensional space. That works well globally, but at retrieval time you are asking about local neighborhoods — specifically, whether the top-20 documents returned for a given query are ordered by *relevance to that exact query*, not just proximity in embedding space.</p>
+
+<p class="text-gray-300 leading-relaxed">Three structural weaknesses appear repeatedly in production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embedding compression loss.</strong> A 1,536-dimensional embedding must encode all semantic content of a 512-token document into a fixed-size vector. Information is lost. Two documents with different specific claims can land at nearly identical distances from a query vector because their general topics are the same. A question about "PostgreSQL index bloat mitigation" may return documents about "PostgreSQL index performance" ranked higher than a document that actually explains <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REINDEX CONCURRENTLY</code> — because "index performance" is a broader, more common phrase in training data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Asymmetric query–document length mismatch.</strong> Queries are short. Documents are long. The embedding of a short query occupies a different statistical region than the embedding of a long, detailed document, even when the document directly answers the query. Bi-encoder models (the architecture behind most embedding APIs) encode the query and document independently, then compare the resulting vectors. This is efficient but structurally limited.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Approximate nearest neighbor (ANN) index error.</strong> HNSW and IVF indexes trade recall for speed. A well-tuned HNSW index with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search=100</code> typically achieves 95–98% recall against exact k-NN. That means 2–5 out of every 100 results are wrong even before relevance ordering enters the picture. Re-ranking does not fix ANN recall loss directly — that requires tuning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> or using hybrid search — but it does improve the ordering of whatever candidates are returned.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical solution is a two-stage retrieval pattern: retrieve a larger candidate set (top-50 to top-200) using fast ANN search, then re-rank that set with a slower but more accurate model, and return the top-k of that re-ranked set to the application. This keeps latency acceptable because the re-ranker only processes tens of documents, not millions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.2 Cross-Encoder Architecture and Why It Works Better</h3>
+
+<p class="text-gray-300 leading-relaxed">The fundamental architectural difference between bi-encoders (used for embedding generation) and cross-encoders (used for re-ranking) explains the accuracy gap.</p>
+
+<p class="text-gray-300 leading-relaxed">A <strong class="text-white">bi-encoder</strong> encodes query and document separately:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>query  → encoder → q_vector
+document → encoder → d_vector
+score = cosine_similarity(q_vector, d_vector)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A <strong class="text-white">cross-encoder</strong> processes the query and document jointly as a single input:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>[query, document] → encoder → relevance_score</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Because the cross-encoder sees both texts together, its attention mechanism can directly compare tokens across query and document. It can identify that the query phrase "index bloat mitigation" matches the document phrase "reclaiming space after index page splits" through multi-layer cross-attention, even though those phrases share no vocabulary. Bi-encoders cannot do this — the vectors are already frozen before comparison.</p>
+
+<p class="text-gray-300 leading-relaxed">The tradeoff is latency and throughput. A bi-encoder query requires one inference pass for the query (which can be cached) plus a lookup against pre-computed document vectors. A cross-encoder requires one inference pass per (query, document) pair. At 50 candidates, that is 50 inference passes. This is why cross-encoders are never used as primary retrieval mechanisms against full indexes.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Sentence-Transformers Cross-Encoder</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sentence-transformers</code> library provides a clean interface to cross-encoder models. The model family <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cross-encoder/ms-marco-MiniLM-L-6-v2</code> is a common choice for English re-ranking — it balances speed and accuracy, running roughly 200–400 pairs per second on a modern CPU.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from sentence_transformers import CrossEncoder
+import numpy as np
+
+# Load a cross-encoder trained on MS MARCO passage ranking
+model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+
+query = "How do I reduce index bloat in PostgreSQL?"
+
+# Candidate documents from ANN retrieval (top-20 from pgvector)
+candidates = [
+    {
+        "id": "doc_001",
+        "text": "PostgreSQL VACUUM reclaims storage occupied by dead tuples. Running VACUUM ANALYZE regularly keeps table statistics current and prevents table bloat.",
+    },
+    {
+        "id": "doc_002",
+        "text": "Index bloat occurs when B-tree indexes accumulate dead pages after heavy UPDATE and DELETE workloads. REINDEX CONCURRENTLY rebuilds the index without taking an exclusive lock, making it safe for production use.",
+    },
+    {
+        "id": "doc_003",
+        "text": "The pg_stat_user_indexes view shows index scans. If an index has zero scans over a long period, it may be unused and safe to drop.",
+    },
+    {
+        "id": "doc_004",
+        "text": "autovacuum_vacuum_scale_factor controls how much table bloat triggers autovacuum. Lowering this value from the default 0.2 to 0.05 for high-write tables reduces both table and index bloat over time.",
+    },
+    {
+        "id": "doc_005",
+        "text": "Index performance in PostgreSQL depends on statistics. Running ANALYZE after bulk loads ensures the query planner uses indexes correctly.",
+    },
+]
+
+# Build input pairs for the cross-encoder
+pairs = [(query, doc["text"]) for doc in candidates]
+
+# Score all pairs in one batched call
+scores = model.predict(pairs, batch_size=16, show_progress_bar=False)
+
+# Attach scores and sort descending
+for doc, score in zip(candidates, scores):
+    doc["rerank_score"] = float(score)
+
+reranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+
+print("Re-ranked results:")
+for rank, doc in enumerate(reranked, 1):
+    print(f"  Rank {rank:02d} | Score {doc['rerank_score']:+.4f} | {doc['id']}: {doc['text'][:80]}...")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Expected output shows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">doc_002</code> (about <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REINDEX CONCURRENTLY</code>) rising to rank 1, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">doc_004</code> (about <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor</code>) to rank 2 — both directly addressing bloat mitigation, while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">doc_001</code> (general VACUUM) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">doc_005</code> (index performance, not bloat) fall.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.3 Re-ranking with Cohere and Production API Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">For teams using managed embedding services, Cohere's Rerank API provides cross-encoder quality re-ranking without model hosting. It accepts a query and a list of document strings, returns relevance scores and re-ordered indices, and handles tokenization and batching internally.</p>
+
+<p class="text-gray-300 leading-relaxed">Cohere Rerank v3 supports up to 10,000 document tokens per call across all documents, processes up to 1,000 documents in a single request, and returns results in under 200ms for typical 50-document payloads.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import cohere
+import os
+from typing import Any
+
+co = cohere.Client(api_key=os.environ["COHERE_API_KEY"])
+
+def rerank_with_cohere(
+    query: str,
+    documents: list[dict[str, Any]],
+    text_field: str = "text",
+    top_n: int = 5,
+    model: str = "rerank-english-v3.0",
+) -&gt; list[dict[str, Any]]:
+    """
+    Re-rank a list of candidate documents using Cohere Rerank.
+
+    Args:
+        query: The user query string.
+        documents: List of dicts, each containing at least `text_field`.
+        text_field: Key in each dict that holds the document text.
+        top_n: How many top results to return after re-ranking.
+        model: Cohere rerank model identifier.
+
+    Returns:
+        Top-n documents sorted by rerank relevance score, descending.
+    """
+    texts = [doc[text_field] for doc in documents]
+
+    response = co.rerank(
+        query=query,
+        documents=texts,
+        top_n=top_n,
+        model=model,
+        return_documents=True,
+    )
+
+    reranked = []
+    for result in response.results:
+        original_doc = documents[result.index].copy()
+        original_doc["rerank_score"] = result.relevance_score
+        original_doc["original_rank"] = result.index
+        reranked.append(original_doc)
+
+    return reranked
+
+
+# --- Integration with Pinecone vector search ---
+from pinecone import Pinecone
+from openai import OpenAI
+
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index = pc.Index("knowledge-base")
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+def retrieve_and_rerank(query: str, top_k_retrieve: int = 50, top_k_final: int = 5):
+    # Stage 1: embed the query
+    embed_response = openai_client.embeddings.create(
+        input=query,
+        model="text-embedding-3-small",
+    )
+    query_vector = embed_response.data[0].embedding
+
+    # Stage 2: ANN retrieval — fetch a large candidate set
+    pinecone_response = index.query(
+        vector=query_vector,
+        top_k=top_k_retrieve,
+        include_metadata=True,
+    )
+
+    candidates = [
+        {
+            "id": match["id"],
+            "text": match["metadata"].get("text", ""),
+            "source": match["metadata"].get("source", ""),
+            "vector_score": match["score"],
+        }
+        for match in pinecone_response["matches"]
+        if match["metadata"].get("text")  # skip empty metadata
+    ]
+
+    if not candidates:
+        return []
+
+    # Stage 3: cross-encoder re-ranking via Cohere
+    reranked = rerank_with_cohere(
+        query=query,
+        documents=candidates,
+        text_field="text",
+        top_n=top_k_final,
+    )
+
+    return reranked
+
+
+results = retrieve_and_rerank(
+    query="What autovacuum settings reduce index bloat on high-write tables?",
+    top_k_retrieve=50,
+    top_k_final=5,
+)
+
+for r in results:
+    print(
+        f"ID: {r['id']} | Rerank: {r['rerank_score']:.4f} | "
+        f"VectorScore: {r['vector_score']:.4f} | {r['text'][:100]}"
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One important operational note: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector_score</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rerank_score</code> are not comparable. Cosine similarity from Pinecone runs roughly 0.7–0.95 for retrieved documents. Cohere relevance scores run 0.0–1.0 but are calibrated differently — a score of 0.3 from Cohere may represent a highly relevant document depending on the corpus. Always sort by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rerank_score</code>, never blend the two scores numerically without calibration.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.4 Implementing Re-ranking in pgvector Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">When your vector store is PostgreSQL with pgvector, the re-ranking step happens in the application layer after the SQL retrieval. The database returns candidate rows with their distance values; Python applies the cross-encoder and returns the re-ordered set.</p>
+
+<p class="text-gray-300 leading-relaxed">A common pattern stores document chunks with their embeddings and full text in the same table, allowing the retrieval query to return everything needed for re-ranking in a single round trip.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Schema for a knowledge base with full text available for re-ranking
+
+CREATE TABLE knowledge_chunks (
+    id          BIGSERIAL PRIMARY KEY,
+    document_id UUID NOT NULL,
+    chunk_index INT NOT NULL,
+    chunk_text  TEXT NOT NULL,          -- full text, needed by re-ranker
+    embedding   VECTOR(1536),
+    source_url  TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX ON knowledge_chunks USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Retrieve top-50 candidates with full text for re-ranking
+-- The application layer will reduce this to top-5 after re-ranking
+PREPARE retrieve_candidates (VECTOR(1536), INT) AS
+    SELECT
+        id,
+        document_id,
+        chunk_index,
+        chunk_text,
+        source_url,
+        1 - (embedding &lt;=&gt; $1) AS cosine_similarity
+    FROM knowledge_chunks
+    ORDER BY embedding &lt;=&gt; $1
+    LIMIT $2;
+
+-- Execute: retrieve 50 candidates for a given query embedding
+EXECUTE retrieve_candidates('[...query vector...]', 50);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import psycopg2
+import psycopg2.extras
+from sentence_transformers import CrossEncoder
+from openai import OpenAI
+import os
+
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", max_length=512)
+
+def get_query_embedding(query: str) -&gt; list[float]:
+    response = openai_client.embeddings.create(
+        input=query,
+        model="text-embedding-3-small",
+    )
+    return response.data[0].embedding
+
+
+def pgvector_retrieve_and_rerank(
+    query: str,
+    conn_string: str,
+    top_k_retrieve: int = 50,
+    top_k_final: int = 5,
+) -&gt; list[dict]:
+
+    embedding = get_query_embedding(query)
+
+    # Format vector as PostgreSQL array literal
+    vector_literal = "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
+
+    with psycopg2.connect(conn_string) as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    id,
+                    document_id::TEXT,
+                    chunk_index,
+                    chunk_text,
+                    source_url,
+                    1 - (embedding &lt;=&gt; %s::vector) AS cosine_similarity
+                FROM knowledge_chunks
+                ORDER BY embedding &lt;=&gt; %s::vector
+                LIMIT %s
+                """,
+                (vector_literal, vector_literal, top_k_retrieve),
+            )
+            candidates = [dict(row) for row in cur.fetchall()]
+
+    if not candidates:
+        return []
+
+    # Cross-encoder scoring
+    pairs = [(query, doc["chunk_text"]) for doc in candidates]
+    scores = cross_encoder.predict(pairs, batch_size=32, show_progress_bar=False)
+
+    for doc, score in zip(candidates, scores):
+        doc["rerank_score"] = float(score)
+
+    reranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+    return reranked[:top_k_final]
+
+
+# Usage
+results = pgvector_retrieve_and_rerank(
+    query="How does REINDEX CONCURRENTLY differ from REINDEX in terms of locking?",
+    conn_string=os.environ["DATABASE_URL"],
+    top_k_retrieve=50,
+    top_k_final=5,
+)
+
+for rank, doc in enumerate(results, 1):
+    print(
+        f"Rank {rank} | Rerank: {doc['rerank_score']:+.3f} | "
+        f"Vector: {doc['cosine_similarity']:.3f} | "
+        f"Chunk {doc['chunk_index']} | {doc['chunk_text'][:120]}"
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For latency budgets: on a typical m5.large EC2 instance, retrieving 50 rows from pgvector takes 5–15ms. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ms-marco-MiniLM-L-6-v2</code> cross-encoder scores 50 pairs on CPU in approximately 120–200ms. Total latency for the two-stage retrieval stays under 300ms, well within a 500ms SLA for interactive search. If CPU latency is unacceptable, Cohere's API often beats local CPU inference: 50 documents through Cohere Rerank typically completes in 80–150ms round-trip from a co-located cloud instance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.5 LLM-Based Re-ranking and Reciprocal Rank Fusion</h3>
+
+<p class="text-gray-300 leading-relaxed">Cross-encoder re-ranking is the dominant pattern, but two additional techniques appear in production pipelines and are worth understanding.</p>
+
+<p class="text-gray-300 leading-relaxed">#### LLM-Based Relevance Scoring</p>
+
+<p class="text-gray-300 leading-relaxed">For domains with specialized vocabulary where general cross-encoder models underperform — legal documents, medical literature, internal engineering wikis — an LLM can score relevance directly. This is slower and more expensive than a cross-encoder but leverages the LLM's domain knowledge.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import asyncio
+import json
+from openai import AsyncOpenAI
+
+async_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+RELEVANCE_PROMPT = """You are a relevance scoring assistant. Given a query and a document passage, output a JSON object with a single key "score" containing an integer from 0 to 10, where:
+- 0-2: The passage is not relevant to the query.
+- 3-5: The passage is tangentially related but does not answer the query.
+- 6-8: The passage is relevant and partially answers the query.
+- 9-10: The passage directly and completely answers the query.
+
+Output ONLY valid JSON. No explanation.
+
+Query: {query}
+Passage: {passage}"""
+
+
+async def score_document_relevance(
+    query: str, passage: str, model: str = "gpt-4o-mini"
+) -&gt; float:
+    prompt = RELEVANCE_PROMPT.format(query=query, passage=passage[:1000])
+    try:
+        response = await async_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+            max_tokens=20,
+            response_format={"type": "json_object"},
+        )
+        result = json.loads(response.choices[0].message.content)
+        return float(result.get("score", 0)) / 10.0
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return 0.0
+
+
+async def llm_rerank(
+    query: str, candidates: list[dict], text_field: str = "text", top_n: int = 5
+) -&gt; list[dict]:
+    tasks = [
+        score_document_relevance(query, doc[text_field]) for doc in candidates
+    ]
+    scores = await asyncio.gather(*tasks)
+
+    for doc, score in zip(candidates, scores):
+        doc["llm_rerank_score"] = score
+
+    reranked = sorted(candidates, key=lambda x: x["llm_rerank_score"], reverse=True)
+    return reranked[:top_n]
+
+
+# Run async re-ranking
+import asyncio
+
+candidates = [...]  # from ANN retrieval
+reranked = asyncio.run(llm_rerank(query="...", candidates=candidates))</code></pre>
+
+<p class="text-gray-300 leading-relaxed">LLM re-ranking with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gpt-4o-mini</code> costs approximately $0.0002 per document scored and adds 50–150ms per concurrent batch of 10 documents. It is justifiable for high-value queries in professional applications; it is not justifiable for general-purpose search with thousands of queries per minute.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Reciprocal Rank Fusion</p>
+
+<p class="text-gray-300 leading-relaxed">Reciprocal Rank Fusion (RRF) combines multiple ranked lists — for example, a vector search result list and a keyword BM25 result list — into a single merged ranking without requiring score normalization. It is not a re-ranking model but a re-ranking *algorithm*, and it pairs naturally with hybrid search (covered in Chapter 22).</p>
+
+<p class="text-gray-300 leading-relaxed">The formula for RRF score of document <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">d</code> given ranked lists <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">R₁, R₂, ..., Rₖ</code> is:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>RRF(d) = Σ 1 / (k + rank_i(d))</code></pre>
+
+<p class="text-gray-300 leading-relaxed">where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">k</code> is a constant (typically 60) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rank_i(d)</code> is the rank of document <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">d</code> in list <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">i</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from collections import defaultdict
+
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[str]],
+    k: int = 60,
+) -&gt; list[tuple[str, float]]:
+    """
+    Merge multiple ranked lists of document IDs using Reciprocal Rank Fusion.
+
+    Args:
+        ranked_lists: Each inner list is a ranked list of document IDs,
+                      index 0 = rank 1 (highest), index -1 = lowest rank.
+        k: RRF constant. Higher values reduce the impact of top ranks.
+           k=60 is the standard value from the original Cormack et al. 2009 paper.
+
+    Returns:
+        Sorted list of (document_id, rrf_score) tuples, descending by score.
+    """
+    scores: dict[str, float] = defaultdict(float)
+
+    for ranked_list in ranked_lists:
+        for rank_zero_based, doc_id in enumerate(ranked_list):
+            rank_one_based = rank_zero_based + 1
+            scores[doc_id] += 1.0 / (k + rank_one_based)
+
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+
+# Example: combine vector search results with BM25 keyword search results
+vector_result_ids = ["doc_002", "doc_005", "doc_001", "doc_004", "doc_003"]
+bm25_result_ids   = ["doc_004", "doc_002", "doc_003", "doc_001", "doc_005"]
+
+fused = reciprocal_rank_fusion([vector_result_ids, bm25_result_ids])
+
+print("RRF-merged ranking:")
+for rank, (doc_id, score) in enumerate(fused[:5], 1):
+    print(f"  Rank {rank}: {doc_id} | RRF score: {score:.5f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">RRF is computationally free — it runs in microseconds. Its value comes from combining signal sources, not from deeper relevance modeling. Use it when you have hybrid search returning two lists; use a cross-encoder when you need actual semantic re-ranking.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.6 Production Patterns: Latency, Caching, and Model Selection</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying re-ranking in production requires concrete decisions on model hosting, latency budgets, and caching strategy.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Model Selection Matrix</p>
+
+<p class="text-gray-300 leading-relaxed">| Model | Latency (50 docs, CPU) | Latency (50 docs, GPU) | Cost | Quality |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ms-marco-MiniLM-L-6-v2</code> | 120–200ms | 15–30ms | Self-hosted | Good for general English |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ms-marco-MiniLM-L-12-v2</code> | 250–400ms | 25–</p>
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>
