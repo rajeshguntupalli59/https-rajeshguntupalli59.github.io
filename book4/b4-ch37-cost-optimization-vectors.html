@@ -1,0 +1,454 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 37 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization</h2>
+
+<p class="text-gray-300 leading-relaxed">Storage and query costs in vector databases grow linearly with two variables: the number of vectors and the size of each vector. A production RAG system ingesting documents at scale can easily accumulate tens of millions of 1536-dimensional float32 vectors — roughly 90 GB of raw embedding data before any indexing overhead. This chapter covers the two primary techniques for controlling that growth without sacrificing retrieval quality: dimensionality reduction, which shrinks the number of dimensions per vector, and quantization, which shrinks the number of bits per dimension. Both approaches trade a small, measurable amount of recall for significant savings in storage, memory, and query latency. Understanding exactly where those tradeoffs land — and how to measure them — is the engineering work this chapter addresses.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Cost Structure of Vector Storage</h3>
+
+<p class="text-gray-300 leading-relaxed">Before optimizing anything, understand what you're paying for. Vector databases carry costs along four axes that compound each other.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Raw storage</strong> is the floor. A float32 value occupies 4 bytes. A 1536-dimensional OpenAI <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> vector is 6,144 bytes (6 KB) per document. At 10 million documents, that's 58 GB before indexes. Switch to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> at 3072 dimensions and you're at 117 GB. Pinecone, Weaviate, and Qdrant all charge for storage either directly or through node sizing, so this matters immediately.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index memory</strong> multiplies the base storage. HNSW indexes — the most common structure across all major vector databases — maintain neighbor graphs that consume roughly 1.5× to 4× the raw vector memory depending on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">M</code> parameter (graph connectivity). A 58 GB float32 dataset can easily require 200+ GB of RAM to serve with HNSW at reasonable recall.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query throughput cost</strong> ties to memory pressure. When working sets don't fit in RAM, queries hit disk, and latency spikes from single-digit milliseconds to hundreds. Cloud providers size instances to fit vector indexes in memory, so every unnecessary byte in your vectors translates directly to a larger, more expensive instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embedding API costs</strong> sit upstream. OpenAI charges per token for embedding generation. If you're re-embedding during pipeline changes or re-indexing after dimension changes, those API calls add up fast.</p>
+
+<p class="text-gray-300 leading-relaxed">The table below shows approximate storage requirements for common embedding models at 10 million vectors:</p>
+
+<p class="text-gray-300 leading-relaxed">| Model | Dimensions | float32 Storage | int8 Storage | Binary Storage |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> | 1536 | 58 GB | 14.6 GB | 1.8 GB |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> | 3072 | 117 GB | 29.3 GB | 3.7 GB |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> | 1536 | 58 GB | 14.6 GB | 1.8 GB |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> | 384 | 14.6 GB | 3.7 GB | 0.46 GB |</p>
+<p class="text-gray-300 leading-relaxed">| Cohere <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-english-v3.0</code> | 1024 | 39 GB | 9.8 GB | 1.2 GB |</p>
+
+<p class="text-gray-300 leading-relaxed">The binary column is not a typo. That's the endgame of quantization: 1 bit per dimension instead of 32.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Dimensionality Reduction: PCA, Matryoshka, and Native Truncation</h3>
+
+<p class="text-gray-300 leading-relaxed">Dimensionality reduction eliminates dimensions from vectors, either by training a projection (PCA) or by using embedding models designed to work well at reduced sizes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PCA-based reduction</strong> is the classical approach. You collect a representative sample of your vectors, fit a PCA transformation matrix, and project all vectors into a lower-dimensional space that preserves maximum variance. The projection matrix must be stored and applied to every new query vector at search time — this is the runtime cost of PCA.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import numpy as np
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import normalize
+import pickle
+
+def fit_pca_reducer(sample_vectors: np.ndarray, target_dims: int) -&gt; PCA:
+    """
+    Fit a PCA reducer on a sample of your corpus vectors.
+    sample_vectors: shape (n_samples, original_dims)
+    target_dims: number of dimensions to keep
+    """
+    pca = PCA(n_components=target_dims, random_state=42)
+    pca.fit(sample_vectors)
+    
+    explained = pca.explained_variance_ratio_.sum()
+    print(f"Explained variance with {target_dims} dims: {explained:.3f}")
+    
+    return pca
+
+def reduce_and_normalize(vectors: np.ndarray, pca: PCA) -&gt; np.ndarray:
+    """
+    Project and L2-normalize. Normalization is required after PCA
+    if you use cosine similarity for search.
+    """
+    reduced = pca.transform(vectors)
+    return normalize(reduced, norm='l2')
+
+# Workflow: sample 100k vectors from your corpus
+# (representative spread — don't use only recent documents)
+sample = np.load("corpus_sample_100k.npy")   # shape (100000, 1536)
+
+pca = fit_pca_reducer(sample, target_dims=512)
+
+# Save projection matrix for query-time use
+with open("pca_reducer_1536_to_512.pkl", "wb") as f:
+    pickle.dump(pca, f)
+
+# Process your full corpus in batches
+def process_batch(raw_batch: np.ndarray, pca: PCA) -&gt; np.ndarray:
+    return reduce_and_normalize(raw_batch, pca)
+
+# Check how many dimensions you actually need
+for dims in [128, 256, 512, 768, 1024]:
+    test_pca = PCA(n_components=dims, random_state=42)
+    test_pca.fit(sample)
+    variance = test_pca.explained_variance_ratio_.sum()
+    print(f"  {dims} dims → {variance:.4f} explained variance ({variance*100:.1f}%)")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running this on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> vectors typically yields 95%+ explained variance at 512 dimensions. The problem is that explained variance doesn't directly map to recall — you need to measure recall separately, which means running benchmark queries before committing to a target dimension count.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Matryoshka Representation Learning (MRL)</strong> changes the game. OpenAI's newer models (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>) and Cohere's v3 models are trained with MRL, meaning the first N dimensions of the full vector are themselves a valid, high-quality embedding. You can truncate rather than project. No projection matrix required, no transformation at query time, and the quality at reduced dimensions is better than PCA because the model was explicitly trained for it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from openai import OpenAI
+import numpy as np
+
+client = OpenAI()
+
+def embed_with_truncation(
+    texts: list[str],
+    model: str = "text-embedding-3-small",
+    dimensions: int = 512   # native truncation — MRL models only
+) -&gt; np.ndarray:
+    """
+    OpenAI supports native dimension truncation via the `dimensions` parameter.
+    Valid only for text-embedding-3-* models.
+    """
+    response = client.embeddings.create(
+        model=model,
+        input=texts,
+        dimensions=dimensions   # API truncates and re-normalizes for you
+    )
+    return np.array([item.embedding for item in response.data])
+
+# Compare quality across dimension counts
+test_queries = [
+    "database indexing strategies",
+    "vector similarity search performance",
+    "cost optimization for embeddings"
+]
+
+for dims in [256, 512, 768, 1536]:
+    embeddings = embed_with_truncation(test_queries, dimensions=dims)
+    print(f"dims={dims}: shape={embeddings.shape}, "
+          f"norm={np.linalg.norm(embeddings[0]):.4f}")
+
+# For text-embedding-3-large: max 3072, usable at 256, 512, 1024, 3072
+# OpenAI's benchmarks show 512-dim 3-small outperforms 1536-dim ada-002
+# on MTEB — smaller is sometimes better when MRL-trained</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The operational advantage here is significant: you can change your target dimension count by updating the API parameter and re-indexing, with no separate transformation pipeline to maintain.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Choosing a target dimension</strong> is an empirical question. The practical process:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Generate embeddings at your target dimension and at full dimension for a held-out query set (minimum 500 queries with known relevant documents).</p>
+<p class="text-gray-300 leading-relaxed">2. Run nearest-neighbor retrieval at both sizes with identical HNSW parameters.</p>
+<p class="text-gray-300 leading-relaxed">3. Compute Recall@10 at both sizes.</p>
+<p class="text-gray-300 leading-relaxed">4. Accept the reduction if recall drop is under 3–5% for your use case.</p>
+
+<p class="text-gray-300 leading-relaxed">For most RAG applications using MRL-trained models, 512 dimensions achieves recall within 2% of 1536 while cutting storage and index memory by two thirds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Scalar Quantization: float32 to int8</h3>
+
+<p class="text-gray-300 leading-relaxed">Quantization reduces the number of bits per dimension. Scalar quantization maps each float32 value to an integer within a fixed range — typically int8 (256 levels) or even uint8. The loss in precision is real but bounded, and the memory savings are immediate: 4 bytes becomes 1 byte per dimension, a 4× reduction.</p>
+
+<p class="text-gray-300 leading-relaxed">The math is straightforward. For a vector where values span [-1.0, 1.0], each float32 is mapped to an int8 using:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>quantized = round(float_value × 127)
+dequantized = quantized / 127</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Most vector databases handle this transparently. Qdrant's scalar quantization is production-grade and simple to configure:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    VectorParams, Distance,
+    ScalarQuantizationConfig, ScalarType,
+    QuantizationSearchParams
+)
+
+client = QdrantClient(url="http://localhost:6333")
+
+# Create collection with int8 scalar quantization
+client.create_collection(
+    collection_name="documents_sq",
+    vectors_config=VectorParams(
+        size=1536,
+        distance=Distance.COSINE
+    ),
+    quantization_config=ScalarQuantizationConfig(
+        type=ScalarType.INT8,
+        quantile=0.99,      # clip outliers: 99th percentile maps to max int8
+        always_ram=True     # keep quantized index in RAM, fetch originals from disk
+    )
+)
+
+# always_ram=True is the key production setting:
+# - Search uses quantized (1-byte) vectors for fast candidate selection
+# - Top candidates are re-scored with original float32 vectors
+# - Original vectors can live on disk (SSD), quantized in RAM
+# This is "quantization with rescoring" — near full recall at fraction of memory
+
+# Search with rescoring enabled (default when quantization is configured)
+results = client.search(
+    collection_name="documents_sq",
+    query_vector=[0.1] * 1536,   # your actual query embedding here
+    limit=10,
+    search_params=QuantizationSearchParams(
+        ignore=False,           # use quantization for initial search
+        rescore=True,           # rescore top candidates with originals
+        oversampling=2.0        # fetch 20 candidates, rescore to return 10
+    )
+)
+
+# oversampling controls the recall/speed tradeoff:
+# 1.0 → fastest, lowest recall
+# 3.0 → slower, highest recall (approaches float32 quality)
+# 2.0 is the practical default for most production use cases
+
+print(f"Retrieved {len(results)} results")
+for r in results:
+    print(f"  id={r.id}, score={r.score:.4f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector's quantization</strong> arrived in version 0.7.0 with halfvec (float16) support and binary quantization:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Option 1: halfvec — stores float16, halves storage vs float32
+-- Requires pgvector &gt;= 0.7.0
+
+CREATE TABLE documents_half (
+    id          BIGSERIAL PRIMARY KEY,
+    content     TEXT,
+    embedding   HALFVEC(1536)   -- 2 bytes per dim instead of 4
+);
+
+-- HNSW index on halfvec — same syntax as VECTOR
+CREATE INDEX ON documents_half
+USING hnsw (embedding halfvec_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Query: cast your float32 query to halfvec at search time
+SELECT id, content, embedding &lt;=&gt; $1::HALFVEC AS distance
+FROM documents_half
+ORDER BY distance
+LIMIT 10;
+
+-- Option 2: Binary quantization with BIT type
+-- Each dimension becomes 1 bit: positive float → 1, negative → 0
+-- Requires pgvector &gt;= 0.7.0
+
+CREATE TABLE documents_binary (
+    id              BIGSERIAL PRIMARY KEY,
+    content         TEXT,
+    embedding_full  VECTOR(1536),    -- keep original for rescoring
+    embedding_bin   BIT(1536)        -- binary quantized
+);
+
+-- Function to binarize a vector
+CREATE OR REPLACE FUNCTION binarize(v VECTOR) RETURNS BIT AS $$
+DECLARE
+    result BIT;
+    i      INT;
+    arr    FLOAT[];
+    bits   TEXT := '';
+BEGIN
+    arr := ARRAY(SELECT unnest(v::FLOAT[]));
+    FOR i IN 1..array_length(arr, 1) LOOP
+        IF arr[i] &gt;= 0 THEN
+            bits := bits || '1';
+        ELSE
+            bits := bits || '0';
+        END IF;
+    END LOOP;
+    RETURN bits::BIT(1536);
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Index on binary vectors using Hamming distance
+CREATE INDEX ON documents_binary
+USING hnsw (embedding_bin bit_hamming_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Two-phase search: binary for candidate selection, float32 for rescoring
+WITH binary_candidates AS (
+    SELECT id, embedding_full,
+           bit_count(embedding_bin # $2::BIT(1536)) AS hamming_dist
+    FROM documents_binary
+    ORDER BY hamming_dist
+    LIMIT 100   -- oversample: get 100 via binary search
+)
+SELECT id, embedding_full &lt;=&gt; $1::VECTOR AS cosine_dist
+FROM binary_candidates
+ORDER BY cosine_dist
+LIMIT 10;      -- rerank top 100 by exact cosine, return 10
+
+-- $1 = float32 query vector, $2 = binary query vector (same query, both forms)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The two-phase pattern — coarse binary search, exact float32 reranking — is the same pattern Qdrant calls "rescoring." It's the standard production approach for binary quantization and delivers recall within 1–3% of full float32 search at a fraction of the memory cost.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Product Quantization and Vector Database Native Support</h3>
+
+<p class="text-gray-300 leading-relaxed">Product quantization (PQ) goes further than scalar quantization by dividing each high-dimensional vector into subvectors and quantizing each subvector against a learned codebook. The result is a compact code — often 8–32 bytes for a 1536-dimensional vector — that approximates the original with reasonable accuracy.</p>
+
+<p class="text-gray-300 leading-relaxed">PQ is more complex than scalar quantization: it requires a training phase to build codebooks, and the codebooks must be stored and used at query time. The payoff is compression ratios of 32× to 96× with recall that holds up better than naive binary quantization for unoptimized models.</p>
+
+<p class="text-gray-300 leading-relaxed">Faiss, the underlying library in many vector databases, exposes PQ directly. Weaviate and Milvus expose it through their configuration APIs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — Milvus PQ configuration via pymilvus
+from pymilvus import (
+    connections, FieldSchema, CollectionSchema,
+    DataType, Collection, utility
+)
+
+connections.connect(host="localhost", port="19530")
+
+fields = [
+    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+    FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
+    FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=1536)
+]
+
+schema = CollectionSchema(fields=fields, description="PQ quantized documents")
+collection = Collection(name="documents_pq", schema=schema)
+
+# IVF_PQ index: inverted file + product quantization
+# This is the standard high-compression option in Milvus/Faiss
+index_params = {
+    "metric_type": "IP",          # inner product (use normalized vectors for cosine)
+    "index_type": "IVF_PQ",
+    "params": {
+        "nlist": 1024,            # number of IVF clusters (scale with sqrt(n_vectors))
+        "m": 16,                  # number of subvectors (must divide dim evenly: 1536/16=96)
+        "nbits": 8                # bits per subvector code (8 = 256 centroids per subquantizer)
+    }
+}
+# Memory per vector: m * (nbits/8) bytes = 16 * 1 = 16 bytes vs 6144 bytes float32
+# Compression ratio: 384x
+
+collection.create_index(field_name="embedding", index_params=index_params)
+collection.load()
+
+# Search — nprobe controls how many IVF clusters to check
+# More clusters → higher recall, higher latency
+search_params = {
+    "metric_type": "IP",
+    "params": {"nprobe": 64}    # check 64 of 1024 clusters; 6.25% of index
+}
+
+results = collection.search(
+    data=[[0.1] * 1536],        # query embedding (normalized)
+    anns_field="embedding",
+    param=search_params,
+    limit=10,
+    output_fields=["text"]
+)
+
+for hits in results:
+    for hit in hits:
+        print(f"id={hit.id}, score={hit.score:.4f}, text={hit.entity.get('text')[:80]}")
+
+# PQ recall benchmarking guide:
+# nprobe=10  → ~85% recall@10, fastest
+# nprobe=64  → ~93% recall@10, good default
+# nprobe=256 → ~97% recall@10, slowest (approaching brute force)
+# Tune nprobe to hit your latency SLA, then evaluate recall</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Weaviate exposes its own PQ interface through its schema configuration, which is worth knowing if you're running Weaviate in production:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — Weaviate PQ configuration via weaviate-client v4
+import weaviate
+from weaviate.classes.config import (
+    Configure, Property, DataType, VectorDistances
+)
+
+client = weaviate.connect_to_local()
+
+# Create collection with PQ enabled
+client.collections.create(
+    name="DocumentsPQ",
+    vectorizer_config=Configure.Vectorizer.none(),   # bring your own vectors
+    vector_index_config=Configure.VectorIndex.hnsw(
+        distance_metric=VectorDistances.COSINE,
+        quantizer=Configure.VectorIndex.Quantizer.pq(
+            training_limit=100_000,   # vectors needed before PQ kicks in
+            segments=96,              # 1536 dims / 96 segments = 16 dims per segment
+            centroids=256             # 2^8 centroids (8-bit codes)
+        )
+    ),
+    properties=[
+        Property(name="content", data_type=DataType.TEXT),
+        Property(name="source", data_type=DataType.TEXT)
+    ]
+)
+
+# Weaviate trains PQ automatically once training_limit vectors are loaded
+# Before training_limit: stores float32 flat (temporary, high memory)
+# After training_limit: compresses existing vectors + new vectors
+
+# For production: pre-populate with training_limit vectors before going live
+# Or set a lower training_limit if your corpus starts small
+
+client.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The practical PQ tradeoff: you're trading recall and query-time CPU for memory. PQ requires decoding compact codes during distance computation, which is CPU-intensive. On modern hardware with SIMD support, Faiss makes this fast — but it's not free. Benchmark both latency and recall before committing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Measuring the Tradeoffs: A Recall Benchmarking Framework</h3>
+
+<p class="text-gray-300 leading-relaxed">Every compression decision requires recall validation. "Recall@K" measures what fraction of the true top-K nearest neighbors you retrieve when using an approximate or compressed index. This is your primary metric.</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>
