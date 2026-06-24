@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 11: Aurora Serverless v2: Auto-Scaling in Practice — The Cloud Database Engineer</title>
+  <meta name="description" content="The Cloud Database Engineer Chapter 11: Aurora Serverless v2: Auto-Scaling in Practice. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-orange-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-orange-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 5 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-orange-400 hover:text-orange-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-orange-900/40 border border-orange-800/40 text-orange-300 text-xs rounded-full font-medium">Chapter 11 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The Cloud Database Engineer</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 11: Aurora Serverless v2: Auto-Scaling in Practice</h2>
+
+<p class="text-gray-300 leading-relaxed">Aurora Serverless v2 represents one of the more significant architectural departures from traditional database capacity planning. Where you once sized an instance, benchmarked it, added 30% headroom, and hoped your estimates held through the next fiscal year, Aurora Serverless v2 lets the database scale compute capacity up and down in near real-time — in increments as small as 0.5 ACUs (Aurora Capacity Units) — without dropping connections or requiring a restart. For a DBA who has spent years managing instance fleets, over-provisioning for peak loads, and scheduling maintenance windows for vertical scaling, this requires a genuine shift in how you think about capacity. This chapter covers how ACUs work, how to configure scaling bounds, how the system behaves under real production load, what the billing model means for your architecture decisions, and where the gotchas live — particularly around connection behavior, writer/reader asymmetry, and the interactions between Serverless v2 and Aurora Global Database.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.1 Aurora Capacity Units: What You're Actually Scaling</h3>
+
+<p class="text-gray-300 leading-relaxed">Before configuring anything, you need a clear mental model of what an Aurora Capacity Unit is. AWS defines 1 ACU as approximately 2 GiB of memory, with a proportional allocation of CPU and networking. This is not an exact ratio — Aurora does not expose the raw vCPU count the way an EC2 instance does — but as a working approximation, a 64 ACU instance is roughly equivalent to a db.r6g.16xlarge in CPU and memory terms, and a 0.5 ACU instance is a tiny slice suitable only for near-idle workloads.</p>
+
+<p class="text-gray-300 leading-relaxed">The scaling range you configure is expressed as a minimum and maximum ACU value. The minimum can be as low as 0.5 ACUs (though there are practical implications to setting it this low, covered in §11.3). The maximum can be as high as 256 ACUs as of the current service limits, though that ceiling has been raised several times and you should check the AWS documentation for the current value.</p>
+
+<p class="text-gray-300 leading-relaxed">What makes Serverless v2 categorically different from Serverless v1 is that scaling is <strong class="text-white">continuous and fine-grained</strong>. v1 scaled in discrete steps and could take 15–30 seconds to respond, during which queries would queue or time out. v2 scales in sub-second increments. In practice this means that a sudden spike — a batch job firing, a marketing email going out, an end-of-day report — gets absorbed without the application seeing a degraded response time curve typical of traditional vertical scaling events.</p>
+
+<p class="text-gray-300 leading-relaxed">One thing experienced DBAs sometimes misunderstand early on: ACU scaling only applies to <strong class="text-white">compute</strong>. Aurora storage is always decoupled from the compute tier. The Aurora distributed storage layer scales automatically regardless of your ACU configuration, handles up to 128 TiB per cluster, and you are billed for storage separately. This matches the Aurora architecture you learned in Chapter 9 — the storage layer is shared across all instances in the cluster.</p>
+
+<p class="text-gray-300 leading-relaxed">The relationship between ACUs and what you can observe in CloudWatch is through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ServerlessDatabaseCapacity</code> metric, which reports the current ACU level. Pair this with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPUUtilization</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeableMemory</code> to build a complete picture of scaling behavior.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run this against Aurora PostgreSQL to correlate what you observe
+-- in CloudWatch with what the database is actually doing
+SELECT 
+    now()                                        AS sample_time,
+    pg_postmaster_start_time()                   AS db_start_time,
+    (SELECT count(*) FROM pg_stat_activity)      AS total_connections,
+    (SELECT count(*) FROM pg_stat_activity 
+     WHERE state = 'active')                     AS active_connections,
+    (SELECT count(*) FROM pg_stat_activity 
+     WHERE wait_event_type IS NOT NULL)          AS waiting_connections,
+    pg_size_pretty(pg_database_size(current_database())) AS db_size;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This query, run periodically from a monitoring process, establishes the connection load baseline you'll use to validate that your ACU minimum is sized appropriately for your idle-state connection overhead.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.2 Provisioning Aurora Serverless v2 with the AWS CLI and Terraform</h3>
+
+<p class="text-gray-300 leading-relaxed">Creating a Serverless v2 cluster is a two-step process: you create the Aurora cluster, then you add instances to it with a serverless scaling configuration. This is different from Aurora Serverless v1, where the cluster itself was serverless. In v2, the cluster is a standard Aurora cluster and the serverless behavior is a property of the individual DB instances within it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating the cluster via AWS CLI:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Step 1: Create the Aurora cluster (MySQL-compatible shown first, 
+# then PostgreSQL pattern below)
+aws rds create-db-cluster \
+  --db-cluster-identifier prod-serverless-v2 \
+  --engine aurora-postgresql \
+  --engine-version 15.4 \
+  --master-username dbadmin \
+  --master-user-password "${DB_MASTER_PASSWORD}" \
+  --vpc-security-group-ids sg-0abc123def456789a \
+  --db-subnet-group-name prod-aurora-subnet-group \
+  --backup-retention-period 7 \
+  --preferred-backup-window "03:00-04:00" \
+  --preferred-maintenance-window "sun:05:00-sun:06:00" \
+  --storage-encrypted \
+  --kms-key-id arn:aws:kms:us-east-1:123456789012:key/mrk-abc123 \
+  --enable-cloudwatch-logs-exports '["postgresql"]' \
+  --deletion-protection \
+  --region us-east-1
+
+# Step 2: Add the writer instance with Serverless v2 scaling configuration
+aws rds create-db-instance \
+  --db-instance-identifier prod-serverless-v2-writer \
+  --db-cluster-identifier prod-serverless-v2 \
+  --db-instance-class db.serverless \
+  --engine aurora-postgresql \
+  --region us-east-1
+
+# Step 3: Modify the cluster's scaling configuration
+# MinCapacity: 2 ACUs (never go below this — rationale in §11.3)
+# MaxCapacity: 64 ACUs (size to your known peak, not theoretical maximum)
+aws rds modify-db-cluster \
+  --db-cluster-identifier prod-serverless-v2 \
+  --serverless-v2-scaling-configuration MinCapacity=2,MaxCapacity=64 \
+  --apply-immediately \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Equivalent Terraform configuration:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># terraform/aurora_serverless_v2/main.tf
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 5.0"
+    }
+  }
+}
+
+locals {
+  cluster_id = "prod-serverless-v2"
+  engine_ver = "15.4"
+  min_acu    = 2
+  max_acu    = 64
+}
+
+resource "aws_rds_cluster" "serverless_v2" {
+  cluster_identifier        = local.cluster_id
+  engine                    = "aurora-postgresql"
+  engine_version            = local.engine_ver
+  master_username           = var.master_username
+  master_password           = var.master_password
+  vpc_security_group_ids    = [aws_security_group.aurora.id]
+  db_subnet_group_name      = aws_db_subnet_group.aurora.name
+  backup_retention_period   = 7
+  preferred_backup_window   = "03:00-04:00"
+  storage_encrypted         = true
+  kms_key_id               = var.kms_key_arn
+  deletion_protection       = true
+  skip_final_snapshot       = false
+  final_snapshot_identifier = "${local.cluster_id}-final"
+
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+
+  serverless_v2_scaling_configuration {
+    min_capacity = local.min_acu
+    max_capacity = local.max_acu
+  }
+
+  tags = {
+    Environment = "production"
+    ManagedBy   = "terraform"
+    Owner       = "platform-dba"
+  }
+}
+
+resource "aws_rds_cluster_instance" "writer" {
+  identifier         = "${local.cluster_id}-writer"
+  cluster_identifier = aws_rds_cluster.serverless_v2.id
+  instance_class     = "db.serverless"
+  engine             = aws_rds_cluster.serverless_v2.engine
+  engine_version     = aws_rds_cluster.serverless_v2.engine_version
+
+  performance_insights_enabled          = true
+  performance_insights_retention_period = 7
+  monitoring_interval                   = 60
+  monitoring_role_arn                   = var.enhanced_monitoring_role_arn
+
+  tags = {
+    Role = "writer"
+  }
+}
+
+resource "aws_rds_cluster_instance" "reader" {
+  count              = var.reader_count  # typically 1 or 2 in production
+  identifier         = "${local.cluster_id}-reader-${count.index}"
+  cluster_identifier = aws_rds_cluster.serverless_v2.id
+  instance_class     = "db.serverless"
+  engine             = aws_rds_cluster.serverless_v2.engine
+  engine_version     = aws_rds_cluster.serverless_v2.engine_version
+
+  performance_insights_enabled          = true
+  performance_insights_retention_period = 7
+  monitoring_interval                   = 60
+  monitoring_role_arn                   = var.enhanced_monitoring_role_arn
+
+  tags = {
+    Role = "reader"
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One point worth noting: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.serverless</code> is the instance class you specify — it is not a size within a family like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code>. The ACU range you set on the cluster governs the actual compute allocation. This means you can have a writer and multiple readers that each independently scale within the same ACU bounds. The writer and readers do not share an ACU budget; each instance scales individually.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.3 Scaling Behavior: What Triggers It, How Fast It Responds</h3>
+
+<p class="text-gray-300 leading-relaxed">Understanding the scaling triggers prevents you from being surprised by billing spikes and helps you tune the min/max bounds correctly. Aurora Serverless v2 monitors several signals to decide when to scale:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **CPU utilization** relative to current capacity</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Memory pressure** (buffer pool fill rate, swap activity)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connection count** relative to the `max_connections` value for the current ACU level</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Database load** as reported by the Performance Insights average active sessions metric</li>
+
+<p class="text-gray-300 leading-relaxed">When any of these signals indicates the current ACU level is insufficient, the service scales up. Scale-up is aggressive by design — it happens in small increments but very quickly, typically completing within 1–2 seconds. Scale-down is deliberate and slow. AWS does not want a brief lull between query bursts to trigger a scale-down that then requires a scale-up moments later. In practice, expect scale-down to lag behind reduced load by several minutes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The minimum ACU floor matters more than people expect.</strong> At 0.5 ACUs, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> on Aurora PostgreSQL is approximately 90. That sounds fine until you realize that PgBouncer or RDS Proxy pools often open tens of connections just for health checks and pool maintenance, and your application likely has connection pools of its own. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MinCapacity=0.5</code> on a production cluster will result in connection failures whenever the cluster is at its minimum — usually late at night when you don't notice until your monitoring alerts on a failed 3 AM backup job.</p>
+
+<p class="text-gray-300 leading-relaxed">A practical minimum for production PostgreSQL workloads is <strong class="text-white">2 ACUs</strong> (approximately 4 GiB RAM, ~450 max connections). For MySQL-compatible Aurora, the connection scaling is more favorable at low ACU counts, but the same principle applies: never set your minimum to a value that makes the idle-state connection budget uncomfortably tight.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> formula for Aurora PostgreSQL Serverless v2 is:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>LEAST({DBInstanceClassMemory/9531392}, 5000)</code></pre>
+<p class="text-gray-300 leading-relaxed">where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBInstanceClassMemory</code> is in bytes. At 2 ACUs (≈4 GiB), this yields approximately 450 connections. At 8 ACUs (≈16 GiB), approximately 1800. At 32 ACUs (≈64 GiB), approximately 7000.</p>
+
+<p class="text-gray-300 leading-relaxed">You can verify what your cluster is currently using:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Aurora PostgreSQL: check current connection limit and usage
+SELECT 
+    current_setting('max_connections')::int          AS max_connections,
+    count(*)                                          AS current_connections,
+    count(*) FILTER (WHERE state = 'idle')           AS idle_connections,
+    count(*) FILTER (WHERE state = 'active')         AS active_connections,
+    count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,
+    round(
+        count(*)::numeric / 
+        current_setting('max_connections')::numeric * 100, 
+    1)                                               AS pct_utilized
+FROM pg_stat_activity
+WHERE pid &lt;&gt; pg_backend_pid();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pct_utilized</code> regularly exceeds 70% at your minimum ACU level, your minimum is too low. A scale-up event that is triggered by memory or CPU pressure will also increase the connection limit headroom — but the scale-up takes 1–2 seconds, and in that window, new connection attempts against a fully saturated connection limit will fail immediately.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.4 RDS Proxy Integration and the Connection Management Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">For Serverless v2, RDS Proxy is not optional — it is the architectural pattern that makes the auto-scaling behavior compatible with application-level connection pooling. Here is why.</p>
+
+<p class="text-gray-300 leading-relaxed">When Aurora Serverless v2 scales its ACU level, the database endpoint does not change, connections are not dropped, and there is no TCP-level interruption. This is the advertised behavior, and it holds true in steady-state scaling. However, at the extremes — when the cluster scales to its minimum and stays there for an extended idle period, or when you change the ACU bounds via a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modify-db-cluster</code> call — brief disruptions are possible. RDS Proxy absorbs these by maintaining its own connection pool to the backend and presenting a stable connection surface to applications.</p>
+
+<p class="text-gray-300 leading-relaxed">Beyond that protective function, RDS Proxy serves the standard purpose of multiplexing many application connections onto fewer database connections — a pattern you would traditionally implement with PgBouncer or pgpool-II on-premises. RDS Proxy uses IAM authentication and Secrets Manager to rotate credentials without connection disruption, which maps to what you previously handled manually in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> and password rotation scripts.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create RDS Proxy for the Serverless v2 cluster
+aws rds create-db-proxy \
+  --db-proxy-name prod-serverless-v2-proxy \
+  --engine-family POSTGRESQL \
+  --auth '[
+    {
+      "AuthScheme": "SECRETS",
+      "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/aurora/dbadmin",
+      "IAMAuth": "REQUIRED"
+    }
+  ]' \
+  --role-arn arn:aws:iam::123456789012:role/rds-proxy-role \
+  --vpc-subnet-ids subnet-0abc123 subnet-0def456 subnet-0ghi789 \
+  --vpc-security-group-ids sg-0abc123def456789a \
+  --require-tls \
+  --idle-client-timeout 1800 \
+  --debug-logging false \
+  --region us-east-1
+
+# Register the Aurora cluster as the proxy target
+aws rds register-db-proxy-targets \
+  --db-proxy-name prod-serverless-v2-proxy \
+  --db-cluster-identifiers prod-serverless-v2 \
+  --region us-east-1
+
+# Create a reader endpoint proxy target group for read scaling
+aws rds create-db-proxy-endpoint \
+  --db-proxy-name prod-serverless-v2-proxy \
+  --db-proxy-endpoint-name prod-serverless-v2-proxy-reader \
+  --vpc-subnet-ids subnet-0abc123 subnet-0def456 subnet-0ghi789 \
+  --vpc-security-group-ids sg-0abc123def456789a \
+  --target-role READ_ONLY \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">IAM authentication through RDS Proxy replaces the traditional <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> + password authentication model. Your application no longer stores a database password in its configuration. Instead, it generates a short-lived authentication token using the AWS SDK:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python: Generate RDS IAM auth token and connect through RDS Proxy
+# Requires boto3 and psycopg2
+
+import boto3
+import psycopg2
+import os
+from botocore.exceptions import ClientError
+
+def get_rds_auth_token(
+    hostname: str,
+    port: int,
+    username: str,
+    region: str
+) -&gt; str:
+    """
+    Generate a 15-minute IAM authentication token for RDS/RDS Proxy.
+    The EC2 instance or Lambda function must have an IAM role with
+    rds-db:connect permission on the target resource.
+    """
+    client = boto3.client("rds", region_name=region)
+    token = client.generate_db_auth_token(
+        DBHostname=hostname,
+        Port=port,
+        DBUsername=username,
+        Region=region
+    )
+    return token
+
+
+def get_connection(read_only: bool = False) -&gt; psycopg2.extensions.connection:
+    """
+    Return a psycopg2 connection through RDS Proxy.
+    Uses IAM auth — no password stored in environment or config files.
+    """
+    region = os.environ["AWS_REGION"]
+    
+    if read_only:
+        host = os.environ["RDS_PROXY_READER_ENDPOINT"]
+    else:
+        host = os.environ["RDS_PROXY_WRITER_ENDPOINT"]
+    
+    port = int(os.environ.get("DB_PORT", "5432"))
+    username = os.environ["DB_USERNAME"]
+    dbname = os.environ["DB_NAME"]
+
+    token = get_rds_auth_token(host, port, username, region)
+
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        user=username,
+        password=token,       # IAM token used as password
+        dbname=dbname,
+        sslmode="verify-full",
+        sslrootcert="/etc/ssl/certs/rds-combined-ca-bundle.pem",
+        connect_timeout=10
+    )
+
+    # For read-only connections, enforce at the session level
+    # as a defensive measure even though the proxy endpoint is read-only
+    if read_only:
+        conn.set_session(readonly=True)
+
+    return conn
+
+
+def execute_query(query: str, params: tuple = None, read_only: bool = False):
+    """
+    Execute a query and return results. Demonstrates connection reuse pattern
+    appropriate for Lambda or short-lived application processes.
+    For long-lived services, use a connection pool (e.g., psycopg2.pool or
+    SQLAlchemy) with a max_overflow sized to your ACU minimum's connection budget.
+    """
+    conn = None
+    try:
+        conn = get_connection(read_only=read_only)
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            if cur.description:  # SELECT
+                return cur.fetchall()
+            conn.commit()
+            return cur.rowcount
+    except psycopg2.OperationalError as e:
+        # Log and re-raise — let the caller decide on retry strategy
+        # Common causes: proxy is rotating target, ACU scale event in progress
+        raise RuntimeError(f"Database connection failed: {e}") from e
+    finally:
+        if conn and not conn.closed:
+            conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One behavioral difference from on-premises PgBouncer that catches DBAs off guard: RDS Proxy operates in <strong class="text-white">transaction pooling mode</strong> for MySQL and <strong class="text-white">session pooling mode</strong> for PostgreSQL by default. Session pooling means that a proxy connection is pinned to a specific backend connection for the life of the session — it does not multiplex at the transaction level the way PgBouncer does in transaction mode. This limits the connection compression ratio for PostgreSQL workloads. The practical implication is that you should not expect RDS Proxy to reduce your backend connection count by 10:1 for a PostgreSQL Serverless v2 cluster the way it might for MySQL. Budget for a proxy-to-backend ratio closer to 3:1 or 4:1 for PostgreSQL.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.5 Monitoring, Alerting, and Cost Governance</h3>
+
+<p class="text-gray-300 leading-relaxed">Aurora Serverless v2 billing is straightforward to understand but easy to mismanage. You are billed per ACU-hour, plus storage, plus I/O (unless you use Aurora I/O-Optimized storage). The ACU-hour cost is approximately $0.12–$0.20 per ACU-hour depending on region (check the current AWS pricing page for your region). A cluster that runs at 8 ACUs continuously costs roughly $0.12 × 8 × 730 hours/month = ~$701/month for the writer alone. The same workload on a db.r6g.2xlarge (8 vCPUs, 64 GiB) runs approximately $700–$900/month depending on reservation status. The economic argument for Serverless v2 is workloads that are <strong class="text-white">spiky rather than flat</strong> — where the average utilization is 20–30% of the peak.</p>
+
+<p class="text-gray-300 leading-relaxed">CloudWatch provides the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ServerlessDatabaseCapacity</code> metric, which you should track alongside <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPUUtilization</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeableMemory</code> to build a scaling profile. The following CloudWatch alarm setup uses the AWS CLI to alert when the cluster is approaching its maximum ACU ceiling:</p>
+
+    </div>
+    <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The Cloud Database Engineer</div>
+  </footer>
+</body>
+</html>
