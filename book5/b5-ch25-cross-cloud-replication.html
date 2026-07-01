@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 25: Cross-Cloud Replication Architectures — The Cloud Database Engineer</title>
+  <meta name="description" content="The Cloud Database Engineer Chapter 25: Cross-Cloud Replication Architectures. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-orange-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-orange-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 5 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-orange-400 hover:text-orange-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-orange-900/40 border border-orange-800/40 text-orange-300 text-xs rounded-full font-medium">Chapter 25 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The Cloud Database Engineer</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 25: Cross-Cloud Replication Architectures</h2>
+
+<p class="text-gray-300 leading-relaxed">Replication across cloud providers is one of the most architecturally demanding problems a cloud DBA will face. The need arises more often than you might expect: regulatory requirements that mandate data residency in specific regions served by different providers, acquisitions that land you with a PostgreSQL workload on GCP when your primary platform is AWS, disaster recovery strategies that treat provider failure as a first-class concern, or hybrid architectures where one cloud handles analytical workloads while another handles OLTP. Whatever the driver, cross-cloud replication forces you to reason about things that same-provider replication abstracts away—network transit costs, TLS certificate management across trust boundaries, WAL format incompatibilities between managed service versions, and the operational reality that you cannot place both ends of the replication stream inside the same VPC. This chapter covers the architectural patterns, tooling options, and production configuration required to build reliable cross-cloud replication between AWS RDS/Aurora, Azure SQL Database, and Google Cloud SQL/AlloyDB.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.1 Understanding the Cross-Cloud Replication Landscape</h3>
+
+<p class="text-gray-300 leading-relaxed">Before writing a single line of configuration, you need to accept a fundamental constraint: no managed database service natively supports another cloud's replication protocol. AWS Aurora's Global Database uses Aurora-specific storage replication. Azure SQL's active geo-replication uses proprietary log shipping. Google's Spanner uses its own Paxos-based replication internally. None of these speak to each other natively.</p>
+
+<p class="text-gray-300 leading-relaxed">This means every cross-cloud replication architecture uses one of three approaches:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Logical replication over the public internet or dedicated interconnects.</strong> PostgreSQL's logical replication (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_logical</code> or the native logical replication built into PostgreSQL 10+) works between any two PostgreSQL-compatible endpoints that can reach each other over TCP. AWS RDS for PostgreSQL, Google Cloud SQL for PostgreSQL, and Azure Database for PostgreSQL all support logical replication. The catch is that they may run slightly different PostgreSQL minor versions, and WAL-level logical decoding requires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> to be set—something you control through Parameter Groups on RDS, flags on Cloud SQL, and server parameters on Azure Database for PostgreSQL.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Change Data Capture (CDC) through an intermediary.</strong> Tools like AWS DMS, Debezium, and Striim sit between the source and target, read the source's transaction log, transform the events, and write them to the target. This is the most flexible approach because the source and target do not need to run the same database engine. You can replicate from SQL Server on AWS RDS to PostgreSQL on Google Cloud SQL using DMS with SCT-generated schema mappings, for example.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Application-level dual-write.</strong> The application writes to both cloud databases simultaneously, with one treated as authoritative for conflict resolution. This is the most operationally fragile pattern and only makes sense when you cannot get replication lag below acceptable thresholds for your workload's consistency requirements.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical choice for most production architectures is logical replication for same-engine scenarios and CDC via DMS or Debezium for cross-engine scenarios. The remainder of this chapter covers both.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Network connectivity is the prerequisite you cannot skip.</strong> Cross-cloud replication requires stable, low-latency, encrypted connectivity between the two clouds. Your options, roughly ordered by reliability and cost:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AWS Direct Connect + Azure ExpressRoute or Google Cloud Interconnect**: dedicated private circuits, lowest jitter, highest cost, typically $500–$2,000/month per 1Gbps port plus cross-connect fees.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **VPN over the public internet**: IPsec tunnels between VGW (AWS) and VPN Gateway (Azure/GCP), adequate for lower-throughput replication, ~50–200ms latency cross-region, ~$50–150/month.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Public internet with TLS**: no dedicated circuit, lowest cost, highest variability. Acceptable for replication that can tolerate seconds of lag; not appropriate for anything approaching synchronous replication.</li>
+
+<p class="text-gray-300 leading-relaxed">For production replication carrying more than ~100 MB/s of WAL data, you want dedicated interconnects. For secondary replicas used for disaster recovery where RPO of a few seconds is acceptable, a well-tuned VPN tunnel is usually sufficient.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.2 Logical Replication: PostgreSQL Across AWS, Azure, and GCP</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL logical replication uses a publisher/subscriber model. The publisher exposes a publication (a named set of tables), and subscribers connect to it using a replication slot, decode the WAL stream, and apply changes. This is conceptually the same as setting up <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> to allow a replication user and granting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REPLICATION</code> privilege—except that in the managed service world, you configure connectivity through security groups, firewall rules, and IAM policies rather than filesystem-level configuration files.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enabling logical replication on AWS RDS for PostgreSQL:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create or modify a parameter group to enable logical replication
+aws rds create-db-parameter-group \
+  --db-parameter-group-name prod-pg15-logical \
+  --db-parameter-group-family postgres15 \
+  --description "PostgreSQL 15 with logical replication enabled" \
+  --region us-east-1
+
+# Set wal_level to logical (requires reboot)
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name prod-pg15-logical \
+  --parameters \
+    "ParameterName=rds.logical_replication,ParameterValue=1,ApplyMethod=pending-reboot" \
+  --region us-east-1
+
+# Apply the parameter group to the instance
+aws rds modify-db-instance \
+  --db-instance-identifier prod-postgres-primary \
+  --db-parameter-group-name prod-pg15-logical \
+  --apply-immediately \
+  --region us-east-1
+
+# Reboot to apply (schedule this during maintenance window)
+aws rds reboot-db-instance \
+  --db-instance-identifier prod-postgres-primary \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On RDS, setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds.logical_replication = 1</code> automatically promotes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logical</code> and sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_replication_slots</code> to at least 10 and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code> to at least 10. You do not set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level</code> directly—RDS controls that parameter. This is one of the managed service constraints you adapt to rather than fight.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enabling logical replication on Google Cloud SQL for PostgreSQL:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable logical replication via Cloud SQL flags
+gcloud sql instances patch prod-postgres-replica \
+  --database-flags cloudsql.logical_decoding=on \
+  --project my-gcp-project \
+  --region us-central1
+
+# Verify the flag was applied
+gcloud sql instances describe prod-postgres-replica \
+  --project my-gcp-project \
+  --format="json(settings.databaseFlags)"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up the publication on AWS RDS (publisher side):</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connect to the AWS RDS PostgreSQL instance
+-- Create a dedicated replication user
+CREATE ROLE replication_user WITH REPLICATION LOGIN PASSWORD 'use-a-vault-managed-secret';
+
+-- Grant SELECT on all tables that will be replicated
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO replication_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO replication_user;
+
+-- Create the publication
+-- Publishing all tables is convenient but adds overhead for large schemas;
+-- publishing specific tables is better for production
+CREATE PUBLICATION cross_cloud_pub
+  FOR TABLE orders, order_items, customers, inventory
+  WITH (publish = 'insert, update, delete');
+
+-- Verify the publication
+SELECT pubname, puballtables, pubinsert, pubupdate, pubdelete
+FROM pg_publication;
+
+-- Create a replication slot for the GCP subscriber
+-- Named slots track LSN position and ensure no WAL is discarded before the subscriber consumes it
+SELECT pg_create_logical_replication_slot('gcp_subscriber_slot', 'pgoutput');
+
+-- Monitor slot lag — this is critical; unconsumed slots cause WAL accumulation
+SELECT slot_name,
+       pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS replication_lag_size,
+       active
+FROM pg_replication_slots;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up the subscription on Google Cloud SQL (subscriber side):</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connect to the Google Cloud SQL PostgreSQL instance
+-- The schema must exist on the subscriber before the subscription starts
+-- Use pg_dump --schema-only on the publisher or SCT to generate it
+
+-- Create the subscription pointing to the AWS RDS publisher
+-- The host is the RDS endpoint; connectivity must be established first (VPN or public)
+CREATE SUBSCRIPTION cross_cloud_sub
+  CONNECTION 'host=prod-postgres-primary.c3bxyz123.us-east-1.rds.amazonaws.com
+              port=5432
+              dbname=productiondb
+              user=replication_user
+              password=use-a-vault-managed-secret
+              sslmode=require'
+  PUBLICATION cross_cloud_pub
+  WITH (
+    slot_name = 'gcp_subscriber_slot',
+    create_slot = false,        -- we already created it on the publisher
+    enabled = true,
+    copy_data = true            -- performs initial table sync before streaming
+  );
+
+-- Monitor subscription status
+SELECT subname,
+       pid,
+       received_lsn,
+       latest_end_lsn,
+       pg_size_pretty(pg_wal_lsn_diff(latest_end_lsn, received_lsn)) AS lag
+FROM pg_stat_subscription;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Critical production gotcha: replication slot WAL accumulation.</strong> If the GCP subscriber falls behind or disconnects, the replication slot on AWS RDS will prevent WAL segments from being recycled. A subscriber that is down for 6 hours on a write-heavy database can accumulate tens of gigabytes of WAL. RDS will run out of storage and become unavailable before it drops the slot. Set an alarm on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TransactionLogsDiskUsage</code> CloudWatch metric and configure a slot monitoring job:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import psycopg2
+
+def check_replication_slot_lag(rds_host, port, dbname, user, password, slot_name, lag_threshold_gb=10):
+    """
+    Monitor replication slot lag and publish to CloudWatch.
+    Run this every 5 minutes from a Lambda or EC2 instance.
+    """
+    conn = psycopg2.connect(
+        host=rds_host,
+        port=port,
+        dbname=dbname,
+        user=user,
+        password=password,
+        sslmode='require'
+    )
+    
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT slot_name,
+               active,
+               pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
+        FROM pg_replication_slots
+        WHERE slot_name = %s
+    """, (slot_name,))
+    
+    row = cur.fetchone()
+    if not row:
+        print(f"WARNING: Slot {slot_name} does not exist")
+        return
+    
+    slot_name_db, active, lag_bytes = row
+    lag_gb = lag_bytes / (1024 ** 3)
+    
+    cw = boto3.client('cloudwatch', region_name='us-east-1')
+    cw.put_metric_data(
+        Namespace='CrossCloudReplication',
+        MetricData=[{
+            'MetricName': 'ReplicationSlotLagGB',
+            'Dimensions': [
+                {'Name': 'SlotName', 'Value': slot_name},
+                {'Name': 'Instance', 'Value': rds_host.split('.')[0]}
+            ],
+            'Value': lag_gb,
+            'Unit': 'None'
+        }]
+    )
+    
+    if lag_gb &gt; lag_threshold_gb:
+        print(f"ALERT: Slot {slot_name} lag is {lag_gb:.2f} GB — exceeds {lag_threshold_gb} GB threshold")
+        # Drop the slot if subscriber has been inactive for extended period
+        # Only do this if you have a clear runbook for resynchronization
+        if not active:
+            print(f"Slot {slot_name} is INACTIVE. Consider dropping and resynchronizing.")
+    
+    cur.close()
+    conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.3 AWS DMS for Cross-Cloud CDC Replication</h3>
+
+<p class="text-gray-300 leading-relaxed">AWS Database Migration Service supports continuous CDC replication to and from non-AWS endpoints. Despite the name, DMS is not just for one-time migrations—its ongoing replication mode makes it viable for keeping a GCP or Azure database synchronized with an AWS source. The key limitation is that DMS applies changes with a latency of roughly 1–10 seconds under normal load, making it appropriate for near-real-time analytics replicas and DR targets but not for synchronous replication or read scaling.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Terraform configuration for a DMS cross-cloud replication task (AWS RDS PostgreSQL to Cloud SQL PostgreSQL):</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># terraform/cross_cloud_dms.tf
+
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~&gt; 5.0"
+    }
+  }
+}
+
+# DMS Replication Instance — runs in your VPC, needs NAT gateway for outbound to GCP
+resource "aws_dms_replication_instance" "cross_cloud" {
+  replication_instance_id     = "cross-cloud-dms-prod"
+  replication_instance_class  = "dms.r6i.2xlarge"  # 8 vCPU, 64 GB RAM — appropriate for ~5,000 TPS
+  allocated_storage           = 500                 # GB, for LOB column buffering
+  engine_version              = "3.5.2"
+  multi_az                    = true                # HA for the replication instance itself
+  publicly_accessible         = false
+  vpc_security_group_ids      = [aws_security_group.dms_sg.id]
+  replication_subnet_group_id = aws_dms_replication_subnet_group.main.id
+
+  tags = {
+    Environment = "production"
+    Owner       = "database-team"
+  }
+}
+
+# Source endpoint: AWS RDS PostgreSQL
+resource "aws_dms_endpoint" "source_rds" {
+  endpoint_id   = "source-rds-postgres-prod"
+  endpoint_type = "source"
+  engine_name   = "postgres"
+
+  server_name   = "prod-postgres-primary.c3bxyz123.us-east-1.rds.amazonaws.com"
+  port          = 5432
+  database_name = "productiondb"
+  username      = "dms_user"
+  password      = var.rds_dms_password  # Use Secrets Manager in production
+  ssl_mode      = "require"
+
+  postgres_settings {
+    capture_ddls        = false  # DDL capture requires additional setup
+    heartbeat_enable    = true
+    heartbeat_frequency = 5      # seconds between heartbeats
+    slot_name           = "dms_replication_slot"
+    plugin_name         = "pglogical"  # or "test_decoding" — pglogical is more reliable for DMS
+  }
+}
+
+# Target endpoint: Google Cloud SQL PostgreSQL
+# GCP Cloud SQL must have a public IP or Cloud SQL Proxy configured
+# DMS connects over the internet or through VPN
+resource "aws_dms_endpoint" "target_cloud_sql" {
+  endpoint_id   = "target-cloud-sql-prod"
+  endpoint_type = "target"
+  engine_name   = "postgres"
+
+  server_name   = "34.xxx.xxx.xxx"  # Cloud SQL public IP with authorized network for DMS replication instance's EIP
+  port          = 5432
+  database_name = "productiondb_replica"
+  username      = "dms_target_user"
+  password      = var.cloud_sql_dms_password
+  ssl_mode      = "require"
+}
+
+# Replication task: full load + ongoing CDC
+resource "aws_dms_replication_task" "cross_cloud_sync" {
+  replication_task_id      = "prod-aws-to-gcp-sync"
+  migration_type           = "full-load-and-cdc"
+  replication_instance_arn = aws_dms_replication_instance.cross_cloud.replication_instance_arn
+  source_endpoint_arn      = aws_dms_endpoint.source_rds.endpoint_arn
+  target_endpoint_arn      = aws_dms_endpoint.target_cloud_sql.endpoint_arn
+
+  table_mappings = jsonencode({
+    rules = [
+      {
+        rule-type = "selection"
+        rule-id   = "1"
+        rule-name = "include-production-tables"
+        object-locator = {
+          schema-name = "public"
+          table-name  = "%"  # all tables — narrow this for large schemas
+        }
+        rule-action = "include"
+      },
+      {
+        rule-type = "selection"
+        rule-id   = "2"
+        rule-name = "exclude-audit-logs"
+        object-locator = {
+          schema-name = "public"
+          table-name  = "audit_%"
+        }
+        rule-action = "exclude"
+      }
+    ]
+  })
+
+  replication_task_settings = jsonencode({
+    TargetMetadata = {
+      TargetSchema              = "public"
+      SupportLobs               = true
+      FullLobMode               = false
+      LobChunkSize              = 64   # KB — increase for large BYTEA columns
+      LimitedSizeLobMode        = true
+      LobMaxSize                = 32768  # KB = 32 MB max LOB size
+    }
+    FullLoadSettings = {
+      TargetTablePrepMode       = "DO_NOTHING"  # TRUNCATE_BEFORE_LOAD or DO_NOTHING
+      CreatePkAfterFullLoad     = false
+      StopTaskCachedChangesApplied = false
+      StopTaskCachedChangesNotApplied = false
+      MaxFullLoadSubTasks       = 8
+      TransactionConsistencyTimeout = 600
+      CommitRate                = 50000  # rows per commit on target
+    }
+    Logging = {
+      EnableLogging = true
+      LogComponents = [
+        { Id = "SOURCE_UNLOAD", Severity = "LOGGER_SEVERITY_DEFAULT" },
+        { Id = "TARGET_LOAD",   Severity = "LOGGER_SEVERITY_DEFAULT" },
+        { Id = "TASK_MANAGER",  Severity = "LOGGER_SEVERITY_DEFAULT" }
+      ]
+    }
+    ControlTablesSettings = {
+      historyTimeslotInMinutes  = 5
+      StatusTableEnabled        = true
+      SuspendedTablesTableEnabled = true
+    }
+  })
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">DMS gotchas for cross-cloud replication:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">First, DMS cannot replicate DDL changes in CDC mode for PostgreSQL by default. If a developer adds a column to a replicated table, the CDC stream will start failing for that table once rows with the new column arrive. You need a DDL change management process: apply the schema change to the target first, then apply it to the source, with a brief replication pause if the DDL is destructive.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, the DMS replication instance needs connectivity to both endpoints. For a private RDS source, you route through the VPC normally. For the Cloud SQL target, you have two options: enable Cloud SQL's public IP and whitelist the DMS replication instance's Elastic IP address in the Cloud SQL authorized networks list, or use Cloud SQL Auth Proxy running on an EC2 instance in the same VPC as DMS. The proxy approach is more secure and preferred for production.</p>
+
+<p class="text-gray-300 leading-relaxed">Third, DMS requires that the PostgreSQL source has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> and that the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pglogical</code> extension is installed. On RDS, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pglogical</code> is available as a supported extension—you create it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE EXTENSION pglogical;</code> once <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds.logical_replication = 1</code> is set. DMS creates and manages its own replication slot; you do not create it manually.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.4 Azure SQL as a Cross-Cloud Replication Target</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Database (the PaaS offering on SQL Server's engine) does not natively participate in PostgreSQL or MySQL logical replication. Getting data into or out of Azure SQL from another cloud's database engine requires one of two approaches: DMS (which supports Azure SQL as a target), or SQL Server's own replication mechanisms—transactional replication or the Azure Data Factory copy pipelines—when Azure SQL is involved on both ends.</p>
+
+<p class="text-gray-300 leading-relaxed">For a common production scenario—AWS RDS for SQL Server replicating to Azure SQL Database for analytics or DR—you have a genuine option in SQL Server's native transactional replication, but only if the AWS side is RDS for SQL Server (not Aurora). The Azure SQL end acts as the subscriber. The challenge is that Azure SQL is always behind a fully qualified domain name in a Microsoft-managed network, and the publisher (RDS for SQL Server) must be able to reach the Azure SQL subscriber. You accomplish this through an Azure Private Link endpoint published to AWS via Transit Gateway or VPN.</p>
+
+<p class="text-gray-300 leading-relaxed">For the more common scenario today—PostgreSQL on AWS to Azure Database for PostgreSQL for cross-cloud DR—logical replication works as described in Section 25.2. Azure Database for PostgreSQL Flexible Server supports logical replication from PostgreSQL 11+ and sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure.replication_support</code> server parameter.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enabling logical replication on Azure Database for PostgreSQL Flexible Server:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Set replication support level using Azure CLI
+az postgres flexible-server parameter set \
+  --resource-group rg-database-prod \
+  --server-name prod-postgres-azure \
+  --name azure.replication_support \
+  --value LOGICAL
+
+# Restart the server to apply the parameter
+az postgres flexible-server restart \
+  --resource-group rg-database-prod \
+  --name prod-postgres-azure
+
+# Verify the parameter
+az postgres flexible-server parameter show \
+  --resource-group rg-database-prod \
+  --server-name prod-postgres-azure \
+  --name azure.replication_support \
+  --query value
+
+# Add the AWS NAT Gateway IP to the Azure firewall rules
+# (if using public internet connectivity rather than VPN)
+az postgres flexible-server firewall-rule create \
+  --resource-group rg-database-prod \
+  --name prod-postgres-azure \
+  --rule-name allow-aws-nat-gateway \
+  --start-ip-address 54.xxx.xxx.xxx \
+  --end-ip-address 54.xxx.xxx.xxx</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring cross-cloud replication lag with Azure Monitor and CloudWatch together:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A mature cross-cloud replication operation monitors lag from both ends. The publisher (AWS) measures how much WAL is in the slot waiting to be consumed. The subscriber (Azure) measures how far behind its applied LSN is from the publisher's current LSN. Building a unified view requires pulling metrics from both clouds into a single observability system—Datadog, Grafana with multi-cloud datasources, or a custom pipeline.</p>
+
+    </div>
+    <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The Cloud Database Engineer</div>
+  </footer>
+</body>
+</html>
