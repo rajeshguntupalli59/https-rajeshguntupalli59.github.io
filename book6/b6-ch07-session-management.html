@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 7: Session Management for Multi-Turn LLM Conversations — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 7: Session Management for Multi-Turn LLM Conversations. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 7 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 7: Session Management for Multi-Turn LLM Conversations</h2>
+
+<p class="text-gray-300 leading-relaxed">Every LLM API call is stateless. The model receives a list of messages, generates a response, and forgets everything. Building a chatbot or agent that feels coherent across turns — that remembers what the user said three messages ago, that can reference an earlier decision, that knows when a conversation ended and a new one began — requires you to manage all of that state yourself. PostgreSQL is exceptionally well-suited for this job, and this chapter shows you exactly how to do it.</p>
+
+<p class="text-gray-300 leading-relaxed">You will design a conversation session schema that scales from prototype to production, implement context window management so you never send more tokens than a model can handle, build sliding-window and summary-based memory strategies, wire everything into a FastAPI service with async Python, and add pg_notify for real-time streaming. By the end, you will have a session layer that any LLM application can run on top of.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.1 The Conversation State Problem</h3>
+
+<p class="text-gray-300 leading-relaxed">When a user types "what about the second option you mentioned?" the model needs the full conversation history to understand what "second option" means. You are responsible for loading that history from storage, trimming it to fit within a context window, injecting it into the API call, and then saving the new exchange back to storage — all within the latency budget of a user-facing request.</p>
+
+<p class="text-gray-300 leading-relaxed">This is not a simple key-value cache problem. Conversation state has structure: turns have roles, timestamps, token counts, and optional metadata. Sessions have owners, creation times, expiry policies, and relationships to RAG retrieval results. You need to query "show me all sessions where the user asked about billing in the last 30 days" — something Redis alone cannot do efficiently. You need row-level security so that user A cannot read user B's conversation history. You need audit logs for compliance. These are exactly the things PostgreSQL was built for.</p>
+
+<p class="text-gray-300 leading-relaxed">The fundamental data model has three entities: a <strong class="text-white">session</strong> (a container that groups turns), a <strong class="text-white">message</strong> (a single turn from user, assistant, system, or tool), and a <strong class="text-white">session summary</strong> (a compressed representation of older context). Everything else flows from these three tables.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core session management schema
+-- Run this in your application database
+
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "vector";
+
+-- ── Sessions ────────────────────────────────────────────────────────────────
+
+CREATE TABLE ai_sessions (
+    session_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id           UUID NOT NULL,
+    title             TEXT,                          -- auto-generated or user-set
+    model_name        TEXT NOT NULL DEFAULT 'gpt-4o',
+    system_prompt     TEXT,                          -- session-level system prompt
+    temperature       NUMERIC(3,2) DEFAULT 0.7,
+    status            TEXT NOT NULL DEFAULT 'active'
+                          CHECK (status IN ('active', 'archived', 'deleted')),
+    token_budget      INTEGER NOT NULL DEFAULT 128000,
+    tokens_used       INTEGER NOT NULL DEFAULT 0,
+    metadata          JSONB NOT NULL DEFAULT '{}',   -- app-specific context
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_active_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at        TIMESTAMPTZ,                   -- NULL = never
+    CONSTRAINT valid_temperature CHECK (temperature BETWEEN 0.0 AND 2.0)
+);
+
+CREATE INDEX idx_sessions_user_status
+    ON ai_sessions (user_id, status, last_active_at DESC);
+
+CREATE INDEX idx_sessions_metadata
+    ON ai_sessions USING GIN (metadata);
+
+-- ── Messages ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE ai_messages (
+    message_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id        UUID NOT NULL REFERENCES ai_sessions (session_id) ON DELETE CASCADE,
+    role              TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+    content           TEXT NOT NULL,
+    tool_name         TEXT,                          -- populated when role = 'tool'
+    tool_call_id      TEXT,                          -- OpenAI function calling correlation
+    token_count       INTEGER,                       -- filled by application after counting
+    prompt_tokens     INTEGER,                       -- filled from API response
+    completion_tokens INTEGER,                       -- filled from API response
+    model_name        TEXT,                          -- which model actually responded
+    finish_reason     TEXT,                          -- 'stop', 'length', 'tool_calls', etc.
+    embedding         VECTOR(1536),                  -- for semantic message search
+    latency_ms        INTEGER,                       -- time to first token / full response
+    metadata          JSONB NOT NULL DEFAULT '{}',   -- citations, sources, scores, etc.
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sequence_num      INTEGER NOT NULL               -- explicit ordering within a session
+);
+
+CREATE UNIQUE INDEX idx_messages_session_sequence
+    ON ai_messages (session_id, sequence_num);
+
+CREATE INDEX idx_messages_session_created
+    ON ai_messages (session_id, created_at);
+
+CREATE INDEX idx_messages_role
+    ON ai_messages (session_id, role);
+
+CREATE INDEX idx_messages_embedding
+    ON ai_messages USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Automatically update session activity and token counter
+CREATE OR REPLACE FUNCTION update_session_on_message()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE ai_sessions
+    SET
+        last_active_at = NOW(),
+        tokens_used    = tokens_used + COALESCE(NEW.token_count, 0)
+    WHERE session_id = NEW.session_id;
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_session_update
+    AFTER INSERT ON ai_messages
+    FOR EACH ROW EXECUTE FUNCTION update_session_on_message();
+
+-- ── Session Summaries ─────────────────────────────────────────────────────────
+
+CREATE TABLE ai_session_summaries (
+    summary_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id        UUID NOT NULL REFERENCES ai_sessions (session_id) ON DELETE CASCADE,
+    summary_text      TEXT NOT NULL,
+    embedding         VECTOR(1536),
+    covers_up_to_seq  INTEGER NOT NULL,              -- highest sequence_num summarized
+    token_count       INTEGER,
+    model_name        TEXT NOT NULL,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_summaries_session
+    ON ai_session_summaries (session_id, covers_up_to_seq DESC);
+
+-- ── Audit Log ─────────────────────────────────────────────────────────────────
+
+CREATE TABLE ai_session_audit (
+    audit_id     BIGSERIAL PRIMARY KEY,
+    session_id   UUID NOT NULL,
+    user_id      UUID NOT NULL,
+    event_type   TEXT NOT NULL,                     -- 'created', 'archived', 'deleted', 'exported'
+    actor_id     UUID,                              -- could be a different admin user
+    detail       JSONB DEFAULT '{}',
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_session ON ai_session_audit (session_id, created_at);
+CREATE INDEX idx_audit_user    ON ai_session_audit (user_id, created_at);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema gives you something no pure-vector store provides: you can write SQL like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT session_id, COUNT(*) as turns FROM ai_messages WHERE role = 'user' GROUP BY session_id HAVING COUNT(*) > 20</code> to find long conversations, join sessions to your users table for billing, or alert on sessions where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finish_reason = 'length'</code> because the model ran out of context. The relational layer is what makes conversations queryable assets rather than opaque blobs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.2 Context Window Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Every model has a maximum context length — 128K tokens for GPT-4o, 200K for Claude 3.5 Sonnet, 1M for Gemini 1.5. Exceeding it causes the API to return an error or silently truncate your history. Managing what goes into the context window is one of the most important responsibilities of your session layer.</p>
+
+<p class="text-gray-300 leading-relaxed">The naive approach — send all messages — breaks the moment a conversation grows past the limit. The two production-viable strategies are <strong class="text-white">sliding window</strong> (keep the N most recent messages) and <strong class="text-white">summarize-and-trim</strong> (compress old messages into a summary, keep recent ones verbatim). Both require knowing the token count of each message before you can make the decision.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Context window management queries
+
+-- ── 1. Get messages for a context window (sliding window strategy) ──────────
+-- Returns messages in chronological order, limited to stay under token budget.
+-- Always includes system message(s) plus the most recent turns.
+
+WITH session_info AS (
+    SELECT token_budget FROM ai_sessions WHERE session_id = $1
+),
+system_msgs AS (
+    SELECT message_id, role, content, token_count, sequence_num
+    FROM   ai_messages
+    WHERE  session_id = $1 AND role = 'system'
+    ORDER  BY sequence_num
+),
+system_tokens AS (
+    SELECT COALESCE(SUM(token_count), 0) AS total FROM system_msgs
+),
+recent_msgs AS (
+    -- Walk backwards from most recent, accumulating tokens until we hit the budget
+    SELECT
+        m.message_id,
+        m.role,
+        m.content,
+        m.tool_name,
+        m.tool_call_id,
+        m.token_count,
+        m.sequence_num,
+        SUM(m.token_count) OVER (
+            ORDER BY m.sequence_num DESC
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS running_tokens
+    FROM ai_messages m, session_info si, system_tokens st
+    WHERE m.session_id = $1
+      AND m.role != 'system'
+    ORDER BY m.sequence_num DESC
+)
+SELECT role, content, tool_name, tool_call_id, sequence_num
+FROM (
+    SELECT * FROM system_msgs
+    UNION ALL
+    SELECT message_id, role, content, tool_name, token_count, sequence_num
+    FROM recent_msgs r, session_info si, system_tokens st
+    WHERE r.running_tokens &lt;= (si.token_budget - st.total - 2000)  -- 2000 token reserve for response
+) combined
+ORDER BY sequence_num;
+
+-- ── 2. Check whether summarization is needed ─────────────────────────────────
+
+SELECT
+    s.session_id,
+    s.tokens_used,
+    s.token_budget,
+    ROUND(s.tokens_used::numeric / s.token_budget * 100, 1) AS pct_used,
+    COUNT(m.message_id) FILTER (WHERE m.role != 'system') AS non_system_turns,
+    MAX(COALESCE(ss.covers_up_to_seq, 0)) AS last_summarized_seq,
+    MAX(m.sequence_num) AS latest_seq
+FROM ai_sessions s
+JOIN ai_messages m ON m.session_id = s.session_id
+LEFT JOIN ai_session_summaries ss ON ss.session_id = s.session_id
+WHERE s.session_id = $1
+GROUP BY s.session_id, s.tokens_used, s.token_budget;
+
+-- ── 3. Get messages that need to be summarized ────────────────────────────────
+-- Returns the "old" portion of the conversation: everything before the most
+-- recent summary, down to a configurable recent-window size.
+
+SELECT role, content, sequence_num
+FROM ai_messages
+WHERE session_id    = $1
+  AND sequence_num  &gt; $2   -- $2 = covers_up_to_seq from latest summary (or 0)
+  AND sequence_num  &lt;= (
+      SELECT MAX(sequence_num) - $3   -- $3 = number of recent turns to keep verbatim
+      FROM ai_messages
+      WHERE session_id = $1
+  )
+  AND role != 'system'
+ORDER BY sequence_num;
+
+-- ── 4. Insert a new summary record ───────────────────────────────────────────
+
+INSERT INTO ai_session_summaries
+    (session_id, summary_text, covers_up_to_seq, token_count, model_name)
+VALUES
+    ($1, $2, $3, $4, $5)
+RETURNING summary_id;
+
+-- ── 5. Session health dashboard ────────────────────────────────────────────────
+
+SELECT
+    s.session_id,
+    s.user_id,
+    s.model_name,
+    s.status,
+    s.tokens_used,
+    s.token_budget,
+    ROUND(s.tokens_used::numeric / s.token_budget * 100, 1)   AS context_pct,
+    COUNT(m.message_id)                                         AS total_messages,
+    COUNT(m.message_id) FILTER (WHERE m.role = 'user')         AS user_turns,
+    AVG(m.latency_ms)  FILTER (WHERE m.role = 'assistant')     AS avg_latency_ms,
+    SUM(m.completion_tokens) FILTER (WHERE m.role = 'assistant') AS total_output_tokens,
+    s.last_active_at,
+    s.created_at
+FROM ai_sessions s
+LEFT JOIN ai_messages m ON m.session_id = s.session_id
+WHERE s.user_id = $1
+  AND s.status  = 'active'
+GROUP BY s.session_id
+ORDER BY s.last_active_at DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The token reserve in query 1 (the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">- 2000</code> part) is deliberate: you always want headroom for the model's response. If you pack the context to exactly the limit, the model may return <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finish_reason = 'length'</code> and cut off mid-sentence. Build this reserve into the query rather than relying on the application layer to remember it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.3 The Python Session Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">The schema is the foundation; the Python service is where turns actually flow. The session manager class below handles the full lifecycle: creating sessions, loading context-managed history, appending new messages with accurate token counts, and triggering summarization when the context fills up.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
