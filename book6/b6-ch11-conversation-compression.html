@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 11: Conversation Summarization and Compression in the Database — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 11: Conversation Summarization and Compression in the Database. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 11 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 11: Conversation Summarization and Compression in the Database</h2>
+
+<p class="text-gray-300 leading-relaxed">Every production chatbot eventually runs into the same wall: context windows are finite, tokens are expensive, and users have long memories. A customer who started a support conversation three weeks ago expects your AI to remember the resolution — but storing every message verbatim and replaying the full transcript on each request is neither scalable nor economical. Conversation summarization solves this by compressing older turns into dense representations while keeping recent turns verbatim, giving the model enough context without burning your token budget. This chapter shows how to design, implement, and operate a conversation compression pipeline entirely within PostgreSQL, with async summarization jobs, rolling summaries, embedding-based retrieval for relevant history, and production-grade monitoring. PostgreSQL is the right place to build this — it gives you transactional consistency between raw messages and their summaries, trigger-driven automation, JSONB for metadata, and pgvector for semantic recall, all in one system rather than five.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.1 The Context Window Problem and Why Compression Belongs in the Database</h3>
+
+<p class="text-gray-300 leading-relaxed">A language model doesn't read your database. It reads a prompt. Everything your application knows about a user's conversation history has to be squeezed into that prompt before the model ever sees it. This creates a hard engineering constraint: the prompt must be short enough to fit the context window, recent enough to feel coherent, and complete enough to be useful. Most teams handle this badly — they either truncate blindly (losing critical information), replay everything (burning tokens), or move to an external vector store (losing transactional consistency).</p>
+
+<p class="text-gray-300 leading-relaxed">The database-centric approach treats conversation memory as a first-class data problem. Messages are rows. Summaries are rows. Embeddings are columns. The rules for when to summarize, what to include, and how to retrieve relevant history are queries. Every operation is transactional, auditable, and indexable.</p>
+
+<p class="text-gray-300 leading-relaxed">The strategy has three tiers:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Verbatim recent history</strong>: the last N turns, always included in full. N is typically 4–10 depending on average turn length.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Rolling summary</strong>: a periodically regenerated compressed narrative of older turns, included as a paragraph-length summary.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 3 — Semantic recall</strong>: embeddings of older turns, queried at retrieval time to pull back turns that are semantically similar to the current user message, even if they happened long ago.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Complete schema for a three-tier conversation memory system
+
+CREATE EXTENSION IF NOT EXISTS pgvector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- for fuzzy search on text content
+
+-- Core conversation and session tracking
+CREATE TABLE conversations (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             BIGINT NOT NULL,
+    channel             TEXT NOT NULL DEFAULT 'web',   -- web, slack, api, mobile
+    title               TEXT,                           -- auto-generated or user-set
+    status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'deleted')),
+    metadata            JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_active_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    message_count       INT NOT NULL DEFAULT 0,
+    total_tokens_used   BIGINT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_conversations_user_active
+    ON conversations (user_id, last_active_at DESC)
+    WHERE status = 'active';
+
+-- Raw message store — the source of truth
+CREATE TABLE messages (
+    id              BIGSERIAL PRIMARY KEY,
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    turn_number     INT NOT NULL,           -- sequential within conversation
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content         TEXT NOT NULL,
+    content_tokens  INT,                    -- populated by application layer
+    model_used      TEXT,                   -- which model generated this (for assistant turns)
+    metadata        JSONB NOT NULL DEFAULT '{}',  -- tool calls, citations, latency, etc.
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    summarized      BOOLEAN NOT NULL DEFAULT FALSE,  -- has this turn been rolled into a summary?
+    UNIQUE (conversation_id, turn_number)
+);
+
+CREATE INDEX idx_messages_conversation_turn
+    ON messages (conversation_id, turn_number DESC);
+
+CREATE INDEX idx_messages_unsummarized
+    ON messages (conversation_id, turn_number)
+    WHERE summarized = FALSE;
+
+-- Rolling summaries — one or more per conversation
+CREATE TABLE conversation_summaries (
+    id                  BIGSERIAL PRIMARY KEY,
+    conversation_id     UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    summary_version     INT NOT NULL DEFAULT 1,  -- increments on each regeneration
+    turn_range_start    INT NOT NULL,            -- first turn number covered
+    turn_range_end      INT NOT NULL,            -- last turn number covered
+    content             TEXT NOT NULL,           -- the summary text
+    content_tokens      INT,
+    model_used          TEXT NOT NULL,
+    generation_latency_ms INT,
+    is_current          BOOLEAN NOT NULL DEFAULT TRUE,
+    embedding           VECTOR(1536),            -- embed the summary for semantic retrieval
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (conversation_id, summary_version)
+);
+
+CREATE INDEX idx_summaries_conversation_current
+    ON conversation_summaries (conversation_id, summary_version DESC)
+    WHERE is_current = TRUE;
+
+CREATE INDEX idx_summaries_embedding
+    ON conversation_summaries USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Per-message embeddings for semantic recall (Tier 3)
+CREATE TABLE message_embeddings (
+    message_id      BIGINT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    embedding       VECTOR(1536) NOT NULL,
+    model_used      TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_message_embeddings_vec
+    ON message_embeddings USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Compression job queue — tracks summarization work
+CREATE TABLE summarization_jobs (
+    id                  BIGSERIAL PRIMARY KEY,
+    conversation_id     UUID NOT NULL REFERENCES conversations(id),
+    status              TEXT NOT NULL DEFAULT 'pending'
+                        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    trigger_reason      TEXT NOT NULL,  -- 'turn_count', 'token_budget', 'manual', 'scheduled'
+    turns_to_summarize  INT[],          -- array of turn numbers to compress
+    attempt_count       INT NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    scheduled_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at          TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_summarization_jobs_pending
+    ON summarization_jobs (scheduled_at)
+    WHERE status = 'pending';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema is intentionally normalized. Summaries are rows, not JSONB fields buried inside a conversation record. That gives you version history, allows multiple granularities of summary (chapter-level, session-level), and makes it straightforward to query which turns have and haven't been compressed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.2 Trigger-Driven Compression Scheduling</h3>
+
+<p class="text-gray-300 leading-relaxed">The best compression pipelines are invisible to application code. When a message is inserted, a database trigger evaluates whether compression is needed and enqueues a job if so. The application doesn't make that decision — the database does, consistently, every time.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Function to count unsummarized tokens and decide whether to enqueue compression
+CREATE OR REPLACE FUNCTION estimate_message_tokens(content TEXT)
+RETURNS INT
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    -- Rough approximation: 1 token ≈ 4 characters for English
+    -- Replace with a more precise calculation if needed
+    SELECT greatest(1, length(content) / 4);
+$$;
+
+CREATE OR REPLACE FUNCTION update_conversation_stats()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE conversations
+    SET
+        message_count      = message_count + 1,
+        last_active_at     = now(),
+        total_tokens_used  = total_tokens_used + COALESCE(NEW.content_tokens, estimate_message_tokens(NEW.content))
+    WHERE id = NEW.conversation_id;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_update_conversation_stats
+    AFTER INSERT ON messages
+    FOR EACH ROW
+    EXECUTE FUNCTION update_conversation_stats();
+
+-- Core compression scheduler: enqueues a job when unsummarized turns exceed threshold
+CREATE OR REPLACE FUNCTION maybe_schedule_summarization()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_unsummarized_count    INT;
+    v_unsummarized_tokens   BIGINT;
+    v_turn_threshold        INT     := 15;   -- summarize after 15 unsummarized turns
+    v_token_threshold       INT     := 6000; -- or after ~6k unsummarized tokens
+    v_keep_verbatim         INT     := 6;    -- always keep last 6 turns verbatim
+    v_turns_to_summarize    INT[];
+    v_pending_exists        BOOLEAN;
+BEGIN
+    -- Don't schedule if there's already a pending job for this conversation
+    SELECT EXISTS (
+        SELECT 1 FROM summarization_jobs
+        WHERE conversation_id = NEW.conversation_id
+          AND status IN ('pending', 'running')
+    ) INTO v_pending_exists;
+
+    IF v_pending_exists THEN
+        RETURN NEW;
+    END IF;
+
+    -- Count unsummarized turns, excluding the most recent ones we want to keep verbatim
+    SELECT
+        COUNT(*),
+        COALESCE(SUM(COALESCE(content_tokens, estimate_message_tokens(content))), 0)
+    INTO v_unsummarized_count, v_unsummarized_tokens
+    FROM messages m
+    WHERE m.conversation_id = NEW.conversation_id
+      AND m.summarized = FALSE
+      AND m.turn_number &lt; (
+          SELECT turn_number
+          FROM messages
+          WHERE conversation_id = NEW.conversation_id
+          ORDER BY turn_number DESC
+          LIMIT 1 OFFSET (v_keep_verbatim - 1)
+      );
+
+    -- Check if we've crossed either threshold
+    IF v_unsummarized_count &gt;= v_turn_threshold OR v_unsummarized_tokens &gt;= v_token_threshold THEN
+
+        -- Collect the turn numbers that need summarizing
+        SELECT array_agg(turn_number ORDER BY turn_number)
+        INTO v_turns_to_summarize
+        FROM messages m
+        WHERE m.conversation_id = NEW.conversation_id
+          AND m.summarized = FALSE
+          AND m.turn_number &lt; (
+              SELECT turn_number
+              FROM messages
+              WHERE conversation_id = NEW.conversation_id
+              ORDER BY turn_number DESC
+              LIMIT 1 OFFSET (v_keep_verbatim - 1)
+          );
+
+        INSERT INTO summarization_jobs (
+            conversation_id,
+            trigger_reason,
+            turns_to_summarize
+        ) VALUES (
+            NEW.conversation_id,
+            CASE
+                WHEN v_unsummarized_tokens &gt;= v_token_threshold THEN 'token_budget'
+                ELSE 'turn_count'
+            END,
+            v_turns_to_summarize
+        );
+
+        -- Notify the async worker via pg_notify
+        PERFORM pg_notify(
+            'summarization_needed',
+            json_build_object(
+                'conversation_id', NEW.conversation_id,
+                'turn_count',      v_unsummarized_count,
+                'token_estimate',  v_unsummarized_tokens
+            )::text
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_maybe_schedule_summarization
+    AFTER INSERT ON messages
+    FOR EACH ROW
+    WHEN (NEW.role IN ('assistant', 'user'))  -- don't trigger on system/tool messages
+    EXECUTE FUNCTION maybe_schedule_summarization();
+
+-- Helper view: what context should be assembled for a given conversation?
+CREATE OR REPLACE VIEW conversation_context AS
+SELECT
+    c.id AS conversation_id,
+    c.user_id,
+    -- Current summary (if any)
+    cs.content           AS summary_text,
+    cs.turn_range_start  AS summary_covers_from,
+    cs.turn_range_end    AS summary_covers_to,
+    -- Recent verbatim turns
+    (
+        SELECT json_agg(
+            json_build_object(
+                'role',       m.role,
+                'content',    m.content,
+                'turn',       m.turn_number,
+                'created_at', m.created_at
+            )
+            ORDER BY m.turn_number
+        )
+        FROM messages m
+        WHERE m.conversation_id = c.id
+          AND m.summarized = FALSE
+    ) AS recent_turns,
+    c.message_count,
+    c.last_active_at
+FROM conversations c
+LEFT JOIN conversation_summaries cs
+    ON cs.conversation_id = c.id
+    AND cs.is_current = TRUE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> call at the end of the trigger is what connects the database event to your async Python worker. The trigger does the decision-making; the worker does the expensive LLM call. This separation means your INSERT latency is unaffected by summarization time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">11.3 The Summarization Worker</h3>
+
+<p class="text-gray-300 leading-relaxed">The async worker listens on the PostgreSQL notification channel and processes jobs when they appear. It uses Celery for retry logic and Claude or GPT-4o for the actual summarization, then writes the result back and marks messages as summarized — atomically.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
