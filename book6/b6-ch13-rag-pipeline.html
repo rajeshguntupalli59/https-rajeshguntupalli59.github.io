@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 13: End-to-End RAG Pipeline with PostgreSQL — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 13: End-to-End RAG Pipeline with PostgreSQL. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 13 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 13: End-to-End RAG Pipeline with PostgreSQL</h2>
+
+<p class="text-gray-300 leading-relaxed">Retrieval-Augmented Generation is where most PostgreSQL teams start their AI journey, and for good reason: you already have the data, you already trust the database, and pgvector gives you a production-grade vector store without spinning up yet another infrastructure component. But most RAG tutorials stop at the happy path — embed some text, store a vector, run a similarity search, hand it to the LLM. Real RAG pipelines have ingestion queues, metadata filtering, reranking, caching, multi-tenant isolation, citation tracking, and observability. This chapter builds the entire stack from raw document to grounded LLM response, using PostgreSQL as the backbone at every layer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.1 Designing the RAG Schema</h3>
+
+<p class="text-gray-300 leading-relaxed">Before writing a single line of Python, the schema design determines everything. A well-designed RAG schema handles the full document lifecycle: ingestion status, chunking, embedding storage, retrieval metadata, and answer audit trails. Getting this wrong means rebuilding under production load.</p>
+
+<p class="text-gray-300 leading-relaxed">The core tables form a directed graph: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">documents</code> → <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> → <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chunk_embeddings</code>. A separate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">retrieval_log</code> table captures what was retrieved for each query, enabling offline evaluation of retrieval quality. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">conversations</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">conversation_turns</code> tables store the multi-turn context that transforms a one-shot Q&A system into an actual assistant.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Complete RAG schema with production-ready structure
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;    -- for hybrid text search
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Tenants table for multi-tenant RAG deployments
+CREATE TABLE tenants (
+    tenant_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name            TEXT NOT NULL UNIQUE,
+    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    llm_model       TEXT NOT NULL DEFAULT 'gpt-4o',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Source document registry
+CREATE TABLE documents (
+    document_id     UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    title           TEXT NOT NULL,
+    source_uri      TEXT,                          -- s3://, file://, https://
+    content_type    TEXT NOT NULL DEFAULT 'text/plain',
+    raw_content     TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',   -- author, tags, version, etc.
+    word_count      INTEGER,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending','processing','embedded','failed')),
+    error_detail    TEXT,
+    ingested_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_documents_tenant     ON documents(tenant_id);
+CREATE INDEX idx_documents_status     ON documents(status);
+CREATE INDEX idx_documents_metadata   ON documents USING GIN(metadata);
+
+-- Chunks produced from each document
+CREATE TABLE document_chunks (
+    chunk_id        UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    document_id     UUID NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    chunk_index     INTEGER NOT NULL,              -- position within document
+    content         TEXT NOT NULL,
+    token_count     INTEGER,
+    chunk_metadata  JSONB NOT NULL DEFAULT '{}',   -- page_number, section, etc.
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(document_id, chunk_index)
+);
+
+CREATE INDEX idx_chunks_document   ON document_chunks(document_id);
+CREATE INDEX idx_chunks_tenant     ON document_chunks(tenant_id);
+-- GIN index for keyword fallback search
+CREATE INDEX idx_chunks_content_fts ON document_chunks
+    USING GIN(to_tsvector('english', content));
+-- Trigram index for fuzzy matching
+CREATE INDEX idx_chunks_trgm ON document_chunks USING GIN(content gin_trgm_ops);
+
+-- Embedding storage — separate table allows model migrations
+CREATE TABLE chunk_embeddings (
+    embedding_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    chunk_id        UUID NOT NULL REFERENCES document_chunks(chunk_id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    model_name      TEXT NOT NULL,
+    embedding       vector(1536),                  -- OpenAI small; adjust per model
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(chunk_id, model_name)
+);
+
+-- IVFFlat index — tune lists based on row count (rows / 1000, min 10)
+CREATE INDEX idx_embeddings_vector ON chunk_embeddings
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Conversations
+CREATE TABLE conversations (
+    conversation_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    user_id         TEXT,
+    title           TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_active_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE conversation_turns (
+    turn_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    conversation_id UUID NOT NULL REFERENCES conversations(conversation_id),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    role            TEXT NOT NULL CHECK (role IN ('user','assistant','system')),
+    content         TEXT NOT NULL,
+    turn_index      INTEGER NOT NULL,
+    model_used      TEXT,
+    prompt_tokens   INTEGER,
+    completion_tokens INTEGER,
+    latency_ms      INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_turns_conversation ON conversation_turns(conversation_id, turn_index);
+
+-- Retrieval audit: what did we retrieve for each query?
+CREATE TABLE retrieval_log (
+    retrieval_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    turn_id         UUID REFERENCES conversation_turns(turn_id),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    query_text      TEXT NOT NULL,
+    query_embedding vector(1536),
+    retrieved_chunks JSONB NOT NULL DEFAULT '[]', -- [{chunk_id, score, rank}]
+    retrieval_strategy TEXT,                      -- 'vector','hybrid','reranked'
+    retrieval_ms    INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Row-level security: each tenant sees only their own data
+ALTER TABLE documents         ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_chunks   ENABLE ROW LEVEL SECURITY;
+ALTER TABLE chunk_embeddings  ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversations     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversation_turns ENABLE ROW LEVEL SECURITY;
+ALTER TABLE retrieval_log     ENABLE ROW LEVEL SECURITY;
+
+-- RLS policies use app.current_tenant_id set per connection
+CREATE POLICY tenant_isolation ON documents
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON document_chunks
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON chunk_embeddings
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON conversations
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON conversation_turns
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+CREATE POLICY tenant_isolation ON retrieval_log
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The separation of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chunk_embeddings</code> pays off immediately when you want to re-embed with a new model. You keep the same chunks, add new rows to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chunk_embeddings</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model_name = 'text-embedding-3-large'</code>, and can run both models in parallel during a migration without touching the chunking logic. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">retrieval_log</code> table is underused in most systems but is the foundation of offline RAG evaluation — once you have it, you can compute MRR and NDCG against ground-truth queries without any external tooling.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.2 Async Document Ingestion Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">Ingestion is where RAG systems fall apart in production. Synchronous ingestion — a user uploads a document and waits for the API to embed it — fails immediately at scale. PDFs take variable amounts of time to parse, embedding APIs have rate limits, and a single large document might produce hundreds of chunks requiring dozens of API calls. The answer is a Celery-based async pipeline where the API accepts documents immediately, writes to PostgreSQL, and notifies workers via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># ingestion/tasks.py — Celery worker for document processing
+
+import os
+import re
+import hashlib
+import asyncio
+from typing import Optional
+from uuid import UUID
+
+import psycopg2
+import psycopg2.extras
+from celery import Celery
+from openai import OpenAI
+import tiktoken
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+REDIS_URL    = os.environ["REDIS_URL"]
+
+app = Celery("rag_ingestion", broker=REDIS_URL, backend=REDIS_URL)
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+tokenizer = tiktoken.get_encoding("cl100k_base")
+
+# ── Chunking ──────────────────────────────────────────────────────────────────
+
+def chunk_text(
+    text: str,
+    chunk_size: int = 512,
+    overlap: int = 64,
+) -&gt; list[dict]:
+    """
+    Token-aware chunking with overlap.
+    Returns list of {content, token_count, chunk_index}.
+    """
+    tokens = tokenizer.encode(text)
+    chunks = []
+    start = 0
+    idx = 0
+
+    while start &lt; len(tokens):
+        end = min(start + chunk_size, len(tokens))
+        chunk_tokens = tokens[start:end]
+        chunk_text = tokenizer.decode(chunk_tokens)
+        chunks.append({
+            "content":     chunk_text,
+            "token_count": len(chunk_tokens),
+            "chunk_index": idx,
+        })
+        start += chunk_size - overlap
+        idx   += 1
+
+    return chunks
+
+
+# ── Embedding ─────────────────────────────────────────────────────────────────
+
+def embed_batch(texts: list[str], model: str = "text-embedding-3-small") -&gt; list[list[float]]:
+    """Embed a batch of texts, respecting OpenAI batch limits."""
+    response = openai_client.embeddings.create(input=texts, model=model)
+    return [item.embedding for item in response.data]
+
+
+# ── Main Celery task ──────────────────────────────────────────────────────────
+
+@app.task(
+    bind=True,
+    autoretry_for=(Exception,),
+    retry_backoff=True,
+    retry_backoff_max=300,
+    max_retries=5,
+    name="ingestion.process_document",
+)
+def process_document(self, document_id: str, tenant_id: str):
+    """
+    Full ingestion pipeline for a single document:
+    1. Mark as processing
+    2. Load raw content
+    3. Chunk
+    4. Insert chunks
+    5. Embed in batches
+    6. Insert embeddings
+    7. Mark as embedded, notify via pg_notify
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = False
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+
+            # ── 1. Lock and mark processing ───────────────────────────────
+            cur.execute("""
+                UPDATE documents
+                SET    status = 'processing', updated_at = NOW()
+                WHERE  document_id = %s AND status = 'pending'
+                RETURNING document_id, raw_content, metadata, title
+            """, (document_id,))
+            row = cur.fetchone()
+
+            if not row:
+                # Already picked up by another worker, idempotent exit
+                return {"skipped": True, "document_id": document_id}
+
+            raw_content = row["raw_content"]
+            if not raw_content or not raw_content.strip():
+                raise ValueError("Document has no content to process")
+
+            conn.commit()
+
+            # ── 2. Chunk ──────────────────────────────────────────────────
+            chunks = chunk_text(raw_content, chunk_size=512, overlap=64)
+
+            # ── 3. Insert chunks ──────────────────────────────────────────
+            chunk_rows = []
+            for chunk in chunks:
+                cur.execute("""
+                    INSERT INTO document_chunks
+                        (document_id, tenant_id, chunk_index, content, token_count)
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING chunk_id
+                """, (
+                    document_id,
+                    tenant_id,
+                    chunk["chunk_index"],
+                    chunk["content"],
+                    chunk["token_count"],
+                ))
+                chunk_id = cur.fetchone()["chunk_id"]
+                chunk_rows.append((chunk_id, chunk["content"]))
+
+            conn.commit()
+
+            # ── 4. Embed in batches of 100 ────────────────────────────────
+            batch_size = 100
+            for i in range(0, len(chunk_rows), batch_size):
+                batch = chunk_rows[i : i + batch_size]
+                chunk_ids = [r[0] for r in batch]
+                texts     = [r[1] for r in batch]
+
+                embeddings = embed_batch(texts, model="text-embedding-3-small")
+
+                for chunk_id, embedding in zip(chunk_ids, embeddings):
+                    cur.execute("""
+                        INSERT INTO chunk_embeddings
+                            (chunk_id, tenant_id, model_name, embedding)
+                        VALUES (%s, %s, %s, %s::vector)
+                        ON CONFLICT (chunk_id, model_name) DO NOTHING
+                    """, (
+                        str(chunk_id),
+                        tenant_id,
+                        "text-embedding-3-small",
+                        str(embedding),
+                    ))
+
+            conn.commit()
+
+            # ── 5. Mark embedded, update word count ───────────────────────
+            word_count = len(raw_content.split())
+            cur.execute("""
+                UPDATE documents
+                SET status      = 'embedded',
+                    word_count  = %s,
+                    ingested_at = NOW(),
+                    updated_at  = NOW()
+                WHERE document_id = %s
+            """, (word_count, document_id))
+
+            # ── 6. Notify downstream listeners ────────────────────────────
+            cur.execute(
+                "SELECT pg_notify('document_embedded', %s)",
+                (f'{{"document_id":"{document_id}","tenant_id":"{tenant_id}"}}',)
+            )
+            conn.commit()
+
+        return {"status": "embedded", "document_id": document_id, "chunks": len(chunks)}
+
+    except Exception as exc:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute("""
+                UPDATE documents
+                SET status = 'failed', error_detail = %s, updated_at = NOW()
+                WHERE document_id = %s
+            """, (str(exc)[:2000], document_id))
+            conn.commit()
+        raise self.retry(exc=exc)
+
+    finally:
+        conn.close()
+
+
+# ── pg_notify listener (run as a separate process) ────────────────────────────
+
+def listen_for_documents():
+    """
+    Listens on 'document_ingestion_requests' channel.
+    External systems drop a document_id and we dispatch to Celery.
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.autocommit = True
+
+    with conn.cursor() as cur:
+        cur.execute("LISTEN document_ingestion_requests;")
+        print("Listening for ingestion requests...")
+
+        import select
+        while True:
+            if select.select([conn], [], [], 30) != ([], [], []):
+                conn.poll()
+                while conn.notifies:
+                    notify = conn.notifies.pop(0)
+                    import json
+                    payload = json.loads(notify.payload)
+                    process_document.delay(
+                        payload["document_id"],
+                        payload["tenant_id"],
+                    )
+                    print(f"Queued: {payload['document_id']}")</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Start the Celery worker with concurrency tuned for I/O-bound embedding calls
+celery -A ingestion.tasks worker \
+  --concurrency=16 \
+  --loglevel=info \
+  --queues=ingestion \
+  --max-tasks-per-child=100
+
+# Start the pg_notify listener in a separate process
+python -m ingestion.listener
+
+# Check worker queue depth
+celery -A ingestion.tasks inspect active
+celery -A ingestion.tasks inspect reserved</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO NOTHING</code> on embedding insertion makes the pipeline idempotent — if a worker crashes mid-batch and Celery retries, you don't get duplicate embeddings or errors. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> at the end of ingestion lets you hook downstream processes (cache invalidation, index rebuilding, webhook delivery) without polling. The listener pattern means any system that can write to PostgreSQL can trigger ingestion — no message broker configuration needed beyond what you already have.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">13.3 Hybrid Retrieval: Vector + Full-Text</h3>
+
+<p class="text-gray-300 leading-relaxed">Pure vector similarity search has a well-documented weakness: it struggles with exact matches. Ask a RAG system about "CVE-2024-1234" or a specific product SKU and cosine similarity between embeddings often retrieves tangentially related chunks rather than the exact document containing that identifier. Hybrid search combines vector similarity with PostgreSQL's full-text search, then applies a reciprocal rank fusion to merge the two result sets.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Stored function for hybrid retrieval with RRF reranking
+-- This runs entirely inside PostgreSQL — no round-trips to Python for ranking
+
+CREATE OR REPLACE FUNCTION hybrid_retrieve(
+    p_tenant_id       UUID,
+    p_query_embedding vector(1536),
+    p_query_text      TEXT,
+    p_top_k           INTEGER DEFAULT 20,
+    p_rrf_k           INTEGER DEFAULT 60,    -- RRF constant, 60 is standard
+    p_metadata_filter JSONB   DEFAULT NULL   -- e.g. '{"source": "manual_v2"}'
+)
+RETURNS TABLE (
+    chunk_id          UUID,
+    document_id       UUID,
+    content           TEXT,
+    chunk_index       INTEGER,
+    chunk_metadata    JSONB,
+    vector_score      FLOAT,
+    fts_score         FLOAT,
+    rrf_score         FLOAT,
+    source_title      TEXT
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    WITH
+
+    -- ── Vector retrieval arm ──────────────────────────────────────────────
+    vector_results AS (
+        SELECT
+            dc.chunk_id,
+            dc.document_id,
+            dc.content,
+            dc.chunk_index,
+            dc.chunk_metadata,
+            1 - (ce.embedding &lt;=&gt; p_query_embedding) AS score,
+            ROW_NUMBER() OVER (
+                ORDER BY ce.embedding &lt;=&gt; p_query_embedding
+            ) AS rank
+        FROM chunk_embeddings ce
+        JOIN document_chunks  dc ON dc.chunk_id   = ce.chunk_id
+        JOIN documents         d ON d.document_id = dc.document_id
+        WHERE ce.tenant_id  = p_tenant_id
+          AND d.status      = 'embedded'
+          AND (p_metadata_filter IS NULL
+               OR d.metadata @&gt; p_metadata_filter)
+        ORDER BY ce.embedding &lt;=&gt; p_query_embedding
+        LIMIT p_top_k * 2    -- retrieve wider set before fusion
+    ),
+
+    -- ── Full-text retrieval arm ───────────────────────────────────────────
+    fts_results AS (
+        SELECT
+            dc.chunk_id,
+            dc.document_id,
+            dc.content,
+            dc.chunk_index,
+            dc.chunk_metadata,
+            ts_rank_cd(
+                to_tsvector('english', dc.content),
+                plainto_tsquery('english', p_query_text)
+            ) AS score,
+            ROW_NUMBER() OVER (
+                ORDER BY ts_rank_cd(
+                    to_tsvector('english', dc.content),
+                    plainto_tsquery('english', p_query_text)
+                ) DESC
+            ) AS rank
+        FROM document_chunks dc
+        JOIN documents         d ON d.document_id = dc.document_id
+        WHERE dc.tenant_id  = p_tenant_id
+          AND d.status      = 'embedded'
+          AND (p_metadata_filter IS NULL
+               OR d.metadata @&gt; p_metadata_filter)
+          AND to_tsvector('english', dc.content)
+              @@ plainto_tsquery('english', p_query_text)
+        ORDER BY score DESC
+        LIMIT p_top_k * 2
+    ),
+
+    -- ── Reciprocal Rank Fusion ────────────────────────────────────────────
+    fused AS (
+        SELECT
+            COALESCE(vr.chunk_id,    fr.chunk_id)    AS chunk_id,
+            COALESCE(vr.document_id, fr.document_id) AS document_id,
+            COALESCE(vr.content,     fr.content)     AS content,
+            COALESCE(vr.chunk_index, fr.chunk_index) AS chunk_index,
+            COALESCE(vr.chunk_metadata, fr.chunk_metadata) AS chunk_metadata,
+            COALESCE(vr.score, 0.0) AS vector_score,
+            COALESCE(fr.score, 0.0) AS fts_score,
+            -- RRF formula: 1/(k + rank) for each arm, summed
+            COALESCE(1.0 / (p_rrf_k + vr.rank), 0) +
+            COALESCE(1.0 / (p_rrf_k + fr.rank), 0) AS rrf_score
+        FROM      vector_results vr
+        FULL JOIN fts_results    fr USING (chunk_id)
+    )
+
+    SELECT
+        f.chunk_id,
+        f.document_id,
+        f.content,
+        f.chunk_index,
+        f.chunk_metadata,
+        f.vector_score,
+        f.fts_score,
+        f.rrf_score,
+        d.title AS source_title
+    FROM fused f
+    JOIN documents d ON d.document_id = f.document_id
+    ORDER BY f.rrf_score DESC
+    LIMIT p_top_k;
+END;
+$$;
+
+
+-- Convenience view: retrieval with document context collapsed
+CREATE OR REPLACE VIEW retrieval_with_context AS
+SELECT
+    hr.*,
+    d.metadata AS document_metadata,
+    d.source_uri
+FROM hybrid_retrieve(
+    NULL::UUID,
+    NULL::vector(1536),
+    '',
+    10
+) hr
+JOIN documents d ON d.document_id = hr.document_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The metadata filter (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">d.metadata @> p_metadata_filter</code>) uses PostgreSQL's JSONB containment operator, meaning you can narrow retrieval to a specific product line, document version, or date range without</p></div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
