@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 15: Query-Time Retrieval: Writing Efficient Vector Queries — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 15: Query-Time Retrieval: Writing Efficient Vector Queries. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 15 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 15: Query-Time Retrieval: Writing Efficient Vector Queries</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector search is only as good as the queries that drive it. Embedding documents into PostgreSQL is the straightforward part — you run text through an embedding model, store the resulting float array, and call it done. The hard part is writing queries that return relevant results fast enough for real users, at real scale, without burning your GPU budget or melting your database under load. This chapter covers the full mechanics of query-time retrieval: how distance operators work and when to choose each one, how to write vector queries that compose cleanly with relational filters, how to tune index behavior at query time, and how to build the retrieval layer of a production RAG system that your database will actually survive serving.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.1 Distance Operators and When Each One Matters</h3>
+
+<p class="text-gray-300 leading-relaxed">pgvector exposes three distance operators, and choosing the wrong one for your embedding model is one of the most common mistakes teams make when moving from prototype to production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cosine distance</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code>) measures the angle between two vectors, ignoring magnitude. Most modern embedding models — OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>, Anthropic's embeddings via Voyage, Cohere's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-v3</code> — produce L2-normalized vectors. For normalized vectors, cosine similarity and dot product similarity are mathematically equivalent: they produce the same ranking. But the operator you choose still matters because the index type that backs it changes performance characteristics.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">L2 distance</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code>) measures Euclidean distance in embedding space. Use this when your model produces unnormalized embeddings or when you're working with embeddings that carry magnitude information you want to preserve — for example, some fine-tuned models where magnitude encodes confidence or frequency.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Negative inner product</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code>) computes the dot product and negates it so that higher similarity means lower operator output (fitting PostgreSQL's ascending sort convention). For normalized vectors, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> rank identically, but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> is slightly faster because it skips the normalization step.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical rule: check your model's documentation. If it says to use cosine similarity (essentially every major API embedding model does), use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code>. If your embeddings are not normalized and you want magnitude-sensitive ranking, use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code>. The following schema demonstrates how to make the operator choice visible and testable:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema: embedding store with operator-aware retrieval functions
+CREATE TABLE document_chunks (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index     INTEGER NOT NULL,
+    content         TEXT NOT NULL,
+    token_count     INTEGER NOT NULL,
+    embedding       VECTOR(1536),           -- OpenAI text-embedding-3-small
+    embedding_model VARCHAR(64) NOT NULL DEFAULT 'text-embedding-3-small',
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(document_id, chunk_index)
+);
+
+-- IVFFlat index for cosine distance (the right choice for OpenAI embeddings)
+CREATE INDEX idx_chunks_embedding_cosine
+    ON document_chunks
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- HNSW index for cosine distance — better recall, higher build cost
+CREATE INDEX idx_chunks_embedding_hnsw
+    ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Basic cosine similarity search
+-- Returns top-k chunks nearest to a query embedding
+CREATE OR REPLACE FUNCTION search_chunks(
+    query_embedding  VECTOR(1536),
+    top_k            INTEGER DEFAULT 10,
+    similarity_threshold FLOAT DEFAULT 0.7
+)
+RETURNS TABLE (
+    id              BIGINT,
+    document_id     BIGINT,
+    content         TEXT,
+    metadata        JSONB,
+    similarity      FLOAT
+)
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT
+        dc.id,
+        dc.document_id,
+        dc.content,
+        dc.metadata,
+        1 - (dc.embedding &lt;=&gt; query_embedding) AS similarity
+    FROM document_chunks dc
+    WHERE dc.embedding IS NOT NULL
+      AND 1 - (dc.embedding &lt;=&gt; query_embedding) &gt;= similarity_threshold
+    ORDER BY dc.embedding &lt;=&gt; query_embedding
+    LIMIT top_k;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Notice that the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code> clause uses a similarity threshold expressed as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1 - distance >= threshold</code>. This is important: a cosine distance of 0.0 means identical vectors (similarity 1.0), and a distance of 2.0 means perfectly opposite (similarity -1.0). Most semantic search applications want results with similarity above 0.7 for meaningful matches. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">similarity_threshold = 0.0</code> disables filtering and returns the nearest neighbors regardless of how far they are — sometimes appropriate when your corpus is small and you always want _something_.</p>
+
+<p class="text-gray-300 leading-relaxed">The distance operators also have different EXPLAIN plan characteristics. Run EXPLAIN ANALYZE against your retrieval queries during development:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inspect the execution plan for a vector search
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT
+    id,
+    content,
+    1 - (embedding &lt;=&gt; '[0.1, 0.2, ...]'::VECTOR(1536)) AS similarity
+FROM document_chunks
+ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::VECTOR(1536)
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When an index is active, you'll see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Index Scan using idx_chunks_embedding_hnsw</code> in the plan. When the query planner falls back to a sequential scan — because the table is too small, statistics are stale, or the query shape doesn't match the index — you'll see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Seq Scan</code> with a much higher actual rows count. Both are correct behavior at different scales; the important thing is knowing which you're getting.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.2 Hybrid Search: Combining Vector and Relational Filters</h3>
+
+<p class="text-gray-300 leading-relaxed">Pure vector search returns the semantically nearest chunks, but production RAG systems almost always have additional constraints. A user asks about Q3 expenses — you want semantically relevant chunks _and_ chunks from financial documents created after a certain date. A multi-tenant SaaS system needs to limit search to chunks belonging to the current tenant. A chatbot for a software product needs to filter by product version.</p>
+
+<p class="text-gray-300 leading-relaxed">These are relational constraints, and they're exactly what PostgreSQL does better than any dedicated vector store. The pattern is called <strong class="text-white">pre-filtering</strong> (apply relational filters before vector ranking) versus <strong class="text-white">post-filtering</strong> (vector rank first, then filter). Pre-filtering is almost always preferable for correctness; post-filtering can miss relevant results if your top-k window is smaller than the filtered result set.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Full schema for multi-tenant document corpus
+CREATE TABLE tenants (
+    id          BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    slug        VARCHAR(64) UNIQUE NOT NULL,
+    plan        VARCHAR(32) NOT NULL DEFAULT 'free'
+);
+
+CREATE TABLE documents (
+    id              BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    tenant_id       BIGINT NOT NULL REFERENCES tenants(id),
+    title           TEXT NOT NULL,
+    source_url      TEXT,
+    doc_type        VARCHAR(64) NOT NULL,   -- 'policy', 'report', 'manual', etc.
+    published_at    TIMESTAMPTZ,
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_documents_tenant ON documents(tenant_id);
+CREATE INDEX idx_documents_type_tenant ON documents(doc_type, tenant_id);
+CREATE INDEX idx_documents_tags ON documents USING gin(tags);
+
+-- Hybrid search function: relational filters + vector similarity
+-- This is the workhorse function for a production RAG retrieval layer
+CREATE OR REPLACE FUNCTION hybrid_search(
+    p_query_embedding   VECTOR(1536),
+    p_tenant_id         BIGINT,
+    p_doc_types         TEXT[]      DEFAULT NULL,
+    p_tags              TEXT[]      DEFAULT NULL,
+    p_published_after   TIMESTAMPTZ DEFAULT NULL,
+    p_top_k             INTEGER     DEFAULT 10,
+    p_min_similarity    FLOAT       DEFAULT 0.65
+)
+RETURNS TABLE (
+    chunk_id        BIGINT,
+    document_id     BIGINT,
+    doc_type        VARCHAR(64),
+    title           TEXT,
+    content         TEXT,
+    metadata        JSONB,
+    published_at    TIMESTAMPTZ,
+    similarity      FLOAT,
+    rank_position   BIGINT
+)
+LANGUAGE sql STABLE PARALLEL SAFE AS $$
+    SELECT
+        dc.id                                            AS chunk_id,
+        d.id                                             AS document_id,
+        d.doc_type,
+        d.title,
+        dc.content,
+        dc.metadata,
+        d.published_at,
+        1 - (dc.embedding &lt;=&gt; p_query_embedding)         AS similarity,
+        ROW_NUMBER() OVER (
+            ORDER BY dc.embedding &lt;=&gt; p_query_embedding
+        )                                                AS rank_position
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    WHERE d.tenant_id = p_tenant_id
+      AND d.is_active = TRUE
+      AND dc.embedding IS NOT NULL
+      AND 1 - (dc.embedding &lt;=&gt; p_query_embedding) &gt;= p_min_similarity
+      AND (p_doc_types IS NULL OR d.doc_type = ANY(p_doc_types))
+      AND (p_tags IS NULL      OR d.tags && p_tags)
+      AND (p_published_after IS NULL OR d.published_at &gt;= p_published_after)
+    ORDER BY dc.embedding &lt;=&gt; p_query_embedding
+    LIMIT p_top_k;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">&&</code> operator on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tags</code> array means "arrays overlap" — the GIN index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">documents.tags</code> makes this fast. Combining a GIN index for the tag filter with an HNSW index for the vector sort produces an efficient plan where PostgreSQL applies the cheap relational filters first, then ranks the survivors by vector distance.</p>
+
+<p class="text-gray-300 leading-relaxed">For scenarios where you also need full-text ranking alongside vector ranking — the full "hybrid" in hybrid search — you can combine <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tsvector</code> BM25 scoring with cosine similarity using Reciprocal Rank Fusion (RRF):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Reciprocal Rank Fusion: blend full-text and vector rankings
+-- RRF score = 1/(k + rank) summed across retrieval methods
+-- k=60 is standard; lower k amplifies differences at the top
+WITH vector_results AS (
+    SELECT
+        dc.id,
+        dc.content,
+        dc.document_id,
+        ROW_NUMBER() OVER (ORDER BY dc.embedding &lt;=&gt; '[...]'::VECTOR(1536)) AS vector_rank
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    WHERE d.tenant_id = 42
+      AND d.is_active = TRUE
+    ORDER BY dc.embedding &lt;=&gt; '[...]'::VECTOR(1536)
+    LIMIT 50   -- candidate pool, wider than final top_k
+),
+fulltext_results AS (
+    SELECT
+        dc.id,
+        dc.content,
+        dc.document_id,
+        ROW_NUMBER() OVER (
+            ORDER BY ts_rank_cd(
+                to_tsvector('english', dc.content),
+                websearch_to_tsquery('english', 'quarterly revenue forecast')
+            ) DESC
+        ) AS text_rank
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    WHERE d.tenant_id = 42
+      AND d.is_active = TRUE
+      AND to_tsvector('english', dc.content)
+          @@ websearch_to_tsquery('english', 'quarterly revenue forecast')
+    LIMIT 50
+),
+rrf_scores AS (
+    SELECT
+        COALESCE(v.id, f.id)              AS chunk_id,
+        COALESCE(v.content, f.content)    AS content,
+        COALESCE(v.document_id, f.document_id) AS document_id,
+        COALESCE(1.0 / (60 + v.vector_rank), 0)  +
+        COALESCE(1.0 / (60 + f.text_rank), 0)    AS rrf_score
+    FROM vector_results v
+    FULL OUTER JOIN fulltext_results f ON v.id = f.id
+)
+SELECT chunk_id, content, document_id, rrf_score
+FROM rrf_scores
+ORDER BY rrf_score DESC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">RRF is model-agnostic and works well across domains without tuning weights. The 60 constant is a smoothing factor that prevents very high-ranked results in one list from completely dominating the final score when they don't appear in the other list.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.3 Index Tuning at Query Time</h3>
+
+<p class="text-gray-300 leading-relaxed">Index configuration is set at CREATE time, but several behaviors can be adjusted per-session or per-query, which is valuable when you need different speed/recall trade-offs for different workloads.</p>
+
+<p class="text-gray-300 leading-relaxed">For HNSW indexes, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code> parameter controls how many candidates the graph search explores. Higher values improve recall at the cost of latency. The default is 40:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tune HNSW recall per session
+-- High-recall mode for offline batch processing or evaluation runs
+SET hnsw.ef_search = 200;
+
+-- Low-latency mode for real-time chat (default is fine here)
+SET hnsw.ef_search = 40;
+
+-- Verify what the planner will use
+SHOW hnsw.ef_search;
+
+-- Per-transaction override (won't persist after COMMIT)
+BEGIN;
+SET LOCAL hnsw.ef_search = 100;
+SELECT * FROM search_chunks('[...]'::VECTOR(1536), 20);
+COMMIT;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For IVFFlat indexes, the analogous parameter is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ivfflat.probes</code> — the number of lists to search. More probes means higher recall but slower queries:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- IVFFlat probe tuning
+-- Rule of thumb: probes = sqrt(lists) for balanced speed/recall
+-- With lists=100, probes=10 is baseline; probes=20 is higher recall
+SET ivfflat.probes = 10;   -- fast, ~85-90% recall
+SET ivfflat.probes = 20;   -- slower, ~95% recall
+SET ivfflat.probes = 100;  -- full scan, 100% recall (defeats the index purpose)
+
+-- Check whether queries are actually using your index
+-- If the planner chooses sequential scan over small result sets, that's correct
+SELECT relname, indexrelname, idx_scan, idx_tup_read, idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE relname = 'document_chunks';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The planner switches between index scan and sequential scan based on statistics and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">enable_indexscan</code> GUC. If you're seeing sequential scans on a large table and you know your HNSW index should be used, run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE document_chunks</code> to refresh statistics. If that doesn't fix it, check whether your query includes any functions that prevent index usage:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- This CAN use the vector index (operator directly on indexed column)
+SELECT id FROM document_chunks
+ORDER BY embedding &lt;=&gt; query_embedding
+LIMIT 10;
+
+-- This CANNOT use the vector index (function wrapping the column)
+-- Don't do this
+SELECT id FROM document_chunks
+ORDER BY vector_distance(embedding, query_embedding)
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Partial indexes are another underused tool. If 90% of your searches target active, non-deleted chunks, a partial index on that subset is smaller, faster to build, and produces better plans:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Partial HNSW index: only active chunks with populated embeddings
+-- Dramatically faster for the 99% case
+CREATE INDEX idx_chunks_active_hnsw
+    ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE embedding IS NOT NULL
+      AND is_deleted = FALSE;
+
+-- The query must match the partial index condition exactly
+-- to get the index scan
+SELECT id, content, 1 - (embedding &lt;=&gt; '[...]'::VECTOR) AS sim
+FROM document_chunks
+WHERE embedding IS NOT NULL
+  AND is_deleted = FALSE
+ORDER BY embedding &lt;=&gt; '[...]'::VECTOR
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.4 Building the Retrieval Layer in Python</h3>
+
+<p class="text-gray-300 leading-relaxed">The query logic above needs to be called from your application. The retrieval layer is the bridge between an LLM request (user question → embedding → SQL → retrieved context → LLM prompt → answer) and PostgreSQL. Here's a production-grade retrieval client using asyncpg, OpenAI for embeddings, and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hybrid_search</code> function defined earlier:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># retrieval/client.py
+# Production retrieval layer: embedding + hybrid search + result formatting
+
+import asyncio
+import hashlib
+import json
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+import asyncpg
+import redis.asyncio as redis
+from openai import AsyncOpenAI
+
+@dataclass
+class RetrievedChunk:
+    chunk_id: int
+    document_id: int
+    doc_type: str
+    title: str
+    content: str
+    metadata: dict
+    published_at: Optional[str]
+    similarity: float
+    rank_position: int
+
+@dataclass
+class RetrievalConfig:
+    top_k: int = 10
+    min_similarity: float = 0.65
+    doc_types: Optional[list[str]] = None
+    tags: Optional[list[str]] = None
+    published_after: Optional[str] = None
+    use_hybrid: bool = True
+    cache_ttl_seconds: int = 300
+
+
+class RetrievalClient:
+    """
+    Query-time retrieval client for PostgreSQL vector search.
+
+    Responsibilities:
+    - Embed the user query using the same model used at ingestion time
+    - Cache embeddings to avoid redundant API calls
+    - Execute hybrid_search via asyncpg
+    - Return structured chunks ready for prompt assembly
+    """
+
+    EMBEDDING_MODEL = "text-embedding-3-small"
+    EMBEDDING_DIMS = 1536
+
+    def __init__(
+        self,
+        pg_pool: asyncpg.Pool,
+        redis_client: redis.Redis,
+        openai_client: AsyncOpenAI,
+    ):
+        self._pool = pg_pool
+        self._redis = redis_client
+        self._openai = openai_client
+
+    async def embed_query(self, text: str) -&gt; list[float]:
+        """
+        Embed a query string, using Redis to cache results.
+        Cache key is a hash of model + text so cache is model-version-safe.
+        """
+        cache_key = "emb:" + hashlib.sha256(
+            f"{self.EMBEDDING_MODEL}:{text}".encode()
+        ).hexdigest()
+
+        cached = await self._redis.get(cache_key)
+        if cached:
+            return json.loads(cached)
+
+        response = await self._openai.embeddings.create(
+            input=text,
+            model=self.EMBEDDING_MODEL,
+        )
+        embedding = response.data[0].embedding
+
+        # Cache for 1 hour — query embeddings are deterministic
+        await self._redis.setex(cache_key, 3600, json.dumps(embedding))
+        return embedding
+
+    def _embedding_to_pg(self, embedding: list[float]) -&gt; str:
+        """Format a Python list as a pgvector literal."""
+        return "[" + ",".join(str(x) for x in embedding) + "]"
+
+    async def retrieve(
+        self,
+        query: str,
+        tenant_id: int,
+        config: Optional[RetrievalConfig] = None,
+    ) -&gt; list[RetrievedChunk]:
+        """
+        Main retrieval entrypoint.
+        Embeds query, runs hybrid_search, returns structured results.
+        """
+        if config is None:
+            config = RetrievalConfig()
+
+        t0 = time.monotonic()
+        embedding = await self.embed_query(query)
+        embed_ms = (time.monotonic() - t0) * 1000
+
+        embedding_literal = self._embedding_to_pg(embedding)
+
+        t1 = time.monotonic()
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    chunk_id, document_id, doc_type, title,
+                    content, metadata, published_at,
+                    similarity, rank_position
+                FROM hybrid_search(
+                    $1::VECTOR,   -- query embedding
+                    $2,           -- tenant_id
+                    $3,           -- doc_types filter
+                    $4,           -- tags filter
+                    $5,           -- published_after filter
+                    $6,           -- top_k
+                    $7            -- min_similarity
+                )
+                """,
+                embedding_literal,
+                tenant_id,
+                config.doc_types,
+                config.tags,
+                config.published_after,
+                config.top_k,
+                config.min_similarity,
+            )
+        query_ms = (time.monotonic() - t1) * 1000
+
+        chunks = [
+            RetrievedChunk(
+                chunk_id=row["chunk_id"],
+                document_id=row["document_id"],
+                doc_type=row["doc_type"],
+                title=row["title"],
+                content=row["content"],
+                metadata=dict(row["metadata"]) if row["metadata"] else {},
+                published_at=str(row["published_at"]) if row["published_after"] else None,
+                similarity=float(row["similarity"]),
+                rank_position=int(row["rank_position"]),
+            )
+            for row in rows
+        ]
+
+        # Structured log for query latency observability
+        print(json.dumps({
+            "event": "retrieval_complete",
+            "tenant_id": tenant_id,
+            "query_preview": query[:80],
+            "embed_ms": round(embed_ms, 1),
+            "query_ms": round(query_ms, 1),
+            "results_count": len(chunks),
+            "top_similarity": chunks[0].similarity if chunks else None,
+        }))
+
+        return chunks
+
+    def format_context_for_prompt(
+        self,
+        chunks: list[RetrievedChunk],
+        max_chars: int = 12000,
+    ) -&gt; str:
+        """
+        Format retrieved chunks into a context block for LLM prompts.
+        Respects a character budget to avoid overflowing context windows.
+        """
+        sections = []
+        total_chars = 0
+
+        for chunk in chunks:
+            header = (
+                f"[Source: {chunk.title} | Type: {chunk.doc_type} "
+                f"| Relevance: {chunk.similarity:.2f}]"
+            )
+            body = chunk.content.strip()
+            section = f"{header}\n{body}"
+            section_chars = len(section)
+
+            if total_chars + section_chars &gt; max_chars:
+                break
+
+            sections.append(section)
+            total_chars += section_chars
+
+        return "\n\n---\n\n".join(sections)
+
+
+# Factory: build the client with connection pools
+async def create_retrieval_client(
+    postgres_dsn: str,
+    redis_url: str,
+    openai_api_key: str,
+) -&gt; RetrievalClient:
+    pg_pool = await asyncpg.create_pool(
+        dsn=postgres_dsn,
+        min_size=5,
+        max_size=20,
+        command_timeout=30,
+    )
+    redis_client = redis.from_url(redis_url, decode_responses=True)
+    openai_client = AsyncOpenAI(api_key=openai_api_key)
+
+    return RetrievalClient(pg_pool, redis_client, openai_client)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Plugging Retrieval into a FastAPI RAG Endpoint</h3>
+
+<p class="text-gray-300 leading-relaxed">The retrieval client needs to live inside a request/response lifecycle. Here's a complete FastAPI</p></div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
