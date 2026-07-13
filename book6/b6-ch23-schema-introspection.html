@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 23: Schema Introspection for AI Query Generation — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 23: Schema Introspection for AI Query Generation. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 23 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 23: Schema Introspection for AI Query Generation</h2>
+
+<p class="text-gray-300 leading-relaxed">When you give an LLM access to a database, the single most important context you can provide is an accurate, well-structured description of what's actually in that database. Schema introspection — the act of reading PostgreSQL's own catalog tables to understand tables, columns, relationships, constraints, indexes, and statistics — transforms a generic language model into a database-aware reasoning engine. This chapter covers how to build that introspection layer: how to extract schema metadata programmatically, how to format it for LLM consumption, how to keep it fresh, and how to wire it into a text-to-SQL pipeline that generates correct queries instead of plausible-sounding ones.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.1 What PostgreSQL Knows About Itself</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL maintains a rich system catalog — a set of internal tables and views that describe every object in every database. Before you can feed schema context to an LLM, you need to understand what's available and how to read it efficiently.</p>
+
+<p class="text-gray-300 leading-relaxed">The primary views you'll use are concentrated in two schemas: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code> (SQL-standard, portable) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_catalog</code> (PostgreSQL-native, more complete). For AI query generation, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_catalog</code> wins on depth. It exposes foreign key relationships, index structures, table statistics, and column-level statistics that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code> either omits or buries.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Foundational catalog query: tables, columns, types, nullability, defaults
+-- Run this to understand your schema extraction baseline
+SELECT
+    t.table_schema,
+    t.table_name,
+    c.column_name,
+    c.ordinal_position,
+    c.data_type,
+    c.udt_name,                          -- actual type name (e.g., vector, jsonb, uuid)
+    c.character_maximum_length,
+    c.numeric_precision,
+    c.is_nullable,
+    c.column_default,
+    pg_catalog.col_description(
+        (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass::oid,
+        c.ordinal_position
+    ) AS column_comment
+FROM information_schema.tables t
+JOIN information_schema.columns c
+    ON t.table_schema = c.table_schema
+    AND t.table_name = c.table_name
+WHERE t.table_schema NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+    AND t.table_type = 'BASE TABLE'
+ORDER BY t.table_schema, t.table_name, c.ordinal_position;
+
+-- Foreign key relationships — the relational structure LLMs need for JOINs
+SELECT
+    tc.table_schema,
+    tc.table_name,
+    kcu.column_name,
+    ccu.table_schema AS foreign_table_schema,
+    ccu.table_name   AS foreign_table_name,
+    ccu.column_name  AS foreign_column_name,
+    tc.constraint_name,
+    rc.update_rule,
+    rc.delete_rule
+FROM information_schema.table_constraints tc
+JOIN information_schema.key_column_usage kcu
+    ON tc.constraint_name = kcu.constraint_name
+    AND tc.table_schema = kcu.table_schema
+JOIN information_schema.referential_constraints rc
+    ON tc.constraint_name = rc.constraint_name
+JOIN information_schema.constraint_column_usage ccu
+    ON ccu.constraint_name = rc.unique_constraint_name
+WHERE tc.constraint_type = 'FOREIGN KEY'
+ORDER BY tc.table_schema, tc.table_name;
+
+-- Check constraints — important for telling LLMs what values are legal
+SELECT
+    tc.table_schema,
+    tc.table_name,
+    tc.constraint_name,
+    cc.check_clause
+FROM information_schema.table_constraints tc
+JOIN information_schema.check_constraints cc
+    ON tc.constraint_name = cc.constraint_name
+WHERE tc.constraint_type = 'CHECK'
+    AND tc.table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY tc.table_schema, tc.table_name;
+
+-- Index information — helps LLM understand what columns are fast to filter on
+SELECT
+    schemaname,
+    tablename,
+    indexname,
+    indexdef,
+    pg_catalog.pg_relation_size(indexname::regclass) AS index_size_bytes
+FROM pg_catalog.pg_indexes
+WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY schemaname, tablename, indexname;
+
+-- Table row counts and size estimates — context for query planning explanations
+SELECT
+    schemaname,
+    relname AS tablename,
+    n_live_tup AS estimated_row_count,
+    pg_catalog.pg_total_relation_size(relid) AS total_size_bytes,
+    last_analyze,
+    last_autoanalyze
+FROM pg_catalog.pg_stat_user_tables
+ORDER BY n_live_tup DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">col_description</code> function deserves attention. It reads the comments you set with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COMMENT ON COLUMN</code>, and those comments become some of the highest-value context you can give an LLM. A column named <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">amt</code> is ambiguous. A column named <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">amt</code> with the comment "Invoice amount in USD cents, always positive" tells the LLM exactly how to use it in a query.</p>
+
+<p class="text-gray-300 leading-relaxed">Add comments to your production tables specifically because you're building an AI layer:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Make your schema self-documenting for LLM consumption
+COMMENT ON TABLE orders IS 'Customer purchase orders. Each row is one order placed via the web app or API.';
+COMMENT ON COLUMN orders.status IS 'Order lifecycle state: pending, confirmed, shipped, delivered, cancelled, refunded';
+COMMENT ON COLUMN orders.total_cents IS 'Order total in USD cents (divide by 100 for display). Includes tax, excludes shipping.';
+COMMENT ON COLUMN orders.customer_id IS 'FK to customers.id. Never null — orders always belong to a customer.';
+COMMENT ON COLUMN orders.metadata IS 'JSONB bag for flexible attributes: promo codes, A/B variants, partner data. Schema varies.';
+
+-- Enum types — LLMs need to know legal values
+COMMENT ON TYPE order_status_enum IS 'Valid values: pending, confirmed, shipped, delivered, cancelled, refunded';
+
+-- Views are queryable too — document them clearly
+COMMENT ON VIEW active_subscriptions IS 
+    'Current active subscriptions only. Excludes cancelled and expired. 
+     Joins subscriptions + customers + plans. Use this instead of raw subscriptions table for most queries.';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.2 Building the Schema Introspection Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">A schema introspection layer has three responsibilities: extract metadata from the catalog, format it for LLM consumption, and cache it so you're not running catalog queries on every user request. Here's a production-ready implementation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># schema_introspector.py
+# Full schema introspection pipeline: PostgreSQL catalog → structured metadata → LLM context
+
+import asyncio
+import hashlib
+import json
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Optional
+
+import asyncpg
+import redis.asyncio as redis
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+
+class ColumnMetadata(BaseModel):
+    name: str
+    data_type: str
+    udt_name: str  # actual PostgreSQL type (vector, jsonb, uuid, etc.)
+    is_nullable: bool
+    column_default: Optional[str]
+    comment: Optional[str]
+    is_primary_key: bool = False
+    is_foreign_key: bool = False
+    foreign_table: Optional[str] = None
+    foreign_column: Optional[str] = None
+
+
+class IndexMetadata(BaseModel):
+    name: str
+    definition: str
+    size_bytes: int
+
+
+class TableMetadata(BaseModel):
+    schema_name: str
+    table_name: str
+    table_comment: Optional[str]
+    columns: list[ColumnMetadata]
+    indexes: list[IndexMetadata]
+    foreign_keys: list[dict]
+    check_constraints: list[str]
+    estimated_row_count: int
+    total_size_bytes: int
+
+
+class SchemaMetadata(BaseModel):
+    database_name: str
+    extracted_at: datetime
+    tables: list[TableMetadata]
+    schema_hash: str  # for cache invalidation
+
+
+class SchemaIntrospector:
+    """
+    Extracts PostgreSQL schema metadata and formats it for LLM context injection.
+    Caches results in Redis to avoid catalog overhead on every query.
+    """
+
+    CACHE_TTL_SECONDS = 300  # 5 minutes — adjust based on schema change frequency
+    CACHE_KEY_PREFIX = "schema_meta:"
+
+    def __init__(self, dsn: str, redis_url: str, target_schemas: list[str] = None):
+        self.dsn = dsn
+        self.redis_url = redis_url
+        self.target_schemas = target_schemas or ["public"]
+        self._pool: Optional[asyncpg.Pool] = None
+        self._redis: Optional[redis.Redis] = None
+
+    async def initialize(self):
+        self._pool = await asyncpg.create_pool(self.dsn, min_size=2, max_size=5)
+        self._redis = redis.from_url(self.redis_url, encoding="utf-8", decode_responses=True)
+
+    async def close(self):
+        if self._pool:
+            await self._pool.close()
+        if self._redis:
+            await self._redis.aclose()
+
+    async def get_schema_metadata(self, force_refresh: bool = False) -&gt; SchemaMetadata:
+        """Main entry point. Returns cached metadata or extracts fresh."""
+        cache_key = f"{self.CACHE_KEY_PREFIX}{':'.join(sorted(self.target_schemas))}"
+
+        if not force_refresh:
+            cached = await self._redis.get(cache_key)
+            if cached:
+                logger.debug("Schema metadata served from cache")
+                return SchemaMetadata.model_validate_json(cached)
+
+        logger.info("Extracting schema metadata from PostgreSQL catalog")
+        metadata = await self._extract_metadata()
+
+        await self._redis.setex(
+            cache_key,
+            self.CACHE_TTL_SECONDS,
+            metadata.model_dump_json(),
+        )
+        return metadata
+
+    async def _extract_metadata(self) -&gt; SchemaMetadata:
+        async with self._pool.acquire() as conn:
+            # Run all extractions in parallel for speed
+            tables_data, fk_data, check_data, index_data, stats_data, pk_data = await asyncio.gather(
+                self._fetch_columns(conn),
+                self._fetch_foreign_keys(conn),
+                self._fetch_check_constraints(conn),
+                self._fetch_indexes(conn),
+                self._fetch_table_stats(conn),
+                self._fetch_primary_keys(conn),
+            )
+
+        db_name = await self._get_database_name()
+        tables = self._assemble_tables(
+            tables_data, fk_data, check_data, index_data, stats_data, pk_data
+        )
+
+        schema_json = json.dumps([t.model_dump(mode="json") for t in tables], default=str)
+        schema_hash = hashlib.sha256(schema_json.encode()).hexdigest()[:12]
+
+        return SchemaMetadata(
+            database_name=db_name,
+            extracted_at=datetime.utcnow(),
+            tables=tables,
+            schema_hash=schema_hash,
+        )
+
+    async def _fetch_columns(self, conn: asyncpg.Connection) -&gt; list[dict]:
+        placeholders = ",".join(f"${i+1}" for i in range(len(self.target_schemas)))
+        query = f"""
+            SELECT
+                t.table_schema,
+                t.table_name,
+                pg_catalog.obj_description(
+                    (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass::oid,
+                    'pg_class'
+                ) AS table_comment,
+                c.column_name,
+                c.ordinal_position,
+                c.data_type,
+                c.udt_name,
+                c.is_nullable = 'YES' AS is_nullable,
+                c.column_default,
+                pg_catalog.col_description(
+                    (quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass::oid,
+                    c.ordinal_position
+                ) AS column_comment
+            FROM information_schema.tables t
+            JOIN information_schema.columns c
+                ON t.table_schema = c.table_schema
+                AND t.table_name = c.table_name
+            WHERE t.table_schema IN ({placeholders})
+                AND t.table_type = 'BASE TABLE'
+            ORDER BY t.table_schema, t.table_name, c.ordinal_position
+        """
+        rows = await conn.fetch(query, *self.target_schemas)
+        return [dict(r) for r in rows]
+
+    async def _fetch_foreign_keys(self, conn: asyncpg.Connection) -&gt; list[dict]:
+        placeholders = ",".join(f"${i+1}" for i in range(len(self.target_schemas)))
+        query = f"""
+            SELECT
+                tc.table_schema,
+                tc.table_name,
+                kcu.column_name,
+                ccu.table_schema AS foreign_table_schema,
+                ccu.table_name   AS foreign_table_name,
+                ccu.column_name  AS foreign_column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.referential_constraints rc
+                ON tc.constraint_name = rc.constraint_name
+            JOIN information_schema.constraint_column_usage ccu
+                ON ccu.constraint_name = rc.unique_constraint_name
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+                AND tc.table_schema IN ({placeholders})
+        """
+        rows = await conn.fetch(query, *self.target_schemas)
+        return [dict(r) for r in rows]
+
+    async def _fetch_primary_keys(self, conn: asyncpg.Connection) -&gt; list[dict]:
+        placeholders = ",".join(f"${i+1}" for i in range(len(self.target_schemas)))
+        query = f"""
+            SELECT
+                tc.table_schema,
+                tc.table_name,
+                kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+                AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+                AND tc.table_schema IN ({placeholders})
+        """
+        rows = await conn.fetch(query, *self.target_schemas)
+        return [dict(r) for r in rows]
+
+    async def _fetch_check_constraints(self, conn: asyncpg.Connection) -&gt; list[dict]:
+        placeholders = ",".join(f"${i+1}" for i in range(len(self.target_schemas)))
+        query = f"""
+            SELECT
+                tc.table_schema,
+                tc.table_name,
+                cc.check_clause
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.check_constraints cc
+                ON tc.constraint_name = cc.constraint_name
+                AND tc.table_schema = cc.constraint_schema
+            WHERE tc.constraint_type = 'CHECK'
+                AND tc.table_schema IN ({placeholders})
+        """
+        rows = await conn.fetch(query, *self.target_schemas)
+        return [dict(r) for r in rows]
+
+    async def _fetch_indexes(self, conn: asyncpg.Connection) -&gt; list[dict]:
+        placeholders = ",".join(f"${i+1}" for i in range(len(self.target_schemas)))
+        query = f"""
+            SELECT
+                schemaname,
+                tablename,
+                indexname,
+                indexdef,
+                COALESCE(pg_catalog.pg_relation_size(
+                    (quote_ident(schemaname) || '.' || quote_ident(indexname))::regclass
+                ), 0) AS index_size_bytes
+            FROM pg_catalog.pg_indexes
+            WHERE schemaname IN ({placeholders})
+            ORDER BY schemaname, tablename, indexname
+        """
+        rows = await conn.fetch(query, *self.target_schemas)
+        return [dict(r) for r in rows]
+
+    async def _fetch_table_stats(self, conn: asyncpg.Connection) -&gt; list[dict]:
+        placeholders = ",".join(f"${i+1}" for i in range(len(self.target_schemas)))
+        query = f"""
+            SELECT
+                schemaname,
+                relname AS tablename,
+                n_live_tup AS estimated_row_count,
+                pg_catalog.pg_total_relation_size(relid) AS total_size_bytes
+            FROM pg_catalog.pg_stat_user_tables
+            WHERE schemaname IN ({placeholders})
+        """
+        rows = await conn.fetch(query, *self.target_schemas)
+        return [dict(r) for r in rows]
+
+    async def _get_database_name(self) -&gt; str:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("SELECT current_database()")
+
+    def _assemble_tables(
+        self,
+        columns_data: list[dict],
+        fk_data: list[dict],
+        check_data: list[dict],
+        index_data: list[dict],
+        stats_data: list[dict],
+        pk_data: list[dict],
+    ) -&gt; list[TableMetadata]:
+        # Build lookup structures
+        fk_lookup: dict[tuple, list] = {}
+        for fk in fk_data:
+            key = (fk["table_schema"], fk["table_name"])
+            fk_lookup.setdefault(key, []).append(fk)
+
+        pk_lookup: dict[tuple, set] = {}
+        for pk in pk_data:
+            key = (pk["table_schema"], pk["table_name"])
+            pk_lookup.setdefault(key, set()).add(pk["column_name"])
+
+        check_lookup: dict[tuple, list] = {}
+        for cc in check_data:
+            key = (cc["table_schema"], cc["table_name"])
+            check_lookup.setdefault(key, []).append(cc["check_clause"])
+
+        index_lookup: dict[tuple, list] = {}
+        for idx in index_data:
+            key = (idx["schemaname"], idx["tablename"])
+            index_lookup.setdefault(key, []).append(idx)
+
+        stats_lookup: dict[tuple, dict] = {}
+        for stat in stats_data:
+            key = (stat["schemaname"], stat["tablename"])
+            stats_lookup[key] = stat
+
+        # Group columns by table
+        tables_dict: dict[tuple, dict] = {}
+        for row in columns_data:
+            key = (row["table_schema"], row["table_name"])
+            if key not in tables_dict:
+                tables_dict[key] = {
+                    "schema_name": row["table_schema"],
+                    "table_name": row["table_name"],
+                    "table_comment": row["table_comment"],
+                    "columns": [],
+                }
+            tables_dict[key]["columns"].append(row)
+
+        result = []
+        for key, tdata in tables_dict.items():
+            fks = fk_lookup.get(key, [])
+            fk_columns = {fk["column_name"]: fk for fk in fks}
+            pks = pk_lookup.get(key, set())
+            stats = stats_lookup.get(key, {})
+            raw_indexes = index_lookup.get(key, [])
+
+            columns = []
+            for col in tdata["columns"]:
+                fk_info = fk_columns.get(col["column_name"])
+                columns.append(ColumnMetadata(
+                    name=col["column_name"],
+                    data_type=col["data_type"],
+                    udt_name=col["udt_name"],
+                    is_nullable=col["is_nullable"],
+                    column_default=col["column_default"],
+                    comment=col["column_comment"],
+                    is_primary_key=col["column_name"] in pks,
+                    is_foreign_key=fk_info is not None,
+                    foreign_table=f"{fk_info['foreign_table_schema']}.{fk_info['foreign_table_name']}" if fk_info else None,
+                    foreign_column=fk_info["foreign_column_name"] if fk_info else None,
+                ))
+
+            indexes = [
+                IndexMetadata(
+                    name=idx["indexname"],
+                    definition=idx["indexdef"],
+                    size_bytes=idx["index_size_bytes"],
+                )
+                for idx in raw_indexes
+            ]
+
+            result.append(TableMetadata(
+                schema_name=key[0],
+                table_name=key[1],
+                table_comment=tdata["table_comment"],
+                columns=columns,
+                indexes=indexes,
+                foreign_keys=fks,
+                check_constraints=check_lookup.get(key, []),
+                estimated_row_count=stats.get("estimated_row_count", 0),
+                total_size_bytes=stats.get("total_size_bytes", 0),
+            ))
+
+        return sorted(result, key=lambda t: (t.schema_name, t.table_name))</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.3 Formatting Schema Context for LLM Consumption</h3>
+
+<p class="text-gray-300 leading-relaxed">Raw metadata is not LLM context. You need a formatter that converts structured metadata into text or structured representations that maximize LLM comprehension while fitting within context window limits. Different tasks need different formats: a CREATE TABLE style representation for SQL generation differs from a JSON-Schema style for JSON output tasks.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
