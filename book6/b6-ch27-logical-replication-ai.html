@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 27: Logical Replication for Real-Time AI Triggers — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 27: Logical Replication for Real-Time AI Triggers. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 27 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 27: Logical Replication for Real-Time AI Triggers</h2>
+
+<p class="text-gray-300 leading-relaxed">Real-time AI systems live or die by the freshness of their context. When a customer updates their profile, your recommendation engine should know immediately. When a support ticket changes status, your AI agent should adapt its response strategy without waiting for the next scheduled batch run. This chapter shows you how to wire PostgreSQL's logical replication infrastructure directly into your AI application layer — turning database changes into AI triggers, embedding refreshes, and autonomous agent actions, all without polling, all without application-layer interceptors, and all without the brittleness of trigger-based queue hacks.</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.1 Logical Replication as an AI Event Bus</h3>
+
+<p class="text-gray-300 leading-relaxed">Most teams bolt an event queue onto their application layer and treat the database as a passive store. That approach creates a class of bugs that are genuinely difficult to eliminate: the application writes to the database and separately publishes an event, and the two can diverge under failure conditions. PostgreSQL's logical replication protocol solves this at the storage layer — it reads the write-ahead log directly, guaranteeing that every committed change, and only committed changes, flows downstream.</p>
+
+<p class="text-gray-300 leading-relaxed">For AI applications this distinction matters more than it might appear. Consider embedding synchronization: if your application publishes a Kafka event that says "document 4421 was updated," but the transaction was later rolled back, your embedding pipeline may attempt to vectorize a document that no longer exists in that state. With logical replication decoding from the WAL, the event is physically impossible to generate for an uncommitted transaction.</p>
+
+<p class="text-gray-300 leading-relaxed">The PostgreSQL logical replication stack has three layers that matter for AI work:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Publications</strong> define which tables and operations (INSERT, UPDATE, DELETE, TRUNCATE) should be exposed. A publication is a first-class PostgreSQL object — no application code required to maintain it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication slots</strong> track consumer progress. The WAL is retained until the slowest consumer has processed it, which means your AI pipeline can fall behind during a traffic spike and catch up without losing events.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Logical decoding plugins</strong> translate the binary WAL format into something your application can consume. The built-in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgoutput</code> plugin is what standard streaming replication uses. For AI pipelines, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal2json</code> is often more practical because it emits JSON that maps directly to Python dictionaries.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable logical replication (requires restart if not already set)
+-- Check current setting first
+SHOW wal_level;
+
+-- In postgresql.conf or via ALTER SYSTEM:
+ALTER SYSTEM SET wal_level = 'logical';
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_wal_senders = 10;
+
+-- After restart, create the publication for AI-relevant tables
+CREATE PUBLICATION ai_event_stream
+  FOR TABLE
+    documents (id, title, content, metadata, updated_at),
+    support_tickets (id, status, priority, description, customer_id, updated_at),
+    user_profiles (id, preferences, embedding_version, updated_at),
+    product_catalog (id, name, description, attributes, price, updated_at)
+  WITH (publish = 'insert, update, delete');
+
+-- Create a replication slot using wal2json for AI pipelines
+-- This requires the wal2json extension to be installed
+SELECT pg_create_logical_replication_slot(
+  'ai_pipeline_slot',
+  'wal2json'
+);
+
+-- Verify the slot exists and is active
+SELECT
+  slot_name,
+  plugin,
+  slot_type,
+  database,
+  active,
+  restart_lsn,
+  confirmed_flush_lsn,
+  pg_size_pretty(
+    pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)
+  ) AS replication_lag
+FROM pg_replication_slots
+WHERE slot_name = 'ai_pipeline_slot';
+
+-- Grant replication privileges to the AI pipeline user
+CREATE ROLE ai_pipeline_user WITH LOGIN REPLICATION PASSWORD 'secure_password_here';
+GRANT SELECT ON documents, support_tickets, user_profiles, product_catalog
+  TO ai_pipeline_user;
+
+-- For row-level security: the replication user needs bypass
+ALTER ROLE ai_pipeline_user BYPASSRLS;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The schema for the tables being replicated should carry enough metadata to let your AI pipeline make intelligent decisions about what work is actually needed:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Documents table with embedding versioning
+CREATE TABLE documents (
+  id            BIGSERIAL PRIMARY KEY,
+  title         TEXT NOT NULL,
+  content       TEXT NOT NULL,
+  content_hash  TEXT GENERATED ALWAYS AS (md5(content)) STORED,
+  metadata      JSONB NOT NULL DEFAULT '{}',
+  embedding     vector(1536),
+  embedding_model TEXT DEFAULT 'text-embedding-3-small',
+  embedding_version INTEGER DEFAULT 0,
+  indexed_at    TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Partial index: only documents needing re-embedding
+CREATE INDEX idx_documents_needs_embedding
+  ON documents (updated_at)
+  WHERE embedding IS NULL
+     OR indexed_at &lt; updated_at;
+
+-- The AI pipeline audit log — what happened and why
+CREATE TABLE ai_pipeline_events (
+  id              BIGSERIAL PRIMARY KEY,
+  source_table    TEXT NOT NULL,
+  source_id       BIGINT NOT NULL,
+  operation       TEXT NOT NULL CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE')),
+  change_data     JSONB NOT NULL,
+  old_data        JSONB,
+  triggered_action TEXT,
+  action_status   TEXT DEFAULT 'pending',
+  processed_at    TIMESTAMPTZ,
+  error_message   TEXT,
+  received_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_pipeline_events_pending
+  ON ai_pipeline_events (received_at)
+  WHERE action_status = 'pending';
+
+CREATE INDEX idx_pipeline_events_source
+  ON ai_pipeline_events (source_table, source_id, received_at DESC);</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.2 Building the WAL Consumer in Python</h3>
+
+<p class="text-gray-300 leading-relaxed">The Python <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">psycopg2</code> library exposes the streaming replication protocol through its <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">extras</code> module. The pattern is straightforward: open a replication connection, start consuming the slot, and dispatch events to your AI handlers. For production, you want this running as a long-lived process — a Celery worker or a dedicated service managed by systemd or your container orchestrator.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># wal_consumer.py — Production WAL consumer for AI pipeline
+import json
+import logging
+import signal
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+import psycopg2
+import psycopg2.extras
+from celery import Celery
+import redis
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s %(message)s'
+)
+logger = logging.getLogger('wal_consumer')
+
+# Redis for deduplication and rate limiting
+redis_client = redis.Redis(host='localhost', port=6379, db=1, decode_responses=True)
+
+# Celery for async AI task dispatch
+celery_app = Celery(
+    'ai_pipeline',
+    broker='redis://localhost:6379/0',
+    backend='redis://localhost:6379/0'
+)
+
+celery_app.conf.update(
+    task_serializer='json',
+    accept_content=['json'],
+    result_serializer='json',
+    timezone='UTC',
+    task_routes={
+        'tasks.refresh_embedding': {'queue': 'embeddings'},
+        'tasks.trigger_ai_analysis': {'queue': 'ai_analysis'},
+        'tasks.notify_agent': {'queue': 'agents'},
+    }
+)
+
+# ─── Event Router ─────────────────────────────────────────────────────────────
+
+class AIEventRouter:
+    """
+    Routes WAL change events to appropriate AI handlers.
+    Each handler is keyed by (table_name, operation).
+    """
+
+    def __init__(self):
+        self.handlers: dict[tuple[str, str], list[Callable]] = {}
+        self.dedup_ttl = 30  # seconds — deduplicate identical events
+
+    def register(self, table: str, operation: str):
+        """Decorator to register an event handler."""
+        def decorator(fn: Callable):
+            key = (table, operation.upper())
+            self.handlers.setdefault(key, []).append(fn)
+            return fn
+        return decorator
+
+    def _dedup_key(self, table: str, row_id: Any, operation: str, lsn: str) -&gt; str:
+        return f"wal_dedup:{table}:{row_id}:{operation}:{lsn}"
+
+    def dispatch(self, event: dict) -&gt; None:
+        table = event.get('table')
+        operation = event.get('type', '').upper()
+        columns = {
+            col['name']: col['value']
+            for col in event.get('columns', [])
+        }
+        old_columns = {
+            col['name']: col['value']
+            for col in event.get('identity', [])
+        } if event.get('identity') else {}
+
+        row_id = columns.get('id') or old_columns.get('id')
+        lsn = event.get('nextlsn', '')
+
+        # Deduplication: skip if we've seen this exact event recently
+        dedup_key = self._dedup_key(table, row_id, operation, lsn)
+        if redis_client.exists(dedup_key):
+            logger.debug(f"Skipping duplicate event: {dedup_key}")
+            return
+        redis_client.setex(dedup_key, self.dedup_ttl, '1')
+
+        handler_key = (table, operation)
+        handlers = self.handlers.get(handler_key, [])
+
+        if not handlers:
+            logger.debug(f"No handlers registered for {table}:{operation}")
+            return
+
+        enriched_event = {
+            'table': table,
+            'operation': operation,
+            'row_id': row_id,
+            'columns': columns,
+            'old_columns': old_columns,
+            'lsn': lsn,
+            'received_at': datetime.now(timezone.utc).isoformat(),
+        }
+
+        for handler in handlers:
+            try:
+                handler(enriched_event)
+            except Exception as exc:
+                logger.error(
+                    f"Handler {handler.__name__} failed for {table}:{row_id}: {exc}",
+                    exc_info=True
+                )
+
+router = AIEventRouter()
+
+# ─── Event Handlers ───────────────────────────────────────────────────────────
+
+@router.register('documents', 'INSERT')
+@router.register('documents', 'UPDATE')
+def handle_document_change(event: dict) -&gt; None:
+    """Trigger embedding refresh when document content changes."""
+    columns = event['columns']
+    old_columns = event.get('old_columns', {})
+
+    # Skip if only non-content fields changed
+    content_changed = (
+        event['operation'] == 'INSERT' or
+        columns.get('content_hash') != old_columns.get('content_hash')
+    )
+
+    if not content_changed:
+        logger.info(f"Document {event['row_id']}: metadata-only change, skipping re-embed")
+        return
+
+    logger.info(f"Document {event['row_id']}: content changed, queuing embedding refresh")
+
+    # Dispatch to Celery embedding queue
+    celery_app.send_task(
+        'tasks.refresh_embedding',
+        kwargs={
+            'document_id': event['row_id'],
+            'content': columns.get('content'),
+            'metadata': columns.get('metadata'),
+            'model': columns.get('embedding_model', 'text-embedding-3-small'),
+        },
+        queue='embeddings',
+        priority=5,
+    )
+
+@router.register('documents', 'DELETE')
+def handle_document_delete(event: dict) -&gt; None:
+    """Clean up embeddings and notify agents when document is deleted."""
+    doc_id = event['row_id']
+    logger.info(f"Document {doc_id}: deleted, scheduling cleanup")
+
+    celery_app.send_task(
+        'tasks.cleanup_document_embeddings',
+        kwargs={'document_id': doc_id},
+        queue='embeddings',
+    )
+
+@router.register('support_tickets', 'UPDATE')
+def handle_ticket_update(event: dict) -&gt; None:
+    """Route ticket status changes to AI triage agent."""
+    old_status = event['old_columns'].get('status')
+    new_status = event['columns'].get('status')
+
+    if old_status == new_status:
+        return
+
+    # Only trigger AI analysis on escalation events
+    escalation_transitions = {
+        ('open', 'escalated'),
+        ('in_progress', 'escalated'),
+        ('open', 'urgent'),
+    }
+
+    if (old_status, new_status) in escalation_transitions:
+        logger.info(
+            f"Ticket {event['row_id']}: escalated {old_status} → {new_status}, "
+            f"triggering AI analysis"
+        )
+        celery_app.send_task(
+            'tasks.trigger_ai_analysis',
+            kwargs={
+                'ticket_id': event['row_id'],
+                'old_status': old_status,
+                'new_status': new_status,
+                'description': event['columns'].get('description'),
+                'priority': event['columns'].get('priority'),
+                'customer_id': event['columns'].get('customer_id'),
+            },
+            queue='ai_analysis',
+            priority=9,  # High priority for escalations
+        )
+
+@router.register('product_catalog', 'INSERT')
+@router.register('product_catalog', 'UPDATE')
+def handle_product_change(event: dict) -&gt; None:
+    """Refresh product embeddings and invalidate recommendation cache."""
+    product_id = event['row_id']
+
+    # Invalidate Redis cache for this product
+    cache_keys = redis_client.keys(f"rec_cache:*:{product_id}:*")
+    if cache_keys:
+        redis_client.delete(*cache_keys)
+        logger.info(f"Product {product_id}: invalidated {len(cache_keys)} cache entries")
+
+    celery_app.send_task(
+        'tasks.refresh_embedding',
+        kwargs={
+            'document_id': product_id,
+            'content': (
+                f"{event['columns'].get('name', '')} "
+                f"{event['columns'].get('description', '')} "
+                f"{json.dumps(event['columns'].get('attributes', {}))}"
+            ),
+            'metadata': {'type': 'product', 'price': event['columns'].get('price')},
+            'model': 'text-embedding-3-small',
+            'target_table': 'product_catalog',
+        },
+        queue='embeddings',
+    )
+
+# ─── WAL Consumer Main Loop ───────────────────────────────────────────────────
+
+class WALConsumer:
+    def __init__(self, dsn: str, slot_name: str, publication_name: str):
+        self.dsn = dsn
+        self.slot_name = slot_name
+        self.publication_name = publication_name
+        self.conn = None
+        self.cursor = None
+        self.running = False
+        self._setup_signal_handlers()
+
+    def _setup_signal_handlers(self):
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+
+    def _handle_shutdown(self, signum, frame):
+        logger.info(f"Received signal {signum}, initiating graceful shutdown")
+        self.running = False
+
+    def connect(self):
+        self.conn = psycopg2.connect(
+            self.dsn,
+            connection_factory=psycopg2.extras.LogicalReplicationConnection
+        )
+        self.cursor = self.conn.cursor()
+        logger.info(f"Connected to replication slot: {self.slot_name}")
+
+    def start_streaming(self):
+        """Start consuming the replication slot with wal2json options."""
+        self.cursor.start_replication(
+            slot_name=self.slot_name,
+            decode=True,
+            options={
+                'pretty-print': '0',
+                'include-lsn': '1',
+                'include-timestamp': '1',
+                'include-transaction': '1',
+                'add-tables': (
+                    'public.documents,'
+                    'public.support_tickets,'
+                    'public.user_profiles,'
+                    'public.product_catalog'
+                ),
+            }
+        )
+        logger.info("Replication stream started")
+
+    def process_message(self, msg):
+        """Process a single WAL message from wal2json."""
+        try:
+            payload = json.loads(msg.payload)
+
+            # wal2json wraps changes in a transaction envelope
+            changes = payload.get('change', [])
+
+            for change in changes:
+                router.dispatch(change)
+
+            # Acknowledge receipt — this advances the replication slot
+            msg.cursor.send_feedback(flush_lsn=msg.data_start)
+
+        except json.JSONDecodeError as exc:
+            logger.error(f"Failed to parse WAL message: {exc}")
+        except Exception as exc:
+            logger.error(f"Error processing WAL message: {exc}", exc_info=True)
+            # Don't acknowledge — let the slot replay from this LSN
+
+    def run(self):
+        self.running = True
+        self.connect()
+        self.start_streaming()
+
+        logger.info("WAL consumer running — waiting for changes")
+
+        while self.running:
+            # consume_stream blocks until a message arrives or timeout
+            self.cursor.consume_stream(
+                self.process_message,
+                keepalive_interval=10  # seconds
+            )
+
+        logger.info("WAL consumer stopped cleanly")
+        if self.conn:
+            self.conn.close()
+
+
+if __name__ == '__main__':
+    import os
+
+    consumer = WALConsumer(
+        dsn=os.environ['DATABASE_URL'],
+        slot_name='ai_pipeline_slot',
+        publication_name='ai_event_stream',
+    )
+    consumer.run()</code></pre>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.3 Embedding Pipeline as a Celery Worker</h3>
+
+<p class="text-gray-300 leading-relaxed">The WAL consumer dispatches work to Celery, which runs the actual AI operations. This separation is important: the WAL consumer must stay responsive and lightweight because PostgreSQL is waiting for acknowledgment. Embedding calls to OpenAI can take 200–800ms — long enough to create backpressure if done synchronously in the consumer loop.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
