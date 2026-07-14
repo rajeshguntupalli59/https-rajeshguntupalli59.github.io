@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 25: Rate Limiting and Quota Tracking for AI Features — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 25: Rate Limiting and Quota Tracking for AI Features. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 25 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 25: Rate Limiting and Quota Tracking for AI Features</h2>
+
+<p class="text-gray-300 leading-relaxed">AI features are expensive in ways that traditional web features are not. A database query that costs microseconds becomes an LLM call that costs hundreds of milliseconds and real dollars. A user who refreshes a page ten times wastes a trivial amount of compute; a user who hammers your RAG endpoint ten times burns through embeddings, retrieval operations, and token budgets simultaneously. Without rate limiting and quota tracking baked into your stack, a single abusive user or a runaway agent loop can exhaust your monthly OpenAI budget before you even wake up to check your email.</p>
+
+<p class="text-gray-300 leading-relaxed">This chapter covers how to design and implement rate limiting and quota tracking as first-class database citizens in PostgreSQL. You will build token accounting tables, sliding window rate limiters, per-tenant quota enforcement, budget alerting pipelines, and cost attribution dashboards — all with PostgreSQL handling the coordination layer that most teams incorrectly push entirely to Redis or application code. The goal is a system where quota state is durable, auditable, and queryable using the same transactional guarantees you already rely on for the rest of your application.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.1 The Economics of AI Features and Why Naive Rate Limiting Fails</h3>
+
+<p class="text-gray-300 leading-relaxed">Most applications bolt rate limiting onto AI features the same way they would bolt it onto a REST endpoint: a Redis counter, a per-minute limit, done. That works fine for HTTP requests. It fails for AI features for three reasons.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tokens are not uniform.</strong> A request that asks your RAG system to summarize a 10,000-word legal document consumes fifty times more tokens than a request asking it to answer "What is the capital of France?" Both count as one request. Any rate limiter that counts requests without counting tokens will be gamed by users who send maximally expensive requests.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Costs are multi-dimensional.</strong> A single RAG query touches embedding generation (input tokens), vector similarity search (compute), LLM completion (input + output tokens), and potentially tool calls if you are running agents. These cost centers need to be tracked independently because they have different providers, different pricing tiers, and different optimization levers.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quotas need to be durable.</strong> If your rate limiting state lives only in Redis and Redis restarts, users get a free reset. For subscription-based AI features where users pay for a monthly token budget, that is a direct revenue loss. Durable quota state in PostgreSQL, with Redis acting as a fast cache in front of it, gives you both performance and correctness.</p>
+
+<p class="text-gray-300 leading-relaxed">The schema design that follows treats every AI operation as a metered event with a cost, recorded transactionally alongside the business event it serves.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core cost accounting schema for AI features
+-- Run once during initial setup
+
+CREATE SCHEMA IF NOT EXISTS ai_quota;
+
+-- Master table of all AI operations with their costs
+CREATE TABLE ai_quota.usage_events (
+    event_id        BIGSERIAL PRIMARY KEY,
+    tenant_id       UUID NOT NULL,
+    user_id         UUID NOT NULL,
+    session_id      UUID,
+    feature_name    TEXT NOT NULL,          -- 'rag_query', 'agent_run', 'embedding_gen'
+    provider        TEXT NOT NULL,          -- 'openai', 'anthropic', 'cohere'
+    model           TEXT NOT NULL,          -- 'gpt-4o', 'claude-3-5-sonnet-20241022'
+    operation_type  TEXT NOT NULL,          -- 'chat_completion', 'embedding', 'tool_call'
+    input_tokens    INTEGER NOT NULL DEFAULT 0,
+    output_tokens   INTEGER NOT NULL DEFAULT 0,
+    embedding_units INTEGER NOT NULL DEFAULT 0,  -- number of texts embedded
+    latency_ms      INTEGER,
+    cost_usd        NUMERIC(12, 8),         -- calculated at insert time
+    request_id      TEXT,                   -- provider's request ID for debugging
+    metadata        JSONB DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Indexes optimized for the quota enforcement queries
+CREATE INDEX idx_usage_events_tenant_time
+    ON ai_quota.usage_events (tenant_id, created_at DESC);
+
+CREATE INDEX idx_usage_events_user_time
+    ON ai_quota.usage_events (user_id, created_at DESC);
+
+CREATE INDEX idx_usage_events_feature
+    ON ai_quota.usage_events (feature_name, tenant_id, created_at DESC);
+
+-- Partition by month to keep the table manageable
+-- In production, use declarative partitioning
+CREATE TABLE ai_quota.usage_events_2025_01
+    PARTITION OF ai_quota.usage_events
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+CREATE TABLE ai_quota.usage_events_2025_02
+    PARTITION OF ai_quota.usage_events
+    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+
+-- Tenant quota configuration
+CREATE TABLE ai_quota.tenant_quotas (
+    tenant_id           UUID PRIMARY KEY,
+    plan_name           TEXT NOT NULL,      -- 'starter', 'growth', 'enterprise'
+    monthly_token_limit BIGINT NOT NULL,    -- total tokens (input + output)
+    monthly_usd_limit   NUMERIC(10, 2),     -- hard dollar cap
+    rpm_limit           INTEGER NOT NULL,   -- requests per minute
+    tpm_limit           INTEGER NOT NULL,   -- tokens per minute
+    concurrent_limit    INTEGER DEFAULT 5,  -- max concurrent AI requests
+    enabled             BOOLEAN DEFAULT TRUE,
+    soft_limit_pct      NUMERIC(5, 2) DEFAULT 80.0,  -- alert threshold %
+    hard_limit_action   TEXT DEFAULT 'block',         -- 'block' or 'degrade'
+    reset_day           INTEGER DEFAULT 1,            -- day of month quota resets
+    created_at          TIMESTAMPTZ DEFAULT NOW(),
+    updated_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Per-user overrides within a tenant
+CREATE TABLE ai_quota.user_quota_overrides (
+    user_id             UUID PRIMARY KEY,
+    tenant_id           UUID NOT NULL REFERENCES ai_quota.tenant_quotas(tenant_id),
+    monthly_token_limit BIGINT,         -- NULL means inherit from tenant
+    rpm_limit           INTEGER,
+    tpm_limit           INTEGER,
+    is_unlimited        BOOLEAN DEFAULT FALSE,
+    reason              TEXT,           -- 'internal_user', 'power_plan', etc.
+    expires_at          TIMESTAMPTZ,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Materialized monthly rollups for fast quota checks
+CREATE TABLE ai_quota.monthly_usage_rollups (
+    tenant_id       UUID NOT NULL,
+    user_id         UUID NOT NULL,
+    year_month      DATE NOT NULL,      -- first day of month
+    total_tokens    BIGINT NOT NULL DEFAULT 0,
+    input_tokens    BIGINT NOT NULL DEFAULT 0,
+    output_tokens   BIGINT NOT NULL DEFAULT 0,
+    total_cost_usd  NUMERIC(12, 4) NOT NULL DEFAULT 0,
+    request_count   INTEGER NOT NULL DEFAULT 0,
+    last_updated    TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, user_id, year_month)
+);
+
+CREATE INDEX idx_rollups_tenant_month
+    ON ai_quota.monthly_usage_rollups (tenant_id, year_month DESC);
+
+-- Seed some plan definitions
+INSERT INTO ai_quota.tenant_quotas
+    (tenant_id, plan_name, monthly_token_limit, monthly_usd_limit,
+     rpm_limit, tpm_limit, concurrent_limit)
+VALUES
+    ('00000000-0000-0000-0000-000000000001', 'starter',    500000,    10.00,  10,  50000,  2),
+    ('00000000-0000-0000-0000-000000000002', 'growth',    5000000,   100.00,  60, 200000,  10),
+    ('00000000-0000-0000-0000-000000000003', 'enterprise', NULL,      NULL,  300, 500000,  50);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema does several things that matter in production. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usage_events</code> table is partitioned so that old months can be archived or dropped without affecting current quota checks. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">monthly_usage_rollups</code> table is a running aggregate — updated transactionally whenever new events are inserted — that lets quota enforcement functions run in constant time rather than aggregating millions of rows on every request.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.2 Sliding Window Rate Limiting in Pure PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">Redis is the standard choice for sliding window rate limiting because of its atomic increment operations. PostgreSQL can do the same thing with advisory locks and atomic upserts, and the advantage is that your rate limit state is in the same transaction as the actual work you are protecting — no two-phase coordination between Redis and Postgres.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern uses a short-lived rate limit window table that tracks request counts within the current minute and current hour windows, plus a function that atomically checks and increments the counter, returning whether the request should be allowed.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Sliding window rate limit state
+-- These rows are ephemeral — the cleanup job removes rows older than 2 hours
+
+CREATE TABLE ai_quota.rate_limit_windows (
+    window_key      TEXT NOT NULL,      -- '{tenant_id}:{user_id}:{window_type}'
+    window_start    TIMESTAMPTZ NOT NULL,
+    token_count     BIGINT NOT NULL DEFAULT 0,
+    request_count   INTEGER NOT NULL DEFAULT 0,
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (window_key, window_start)
+);
+
+CREATE INDEX idx_rl_windows_start
+    ON ai_quota.rate_limit_windows (window_start);
+
+-- Function: atomic rate limit check + increment
+-- Returns: (allowed BOOLEAN, current_tokens BIGINT, limit_tokens INTEGER,
+--           retry_after_seconds INTEGER)
+
+CREATE OR REPLACE FUNCTION ai_quota.check_and_increment_rate_limit(
+    p_tenant_id     UUID,
+    p_user_id       UUID,
+    p_token_estimate INTEGER,   -- estimated tokens for this request
+    p_window_minutes INTEGER DEFAULT 1
+)
+RETURNS TABLE (
+    allowed                 BOOLEAN,
+    current_tokens          BIGINT,
+    limit_tokens            INTEGER,
+    current_requests        INTEGER,
+    limit_requests          INTEGER,
+    retry_after_seconds     INTEGER
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_window_start      TIMESTAMPTZ;
+    v_window_key_tpm    TEXT;
+    v_window_key_rpm    TEXT;
+    v_tpm_limit         INTEGER;
+    v_rpm_limit         INTEGER;
+    v_current_tokens    BIGINT;
+    v_current_requests  INTEGER;
+    v_window_end        TIMESTAMPTZ;
+    v_user_override     ai_quota.user_quota_overrides%ROWTYPE;
+BEGIN
+    -- Truncate to the current window boundary
+    v_window_start := date_trunc('minute', NOW())
+        - ((EXTRACT(MINUTE FROM NOW())::INTEGER % p_window_minutes) * INTERVAL '1 minute');
+
+    v_window_key_tpm := p_tenant_id::TEXT || ':' || p_user_id::TEXT || ':tpm';
+    v_window_key_rpm := p_tenant_id::TEXT || ':' || p_user_id::TEXT || ':rpm';
+
+    -- Look up effective limits (user override takes precedence)
+    SELECT * INTO v_user_override
+    FROM ai_quota.user_quota_overrides
+    WHERE user_id = p_user_id
+      AND (expires_at IS NULL OR expires_at &gt; NOW());
+
+    SELECT
+        COALESCE(v_user_override.tpm_limit, tq.tpm_limit),
+        COALESCE(v_user_override.rpm_limit, tq.rpm_limit)
+    INTO v_tpm_limit, v_rpm_limit
+    FROM ai_quota.tenant_quotas tq
+    WHERE tq.tenant_id = p_tenant_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'No quota configuration found for tenant %', p_tenant_id;
+    END IF;
+
+    -- Short-circuit for unlimited users
+    IF v_user_override.is_unlimited IS TRUE THEN
+        RETURN QUERY SELECT TRUE, 0::BIGINT, v_tpm_limit, 0, v_rpm_limit, 0;
+        RETURN;
+    END IF;
+
+    -- Atomic upsert for token window
+    INSERT INTO ai_quota.rate_limit_windows
+        (window_key, window_start, token_count, request_count, updated_at)
+    VALUES
+        (v_window_key_tpm, v_window_start, p_token_estimate, 1, NOW())
+    ON CONFLICT (window_key, window_start) DO UPDATE
+        SET token_count    = ai_quota.rate_limit_windows.token_count + p_token_estimate,
+            request_count  = ai_quota.rate_limit_windows.request_count + 1,
+            updated_at     = NOW()
+    RETURNING token_count, request_count
+    INTO v_current_tokens, v_current_requests;
+
+    v_window_end := v_window_start + (p_window_minutes * INTERVAL '1 minute');
+
+    -- Check if we exceeded limits
+    IF v_current_tokens &gt; v_tpm_limit OR v_current_requests &gt; v_rpm_limit THEN
+        -- Roll back the increment we just applied
+        UPDATE ai_quota.rate_limit_windows
+        SET token_count   = GREATEST(0, token_count - p_token_estimate),
+            request_count = GREATEST(0, request_count - 1)
+        WHERE window_key = v_window_key_tpm
+          AND window_start = v_window_start;
+
+        RETURN QUERY SELECT
+            FALSE,
+            v_current_tokens,
+            v_tpm_limit,
+            v_current_requests,
+            v_rpm_limit,
+            EXTRACT(EPOCH FROM (v_window_end - NOW()))::INTEGER;
+        RETURN;
+    END IF;
+
+    RETURN QUERY SELECT
+        TRUE,
+        v_current_tokens,
+        v_tpm_limit,
+        v_current_requests,
+        v_rpm_limit,
+        0;
+END;
+$$;
+
+-- Function: check monthly quota (separate from per-minute rate limiting)
+CREATE OR REPLACE FUNCTION ai_quota.check_monthly_quota(
+    p_tenant_id     UUID,
+    p_user_id       UUID,
+    p_token_estimate INTEGER
+)
+RETURNS TABLE (
+    allowed             BOOLEAN,
+    used_tokens         BIGINT,
+    monthly_limit       BIGINT,
+    pct_used            NUMERIC,
+    is_soft_limit_hit   BOOLEAN
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_month_start       DATE;
+    v_used_tokens       BIGINT;
+    v_monthly_limit     BIGINT;
+    v_soft_limit_pct    NUMERIC;
+    v_hard_limit_action TEXT;
+BEGIN
+    v_month_start := date_trunc('month', NOW())::DATE;
+
+    SELECT
+        COALESCE(r.total_tokens, 0),
+        tq.monthly_token_limit,
+        tq.soft_limit_pct,
+        tq.hard_limit_action
+    INTO v_used_tokens, v_monthly_limit, v_soft_limit_pct, v_hard_limit_action
+    FROM ai_quota.tenant_quotas tq
+    LEFT JOIN ai_quota.monthly_usage_rollups r
+        ON r.tenant_id = p_tenant_id
+       AND r.year_month = v_month_start
+       AND r.user_id = p_user_id
+    WHERE tq.tenant_id = p_tenant_id;
+
+    -- NULL limit means unlimited
+    IF v_monthly_limit IS NULL THEN
+        RETURN QUERY SELECT TRUE, v_used_tokens, NULL::BIGINT, 0.0::NUMERIC, FALSE;
+        RETURN;
+    END IF;
+
+    RETURN QUERY SELECT
+        (v_used_tokens + p_token_estimate) &lt;= v_monthly_limit,
+        v_used_tokens,
+        v_monthly_limit,
+        ROUND(v_used_tokens::NUMERIC / v_monthly_limit * 100, 2),
+        v_used_tokens &gt;= (v_monthly_limit * v_soft_limit_pct / 100);
+END;
+$$;
+
+-- Cleanup job: remove old rate limit windows (run via pg_cron or external scheduler)
+CREATE OR REPLACE FUNCTION ai_quota.cleanup_old_windows()
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_deleted INTEGER;
+BEGIN
+    DELETE FROM ai_quota.rate_limit_windows
+    WHERE window_start &lt; NOW() - INTERVAL '2 hours';
+
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key design decision here is the rollback pattern inside <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">check_and_increment_rate_limit</code>. The function optimistically increments the counter, then checks if the new value exceeds the limit, and rolls back only the increment if it does. This is safer than checking first and then incrementing, which would have a race window between two concurrent requests. Under high concurrency, the PostgreSQL row-level lock on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> inside the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT</code> clause serializes the increments correctly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">25.3 Integrating Quota Enforcement into the FastAPI + LLM Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">The quota functions above are useless if application code bypasses them. The enforcement needs to be in a middleware layer that intercepts every AI request before it reaches the LLM provider. The following shows a complete FastAPI middleware pattern with OpenAI and Anthropic SDK integration, plus the post-completion accounting write.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
