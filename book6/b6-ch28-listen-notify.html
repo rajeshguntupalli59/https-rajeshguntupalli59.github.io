@@ -1,0 +1,595 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 28: PostgreSQL LISTEN/NOTIFY for Event-Driven AI — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 28: PostgreSQL LISTEN/NOTIFY for Event-Driven AI. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 28 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 28: PostgreSQL LISTEN/NOTIFY for Event-Driven AI</h2>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's LISTEN/NOTIFY mechanism has existed since version 6.4, quietly doing useful work for developers who needed lightweight pub/sub without reaching for a separate message broker. In AI-native applications, it turns out to be remarkably well-suited for a problem that keeps coming up: how do you trigger AI processing in reaction to database events without adding operational complexity, introducing consistency gaps between your data store and your queue, or polling tables in a loop? This chapter covers how to build event-driven AI pipelines using LISTEN/NOTIFY as the signal layer — connecting PostgreSQL triggers to Python consumers that invoke LLMs, update embeddings, route agent tasks, and fan out notifications to downstream systems. You'll see how this integrates with FastAPI, Celery, Redis, and the Anthropic and OpenAI SDKs, and how to operate these pipelines safely in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.1 Why LISTEN/NOTIFY Belongs in Your AI Stack</h3>
+
+<p class="text-gray-300 leading-relaxed">Before building anything, it's worth understanding what LISTEN/NOTIFY actually is and what it isn't.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">What it is</strong>: A lightweight, in-process pub/sub system built into PostgreSQL. A session issues <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY channel_name, 'payload'</code> and every session currently listening on that channel receives the payload asynchronously. Notifications are transactional — a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> issued inside a transaction isn't delivered until that transaction commits. If the transaction rolls back, the notification is never sent.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">What it isn't</strong>: A durable message queue. If no listener is connected when a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> fires, the notification is lost. There is no persistence, no replay, no dead-letter queue. The payload is limited to 8,000 bytes.</p>
+
+<p class="text-gray-300 leading-relaxed">For AI applications, this combination — transactional delivery, zero persistence, low latency — makes LISTEN/NOTIFY ideal as a *signal layer* rather than a *delivery layer*. The pattern is:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Data changes in PostgreSQL (new document, updated record, user message)</p>
+<p class="text-gray-300 leading-relaxed">2. A trigger fires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> with a lightweight payload (usually just a row ID)</p>
+<p class="text-gray-300 leading-relaxed">3. A Python consumer receives the notification and fetches the full record</p>
+<p class="text-gray-300 leading-relaxed">4. The consumer invokes an LLM or embedding model</p>
+<p class="text-gray-300 leading-relaxed">5. Results are written back to PostgreSQL</p>
+
+<p class="text-gray-300 leading-relaxed">The notification is the trigger. The database is the source of truth. The consumer is stateless. If the consumer crashes, you need a recovery path (we'll cover that), but the data itself is safe.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Why not just use Celery with a broker?</strong> You can, and for heavy workloads you should — and we'll show how they compose. But adding Redis or RabbitMQ as a required dependency means you now have infrastructure to manage, a potential consistency gap (the row was inserted but was the task enqueued?), and operational overhead. For many AI features — embedding new content as it's inserted, routing agent events, invalidating LLM caches — LISTEN/NOTIFY is sufficient and dramatically simpler. The transactional guarantee is the key: you cannot accidentally queue a task for a row that doesn't exist yet.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.2 Schema Design for Event-Driven AI Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">Good schema design here means structuring your tables so that triggers can extract meaningful signals and consumers can efficiently fetch what they need.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core document store with embedding support
+CREATE TABLE documents (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL,
+    title           TEXT NOT NULL,
+    body            TEXT NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    embedding       vector(1536),
+    embedding_model TEXT,
+    embedding_at    TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    indexed_at      TIMESTAMPTZ,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'processing', 'indexed', 'failed'))
+);
+
+CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64)
+    WHERE embedding IS NOT NULL;
+
+CREATE INDEX ON documents (tenant_id, status, created_at DESC);
+CREATE INDEX ON documents (status, created_at) WHERE status = 'pending';
+
+-- AI processing event log — durable record of every notification sent
+CREATE TABLE ai_events (
+    id              BIGSERIAL PRIMARY KEY,
+    event_type      TEXT NOT NULL,
+    entity_type     TEXT NOT NULL,
+    entity_id       UUID NOT NULL,
+    tenant_id       UUID,
+    payload         JSONB NOT NULL DEFAULT '{}',
+    channel         TEXT NOT NULL,
+    notified_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    processed_at    TIMESTAMPTZ,
+    processor_id    TEXT,
+    result          JSONB,
+    error           TEXT,
+    retry_count     INT NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'notified'
+                    CHECK (status IN ('notified', 'processing', 'completed', 'failed', 'abandoned'))
+);
+
+CREATE INDEX ON ai_events (channel, status, notified_at);
+CREATE INDEX ON ai_events (entity_type, entity_id, event_type);
+CREATE INDEX ON ai_events (status, notified_at) WHERE status IN ('notified', 'failed');
+
+-- Conversation store for chat AI features
+CREATE TABLE conversations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL,
+    user_id         UUID NOT NULL,
+    title           TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content         TEXT NOT NULL,
+    content_tokens  INT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    embedding       vector(1536),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX ON messages (conversation_id, created_at);
+CREATE INDEX ON messages (tenant_id, role, created_at DESC);
+
+-- Agent task queue backed by PostgreSQL
+CREATE TABLE agent_tasks (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_id        TEXT NOT NULL,
+    task_type       TEXT NOT NULL,
+    input           JSONB NOT NULL,
+    output          JSONB,
+    status          TEXT NOT NULL DEFAULT 'queued'
+                    CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled')),
+    priority        INT NOT NULL DEFAULT 5,
+    tenant_id       UUID,
+    parent_task_id  UUID REFERENCES agent_tasks(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    error           TEXT,
+    retry_count     INT NOT NULL DEFAULT 0,
+    max_retries     INT NOT NULL DEFAULT 3
+);
+
+CREATE INDEX ON agent_tasks (status, priority DESC, created_at) WHERE status = 'queued';
+CREATE INDEX ON agent_tasks (agent_id, status, created_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now the trigger infrastructure. The key design decision: triggers write to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ai_events</code> *and* issue <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code>. The event log gives you durability and recovery; the notification gives you low-latency delivery.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Generic notification function — used by multiple triggers
+CREATE OR REPLACE FUNCTION notify_ai_event()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_channel   TEXT;
+    v_event_type TEXT;
+    v_entity_id  UUID;
+    v_tenant_id  UUID;
+    v_payload    JSONB;
+    v_event_id   BIGINT;
+    v_notify_payload TEXT;
+BEGIN
+    -- Determine event type
+    v_event_type := TG_OP;  -- INSERT, UPDATE, DELETE
+
+    -- Extract entity info based on table
+    IF TG_TABLE_NAME = 'documents' THEN
+        v_channel   := 'ai_documents';
+        v_entity_id := NEW.id;
+        v_tenant_id := NEW.tenant_id;
+        v_payload   := jsonb_build_object(
+            'operation', TG_OP,
+            'id', NEW.id,
+            'tenant_id', NEW.tenant_id,
+            'status', NEW.status,
+            'has_body', length(NEW.body) &gt; 0
+        );
+
+        -- Only notify on meaningful state changes
+        IF TG_OP = 'UPDATE' AND OLD.body = NEW.body AND OLD.status = NEW.status THEN
+            RETURN NEW;
+        END IF;
+
+    ELSIF TG_TABLE_NAME = 'messages' THEN
+        v_channel   := 'ai_messages';
+        v_entity_id := NEW.id;
+        v_tenant_id := NEW.tenant_id;
+        v_payload   := jsonb_build_object(
+            'operation', TG_OP,
+            'id', NEW.id,
+            'conversation_id', NEW.conversation_id,
+            'tenant_id', NEW.tenant_id,
+            'role', NEW.role
+        );
+
+        -- Only process user messages for LLM response generation
+        IF NEW.role != 'user' THEN
+            RETURN NEW;
+        END IF;
+
+    ELSIF TG_TABLE_NAME = 'agent_tasks' THEN
+        v_channel   := 'ai_agent_tasks';
+        v_entity_id := NEW.id;
+        v_tenant_id := NEW.tenant_id;
+        v_payload   := jsonb_build_object(
+            'operation', TG_OP,
+            'id', NEW.id,
+            'agent_id', NEW.agent_id,
+            'task_type', NEW.task_type,
+            'status', NEW.status,
+            'priority', NEW.priority
+        );
+
+        IF TG_OP = 'UPDATE' AND NEW.status != 'queued' THEN
+            RETURN NEW;
+        END IF;
+    END IF;
+
+    -- Write durable event record first
+    INSERT INTO ai_events (
+        event_type, entity_type, entity_id, tenant_id,
+        payload, channel
+    ) VALUES (
+        v_event_type, TG_TABLE_NAME, v_entity_id, v_tenant_id,
+        v_payload, v_channel
+    ) RETURNING id INTO v_event_id;
+
+    -- Notify payload is minimal — just enough to fetch the record
+    v_notify_payload := jsonb_build_object(
+        'event_id', v_event_id,
+        'entity_id', v_entity_id,
+        'event_type', v_event_type,
+        'table', TG_TABLE_NAME
+    )::text;
+
+    -- Enforce 8000 byte limit
+    IF length(v_notify_payload) &gt; 8000 THEN
+        v_notify_payload := jsonb_build_object(
+            'event_id', v_event_id,
+            'entity_id', v_entity_id
+        )::text;
+    END IF;
+
+    PERFORM pg_notify(v_channel, v_notify_payload);
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach to tables
+CREATE TRIGGER trg_documents_ai_notify
+    AFTER INSERT OR UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION notify_ai_event();
+
+CREATE TRIGGER trg_messages_ai_notify
+    AFTER INSERT ON messages
+    FOR EACH ROW EXECUTE FUNCTION notify_ai_event();
+
+CREATE TRIGGER trg_agent_tasks_ai_notify
+    AFTER INSERT OR UPDATE ON agent_tasks
+    FOR EACH ROW EXECUTE FUNCTION notify_ai_event();
+
+-- Recovery function: find events that were notified but never processed
+CREATE OR REPLACE FUNCTION get_unprocessed_events(
+    p_channel TEXT,
+    p_older_than_seconds INT DEFAULT 30,
+    p_limit INT DEFAULT 100
+)
+RETURNS TABLE (
+    event_id    BIGINT,
+    entity_id   UUID,
+    entity_type TEXT,
+    payload     JSONB,
+    notified_at TIMESTAMPTZ,
+    retry_count INT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        e.id,
+        e.entity_id,
+        e.entity_type,
+        e.payload,
+        e.notified_at,
+        e.retry_count
+    FROM ai_events e
+    WHERE e.channel = p_channel
+      AND e.status IN ('notified', 'failed')
+      AND e.notified_at &lt; now() - (p_older_than_seconds || ' seconds')::interval
+      AND e.retry_count &lt; 5
+    ORDER BY e.notified_at ASC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.3 Python Consumers with asyncpg</h3>
+
+<p class="text-gray-300 leading-relaxed">The Python side uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">asyncpg</code> for async LISTEN/NOTIFY support. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">asyncio</code> event loop, connection pooling, and the AI SDK calls all compose cleanly.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># listener.py — core LISTEN/NOTIFY consumer for AI events
+import asyncio
+import asyncpg
+import json
+import logging
+import signal
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Callable, Coroutine
+
+import anthropic
+import openai
+from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = "postgresql://app_user:secret@localhost:5432/aiapp"
+PROCESSOR_ID = f"worker-{uuid.uuid4().hex[:8]}"
+
+
+@dataclass
+class NotificationEvent:
+    channel: str
+    payload: dict
+    event_id: int
+    entity_id: str
+    entity_type: str
+    event_type: str
+
+
+class AIEventConsumer:
+    """
+    Listens on PostgreSQL NOTIFY channels and dispatches to AI processors.
+    Handles reconnection, recovery, and graceful shutdown.
+    """
+
+    def __init__(self, dsn: str, channels: list[str]):
+        self.dsn = dsn
+        self.channels = channels
+        self.conn: asyncpg.Connection | None = None
+        self.pool: asyncpg.Pool | None = None
+        self.handlers: dict[str, Callable] = {}
+        self.running = False
+        self.shutdown_event = asyncio.Event()
+        self._notification_queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+
+    def register_handler(self, channel: str, handler: Callable) -&gt; None:
+        self.handlers[channel] = handler
+
+    async def start(self) -&gt; None:
+        self.running = True
+        self.pool = await asyncpg.create_pool(
+            self.dsn,
+            min_size=2,
+            max_size=10,
+            command_timeout=60,
+        )
+
+        # Start listener connection (separate from pool — LISTEN requires dedicated connection)
+        await self._connect_listener()
+
+        # Start worker tasks
+        tasks = [
+            asyncio.create_task(self._listen_loop()),
+            asyncio.create_task(self._dispatch_loop()),
+            asyncio.create_task(self._recovery_loop()),
+        ]
+
+        logger.info(f"Consumer {PROCESSOR_ID} started, listening on: {self.channels}")
+
+        await asyncio.gather(*tasks)
+
+    async def _connect_listener(self) -&gt; None:
+        """Establish dedicated connection for LISTEN commands."""
+        self.conn = await asyncpg.connect(self.dsn)
+
+        def _on_notification(conn, pid, channel, payload):
+            """Called by asyncpg from the connection's receive loop."""
+            try:
+                parsed = json.loads(payload)
+                event = NotificationEvent(
+                    channel=channel,
+                    payload=parsed,
+                    event_id=parsed.get("event_id", 0),
+                    entity_id=parsed.get("entity_id", ""),
+                    entity_type=parsed.get("table", ""),
+                    event_type=parsed.get("event_type", ""),
+                )
+                # Non-blocking put — drop if queue is full (backpressure)
+                try:
+                    self._notification_queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    logger.warning(
+                        f"Notification queue full, dropping event {event.event_id} "
+                        f"on channel {channel}. Recovery loop will catch it."
+                    )
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse notification payload: {payload!r}: {e}")
+
+        self.conn.add_listener(None, _on_notification)  # None = all channels
+
+        for channel in self.channels:
+            await self.conn.execute(f"LISTEN {channel}")
+            logger.debug(f"Listening on channel: {channel}")
+
+    async def _listen_loop(self) -&gt; None:
+        """Keep listener connection alive with reconnection logic."""
+        while self.running:
+            try:
+                if self.conn is None or self.conn.is_closed():
+                    logger.warning("Listener connection lost, reconnecting...")
+                    await asyncio.sleep(2)
+                    await self._connect_listener()
+
+                # Keep the connection alive — asyncpg delivers notifications
+                # through the connection's internal receive loop; we just need
+                # to hold the event loop open
+                await asyncio.sleep(1)
+
+            except asyncpg.PostgresConnectionStatusError:
+                logger.exception("Connection error in listen loop")
+                self.conn = None
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Unexpected error in listen loop")
+                await asyncio.sleep(5)
+
+    async def _dispatch_loop(self) -&gt; None:
+        """Pull from notification queue and invoke handlers."""
+        while self.running:
+            try:
+                event = await asyncio.wait_for(
+                    self._notification_queue.get(),
+                    timeout=1.0,
+                )
+                handler = self.handlers.get(event.channel)
+                if handler is None:
+                    logger.warning(f"No handler for channel: {event.channel}")
+                    continue
+
+                # Claim the event in the database
+                claimed = await self._claim_event(event.event_id)
+                if not claimed:
+                    logger.debug(f"Event {event.event_id} already claimed by another worker")
+                    continue
+
+                # Dispatch without blocking the queue
+                asyncio.create_task(
+                    self._run_handler(handler, event)
+                )
+
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in dispatch loop")
+
+    async def _claim_event(self, event_id: int) -&gt; bool:
+        """
+        Atomically claim an event for this processor.
+        Returns True if successfully claimed, False if already taken.
+        """
+        async with self.pool.acquire() as conn:
+            result = await conn.fetchval(
+                """
+                UPDATE ai_events
+                SET status = 'processing',
+                    processor_id = $1
+                WHERE id = $2
+                  AND status = 'notified'
+                RETURNING id
+                """,
+                PROCESSOR_ID,
+                event_id,
+            )
+            return result is not None
+
+    async def _run_handler(self, handler: Callable, event: NotificationEvent) -&gt; None:
+        """Execute handler and record result."""
+        start = time.monotonic()
+        try:
+            result = await handler(event, self.pool)
+            elapsed = time.monotonic() - start
+
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE ai_events
+                    SET status = 'completed',
+                        processed_at = now(),
+                        result = $1
+                    WHERE id = $2
+                    """,
+                    json.dumps({"elapsed_ms": int(elapsed * 1000), "result": result}),
+                    event.event_id,
+                )
+        except Exception as exc:
+            logger.exception(f"Handler failed for event {event.event_id}")
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    UPDATE ai_events
+                    SET status = 'failed',
+                        error = $1,
+                        retry_count = retry_count + 1
+                    WHERE id = $2
+                    """,
+                    str(exc),
+                    event.event_id,
+                )
+
+    async def _recovery_loop(self) -&gt; None:
+        """
+        Periodically scan for unprocessed events — handles the case where
+        notifications were dropped (queue full, consumer was down, etc.)
+        """
+        while self.running:
+            try:
+                await asyncio.sleep(30)  # Check every 30 seconds
+
+                async with self.pool.acquire() as conn:
+                    for channel in self.channels:
+                        rows = await conn.fetch(
+                            "SELECT * FROM get_unprocessed_events($1, 60, 50)",
+                            channel,
+                        )
+                        if rows:
+                            logger.info(
+                                f"Recovery: found {len(rows)} unprocessed events on {channel}"
+                            )
+                        for row in rows:
+                            event = NotificationEvent(
+                                channel=channel,
+                                payload=dict(row["payload"]),
+                                event_id=row["event_id"],
+                                entity_id=str(row["entity_id"]),
+                                entity_type=row["entity_type"],
+                                event_type=row["payload"].get("operation", ""),
+                            )
+                            await self._notification_queue.put(event)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in recovery loop")
+
+    async def stop(self) -&gt; None:
+        self.running = False
+        if self.conn:
+            await self.conn.close()
+        if self.pool:
+            await self.pool.close()
+        logger.info(f"Consumer {PROCESSOR_ID} stopped")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">28.4 AI Handlers: Embeddings, LLM Responses, and Agent Routing</h3>
+
+<p class="text-gray-300 leading-relaxed">With the consumer infrastructure in place, the handlers contain the actual AI logic. Here are three complete handlers covering the most common patterns.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
