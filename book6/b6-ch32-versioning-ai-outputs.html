@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 32: Versioning AI Outputs: Storing Model Generations — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 32: Versioning AI Outputs: Storing Model Generations. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 32 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 32: Versioning AI Outputs: Storing Model Generations</h2>
+
+<p class="text-gray-300 leading-relaxed">Every AI application eventually faces the same uncomfortable moment: something changed, and nobody can explain what. The model was swapped, a prompt was tweaked, a temperature setting drifted, and now outputs that users loved yesterday feel different today. Without a systematic approach to storing and versioning model generations, debugging these regressions is archaeology — sifting through logs, guessing at configurations, and hoping someone left a comment somewhere.</p>
+
+<p class="text-gray-300 leading-relaxed">This chapter builds a complete versioning system for AI-generated outputs using PostgreSQL as the authoritative store. You will design schemas that capture not just the text a model produced, but the full generative context: model identifiers, prompt versions, sampling parameters, token usage, latency, embedding representations of outputs, and lineage chains that connect a generation to its ancestors. You will implement audit trails, diff capabilities, rollback logic, and comparison queries that let you answer questions like "how did GPT-4o's outputs change after our prompt refactor?" or "which model version produced the highest user-rated responses on this topic cluster?" PostgreSQL's JSONB, pgvector, row-level security, and logical replication make it uniquely suited for this work — not as a bolt-on logging system, but as the operational core of a generation lifecycle.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Case for Storing Generations (Not Just Logs)</h3>
+
+<p class="text-gray-300 leading-relaxed">Most teams start by writing model outputs to application logs or a flat events table. This works until you need to answer a question that requires joining generations with prompts, comparing outputs across model versions, or clustering similar responses. Log files can not do joins. A flat events table collapses context you will later wish you had preserved.</p>
+
+<p class="text-gray-300 leading-relaxed">The distinction between *logging* and *storing generations* is architectural. Logging answers "did this happen?" Storing generations answers "what was produced, under what conditions, and how does it compare to everything else we have produced?" The second question requires schema.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL earns its place here through several capabilities that vector-only stores and document databases do not provide:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Relational integrity between generations and their inputs.</strong> A generation is the product of a prompt, a model, a parameter set, and optionally a conversation thread. Foreign keys enforce that you cannot store a generation that references a prompt version that does not exist. This sounds obvious until you have a production system where prompt templates are deployed independently of application code, and a misconfigured deployment introduces orphan generations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">JSONB for heterogeneous generation metadata.</strong> Different model families return different metadata shapes. OpenAI returns <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">usage</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finish_reason</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">system_fingerprint</code>. Anthropic returns <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_reason</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_sequence</code>, and model-specific identifiers. Rather than normalizing every API response shape into a rigid schema, you store the raw API response in JSONB alongside normalized columns for the fields you query most. You get structure where you need it and flexibility where schemas diverge.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector for semantic comparison.</strong> Embedding each generation's output text lets you query "find all past generations semantically similar to this new output" — which is how you detect when a model starts drifting, when two supposedly different prompts produce convergent outputs, or when a generation is suspiciously similar to training data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Window functions and CTEs for lineage queries.</strong> When a user iterates on a generated document through multiple rounds of model refinement, the generation chain forms a tree. PostgreSQL's recursive CTEs can traverse that tree efficiently. No comparable feature exists in Redis or a dedicated vector store.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Design: The Generation Store</h3>
+
+<p class="text-gray-300 leading-relaxed">The schema centers on four tables: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prompt_versions</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model_configs</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generation_runs</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generation_outputs</code>. A fifth table, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generation_embeddings</code>, keeps vector representations separated from text storage for indexing efficiency.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS pgvector;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- ─────────────────────────────────────────────
+-- Prompt versioning: track every template change
+-- ─────────────────────────────────────────────
+CREATE TABLE prompt_versions (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    prompt_key      TEXT NOT NULL,           -- logical name, e.g. 'summarize_document'
+    version         INTEGER NOT NULL,
+    template        TEXT NOT NULL,
+    variables       JSONB NOT NULL DEFAULT '[]',  -- declared variable names
+    system_prompt   TEXT,
+    author          TEXT NOT NULL,
+    commit_hash     TEXT,                    -- git SHA if deployed via CI
+    deployed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deprecated_at   TIMESTAMPTZ,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (prompt_key, version)
+);
+
+CREATE INDEX idx_prompt_versions_key_version
+    ON prompt_versions (prompt_key, version DESC);
+
+CREATE INDEX idx_prompt_versions_deployed
+    ON prompt_versions (deployed_at DESC)
+    WHERE deprecated_at IS NULL;
+
+-- ─────────────────────────────────────────────
+-- Model configs: every parameter set is versioned
+-- ─────────────────────────────────────────────
+CREATE TABLE model_configs (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    config_name     TEXT NOT NULL,
+    provider        TEXT NOT NULL,           -- 'openai', 'anthropic', 'cohere', etc.
+    model_id        TEXT NOT NULL,           -- 'gpt-4o', 'claude-3-5-sonnet-20241022'
+    model_version   TEXT,                    -- provider's internal version string
+    parameters      JSONB NOT NULL,          -- temperature, top_p, max_tokens, etc.
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    deprecated_at   TIMESTAMPTZ,
+    notes           TEXT,
+    UNIQUE (config_name)
+);
+
+CREATE INDEX idx_model_configs_active
+    ON model_configs (provider, model_id)
+    WHERE is_active = TRUE;
+
+-- ─────────────────────────────────────────────
+-- Generation runs: one row per API call batch
+-- A run groups one or more outputs from the same
+-- invocation context (e.g., sampling N=3)
+-- ─────────────────────────────────────────────
+CREATE TABLE generation_runs (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    run_key             TEXT,                -- caller-assigned idempotency key
+    prompt_version_id   UUID NOT NULL REFERENCES prompt_versions(id),
+    model_config_id     UUID NOT NULL REFERENCES model_configs(id),
+    rendered_prompt     TEXT NOT NULL,       -- the actual prompt after variable substitution
+    rendered_system     TEXT,
+    input_variables     JSONB NOT NULL DEFAULT '{}',
+    conversation_id     UUID,               -- FK to conversation table if part of a thread
+    parent_run_id       UUID REFERENCES generation_runs(id),  -- for iterative refinement
+    requested_by        TEXT NOT NULL,       -- user_id or service_id
+    session_id          TEXT,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    status              TEXT NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending','running','completed','failed','cancelled')),
+    error_message       TEXT,
+    client_metadata     JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (run_key) WHERE run_key IS NOT NULL
+);
+
+CREATE INDEX idx_generation_runs_prompt
+    ON generation_runs (prompt_version_id, started_at DESC);
+
+CREATE INDEX idx_generation_runs_model
+    ON generation_runs (model_config_id, started_at DESC);
+
+CREATE INDEX idx_generation_runs_conversation
+    ON generation_runs (conversation_id)
+    WHERE conversation_id IS NOT NULL;
+
+CREATE INDEX idx_generation_runs_parent
+    ON generation_runs (parent_run_id)
+    WHERE parent_run_id IS NOT NULL;
+
+CREATE INDEX idx_generation_runs_user
+    ON generation_runs (requested_by, started_at DESC);
+
+-- ─────────────────────────────────────────────
+-- Generation outputs: one row per candidate output
+-- A run with n=3 produces 3 output rows
+-- ─────────────────────────────────────────────
+CREATE TABLE generation_outputs (
+    id                  UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    run_id              UUID NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+    sequence_index      INTEGER NOT NULL DEFAULT 0,  -- position within run (for n&gt;1)
+    output_text         TEXT NOT NULL,
+    output_tokens       INTEGER,
+    input_tokens        INTEGER,
+    total_tokens        INTEGER,
+    finish_reason       TEXT,               -- 'stop', 'length', 'content_filter', etc.
+    latency_ms          INTEGER,
+    raw_response        JSONB NOT NULL,     -- complete API response object
+    selected            BOOLEAN,            -- was this output chosen by the application?
+    user_rating         SMALLINT CHECK (user_rating BETWEEN 1 AND 5),
+    user_feedback       TEXT,
+    flagged             BOOLEAN NOT NULL DEFAULT FALSE,
+    flagged_reason      TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (run_id, sequence_index)
+);
+
+CREATE INDEX idx_generation_outputs_run
+    ON generation_outputs (run_id, sequence_index);
+
+CREATE INDEX idx_generation_outputs_selected
+    ON generation_outputs (run_id)
+    WHERE selected = TRUE;
+
+CREATE INDEX idx_generation_outputs_rated
+    ON generation_outputs (user_rating, created_at DESC)
+    WHERE user_rating IS NOT NULL;
+
+-- Full-text search on output content
+CREATE INDEX idx_generation_outputs_fts
+    ON generation_outputs
+    USING gin(to_tsvector('english', output_text));
+
+-- ─────────────────────────────────────────────
+-- Embeddings: separated for index efficiency
+-- Store embedding of output_text for semantic search
+-- ─────────────────────────────────────────────
+CREATE TABLE generation_embeddings (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    output_id       UUID NOT NULL UNIQUE REFERENCES generation_outputs(id) ON DELETE CASCADE,
+    embedding       VECTOR(1536),           -- text-embedding-3-small dimensions
+    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    embedded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_generation_embeddings_vector
+    ON generation_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- ─────────────────────────────────────────────
+-- Audit log: immutable record of all mutations
+-- Written via trigger, never updated
+-- ─────────────────────────────────────────────
+CREATE TABLE generation_audit_log (
+    id              BIGSERIAL PRIMARY KEY,
+    table_name      TEXT NOT NULL,
+    row_id          UUID NOT NULL,
+    operation       TEXT NOT NULL CHECK (operation IN ('INSERT', 'UPDATE', 'DELETE')),
+    changed_by      TEXT,
+    changed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    old_data        JSONB,
+    new_data        JSONB,
+    delta           JSONB    -- computed diff for UPDATE operations
+);
+
+CREATE INDEX idx_audit_log_row
+    ON generation_audit_log (table_name, row_id, changed_at DESC);
+
+CREATE INDEX idx_audit_log_time
+    ON generation_audit_log (changed_at DESC);
+
+-- Audit trigger function
+CREATE OR REPLACE FUNCTION fn_generation_audit()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_delta JSONB := '{}';
+    v_key   TEXT;
+BEGIN
+    IF TG_OP = 'UPDATE' THEN
+        -- Compute delta: only changed keys
+        FOR v_key IN SELECT key FROM jsonb_each(to_jsonb(OLD)) LOOP
+            IF (to_jsonb(OLD) -&gt; v_key) IS DISTINCT FROM (to_jsonb(NEW) -&gt; v_key) THEN
+                v_delta := v_delta || jsonb_build_object(
+                    v_key,
+                    jsonb_build_object('from', to_jsonb(OLD) -&gt; v_key,
+                                       'to',   to_jsonb(NEW) -&gt; v_key)
+                );
+            END IF;
+        END LOOP;
+
+        INSERT INTO generation_audit_log
+            (table_name, row_id, operation, changed_by, old_data, new_data, delta)
+        VALUES
+            (TG_TABLE_NAME, OLD.id, 'UPDATE',
+             current_setting('app.current_user', TRUE),
+             to_jsonb(OLD), to_jsonb(NEW), v_delta);
+        RETURN NEW;
+
+    ELSIF TG_OP = 'DELETE' THEN
+        INSERT INTO generation_audit_log
+            (table_name, row_id, operation, changed_by, old_data)
+        VALUES
+            (TG_TABLE_NAME, OLD.id, 'DELETE',
+             current_setting('app.current_user', TRUE),
+             to_jsonb(OLD));
+        RETURN OLD;
+
+    ELSIF TG_OP = 'INSERT' THEN
+        INSERT INTO generation_audit_log
+            (table_name, row_id, operation, changed_by, new_data)
+        VALUES
+            (TG_TABLE_NAME, NEW.id, 'INSERT',
+             current_setting('app.current_user', TRUE),
+             to_jsonb(NEW));
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Attach audit triggers
+CREATE TRIGGER trg_audit_prompt_versions
+    AFTER INSERT OR UPDATE OR DELETE ON prompt_versions
+    FOR EACH ROW EXECUTE FUNCTION fn_generation_audit();
+
+CREATE TRIGGER trg_audit_generation_outputs
+    AFTER INSERT OR UPDATE OR DELETE ON generation_outputs
+    FOR EACH ROW EXECUTE FUNCTION fn_generation_audit();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema gives you full traceability from a specific output all the way back to the exact prompt template version and model configuration that produced it. The separation of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generation_runs</code> (the invocation context) from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generation_outputs</code> (the candidate texts) is deliberate — it mirrors how APIs like OpenAI handle <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n > 1</code> sampling and lets you store multiple candidates from a single call without duplicating the prompt or metadata.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Capturing Generations: The Python Client</h3>
+
+<p class="text-gray-300 leading-relaxed">The generation store is only useful if every model call flows through a consistent capture layer. The following client wraps both OpenAI and Anthropic calls, stores the run and output in PostgreSQL, queues embedding computation asynchronously via Celery, and publishes a notification via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> so downstream consumers can react immediately.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
