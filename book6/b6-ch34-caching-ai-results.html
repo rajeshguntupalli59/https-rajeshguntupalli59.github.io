@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 34: Caching AI Results in PostgreSQL — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 34: Caching AI Results in PostgreSQL. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 34 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 34: Caching AI Results in PostgreSQL</h2>
+
+<p class="text-gray-300 leading-relaxed">AI inference is expensive. A single GPT-4 call with a 2,000-token prompt costs real money, and at scale — thousands of users, millions of queries — those costs compound fast. Latency is equally punishing: users waiting 3–8 seconds for every response abandon features. This chapter builds a complete caching layer for AI results directly inside PostgreSQL, covering exact-match caching, semantic similarity caching with pgvector, cache invalidation strategies, and the operational patterns that keep your cache healthy in production. You'll see how PostgreSQL's combination of transactional safety, JSONB flexibility, and vector search makes it a uniquely capable caching backend — one that understands the meaning of queries, not just their text.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.1 Why Cache AI Results — and Why PostgreSQL Is the Right Place</h3>
+
+<p class="text-gray-300 leading-relaxed">Every AI application has a distribution of queries that looks roughly the same: a fat tail of rare, unique queries and a surprisingly large bulk of semantically similar questions asked repeatedly in different words. "What are your business hours?" "When do you open?" "Are you open on Saturdays?" These are three different strings that map to the same answer. A naive string-match cache misses all of that. A vector similarity cache catches it.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL with pgvector is the right place for this cache because:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Your application data already lives there.</strong> Cache entries can reference users, sessions, documents, and products with foreign keys — giving you invalidation triggers when source data changes.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Transactional integrity.</strong> A cache write and a conversation history insert happen in one transaction. No partial states.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">pgvector's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> operator</strong> turns semantic matching into a standard SQL query with an index. No separate infrastructure.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Row-level security</strong> lets you scope caches per tenant without query-level filtering code.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">pg_notify</strong> enables real-time cache invalidation across application servers.</p>
+
+<p class="text-gray-300 leading-relaxed">The alternative — Redis + a separate vector store + your relational database — requires you to keep three systems in sync. PostgreSQL handles all three roles.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Core schema design</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cache schema: all AI caching infrastructure lives here
+CREATE SCHEMA IF NOT EXISTS ai_cache;
+
+-- Exact-match cache for deterministic lookups
+CREATE TABLE ai_cache.exact_results (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    cache_key           TEXT NOT NULL,           -- SHA-256 of (model + normalized_prompt)
+    tenant_id           UUID REFERENCES public.tenants(id) ON DELETE CASCADE,
+    model               TEXT NOT NULL,           -- 'gpt-4o', 'claude-3-5-sonnet-20241022'
+    prompt_hash         TEXT NOT NULL,           -- SHA-256 of the raw prompt
+    normalized_prompt   TEXT NOT NULL,           -- lowercase, stripped prompt
+    response_text       TEXT NOT NULL,
+    response_metadata   JSONB NOT NULL DEFAULT '{}',  -- token counts, finish reason, etc.
+    token_input         INTEGER,
+    token_output        INTEGER,
+    cost_usd            NUMERIC(10, 6),
+    hit_count           INTEGER NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ,
+    last_hit_at         TIMESTAMPTZ,
+    invalidated_at      TIMESTAMPTZ,
+    CONSTRAINT uq_exact_cache_key UNIQUE (cache_key)
+);
+
+-- Semantic similarity cache using pgvector
+CREATE TABLE ai_cache.semantic_results (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id           UUID REFERENCES public.tenants(id) ON DELETE CASCADE,
+    model               TEXT NOT NULL,
+    embedding_model     TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    prompt_text         TEXT NOT NULL,
+    prompt_embedding    vector(1536) NOT NULL,
+    response_text       TEXT NOT NULL,
+    response_metadata   JSONB NOT NULL DEFAULT '{}',
+    token_input         INTEGER,
+    token_output        INTEGER,
+    cost_usd            NUMERIC(10, 6),
+    similarity_threshold NUMERIC(4, 3) NOT NULL DEFAULT 0.92,
+    hit_count           INTEGER NOT NULL DEFAULT 0,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    expires_at          TIMESTAMPTZ,
+    last_hit_at         TIMESTAMPTZ,
+    invalidated_at      TIMESTAMPTZ,
+    source_document_ids UUID[] DEFAULT '{}',     -- for invalidation when docs change
+    tags                TEXT[] DEFAULT '{}'
+);
+
+-- HNSW index for fast approximate nearest-neighbor search
+CREATE INDEX idx_semantic_cache_embedding
+    ON ai_cache.semantic_results
+    USING hnsw (prompt_embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Partial index: only active (non-invalidated, non-expired) entries
+CREATE INDEX idx_semantic_cache_active
+    ON ai_cache.semantic_results (tenant_id, model, created_at)
+    WHERE invalidated_at IS NULL AND (expires_at IS NULL OR expires_at &gt; now());
+
+CREATE INDEX idx_exact_cache_active
+    ON ai_cache.exact_results (cache_key)
+    WHERE invalidated_at IS NULL AND (expires_at IS NULL OR expires_at &gt; now());
+
+-- Cache analytics table — track hits and costs saved
+CREATE TABLE ai_cache.access_log (
+    id              BIGSERIAL PRIMARY KEY,
+    cache_type      TEXT NOT NULL CHECK (cache_type IN ('exact', 'semantic', 'miss')),
+    cache_entry_id  UUID,
+    tenant_id       UUID,
+    model           TEXT,
+    similarity      NUMERIC(6, 4),      -- NULL for exact hits
+    latency_ms      INTEGER,
+    cost_saved_usd  NUMERIC(10, 6),
+    accessed_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_access_log_tenant_time
+    ON ai_cache.access_log (tenant_id, accessed_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.2 Exact-Match Caching: The First Line of Defense</h3>
+
+<p class="text-gray-300 leading-relaxed">Exact-match caching is the cheapest, fastest layer. Before calling any LLM, normalize the prompt and compute a cache key. If that key exists in the cache and hasn't expired, return it immediately.</p>
+
+<p class="text-gray-300 leading-relaxed">Normalization matters more than it seems. "What are your hours?" and "What are your hours? " (trailing space) are the same question. Lowercase folding, whitespace normalization, and stripping common filler phrases dramatically increase your exact-hit rate.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Function: normalize a prompt for exact cache lookup
+CREATE OR REPLACE FUNCTION ai_cache.normalize_prompt(raw_prompt TEXT)
+RETURNS TEXT
+LANGUAGE plpgsql IMMUTABLE STRICT
+AS $$
+DECLARE
+    normalized TEXT;
+BEGIN
+    -- Lowercase
+    normalized := lower(raw_prompt);
+    -- Collapse whitespace
+    normalized := regexp_replace(normalized, '\s+', ' ', 'g');
+    -- Strip leading/trailing whitespace
+    normalized := trim(normalized);
+    -- Remove trailing punctuation variations (optional, tune per use case)
+    normalized := regexp_replace(normalized, '[.!?]+$', '', 'g');
+    RETURN normalized;
+END;
+$$;
+
+-- Function: compute cache key from model + normalized prompt
+CREATE OR REPLACE FUNCTION ai_cache.compute_cache_key(
+    p_model TEXT,
+    p_normalized_prompt TEXT,
+    p_tenant_id UUID DEFAULT NULL
+)
+RETURNS TEXT
+LANGUAGE sql IMMUTABLE STRICT
+AS $$
+    SELECT encode(
+        sha256(
+            (COALESCE(p_tenant_id::TEXT, '') || '|' || p_model || '|' || p_normalized_prompt)::bytea
+        ),
+        'hex'
+    );
+$$;
+
+-- Function: look up exact cache hit and bump hit counter atomically
+CREATE OR REPLACE FUNCTION ai_cache.lookup_exact(
+    p_model         TEXT,
+    p_prompt        TEXT,
+    p_tenant_id     UUID DEFAULT NULL
+)
+RETURNS TABLE (
+    cache_id        UUID,
+    response_text   TEXT,
+    response_meta   JSONB,
+    hit_count       INTEGER
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_normalized    TEXT;
+    v_cache_key     TEXT;
+BEGIN
+    v_normalized := ai_cache.normalize_prompt(p_prompt);
+    v_cache_key  := ai_cache.compute_cache_key(p_model, v_normalized, p_tenant_id);
+
+    RETURN QUERY
+    UPDATE ai_cache.exact_results
+    SET
+        hit_count   = ai_cache.exact_results.hit_count + 1,
+        last_hit_at = now()
+    WHERE
+        cache_key       = v_cache_key
+        AND invalidated_at IS NULL
+        AND (expires_at IS NULL OR expires_at &gt; now())
+    RETURNING
+        id,
+        ai_cache.exact_results.response_text,
+        response_metadata,
+        ai_cache.exact_results.hit_count;
+END;
+$$;
+
+-- Function: store a new exact cache entry
+CREATE OR REPLACE FUNCTION ai_cache.store_exact(
+    p_model             TEXT,
+    p_prompt            TEXT,
+    p_response_text     TEXT,
+    p_response_metadata JSONB,
+    p_tenant_id         UUID DEFAULT NULL,
+    p_token_input       INTEGER DEFAULT NULL,
+    p_token_output      INTEGER DEFAULT NULL,
+    p_cost_usd          NUMERIC DEFAULT NULL,
+    p_ttl_seconds       INTEGER DEFAULT NULL
+)
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_normalized    TEXT;
+    v_cache_key     TEXT;
+    v_prompt_hash   TEXT;
+    v_expires_at    TIMESTAMPTZ;
+    v_id            UUID;
+BEGIN
+    v_normalized  := ai_cache.normalize_prompt(p_prompt);
+    v_cache_key   := ai_cache.compute_cache_key(p_model, v_normalized, p_tenant_id);
+    v_prompt_hash := encode(sha256(p_prompt::bytea), 'hex');
+    v_expires_at  := CASE WHEN p_ttl_seconds IS NOT NULL
+                          THEN now() + (p_ttl_seconds || ' seconds')::interval
+                          ELSE NULL END;
+
+    INSERT INTO ai_cache.exact_results (
+        cache_key, tenant_id, model, prompt_hash, normalized_prompt,
+        response_text, response_metadata, token_input, token_output,
+        cost_usd, expires_at
+    )
+    VALUES (
+        v_cache_key, p_tenant_id, p_model, v_prompt_hash, v_normalized,
+        p_response_text, p_response_metadata, p_token_input, p_token_output,
+        p_cost_usd, v_expires_at
+    )
+    ON CONFLICT (cache_key) DO UPDATE
+        SET response_text     = EXCLUDED.response_text,
+            response_metadata = EXCLUDED.response_metadata,
+            token_input       = EXCLUDED.token_input,
+            token_output      = EXCLUDED.token_output,
+            cost_usd          = EXCLUDED.cost_usd,
+            expires_at        = EXCLUDED.expires_at,
+            invalidated_at    = NULL  -- un-invalidate on refresh
+    RETURNING id INTO v_id;
+
+    RETURN v_id;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.3 Semantic Similarity Caching with pgvector</h3>
+
+<p class="text-gray-300 leading-relaxed">Exact caching handles repeats. Semantic caching handles paraphrases. The idea is simple: embed the incoming prompt, then search the cache for stored prompts whose embeddings are within a cosine similarity threshold. If you find one, return its cached response.</p>
+
+<p class="text-gray-300 leading-relaxed">The threshold is the critical tuning knob. Too low (0.80) and you'll return answers to semantically adjacent but actually different questions. Too high (0.99) and you'll miss obvious paraphrases. A starting point of 0.92 works well for factual Q&A. For creative or nuanced tasks, raise it to 0.95.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Function: semantic cache lookup
+CREATE OR REPLACE FUNCTION ai_cache.lookup_semantic(
+    p_model             TEXT,
+    p_prompt_embedding  vector(1536),
+    p_tenant_id         UUID DEFAULT NULL,
+    p_similarity_threshold NUMERIC DEFAULT 0.92,
+    p_limit             INTEGER DEFAULT 1
+)
+RETURNS TABLE (
+    cache_id        UUID,
+    response_text   TEXT,
+    response_meta   JSONB,
+    similarity      NUMERIC,
+    hit_count       INTEGER
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RETURN QUERY
+    WITH candidates AS (
+        SELECT
+            id,
+            ai_cache.semantic_results.response_text,
+            response_metadata,
+            1 - (prompt_embedding &lt;=&gt; p_prompt_embedding) AS cosine_similarity,
+            ai_cache.semantic_results.hit_count
+        FROM ai_cache.semantic_results
+        WHERE
+            model           = p_model
+            AND (tenant_id = p_tenant_id OR (tenant_id IS NULL AND p_tenant_id IS NULL))
+            AND invalidated_at IS NULL
+            AND (expires_at IS NULL OR expires_at &gt; now())
+        ORDER BY prompt_embedding &lt;=&gt; p_prompt_embedding
+        LIMIT 10  -- retrieve top-10 candidates from HNSW, then filter
+    )
+    SELECT
+        id,
+        candidates.response_text,
+        response_metadata,
+        cosine_similarity::NUMERIC,
+        candidates.hit_count
+    FROM candidates
+    WHERE cosine_similarity &gt;= p_similarity_threshold
+    ORDER BY cosine_similarity DESC
+    LIMIT p_limit;
+
+    -- Update hit count for the returned entry (fire and forget via a CTE)
+    UPDATE ai_cache.semantic_results sr
+    SET
+        hit_count   = sr.hit_count + 1,
+        last_hit_at = now()
+    FROM (
+        SELECT id FROM ai_cache.semantic_results
+        WHERE
+            model = p_model
+            AND (tenant_id = p_tenant_id OR (tenant_id IS NULL AND p_tenant_id IS NULL))
+            AND invalidated_at IS NULL
+            AND (expires_at IS NULL OR expires_at &gt; now())
+        ORDER BY prompt_embedding &lt;=&gt; p_prompt_embedding
+        LIMIT 1
+    ) AS top
+    WHERE sr.id = top.id
+      AND (1 - (sr.prompt_embedding &lt;=&gt; p_prompt_embedding)) &gt;= p_similarity_threshold;
+END;
+$$;
+
+-- Function: store semantic cache entry
+CREATE OR REPLACE FUNCTION ai_cache.store_semantic(
+    p_model                 TEXT,
+    p_embedding_model       TEXT,
+    p_prompt_text           TEXT,
+    p_prompt_embedding      vector(1536),
+    p_response_text         TEXT,
+    p_response_metadata     JSONB,
+    p_tenant_id             UUID DEFAULT NULL,
+    p_token_input           INTEGER DEFAULT NULL,
+    p_token_output          INTEGER DEFAULT NULL,
+    p_cost_usd              NUMERIC DEFAULT NULL,
+    p_ttl_seconds           INTEGER DEFAULT NULL,
+    p_source_document_ids   UUID[] DEFAULT '{}',
+    p_tags                  TEXT[] DEFAULT '{}'
+)
+RETURNS UUID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_expires_at    TIMESTAMPTZ;
+    v_id            UUID;
+BEGIN
+    v_expires_at := CASE WHEN p_ttl_seconds IS NOT NULL
+                         THEN now() + (p_ttl_seconds || ' seconds')::interval
+                         ELSE NULL END;
+
+    INSERT INTO ai_cache.semantic_results (
+        tenant_id, model, embedding_model, prompt_text, prompt_embedding,
+        response_text, response_metadata, token_input, token_output,
+        cost_usd, expires_at, source_document_ids, tags
+    )
+    VALUES (
+        p_tenant_id, p_model, p_embedding_model, p_prompt_text, p_prompt_embedding,
+        p_response_text, p_response_metadata, p_token_input, p_token_output,
+        p_cost_usd, v_expires_at, p_source_document_ids, p_tags
+    )
+    RETURNING id INTO v_id;
+
+    RETURN v_id;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now the Python application layer that ties both cache layers together:</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
