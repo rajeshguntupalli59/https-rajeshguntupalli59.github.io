@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 35: Horizontal Scaling for AI-Heavy Read Workloads — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 35: Horizontal Scaling for AI-Heavy Read Workloads. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 35 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 35: Horizontal Scaling for AI-Heavy Read Workloads</h2>
+
+<p class="text-gray-300 leading-relaxed">AI applications have a fundamentally different read profile than traditional web apps. A single RAG query might touch a vector similarity search, a full-text search, several JOIN operations across conversation history, a user preference lookup, and a metadata filter — all before handing results to an LLM that takes 800ms to 3 seconds to respond. Multiply that by hundreds of concurrent users, and your PostgreSQL primary becomes the bottleneck not because it can't store the data, but because it's saturated with expensive read operations that could be offloaded. This chapter covers the full architecture for horizontally scaling AI-heavy read workloads: streaming replicas for read distribution, connection pooling with PgBouncer, replica-aware application patterns, caching layers with Redis, and async workload separation with Celery — all designed around the specific query shapes that LLM-powered applications produce.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Understanding the AI Read Workload Profile</h3>
+
+<p class="text-gray-300 leading-relaxed">Before building a scaling architecture, you need to understand what makes AI application reads different from CRUD application reads.</p>
+
+<p class="text-gray-300 leading-relaxed">A typical e-commerce read is fast and selective: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM products WHERE id = $1</code>. A typical RAG read is expensive and broad:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- A realistic RAG retrieval query — expensive, broad, and run on every user message
+WITH candidate_chunks AS (
+    SELECT
+        dc.id,
+        dc.document_id,
+        dc.chunk_text,
+        dc.chunk_index,
+        dc.embedding &lt;=&gt; $1::vector AS semantic_distance,
+        ts_rank_cd(dc.search_vector, websearch_to_tsquery('english', $2)) AS text_rank
+    FROM document_chunks dc
+    INNER JOIN documents d ON dc.document_id = d.id
+    WHERE
+        d.tenant_id = $3
+        AND d.status = 'active'
+        AND d.collection_id = ANY($4::uuid[])
+        -- Pre-filter to a semantic neighborhood before ranking
+        AND dc.embedding &lt;=&gt; $1::vector &lt; 0.45
+    ORDER BY dc.embedding &lt;=&gt; $1::vector
+    LIMIT 150
+),
+reranked AS (
+    SELECT
+        cc.*,
+        -- Reciprocal rank fusion of semantic + text signals
+        (1.0 / (60 + ROW_NUMBER() OVER (ORDER BY semantic_distance))) +
+        (1.0 / (60 + ROW_NUMBER() OVER (ORDER BY text_rank DESC))) AS rrf_score
+    FROM candidate_chunks cc
+    WHERE text_rank &gt; 0.01 OR semantic_distance &lt; 0.35
+),
+enriched AS (
+    SELECT
+        r.*,
+        d.title AS document_title,
+        d.source_url,
+        d.metadata,
+        ch.content AS conversation_context
+    FROM reranked r
+    INNER JOIN documents d ON r.document_id = d.id
+    LEFT JOIN (
+        SELECT DISTINCT ON (session_id)
+            session_id,
+            content
+        FROM conversation_history
+        WHERE session_id = $5
+        ORDER BY session_id, created_at DESC
+    ) ch ON true
+    WHERE d.tenant_id = $3
+)
+SELECT
+    id,
+    document_id,
+    chunk_text,
+    document_title,
+    source_url,
+    metadata,
+    conversation_context,
+    rrf_score,
+    semantic_distance
+FROM enriched
+ORDER BY rrf_score DESC
+LIMIT $6;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This query:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Performs an IVFFlat or HNSW vector scan across potentially millions of embeddings</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Executes a GIN-indexed full-text search</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Joins three tables</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Uses window functions for reciprocal rank fusion</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Runs for every single user message, hundreds of times per minute at moderate scale</li>
+
+<p class="text-gray-300 leading-relaxed">The right response to this profile is not vertical scaling alone — it's distributing these expensive reads across multiple PostgreSQL instances while keeping writes on the primary.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema baseline for this chapter:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core tables referenced throughout this chapter
+CREATE TABLE tenants (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    plan TEXT NOT NULL DEFAULT 'free',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE documents (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    collection_id UUID NOT NULL,
+    title TEXT NOT NULL,
+    source_url TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'archived', 'processing')),
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE document_chunks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_text TEXT NOT NULL,
+    embedding vector(1536),
+    search_vector tsvector GENERATED ALWAYS AS (
+        to_tsvector('english', chunk_text)
+    ) STORED,
+    token_count INTEGER,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (document_id, chunk_index)
+);
+
+CREATE TABLE conversation_history (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL,
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    role TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content TEXT NOT NULL,
+    tokens_used INTEGER,
+    model TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE query_cache (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES tenants(id),
+    query_hash TEXT NOT NULL,
+    embedding_hash TEXT NOT NULL,
+    result_chunks JSONB NOT NULL,
+    hit_count INTEGER NOT NULL DEFAULT 1,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at TIMESTAMPTZ NOT NULL,
+    UNIQUE (tenant_id, query_hash)
+);
+
+-- Indexes
+CREATE INDEX idx_document_chunks_embedding ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX idx_document_chunks_search_vector ON document_chunks
+    USING GIN (search_vector);
+
+CREATE INDEX idx_documents_tenant_collection ON documents (tenant_id, collection_id)
+    WHERE status = 'active';
+
+CREATE INDEX idx_conversation_history_session ON conversation_history (session_id, created_at DESC);
+
+CREATE INDEX idx_query_cache_lookup ON query_cache (tenant_id, query_hash)
+    WHERE expires_at &gt; NOW();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Streaming Replication and Replica Topology for AI Workloads</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL streaming replication is the foundation of horizontal read scaling. For AI workloads, you want a topology that separates concerns: different replicas can be tuned for different query types.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication setup for production AI workloads:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># postgresql.conf on primary — tuned for AI workload replication
+
+# WAL settings
+wal_level = replica
+max_wal_senders = 10
+wal_keep_size = 2GB
+wal_compression = zstd
+
+# Replication slots (named slots survive restarts)
+# Create slots on primary:
+# SELECT pg_create_physical_replication_slot('replica_rag_01');
+# SELECT pg_create_physical_replication_slot('replica_rag_02');
+
+# Synchronous commit — async for AI reads is fine; writes are on primary
+synchronous_commit = on
+synchronous_standby_names = ''
+
+# Checkpoint tuning — AI workloads generate less WAL than OLTP
+checkpoint_completion_target = 0.9
+max_wal_size = 4GB
+min_wal_size = 512MB
+
+# For pgvector: parallel query on replicas
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 8
+parallel_leader_participation = on</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># postgresql.conf on RAG replica nodes — tuned for heavy vector reads
+
+# Memory — replicas can use more RAM for caching since they don't write
+shared_buffers = 8GB                    # ~25% of RAM
+effective_cache_size = 24GB            # ~75% of RAM
+work_mem = 256MB                       # Large for vector ops and sort
+maintenance_work_mem = 2GB
+
+# pgvector HNSW tuning on replicas
+# ef_search can be set per-session; set a higher default for quality
+# SET hnsw.ef_search = 100;
+
+# Parallel query — maximize for expensive RAG queries
+max_parallel_workers_per_gather = 6
+max_parallel_workers = 12
+parallel_leader_participation = off    # Leader coordinates, doesn't scan
+
+# Hot standby
+hot_standby = on
+hot_standby_feedback = on              # Prevents query cancellation on replicas
+max_standby_streaming_delay = 30s     # Allow long-running vector queries
+
+# Recovery
+recovery_min_apply_delay = 0          # No intentional lag for RAG replicas
+
+# Connection limits
+max_connections = 200                  # Replicas can handle more connections</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pg_hba.conf on primary — allow replica connections
+# TYPE  DATABASE    USER            ADDRESS         METHOD
+host    replication replicator      10.0.1.0/24     scram-sha-256
+
+# postgresql.conf on replica — connection to primary
+# recovery.conf (PostgreSQL &lt; 12) or postgresql.conf (PostgreSQL &gt;= 12)
+
+primary_conninfo = 'host=10.0.1.10 port=5432 user=replicator password=secret application_name=replica_rag_01'
+primary_slot_name = 'replica_rag_01'
+recovery_target_timeline = 'latest'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For AI workloads, consider a three-tier replica topology:</p>
+
+<p class="text-gray-300 leading-relaxed">| Replica Type | Tuning | Purpose |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replica_rag</code> (2-3 nodes) | High work_mem, parallel workers | Vector similarity + hybrid search |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replica_analytics</code> (1 node) | Large maintenance_work_mem | Usage analytics, tenant dashboards |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replica_cache_warmer</code> (1 node) | Read-only, background | Pre-warming query caches |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring replication lag — critical for AI systems:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run on primary — monitor replica lag
+-- Excessive lag means replicas return stale embeddings or miss recent document ingestion
+CREATE OR REPLACE VIEW replication_status AS
+SELECT
+    client_addr,
+    application_name,
+    state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    write_lag,
+    flush_lag,
+    replay_lag,
+    -- Convert lag to human-readable bytes behind
+    pg_wal_lsn_diff(sent_lsn, replay_lsn) AS bytes_behind,
+    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS size_behind
+FROM pg_stat_replication
+ORDER BY replay_lag DESC NULLS LAST;
+
+-- Alert if any replica is more than 60 seconds behind
+-- This means newly ingested documents won't be searchable on that replica
+SELECT
+    application_name,
+    replay_lag,
+    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS bytes_behind
+FROM pg_stat_replication
+WHERE replay_lag &gt; interval '60 seconds'
+   OR pg_wal_lsn_diff(sent_lsn, replay_lsn) &gt; 500 * 1024 * 1024; -- 500MB behind</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">PgBouncer Configuration for AI Connection Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">AI applications have a connection pattern that differs from web apps: fewer, longer-lived connections that hold transactions open during LLM inference. PgBouncer requires specific configuration to handle this without starving replicas.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pgbouncer.ini — primary pool (writes + reads requiring fresh data)
+[databases]
+ai_app_primary = host=10.0.1.10 port=5432 dbname=ai_app
+ai_app_replica1 = host=10.0.1.21 port=5432 dbname=ai_app
+ai_app_replica2 = host=10.0.1.22 port=5432 dbname=ai_app
+
+[pgbouncer]
+listen_port = 6432
+listen_addr = *
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+# Pool mode — transaction pooling works for most AI queries
+# Exception: session-level settings like SET hnsw.ef_search need session mode
+pool_mode = transaction
+
+# Connection limits
+max_client_conn = 2000              # App connections to PgBouncer
+default_pool_size = 25             # PgBouncer connections to each Postgres
+min_pool_size = 5
+reserve_pool_size = 10
+reserve_pool_timeout = 3.0
+
+# AI-specific: queries can be long-running (vector search + LLM wait)
+query_timeout = 120                # 2 minutes max per query
+client_idle_timeout = 300          # 5 min idle disconnect
+server_idle_timeout = 600          # Keep server connections alive
+
+# Important for pgvector: avoid prepared statement conflicts in transaction mode
+max_prepared_statements = 0        # Disable if using transaction mode
+
+# Stats
+stats_period = 30
+log_pooler_errors = 1
+
+[databases]
+# Separate pool for RAG replicas — larger pool, different timeout
+ai_app_rag = host=10.0.1.21,10.0.1.22 port=5432 dbname=ai_app pool_size=40 pool_mode=transaction</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># connection_router.py — intelligent routing between primary and replicas
+# Routes AI reads to replicas, writes to primary, with replica health checking
+
+import asyncio
+import asyncpg
+import redis.asyncio as redis
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Optional, AsyncGenerator
+import logging
+import time
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ReplicaHealth:
+    host: str
+    port: int
+    lag_seconds: float
+    is_healthy: bool
+    last_checked: float
+    connection_count: int
+
+class AIWorkloadRouter:
+    """
+    Routes database connections intelligently for AI workloads.
+    
+    Strategy:
+    - Writes → primary always
+    - RAG queries → replicas with acceptable lag
+    - Conversation history writes → primary
+    - Conversation history reads → replica (slight staleness OK)
+    - Fresh document searches (&lt; 30s after ingest) → primary
+    """
+
+    PRIMARY_DSN = "postgresql://ai_app:secret@pgbouncer:6432/ai_app_primary"
+    REPLICA_DSNS = [
+        "postgresql://ai_app:secret@pgbouncer:6432/ai_app_replica1",
+        "postgresql://ai_app:secret@pgbouncer:6432/ai_app_replica2",
+    ]
+    RAG_POOL_DSN = "postgresql://ai_app:secret@pgbouncer:6432/ai_app_rag"
+
+    # Maximum acceptable replication lag for RAG queries (seconds)
+    MAX_ACCEPTABLE_LAG = 30.0
+
+    def __init__(self, redis_client: redis.Redis):
+        self.redis = redis_client
+        self._primary_pool: Optional[asyncpg.Pool] = None
+        self._rag_pool: Optional[asyncpg.Pool] = None
+        self._replica_health: dict[str, ReplicaHealth] = {}
+        self._health_check_task: Optional[asyncio.Task] = None
+
+    async def initialize(self):
+        """Create connection pools and start health monitoring."""
+        self._primary_pool = await asyncpg.create_pool(
+            self.PRIMARY_DSN,
+            min_size=5,
+            max_size=25,
+            max_inactive_connection_lifetime=300,
+            command_timeout=30,
+        )
+
+        self._rag_pool = await asyncpg.create_pool(
+            self.RAG_POOL_DSN,
+            min_size=10,
+            max_size=50,
+            max_inactive_connection_lifetime=300,
+            # Longer timeout for vector searches
+            command_timeout=90,
+            # Set HNSW ef_search for quality RAG results
+            init=self._configure_rag_session,
+        )
+
+        self._health_check_task = asyncio.create_task(
+            self._replica_health_monitor()
+        )
+        logger.info("AIWorkloadRouter initialized")
+
+    async def _configure_rag_session(self, conn: asyncpg.Connection):
+        """Configure each RAG pool connection for optimal vector search."""
+        await conn.execute("SET hnsw.ef_search = 100")
+        await conn.execute("SET enable_seqscan = off")
+        await conn.execute("SET max_parallel_workers_per_gather = 4")
+
+    async def _replica_health_monitor(self):
+        """Background task that monitors replica lag every 15 seconds."""
+        while True:
+            try:
+                async with self._primary_pool.acquire() as conn:
+                    rows = await conn.fetch("""
+                        SELECT
+                            client_addr::text AS host,
+                            application_name,
+                            EXTRACT(EPOCH FROM replay_lag) AS lag_seconds,
+                            EXTRACT(EPOCH FROM write_lag) AS write_lag_seconds
+                        FROM pg_stat_replication
+                        WHERE state = 'streaming'
+                    """)
+
+                    for row in rows:
+                        host = row['application_name']
+                        lag = row['lag_seconds'] or 0.0
+                        self._replica_health[host] = ReplicaHealth(
+                            host=row['host'],
+                            port=5432,
+                            lag_seconds=lag,
+                            is_healthy=lag &lt; self.MAX_ACCEPTABLE_LAG,
+                            last_checked=time.time(),
+                            connection_count=0,
+                        )
+
+                        # Publish health to Redis for other app instances
+                        await self.redis.setex(
+                            f"replica_health:{host}",
+                            60,
+                            f"{lag:.2f}",
+                        )
+
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+
+            await asyncio.sleep(15)
+
+    def _replicas_healthy(self) -&gt; bool:
+        """Returns True if at least one replica is within acceptable lag."""
+        if not self._replica_health:
+            return False
+        return any(h.is_healthy for h in self._replica_health.values())
+
+    @asynccontextmanager
+    async def read_connection(
+        self,
+        require_fresh: bool = False,
+        workload: str = "general",
+    ) -&gt; AsyncGenerator[asyncpg.Connection, None]:
+        """
+        Get a connection for read operations.
+        
+        Args:
+            require_fresh: If True, always use primary (for post-ingest queries)
+            workload: 'rag' routes to dedicated RAG pool, 'general' to any replica
+        """
+        if require_fresh or not self._replicas_healthy():
+            pool = self._primary_pool
+            logger.debug(f"Read routing to primary (fresh={require_fresh})")
+        elif workload == "rag":
+            pool = self._rag_pool
+            logger.debug("Read routing to RAG pool")
+        else:
+            pool = self._rag_pool  # Could load-balance across replica pools
+            logger.debug("Read routing to replica pool")
+
+        async with pool.acquire() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def write_connection(self) -&gt; AsyncGenerator[asyncpg.Connection, None]:
+        """Always routes to primary for writes."""
+        async with self._primary_pool.acquire() as conn:
+            yield conn
+
+    @asynccontextmanager
+    async def transaction(self) -&gt; AsyncGenerator[asyncpg.Connection, None]:
+        """Transactions always go to primary."""
+        async with self._primary_pool.acquire() as conn:
+            async with conn.transaction():
+                yield conn
+
+    async def close(self):
+        if self._health_check_task:
+            self._health_check_task.cancel()
+        if self._primary_pool:
+            await self._primary_pool.close()
+        if self._rag_pool:
+            await self._rag_pool.close()
+
+
+# Usage in FastAPI application
+from fastapi import FastAPI, Depends, HTTPException
+from pydantic import BaseModel
+import openai
+import uuid
+
+app = FastAPI()
+router: Optional[AIWorkloadRouter] = None
+redis_client: Optional[redis.Redis] = None
+
+
+@app.on_event("startup")
+async def startup():
+    global router, redis_client
+    redis_client = redis.Redis(host="redis", port=6379, decode_responses=True)
+    router = AIWorkloadRouter(redis_client)
+    await router.initialize()
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await router.close()
+    await redis_client.close()
+
+
+def get_router() -&gt; AIWorkloadRouter:
+    return router
+
+
+def get_redis() -&gt; redis.Redis:
+    return redis_client</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Redis Caching Layer for Embedding and RAG Results</h3>
+
+<p class="text-gray-300 leading-relaxed">The most expensive part of a RAG query is often not the PostgreSQL vector search — it's the OpenAI embedding call that precedes it. Caching at multiple layers dramatically reduces latency and cost.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>
