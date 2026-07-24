@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 10: Idle Instance Detection and Automated Shutdown — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 10: Idle Instance Detection and Automated Shutdown. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 10 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 10: Idle Instance Detection and Automated Shutdown</h2>
+
+<p class="text-gray-300 leading-relaxed">Organizations running cloud databases at scale consistently find that 20–35% of their RDS, Azure SQL, and Cloud SQL instances are functionally idle at any given moment — consuming full compute and storage costs while serving zero meaningful workload. At an average of $200–$800/month per db.r6g.large or equivalent instance, a 50-instance fleet can hemorrhage $50,000–$150,000 annually on instances that nobody noticed were abandoned. This chapter builds a complete detection-to-shutdown pipeline: first identifying idle instances using CloudWatch, Azure Monitor, and GCP metrics, then validating idleness against connection counts and query throughput, and finally automating graceful shutdown with appropriate safeguards. Teams that implement this pipeline systematically report 15–30% reductions in their monthly database bills within the first 60 days.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.1 Defining "Idle": Metrics That Actually Matter</h3>
+
+<p class="text-gray-300 leading-relaxed">The instinct to define an idle database as one with zero connections is wrong in practice. Connection poolers like pgBouncer and RDS Proxy maintain persistent connections to the database engine even when no application queries are running. A single health-check query from a monitoring agent counts as a "connection" and will mask genuine idleness if you rely on connection count alone.</p>
+
+<p class="text-gray-300 leading-relaxed">A production-grade idle definition combines four signals measured over a rolling 7-day window:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">DatabaseConnections</strong>: The average number of active connections. For most workloads, a database averaging fewer than 2 connections over 7 days is a strong candidate.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">ReadIOPS + WriteIOPS</strong>: Combined I/O operations per second. A truly idle database shows near-zero I/O. Thresholds below 1 IOPS average over 7 days are reliable.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">CPUUtilization</strong>: CPU below 1% average over 7 days, excluding maintenance windows.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">NetworkReceiveThroughput</strong>: Below 10 KB/s average, which eliminates instances receiving replication traffic or periodic ETL loads.</p>
+
+<p class="text-gray-300 leading-relaxed">Using any single metric produces false positives. A batch ETL job that runs Sunday nights shows zero connections all week but is legitimate. Combining all four signals, with the 7-day rolling window, filters out these jobs reliably.</p>
+
+<p class="text-gray-300 leading-relaxed">The financial logic is straightforward. An <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.large</code> in us-east-1 costs $0.26/hour on-demand, which is $187/month. That instance may have 100 GB of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gp2</code> storage at $0.115/GB, adding $11.50/month — $198.50 total. Multiplied across 20 genuinely idle instances, you are spending $3,970/month. Automated shutdown eliminates that entirely. Even if you implement scheduled stop/start rather than full termination, stopping RDS instances for 16 hours per day on non-production instances saves 67% of the compute cost while keeping storage costs in place, dropping that $187 compute to roughly $62.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.2 Detection Queries and Metric Collection</h3>
+
+<p class="text-gray-300 leading-relaxed">Before automating shutdown, you need a reliable inventory of idle candidates. The following scripts build that inventory across all three clouds.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS: CloudWatch Metrics for Idle RDS Detection</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># idle_detector_aws.py
+# Scans all RDS instances in a region and scores them for idleness
+# Run on a schedule (daily via Lambda or cron)
+# Requires: boto3, IAM permissions for rds:DescribeDBInstances,
+#           cloudwatch:GetMetricStatistics, ce:GetCostAndUsage
+
+import boto3
+import json
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class InstanceIdleScore:
+    instance_id: str
+    instance_class: str
+    engine: str
+    status: str
+    region: str
+    avg_connections: float = 0.0
+    avg_cpu: float = 0.0
+    avg_read_iops: float = 0.0
+    avg_write_iops: float = 0.0
+    avg_network_kb: float = 0.0
+    idle_score: int = 0          # 0-4, higher = more idle
+    monthly_cost_usd: float = 0.0
+    tags: dict = field(default_factory=dict)
+    recommendation: str = ""
+
+# On-demand pricing for common RDS instance classes (us-east-1, MySQL/PostgreSQL)
+# Update this map quarterly or fetch from AWS Price List API
+RDS_HOURLY_PRICING = {
+    "db.t3.micro":    0.017,
+    "db.t3.small":    0.034,
+    "db.t3.medium":   0.068,
+    "db.t3.large":    0.136,
+    "db.r6g.large":   0.260,
+    "db.r6g.xlarge":  0.520,
+    "db.r6g.2xlarge": 1.040,
+    "db.r5.large":    0.240,
+    "db.r5.xlarge":   0.480,
+    "db.r5.2xlarge":  0.960,
+    "db.m6g.large":   0.183,
+    "db.m6g.xlarge":  0.365,
+}
+
+def get_metric_average(cw_client, instance_id, metric_name, namespace,
+                        days=7, period_seconds=604800):
+    """
+    Fetches a single metric average over the past N days.
+    period_seconds=604800 = 1 week (single data point average).
+    """
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=days)
+
+    response = cw_client.get_metric_statistics(
+        Namespace=namespace,
+        MetricName=metric_name,
+        Dimensions=[{"Name": "DBInstanceIdentifier", "Value": instance_id}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=period_seconds,
+        Statistics=["Average"]
+    )
+
+    datapoints = response.get("Datapoints", [])
+    if not datapoints:
+        return 0.0
+    return round(datapoints[0]["Average"], 4)
+
+def score_instance(instance: InstanceIdleScore) -&gt; InstanceIdleScore:
+    """
+    Assigns an idle score 0-4 based on four metric thresholds.
+    Score 4 = idle across all dimensions.
+    """
+    score = 0
+    if instance.avg_connections &lt; 2.0:
+        score += 1
+    if instance.avg_cpu &lt; 1.0:
+        score += 1
+    if (instance.avg_read_iops + instance.avg_write_iops) &lt; 1.0:
+        score += 1
+    if instance.avg_network_kb &lt; 10.0:
+        score += 1
+
+    instance.idle_score = score
+
+    if score == 4:
+        instance.recommendation = "STOP_OR_TERMINATE"
+    elif score == 3:
+        instance.recommendation = "INVESTIGATE_THEN_STOP"
+    elif score == 2:
+        instance.recommendation = "SCHEDULE_REVIEW"
+    else:
+        instance.recommendation = "ACTIVE_KEEP"
+
+    return instance
+
+def estimate_monthly_cost(instance_class: str, storage_gb: int = 0) -&gt; float:
+    hourly = RDS_HOURLY_PRICING.get(instance_class, 0.30)
+    compute = hourly * 24 * 30
+    storage = storage_gb * 0.115          # gp2 pricing
+    return round(compute + storage, 2)
+
+def scan_region(region: str) -&gt; list[InstanceIdleScore]:
+    rds = boto3.client("rds", region_name=region)
+    cw  = boto3.client("cloudwatch", region_name=region)
+
+    paginator = rds.get_paginator("describe_db_instances")
+    results = []
+
+    for page in paginator.paginate():
+        for db in page["DBInstances"]:
+            if db["DBInstanceStatus"] not in ("available", "stopped"):
+                continue
+
+            tags = {t["Key"]: t["Value"]
+                    for t in db.get("TagList", [])}
+
+            # Skip instances explicitly tagged to protect from auto-shutdown
+            if tags.get("AutoShutdown") == "false":
+                continue
+
+            storage_gb = db.get("AllocatedStorage", 0)
+            score_obj = InstanceIdleScore(
+                instance_id=db["DBInstanceIdentifier"],
+                instance_class=db["DBInstanceClass"],
+                engine=db["Engine"],
+                status=db["DBInstanceStatus"],
+                region=region,
+                tags=tags,
+                monthly_cost_usd=estimate_monthly_cost(
+                    db["DBInstanceClass"], storage_gb
+                )
+            )
+
+            # Already stopped instances are trivially idle
+            if db["DBInstanceStatus"] == "stopped":
+                score_obj.idle_score = 4
+                score_obj.recommendation = "ALREADY_STOPPED_VERIFY_DELETION"
+                results.append(score_obj)
+                continue
+
+            iid = db["DBInstanceIdentifier"]
+            score_obj.avg_connections = get_metric_average(
+                cw, iid, "DatabaseConnections", "AWS/RDS")
+            score_obj.avg_cpu = get_metric_average(
+                cw, iid, "CPUUtilization", "AWS/RDS")
+            score_obj.avg_read_iops = get_metric_average(
+                cw, iid, "ReadIOPS", "AWS/RDS")
+            score_obj.avg_write_iops = get_metric_average(
+                cw, iid, "WriteIOPS", "AWS/RDS")
+
+            net_bytes = get_metric_average(
+                cw, iid, "NetworkReceiveThroughput", "AWS/RDS")
+            score_obj.avg_network_kb = round(net_bytes / 1024, 2)
+
+            results.append(score_instance(score_obj))
+
+    return results
+
+def main():
+    regions = ["us-east-1", "us-west-2", "eu-west-1"]
+    all_results = []
+
+    for region in regions:
+        print(f"Scanning {region}...")
+        all_results.extend(scan_region(region))
+
+    # Sort by idle score descending, then cost descending
+    all_results.sort(key=lambda x: (x.idle_score, x.monthly_cost_usd),
+                     reverse=True)
+
+    total_idle_cost = sum(
+        i.monthly_cost_usd for i in all_results
+        if i.idle_score &gt;= 3
+    )
+
+    print(f"\n{'='*70}")
+    print(f"IDLE INSTANCE REPORT — {datetime.now().strftime('%Y-%m-%d')}")
+    print(f"{'='*70}")
+    print(f"Total instances scanned : {len(all_results)}")
+    print(f"Idle candidates (score≥3): "
+          f"{sum(1 for i in all_results if i.idle_score &gt;= 3)}")
+    print(f"Potential monthly savings: ${total_idle_cost:,.2f}")
+    print(f"{'='*70}\n")
+
+    for inst in all_results:
+        if inst.idle_score &gt;= 3:
+            print(f"  {inst.instance_id:&lt;40} "
+                  f"Score:{inst.idle_score}/4  "
+                  f"${inst.monthly_cost_usd:&gt;8.2f}/mo  "
+                  f"{inst.recommendation}")
+
+    # Write JSON for downstream automation
+    output = [vars(i) for i in all_results if i.idle_score &gt;= 3]
+    with open("/tmp/idle_instances.json", "w") as f:
+        json.dump(output, f, indent=2)
+    print(f"\nCandidates written to /tmp/idle_instances.json")
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: Querying Metrics via Azure Monitor</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# azure_idle_detector.sh
+# Detects idle Azure SQL databases using Azure Monitor metrics
+# Requires: az login, Contributor or Monitoring Reader role
+
+SUBSCRIPTION_ID="your-subscription-id"
+LOOKBACK_DAYS=7
+END_TIME=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+START_TIME=$(date -u -d "-${LOOKBACK_DAYS} days" +"%Y-%m-%dT%H:%M:%SZ")
+
+OUTPUT_FILE="/tmp/azure_idle_sql.csv"
+echo "server,database,sku,avg_cpu_pct,avg_connections,dtu_limit,est_monthly_usd,recommendation" \
+  &gt; "$OUTPUT_FILE"
+
+# DTU pricing map (General Purpose, per database/month approximations)
+declare -A DTU_COST
+DTU_COST["Basic"]="4.90"
+DTU_COST["S0"]="14.72"
+DTU_COST["S1"]="29.43"
+DTU_COST["S2"]="58.87"
+DTU_COST["P1"]="465.00"
+DTU_COST["GP_Gen5_2"]="368.00"
+DTU_COST["GP_Gen5_4"]="736.00"
+DTU_COST["BC_Gen5_2"]="1105.00"
+
+az account set --subscription "$SUBSCRIPTION_ID"
+
+# List all SQL servers
+SERVERS=$(az sql server list --query "[].{name:name, rg:resourceGroup}" -o tsv)
+
+while IFS=$'\t' read -r SERVER_NAME RESOURCE_GROUP; do
+    echo "Checking server: $SERVER_NAME"
+
+    # List all databases on this server (exclude master)
+    DATABASES=$(az sql db list \
+        --server "$SERVER_NAME" \
+        --resource-group "$RESOURCE_GROUP" \
+        --query "[?name!='master'].{name:name, sku:sku.name, tier:sku.tier}" \
+        -o tsv)
+
+    while IFS=$'\t' read -r DB_NAME SKU_NAME SKU_TIER; do
+        RESOURCE_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
+        RESOURCE_ID+="/providers/Microsoft.Sql/servers/${SERVER_NAME}"
+        RESOURCE_ID+="/databases/${DB_NAME}"
+
+        # Fetch average CPU percentage over the lookback window
+        AVG_CPU=$(az monitor metrics list \
+            --resource "$RESOURCE_ID" \
+            --metric "cpu_percent" \
+            --start-time "$START_TIME" \
+            --end-time "$END_TIME" \
+            --aggregation Average \
+            --interval P1D \
+            --query "value[0].timeseries[0].data[*].average" \
+            -o tsv 2&gt;/dev/null \
+          | awk 'NF{sum+=$1; count++} END {
+                if(count&gt;0) printf "%.2f", sum/count; else print "0.00"
+            }')
+
+        # Fetch average connection count
+        AVG_CONN=$(az monitor metrics list \
+            --resource "$RESOURCE_ID" \
+            --metric "connection_successful" \
+            --start-time "$START_TIME" \
+            --end-time "$END_TIME" \
+            --aggregation Total \
+            --interval P1D \
+            --query "value[0].timeseries[0].data[*].total" \
+            -o tsv 2&gt;/dev/null \
+          | awk 'NF{sum+=$1; count++} END {
+                if(count&gt;0) printf "%.0f", sum/count; else print "0"
+            }')
+
+        # Look up estimated cost
+        COST="${DTU_COST[$SKU_NAME]:-unknown}"
+
+        # Classify
+        RECOMMENDATION="ACTIVE_KEEP"
+        if (( $(echo "$AVG_CPU &lt; 1.0" | bc -l) )) && \
+           (( $(echo "$AVG_CONN &lt; 50" | bc -l) )); then
+            RECOMMENDATION="PAUSE_OR_DELETE"
+        elif (( $(echo "$AVG_CPU &lt; 5.0" | bc -l) )); then
+            RECOMMENDATION="DOWNSIZE_SKU"
+        fi
+
+        echo "${SERVER_NAME},${DB_NAME},${SKU_NAME},${AVG_CPU}," \
+             "${AVG_CONN},${SKU_NAME},${COST},${RECOMMENDATION}" \
+          &gt;&gt; "$OUTPUT_FILE"
+
+        if [[ "$RECOMMENDATION" == "PAUSE_OR_DELETE" ]]; then
+            echo "  ⚠  IDLE: ${SERVER_NAME}/${DB_NAME} " \
+                 "CPU=${AVG_CPU}% Conn=${AVG_CONN}/day SKU=${SKU_NAME} ~\$${COST}/mo"
+        fi
+
+    done &lt;&lt;&lt; "$DATABASES"
+done &lt;&lt;&lt; "$SERVERS"
+
+echo ""
+echo "Report written to $OUTPUT_FILE"
+echo "Idle databases by potential savings:"
+awk -F',' 'NR&gt;1 && $8=="PAUSE_OR_DELETE" {print $7, $1"/"$2}' "$OUTPUT_FILE" \
+  | sort -rn \
+  | awk '{printf "  $%s/mo  %s\n", $1, $2}'</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP Cloud SQL: Detecting Idle Instances with gcloud and BigQuery</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query against the GCP Billing Export table in BigQuery
+-- Replace `your_project.billing_dataset.gcp_billing_export_v1_XXXXXX`
+-- This surfaces Cloud SQL instances with cost but no meaningful usage
+
+WITH daily_costs AS (
+  SELECT
+    DATE(usage_start_time) AS usage_date,
+    resource.name          AS instance_name,
+    service.description    AS service,
+    sku.description        AS sku_description,
+    SUM(cost)              AS daily_cost_usd,
+    SUM(usage.amount)      AS usage_amount,
+    usage.unit             AS usage_unit
+  FROM
+    `your_project.billing_dataset.gcp_billing_export_v1_XXXXXX`
+  WHERE
+    service.description = 'Cloud SQL'
+    AND DATE(usage_start_time) &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+    AND cost &gt; 0
+  GROUP BY 1, 2, 3, 4, 6, 7
+),
+
+instance_summary AS (
+  SELECT
+    instance_name,
+    SUM(CASE WHEN sku_description LIKE '%CPU%'
+             THEN daily_cost_usd ELSE 0 END)     AS cpu_cost_30d,
+    SUM(CASE WHEN sku_description LIKE '%Storage%'
+             THEN daily_cost_usd ELSE 0 END)      AS storage_cost_30d,
+    SUM(daily_cost_usd)                           AS total_cost_30d,
+    COUNT(DISTINCT usage_date)                    AS days_with_charges
+  FROM daily_costs
+  GROUP BY 1
+),
+
+-- Join to Cloud SQL instance metrics exported via Cloud Monitoring
+-- (assumes you have exported metrics to BigQuery via Monitoring Export)
+metric_summary AS (
+  SELECT
+    resource.labels.database_id               AS instance_name,
+    AVG(point.value.double_value)             AS avg_cpu_utilization
+  FROM
+    `your_project.monitoring_dataset.cloudsql_database`
+  WHERE
+    metric.type = 'cloudsql.googleapis.com/database/cpu/utilization'
+    AND DATE(point.interval.end_time) &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  GROUP BY 1
+)
+
+SELECT
+  i.instance_name,
+  ROUND(i.total_cost_30d, 2)                  AS total_cost_30d_usd,
+  ROUND(i.cpu_cost_30d, 2)                    AS cpu_cost_30d_usd,
+  ROUND(i.storage_cost_30d, 2)                AS storage_cost_30d_usd,
+  i.days_with_charges,
+  ROUND(m.avg_cpu_utilization * 100, 2)       AS avg_cpu_pct_7d,
+  CASE
+    WHEN m.avg_cpu_utilization &lt; 0.01
+     AND i.cpu_cost_30d &gt; 0
+    THEN 'STOP_CANDIDATE'
+    WHEN m.avg_cpu_utilization &lt; 0.05
+    THEN 'DOWNSIZE_CANDIDATE'
+    ELSE 'ACTIVE'
+  END                                          AS recommendation,
+  ROUND(i.cpu_cost_30d * 12, 0)               AS projected_annual_cpu_waste_usd
+FROM instance_summary i
+LEFT JOIN metric_summary m
+  ON i.instance_name = m.instance_name
+WHERE i.total_cost_30d &gt; 10        -- filter out trivial instances
+ORDER BY projected_annual_cpu_waste_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.3 Validating Candidates Before Taking Action</h3>
+
+<p class="text-gray-300 leading-relaxed">Automated detection surfaces candidates. Human or rule-based validation prevents the scenario where you shut down a database that runs a quarterly financial close process and hasn't run in 6 weeks because the last close was 6 weeks ago.</p>
+
+<p class="text-gray-300 leading-relaxed">The validation layer adds three checks before any shutdown action is authorized.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Check 1: Recent Snapshot or Backup Activity</strong></p>
+
+<p class="text-gray-300 leading-relaxed">An instance with a backup taken in the last 24 hours, even if idle by metrics, may be part of an active pipeline. Query RDS automated backups to verify.</p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>
