@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 15: Automated Storage Cleanup: Snapshots, Temp Tables, and Bloat — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 15: Automated Storage Cleanup: Snapshots, Temp Tables, and Bloat. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 15 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 15: Automated Storage Cleanup: Snapshots, Temp Tables, and Bloat</h2>
+
+<p class="text-gray-300 leading-relaxed">Storage is the silent budget drain that most engineering teams discover too late. A typical production RDS PostgreSQL instance that has been running for 18 months accumulates between 40% and 70% of its total storage bill in artifacts that provide zero ongoing business value: orphaned snapshots from deprecated environments, bloated tables where dead tuples outnumber live ones three to one, temporary tables that survived a connection restart, and transaction log backups that retention policies never cleaned up. Organizations running mid-scale database fleets on AWS, Azure, or GCP routinely find $8,000 to $25,000 per month in recoverable storage spend once they instrument and automate cleanup properly. This chapter gives you the diagnostic queries, the cleanup logic, and the scheduled automation to capture that money — and keep capturing it every month without manual intervention.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.1 Diagnosing Where Storage Money Is Actually Going</h3>
+
+<p class="text-gray-300 leading-relaxed">Before automating anything, you need an accurate map of what you are paying for. Cloud providers bill storage across several independent dimensions: provisioned IOPS volume capacity, automated backup retention windows, manual snapshots, cross-region snapshot copies, and transaction log storage. Each line item has a different unit price, and the cost composition varies significantly between AWS, Azure, and GCP.</p>
+
+<p class="text-gray-300 leading-relaxed">On AWS RDS, storage billing breaks down into four categories:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Provisioned volume**: gp2 at $0.115/GB-month or gp3 at $0.092/GB-month (us-east-1, 2024 pricing)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automated backups**: free up to 100% of provisioned storage; each GB beyond that billed at $0.095/GB-month</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Manual snapshots**: $0.095/GB-month, charged from creation date, never expire automatically</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cross-region snapshot copies**: source region egress ($0.02–$0.09/GB depending on region pair) plus destination snapshot storage</li>
+
+<p class="text-gray-300 leading-relaxed">The manual snapshot line item is where teams consistently hemorrhage money. An automated snapshot taken at day 30 of a 30-day retention window gets deleted automatically. A manual snapshot taken on the same day to "preserve a known-good state before a migration" — and then forgotten — costs $0.095/GB-month indefinitely. A 2 TB database snapshot costs $194/month. If your team has been running for three years with ad hoc snapshot practices, multiply that figure by however many forgotten snapshots exist across however many accounts.</p>
+
+<p class="text-gray-300 leading-relaxed">The following query runs against AWS Cost Explorer via CLI and breaks down your RDS storage costs by usage type, giving you the exact composition of what you are paying:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Pull RDS storage cost breakdown for the last 3 months
+# Requires aws cli v2 and Cost Explorer access (us-east-1)
+
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+echo "Fetching RDS storage cost breakdown for account: $AWS_ACCOUNT_ID"
+
+aws ce get-cost-and-usage \
+  --time-period Start=$(date -d '90 days ago' +%Y-%m-%d),End=$(date +%Y-%m-%d) \
+  --granularity MONTHLY \
+  --filter '{
+    "And": [
+      {
+        "Dimensions": {
+          "Key": "SERVICE",
+          "Values": ["Amazon Relational Database Service"]
+        }
+      },
+      {
+        "Dimensions": {
+          "Key": "USAGE_TYPE_GROUP",
+          "Values": [
+            "RDS: Storage",
+            "RDS: Backup",
+            "RDS: Snapshot Export"
+          ]
+        }
+      }
+    ]
+  }' \
+  --group-by Type=DIMENSION,Key=USAGE_TYPE \
+  --metrics BlendedCost UnblendedCost UsageQuantity \
+  --output json | jq -r '
+    .ResultsByTime[] |
+    .TimePeriod.Start as $period |
+    .Groups[] |
+    [$period, .Keys[0],
+     (.Metrics.UnblendedCost.Amount | tonumber | . * 100 | round / 100),
+     (.Metrics.UsageQuantity.Amount | tonumber | . * 100 | round / 100),
+     .Metrics.UsageQuantity.Unit
+    ] | @tsv
+  ' | column -t -s $'\t' -N "Period,UsageType,Cost_USD,Quantity,Unit"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On Azure SQL, the equivalent breakdown lives in Cost Management. Filter by resource type <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">microsoft.sql/servers/databases</code> and group by meter subcategory. You will find separate line items for LRS backup storage, RA-GRS backup storage, and provisioned database storage. The RA-GRS backup storage meter frequently surprises teams — it bills at 1.5x the LRS rate and gets applied to databases configured with geo-redundant backup storage even when the secondary region is never actually used for recovery.</p>
+
+<p class="text-gray-300 leading-relaxed">On GCP Cloud SQL, run this against the billing export table in BigQuery to isolate storage costs by type:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GCP: Storage cost breakdown per Cloud SQL instance, last 90 days
+-- Run in BigQuery against your billing export dataset
+-- Replace `your-project.billing_dataset.gcp_billing_export_v1_*` with your export table
+
+SELECT
+  resource.name                                          AS instance_name,
+  sku.description                                        AS storage_type,
+  SUM(cost)                                              AS total_cost_usd,
+  SUM(usage.amount)                                      AS total_usage,
+  usage.unit                                             AS unit,
+  DATE_TRUNC(usage_start_time, MONTH)                    AS billing_month
+FROM
+  `your-project.billing_dataset.gcp_billing_export_v1_*`
+WHERE
+  service.description = 'Cloud SQL'
+  AND sku.description LIKE '%Storage%'
+  AND usage_start_time &gt;= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 90 DAY)
+GROUP BY
+  resource.name,
+  sku.description,
+  usage.unit,
+  billing_month
+ORDER BY
+  billing_month DESC,
+  total_cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once you have the cost map, the typical distribution in a three-year-old environment looks like this:</p>
+
+<p class="text-gray-300 leading-relaxed">| Category | Typical Share of Storage Bill |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Provisioned volume (active) | 45–55% |</p>
+<p class="text-gray-300 leading-relaxed">| Manual snapshots (forgotten) | 20–35% |</p>
+<p class="text-gray-300 leading-relaxed">| Automated backup overage | 10–20% |</p>
+<p class="text-gray-300 leading-relaxed">| Transaction log backup | 5–15% |</p>
+<p class="text-gray-300 leading-relaxed">| Cross-region copies | 5–10% |</p>
+
+<p class="text-gray-300 leading-relaxed">The "forgotten manual snapshots" line is your first target. Everything in that category can potentially be eliminated with a retention policy and enforcement automation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.2 Snapshot Lifecycle Automation</h3>
+
+<p class="text-gray-300 leading-relaxed">A manual snapshot costs money from the moment it is created to the moment it is explicitly deleted. There is no built-in expiration mechanism on RDS manual snapshots, Azure SQL long-term retention backups, or Cloud SQL on-demand backups. Every team that does not have enforcement automation accumulates snapshots indefinitely.</p>
+
+<p class="text-gray-300 leading-relaxed">The standard approach is to implement a tagging convention at snapshot creation time, then run a scheduled Lambda (or Azure Function or Cloud Run job) that evaluates tags and deletes snapshots past their intended retention date.</p>
+
+<p class="text-gray-300 leading-relaxed">The tagging convention requires two tags on every manual snapshot:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `RetentionDays`: integer, e.g., `30`, `90`, `365`, or `permanent`</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `CreatedBy`: the team or automation that created it</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Purpose`: `pre-migration`, `pre-upgrade`, `compliance`, `ad-hoc`</li>
+
+<p class="text-gray-300 leading-relaxed">Snapshots tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">permanent</code> are exempt from automated deletion. Everything else gets evaluated. The following Python Lambda function implements this logic for AWS RDS:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>"""
+rds_snapshot_cleanup.py
+Lambda function for automated RDS snapshot lifecycle management.
+Deploy with EventBridge rule on daily schedule (cron: 0 2 * * ? *)
+Required IAM permissions:
+  - rds:DescribeDBSnapshots
+  - rds:DeleteDBSnapshot
+  - rds:ListTagsForResource
+  - sns:Publish (for alerting)
+Environment variables:
+  SNS_TOPIC_ARN : ARN of SNS topic for deletion reports
+  DRY_RUN       : "true" to log without deleting (default: "false")
+  MAX_AGE_DAYS  : Hard cap — delete any untagged snapshot older than this (default: 90)
+"""
+
+import boto3
+import json
+import os
+from datetime import datetime, timezone, timedelta
+
+rds_client   = boto3.client('rds')
+sns_client   = boto3.client('sns')
+
+DRY_RUN      = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+MAX_AGE_DAYS = int(os.environ.get('MAX_AGE_DAYS', '90'))
+SNS_TOPIC    = os.environ.get('SNS_TOPIC_ARN', '')
+
+def get_tag_value(tags: list, key: str) -&gt; str | None:
+    for tag in tags:
+        if tag['Key'] == key:
+            return tag['Value']
+    return None
+
+def evaluate_snapshot(snapshot: dict, tags: list) -&gt; dict:
+    """
+    Returns a dict describing what action to take and why.
+    """
+    snap_id        = snapshot['DBSnapshotIdentifier']
+    snap_type      = snapshot['SnapshotType']
+    created_time   = snapshot['SnapshotCreateTime']
+    now            = datetime.now(timezone.utc)
+    age_days       = (now - created_time).days
+    allocated_gb   = snapshot.get('AllocatedStorage', 0)
+    cost_per_month = round(allocated_gb * 0.095, 2)  # us-east-1 snapshot pricing
+
+    # Never touch automated snapshots — RDS manages their lifecycle
+    if snap_type == 'automated':
+        return {'action': 'skip', 'reason': 'automated snapshot'}
+
+    # Check for permanent exemption
+    retention_tag = get_tag_value(tags, 'RetentionDays')
+    if retention_tag and retention_tag.lower() == 'permanent':
+        return {
+            'action'        : 'skip',
+            'reason'        : 'tagged permanent',
+            'age_days'      : age_days,
+            'cost_per_month': cost_per_month
+        }
+
+    # If RetentionDays tag is present and not expired, skip
+    if retention_tag and retention_tag.isdigit():
+        retention_days = int(retention_tag)
+        if age_days &lt;= retention_days:
+            return {
+                'action'        : 'skip',
+                'reason'        : f'within retention ({age_days}/{retention_days} days)',
+                'age_days'      : age_days,
+                'cost_per_month': cost_per_month
+            }
+        else:
+            return {
+                'action'        : 'delete',
+                'reason'        : f'retention expired ({age_days} days &gt; {retention_days} day policy)',
+                'snap_id'       : snap_id,
+                'age_days'      : age_days,
+                'size_gb'       : allocated_gb,
+                'cost_per_month': cost_per_month
+            }
+
+    # No retention tag — apply hard cap
+    if age_days &gt; MAX_AGE_DAYS:
+        return {
+            'action'        : 'delete',
+            'reason'        : f'no retention tag, exceeded hard cap ({age_days} days &gt; {MAX_AGE_DAYS})',
+            'snap_id'       : snap_id,
+            'age_days'      : age_days,
+            'size_gb'       : allocated_gb,
+            'cost_per_month': cost_per_month
+        }
+
+    return {
+        'action'        : 'skip',
+        'reason'        : 'no tag but within hard cap',
+        'age_days'      : age_days,
+        'cost_per_month': cost_per_month
+    }
+
+def lambda_handler(event, context):
+    paginator         = rds_client.get_paginator('describe_db_snapshots')
+    deleted           = []
+    skipped           = []
+    total_savings_usd = 0.0
+
+    for page in paginator.paginate(SnapshotType='manual'):
+        for snapshot in page['DBSnapshots']:
+            if snapshot['Status'] != 'available':
+                continue
+
+            snap_id  = snapshot['DBSnapshotIdentifier']
+            snap_arn = snapshot['DBSnapshotArn']
+
+            tag_response = rds_client.list_tags_for_resource(ResourceName=snap_arn)
+            tags         = tag_response.get('TagList', [])
+            decision     = evaluate_snapshot(snapshot, tags)
+
+            if decision['action'] == 'delete':
+                total_savings_usd += decision.get('cost_per_month', 0)
+                if not DRY_RUN:
+                    try:
+                        rds_client.delete_db_snapshot(DBSnapshotIdentifier=snap_id)
+                        decision['status'] = 'deleted'
+                    except Exception as e:
+                        decision['status'] = f'error: {str(e)}'
+                else:
+                    decision['status'] = 'dry_run_would_delete'
+                deleted.append(decision)
+            else:
+                skipped.append(decision)
+
+    report = {
+        'dry_run'              : DRY_RUN,
+        'snapshots_deleted'    : len(deleted),
+        'snapshots_skipped'    : len(skipped),
+        'estimated_savings_usd': round(total_savings_usd, 2),
+        'deleted_details'      : deleted[:50],   # cap report size
+    }
+
+    print(json.dumps(report, indent=2, default=str))
+
+    if SNS_TOPIC and (deleted or not DRY_RUN):
+        sns_client.publish(
+            TopicArn = SNS_TOPIC,
+            Subject  = f"RDS Snapshot Cleanup: {len(deleted)} deleted, ${total_savings_usd:.2f}/mo recovered",
+            Message  = json.dumps(report, indent=2, default=str)
+        )
+
+    return report</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Deploy this Lambda with an EventBridge rule on a daily schedule at 02:00 UTC. First week, run with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DRY_RUN=true</code> and review the SNS report. After confirming the deletion list looks correct, flip to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DRY_RUN=false</code>. In most environments, the first live run recovers between 15% and 35% of the total RDS storage bill within 24 hours.</p>
+
+<p class="text-gray-300 leading-relaxed">For Azure, the equivalent is a PowerShell Azure Function that evaluates long-term retention backup policies. The key lever there is adjusting the LTR (Long-Term Retention) weekly, monthly, and yearly backup retention values via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Set-AzSqlDatabaseBackupLongTermRetentionPolicy</code> cmdlet. The default values on many older Azure SQL databases are set to maximums during initial setup and never revisited. Dropping weekly retention from 12 weeks to 4 weeks on a 500 GB database reduces RA-GRS backup storage from approximately 6 TB to 2 TB — a saving of roughly $180/month at $0.05/GB-month for RA-GRS.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.3 Identifying and Reclaiming Table Bloat in PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">Table bloat is one of the most persistent and expensive PostgreSQL storage problems. Every UPDATE and DELETE operation leaves dead tuples in the heap. PostgreSQL's MVCC architecture requires this for transaction isolation, but autovacuum's job is to reclaim that space over time. When autovacuum is misconfigured, under-resourced, or blocked, dead tuples accumulate faster than they are reclaimed, and table files grow without bound.</p>
+
+<p class="text-gray-300 leading-relaxed">A heavily bloated table might have 3 GB of actual live data inside a 10 GB file. You are paying for 10 GB of provisioned storage — and in some cases 10 GB of backup storage — to hold 3 GB of useful data. On a gp3 volume at $0.092/GB-month, that 7 GB of bloat costs $0.64/month per table. Across a schema with 200 bloated tables, that becomes $128/month in wasted storage, plus the performance cost of sequential scans reading 3x more data than necessary.</p>
+
+<p class="text-gray-300 leading-relaxed">The following query identifies your worst bloat offenders using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgstattuple</code> extension, which provides accurate physical measurement of dead tuple space:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Identify tables with significant bloat
+-- Requires: CREATE EXTENSION IF NOT EXISTS pgstattuple;
+-- Run as superuser or with pg_stat_scan_tables privilege
+-- This performs physical table scans — run during off-peak hours on large tables
+
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+WITH bloat_analysis AS (
+  SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename))
+                                                  AS total_size,
+    pg_total_relation_size(schemaname || '.' || tablename)
+                                                  AS total_bytes,
+    (pgstattuple(schemaname || '.' || tablename)).dead_tuple_percent
+                                                  AS dead_pct,
+    (pgstattuple(schemaname || '.' || tablename)).dead_tuple_len
+                                                  AS dead_bytes,
+    (pgstattuple(schemaname || '.' || tablename)).free_space
+                                                  AS free_bytes,
+    (pgstattuple(schemaname || '.' || tablename)).tuple_count
+                                                  AS live_tuples
+  FROM
+    pg_tables
+  WHERE
+    schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+    -- Filter to tables worth analyzing (&gt; 100 MB)
+    AND pg_total_relation_size(schemaname || '.' || tablename) &gt; 104857600
+),
+cost_estimate AS (
+  SELECT
+    schemaname,
+    tablename,
+    total_size,
+    total_bytes,
+    dead_pct,
+    live_tuples,
+    dead_bytes                                              AS reclaimable_bytes,
+    free_bytes,
+    -- Estimate reclaimable GB and monthly cost at gp3 pricing ($0.092/GB-month)
+    ROUND((dead_bytes + free_bytes) / 1073741824.0, 3)     AS reclaimable_gb,
+    ROUND(
+      ((dead_bytes + free_bytes) / 1073741824.0) * 0.092,
+      4
+    )                                                       AS monthly_waste_usd
+  FROM
+    bloat_analysis
+  WHERE
+    dead_pct &gt; 10  -- Only surface tables with meaningful bloat
+)
+SELECT
+  schemaname,
+  tablename,
+  total_size,
+  ROUND(dead_pct, 1)                                        AS dead_pct,
+  live_tuples,
+  pg_size_pretty(reclaimable_bytes)                         AS reclaimable_data,
+  reclaimable_gb,
+  monthly_waste_usd,
+  CASE
+    WHEN dead_pct &gt; 50 THEN 'VACUUM FULL or pg_repack immediately'
+    WHEN dead_pct &gt; 25 THEN 'Schedule pg_repack within 7 days'
+    WHEN dead_pct &gt; 10 THEN 'Tune autovacuum thresholds'
+    ELSE 'Monitor'
+  END                                                       AS recommended_action
+FROM
+  cost_estimate
+ORDER BY
+  monthly_waste_usd DESC
+LIMIT 30;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When this query surfaces tables with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dead_pct > 50</code>, your first instinct might be to run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code>. On a busy production system, avoid it. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> acquires an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AccessExclusiveLock</code>, blocking all reads and writes for the duration of the operation. On a 50 GB table with heavy fragmentation, that can mean 45 minutes to 2 hours of complete table unavailability.</p>
+
+<p class="text-gray-300 leading-relaxed">Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code> instead. It rebuilds the table online using a trigger-based approach that tracks changes during the rebuild and applies them at the final cutover, which requires only a brief lock at the end. Install it as a PostgreSQL extension and run it from a scheduled cron job on the database host or from a container:</p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>
