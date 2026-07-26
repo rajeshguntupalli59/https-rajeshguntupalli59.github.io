@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 16: Compressing Data at Rest: Savings and Tradeoffs — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 16: Compressing Data at Rest: Savings and Tradeoffs. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 16 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 16: Compressing Data at Rest: Savings and Tradeoffs</h2>
+
+<p class="text-gray-300 leading-relaxed">Storage compression is one of the most underutilized levers in cloud database cost management. Organizations running 2–5 TB of uncompressed transactional data on AWS RDS, Azure SQL, or Google Cloud SQL regularly see 40–70% storage reduction after enabling the right compression strategy — translating to $800–$3,500 per month in direct storage savings on a single database instance before accounting for reduced backup costs, lower data transfer fees, and faster I/O on compressed pages. This chapter walks through how to identify what is compressible, which compression algorithms and engine features to use per cloud platform, how to measure the performance tradeoff honestly, and how to automate compression enforcement across a fleet of databases so savings compound over time rather than remaining a one-off project.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.1 Understanding What You Are Actually Paying For Before Compressing Anything</h3>
+
+<p class="text-gray-300 leading-relaxed">Compression that targets the wrong data delivers almost nothing. A 500 GB database where 400 GB is already binary BLOBs, encrypted payloads, or JPEG thumbnails stored as bytea will see near-zero compression gain. Before touching a single compression setting, spend thirty minutes identifying which data is actually compressible.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Storage Cost Breakdown</strong></p>
+
+<p class="text-gray-300 leading-relaxed">On AWS RDS with gp3 storage, you pay $0.115 per GB-month for the primary volume. Multi-AZ doubles that to $0.230 per GB-month because RDS replicates the entire EBS volume to the standby. Automated backups stored in S3 add another $0.095 per GB-month for retention beyond the free tier. On a 3 TB Multi-AZ PostgreSQL instance with 14-day backup retention, the all-in storage cost looks like this:</p>
+
+<p class="text-gray-300 leading-relaxed">| Component | Size | Rate | Monthly Cost |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Primary EBS (gp3) | 3,000 GB | $0.115 | $345.00 |</p>
+<p class="text-gray-300 leading-relaxed">| Standby EBS (Multi-AZ) | 3,000 GB | $0.115 | $345.00 |</p>
+<p class="text-gray-300 leading-relaxed">| Automated backups | ~2,400 GB | $0.095 | $228.00 |</p>
+<p class="text-gray-300 leading-relaxed">| Total | | | <strong class="text-white">$918.00/month</strong> |</p>
+
+<p class="text-gray-300 leading-relaxed">If compression reduces the primary volume to 1,200 GB — a 60% reduction common with mixed OLTP data — the same table drops to $367.20/month. That is $550.80 in monthly savings on storage alone, not counting backup savings, before you touch instance sizing.</p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Managed Instance on Business Critical tier charges $0.115 per GB-month (General Purpose is $0.115 as well, but Business Critical adds locally redundant replicas automatically). Google Cloud SQL for PostgreSQL charges $0.170 per GB-month on SSD storage with HA, making storage compression proportionally more valuable on GCP than on AWS.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Finding Compressible Data in PostgreSQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Start by identifying table-level bloat, data type distribution, and actual compression readiness:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the largest tables and their estimated compression potential
+-- Run this on AWS RDS PostgreSQL, Aurora PostgreSQL, or Cloud SQL for PostgreSQL
+
+WITH table_sizes AS (
+    SELECT
+        schemaname,
+        tablename,
+        pg_total_relation_size(schemaname || '.' || tablename) AS total_bytes,
+        pg_relation_size(schemaname || '.' || tablename) AS table_bytes,
+        pg_total_relation_size(schemaname || '.' || tablename)
+            - pg_relation_size(schemaname || '.' || tablename) AS index_bytes
+    FROM pg_tables
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+),
+column_type_analysis AS (
+    SELECT
+        c.table_schema,
+        c.table_name,
+        COUNT(*) FILTER (WHERE data_type IN ('text', 'character varying', 'json', 'jsonb', 'xml')) AS text_columns,
+        COUNT(*) FILTER (WHERE data_type IN ('bytea', 'bit varying')) AS binary_columns,
+        COUNT(*) AS total_columns
+    FROM information_schema.columns c
+    WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
+    GROUP BY c.table_schema, c.table_name
+)
+SELECT
+    ts.schemaname,
+    ts.tablename,
+    pg_size_pretty(ts.total_bytes) AS total_size,
+    pg_size_pretty(ts.table_bytes) AS table_data_size,
+    pg_size_pretty(ts.index_bytes) AS index_size,
+    ct.text_columns,
+    ct.binary_columns,
+    ct.total_columns,
+    ROUND(ct.text_columns::numeric / NULLIF(ct.total_columns, 0) * 100, 1) AS pct_text_columns,
+    -- Tables with &gt;40% text columns and &gt;100MB are compression candidates
+    CASE
+        WHEN ct.text_columns::numeric / NULLIF(ct.total_columns, 0) &gt; 0.4
+             AND ts.table_bytes &gt; 104857600
+        THEN 'HIGH PRIORITY'
+        WHEN ct.text_columns::numeric / NULLIF(ct.total_columns, 0) &gt; 0.2
+             AND ts.table_bytes &gt; 52428800
+        THEN 'MEDIUM PRIORITY'
+        ELSE 'LOW PRIORITY'
+    END AS compression_priority
+FROM table_sizes ts
+JOIN column_type_analysis ct
+    ON ts.schemaname = ct.table_schema
+    AND ts.tablename = ct.table_name
+WHERE ts.total_bytes &gt; 10485760  -- Only tables &gt; 10 MB
+ORDER BY ts.total_bytes DESC
+LIMIT 50;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Finding Compressible Data in SQL Server (Azure SQL / RDS SQL Server)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate compression savings before applying compression on SQL Server
+-- Works on Azure SQL Database, Azure SQL Managed Instance, and RDS for SQL Server
+
+SELECT
+    s.name AS schema_name,
+    t.name AS table_name,
+    p.partition_number,
+    p.rows,
+    a.total_pages * 8 / 1024 AS total_size_mb,
+    a.used_pages * 8 / 1024 AS used_size_mb,
+    -- sp_estimate_data_compression_savings equivalent inline view
+    -- Run the stored procedure separately per table for exact estimates
+    CASE
+        WHEN a.total_pages * 8 / 1024 &gt; 1000 THEN 'Run sp_estimate_data_compression_savings'
+        ELSE 'Small table - compress in bulk'
+    END AS recommendation
+FROM sys.tables t
+INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+INNER JOIN sys.partitions p ON t.object_id = p.object_id
+INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+WHERE p.index_id IN (0, 1)  -- Heap or clustered index only
+  AND a.total_pages * 8 / 1024 &gt; 50  -- Tables &gt; 50 MB
+ORDER BY a.total_pages DESC;
+
+-- For each candidate table, run this to get actual estimated savings:
+-- EXEC sp_estimate_data_compression_savings
+--     @schema_name = 'dbo',
+--     @object_name = 'YourTableName',
+--     @index_id = NULL,
+--     @partition_number = NULL,
+--     @data_compression = 'PAGE';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The output from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_estimate_data_compression_savings</code> gives you size_with_current_compression_setting, size_with_requested_compression_setting, and the delta as a percentage. Run this across your top twenty tables, sum the delta column, and you have a credible number to present to a budget holder.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.2 Compression Options by Database Engine and Cloud Platform</h3>
+
+<p class="text-gray-300 leading-relaxed">Each database engine offers different compression mechanisms, and each cloud platform has its own constraints on which ones are available. Using the right compression at the right layer is the difference between a 60% reduction and a 5% reduction.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: TOAST, pg_compress, and tablespace-level approaches</strong></p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL uses TOAST (The Oversized-Attribute Storage Technique) automatically for column values exceeding approximately 2 KB. TOAST compresses the value using LZ4 (PostgreSQL 14+) or PGLZ (earlier versions) before writing it to the TOAST table. The key insight is that this is transparent — no schema changes required — but you control which algorithm it uses.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL 14 and later (available on RDS PostgreSQL 14+, Aurora PostgreSQL 14+, and Cloud SQL for PostgreSQL 14+) allows setting the compression method per column:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current TOAST compression settings for a table
+SELECT
+    attname AS column_name,
+    attstorage AS storage_mode,
+    attcompression AS compression_method,
+    -- attstorage values: 'p'=plain, 'e'=external, 'x'=extended (TOAST+compress), 'm'=main
+    CASE attstorage
+        WHEN 'p' THEN 'No TOAST - always inline'
+        WHEN 'e' THEN 'External TOAST - no compression'
+        WHEN 'x' THEN 'Extended - TOAST with compression (best)'
+        WHEN 'm' THEN 'Main - compress first, TOAST if needed'
+    END AS storage_description,
+    CASE attcompression
+        WHEN '' THEN 'Default (pglz on PG13-, lz4 on PG14+)'
+        WHEN 'p' THEN 'pglz'
+        WHEN 'l' THEN 'lz4'
+    END AS compression_algorithm
+FROM pg_attribute
+WHERE attrelid = 'your_schema.your_table'::regclass
+  AND attnum &gt; 0
+  AND NOT attisdropped
+ORDER BY attnum;
+
+-- Switch a text column from pglz to lz4 (PostgreSQL 14+, RDS PG14+, Aurora PG14+)
+-- lz4 is 3-5x faster to compress/decompress than pglz with similar compression ratios
+ALTER TABLE your_schema.your_table
+    ALTER COLUMN description SET COMPRESSION lz4;
+
+ALTER TABLE your_schema.your_table
+    ALTER COLUMN payload SET COMPRESSION lz4;
+
+-- Force recompression of existing rows by rewriting the table
+-- Schedule during a maintenance window - this takes an ACCESS EXCLUSIVE lock
+-- For large tables, use pg_repack instead (no lock):
+-- pg_repack --table your_schema.your_table -d your_database
+VACUUM FULL your_schema.your_table;
+
+-- Verify compression took effect on existing TOAST data
+SELECT
+    pg_size_pretty(pg_total_relation_size('your_schema.your_table')) AS total_with_toast,
+    pg_size_pretty(pg_relation_size('your_schema.your_table')) AS main_table,
+    pg_size_pretty(
+        pg_total_relation_size('your_schema.your_table')
+        - pg_relation_size('your_schema.your_table')
+    ) AS toast_and_indexes;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server on Azure SQL and RDS: Row and Page Compression</strong></p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server offers two compression levels that matter operationally:</p>
+
+<p class="text-gray-300 leading-relaxed">*Row compression* stores fixed-length data types (INT, CHAR, DATETIME) in variable-length format, eliminating trailing zeros and padding. Typical savings: 10–25% for OLTP tables.</p>
+
+<p class="text-gray-300 leading-relaxed">*Page compression* applies row compression first, then adds prefix compression (stores repeated column prefixes once per page) and dictionary compression (deduplicates repeated values within a page). Typical savings: 30–60% for tables with repeating values in indexed columns.</p>
+
+<p class="text-gray-300 leading-relaxed">Page compression costs more CPU — typically 5–15% additional CPU utilization on read-heavy workloads and up to 25% on write-heavy workloads. On Azure SQL, where you pay for DTUs or vCores, that CPU tradeoff needs to be weighed against storage savings. On a Business Critical instance with 8 vCores at $1.008/hour, a 15% CPU increase costs roughly $108/month. If page compression saves 800 GB of storage at $0.115/GB, that is $92/month in pure storage — a net loss. Row compression at 5% CPU overhead saving the same 300 GB is easily worth it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Apply page compression to a table on Azure SQL or RDS SQL Server
+-- First, estimate savings (separate statement per table)
+EXEC sp_estimate_data_compression_savings
+    @schema_name = 'Sales',
+    @object_name = 'OrderLineItems',
+    @index_id = NULL,
+    @partition_number = NULL,
+    @data_compression = 'PAGE';
+
+-- Apply row compression (lower CPU cost, moderate savings)
+ALTER TABLE Sales.OrderLineItems
+REBUILD WITH (DATA_COMPRESSION = ROW);
+
+-- Apply page compression to the clustered index
+ALTER TABLE Sales.OrderLineItems
+REBUILD PARTITION = ALL WITH (DATA_COMPRESSION = PAGE);
+
+-- Apply page compression to a specific nonclustered index
+ALTER INDEX IX_OrderLineItems_OrderDate ON Sales.OrderLineItems
+REBUILD WITH (DATA_COMPRESSION = PAGE);
+
+-- Check current compression status across all tables
+SELECT
+    s.name AS schema_name,
+    t.name AS table_name,
+    i.name AS index_name,
+    i.type_desc AS index_type,
+    p.data_compression_desc AS current_compression,
+    SUM(a.total_pages) * 8 / 1024 AS size_mb
+FROM sys.tables t
+INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+INNER JOIN sys.indexes i ON t.object_id = i.object_id
+INNER JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+GROUP BY s.name, t.name, i.name, i.type_desc, p.data_compression_desc
+ORDER BY SUM(a.total_pages) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">MySQL / Aurora MySQL: InnoDB Compression and Page Size</strong></p>
+
+<p class="text-gray-300 leading-relaxed">InnoDB row format compression (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROW_FORMAT=COMPRESSED</code>) has been available since MySQL 5.5 but carries a significant caveat: it halves the effective buffer pool utilization because InnoDB keeps both compressed and uncompressed versions of each page in the buffer pool. This makes InnoDB row compression a poor choice for frequently accessed hot tables.</p>
+
+<p class="text-gray-300 leading-relaxed">The better option for Aurora MySQL and RDS MySQL 8.0+ is Barracuda file format with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KEY_BLOCK_SIZE</code> tuning. For cold or archive tables, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROW_FORMAT=COMPRESSED KEY_BLOCK_SIZE=8</code> achieves 40–60% compression with acceptable performance since those pages rarely appear in the buffer pool.</p>
+
+<p class="text-gray-300 leading-relaxed">The right approach for Aurora MySQL specifically is to use the Aurora storage engine's built-in compression, which operates at the storage layer and does not penalize the buffer pool — it is always on and transparent. Measuring Aurora storage savings therefore requires comparing Aurora's reported volume size against what the same data would occupy on a standard MySQL installation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.3 Measuring the Real Performance Tradeoff</h3>
+
+<p class="text-gray-300 leading-relaxed">Enabling compression without measuring its CPU and latency impact is how organizations discover problems in production at 2 AM. The measurement methodology below runs before and after compression to capture an honest before/after comparison.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Measuring Query Performance Against Compressed TOAST Data</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture baseline query performance before compression changes
+-- Run this before altering any compression settings
+
+-- Enable pg_stat_statements if not already enabled
+-- (On RDS, add pg_stat_statements to shared_preload_libraries via parameter group)
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Capture baseline for queries touching the tables you plan to compress
+SELECT
+    left(query, 100) AS query_snippet,
+    calls,
+    ROUND(total_exec_time::numeric, 2) AS total_ms,
+    ROUND(mean_exec_time::numeric, 4) AS mean_ms,
+    ROUND(stddev_exec_time::numeric, 4) AS stddev_ms,
+    rows,
+    shared_blks_read,
+    shared_blks_hit,
+    ROUND(
+        shared_blks_hit::numeric /
+        NULLIF(shared_blks_hit + shared_blks_read, 0) * 100, 2
+    ) AS buffer_hit_pct
+FROM pg_stat_statements
+WHERE query ILIKE '%your_table_name%'
+  AND calls &gt; 100
+ORDER BY mean_exec_time DESC;
+
+-- Reset stats, apply compression, run workload for 1 hour, then compare
+SELECT pg_stat_statements_reset();
+
+-- After compression and workload replay, run again and compare mean_ms values
+-- Also check shared_blks_read: if TOAST decompression causes more block reads,
+-- you will see this number increase even if mean query time stays flat
+
+-- Check CloudWatch metrics alongside this for CPU correlation
+-- Use RDS Performance Insights to correlate CPU spikes with compression events</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring Compression CPU Impact with CloudWatch and Python</strong></p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>
