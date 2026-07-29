@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 25: Data Replication — The DBA Handbook</title>
   <meta name="description" content="The DBA Handbook Chapter 25: Data Replication. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -19,8 +23,8 @@
       <div class="flex items-center gap-1 text-xs">
         <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
         <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
-        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
-        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../book.html"      class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Books</a>
+        <a href="index.html"        class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Chapters</a>
         <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
         <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
         <a href="../products.html"
@@ -63,6 +67,20 @@
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Streaming Replication in PostgreSQL</h3>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL's streaming replication is the foundation of almost every high-availability PostgreSQL deployment in production today. It works by having the primary continuously stream Write-Ahead Log (WAL) records to one or more standby servers, which replay those records to stay current. Because WAL is the authoritative record of every change made to the database — every insert, update, delete, index update, vacuum action — replaying WAL on a standby is guaranteed to produce an identical database state.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant P as Primary
+    participant S1 as Sync Standby
+    participant S2 as Async Standby
+    P->>P: Write commits to local WAL
+    P->>S1: Stream WAL record
+    S1->>S1: write + flush to disk
+    S1-->>P: Acknowledge (flush_lsn)
+    P->>P: Commit confirmed to client
+    P->>S2: Stream WAL record (async, no wait)
+    S2->>S2: write + flush + replay</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Figure: Streaming replication protocol — the primary waits for a synchronous standby to flush before confirming the commit, while an asynchronous standby receives the same WAL stream without blocking the primary.*</p>
 
 <p class="text-gray-300 leading-relaxed">Setting up streaming replication starts with the primary's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code>, a base backup, and a handful of parameters on the standby. On the primary, you need to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = replica</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logical</code> if you plan to layer logical replication on top), configure <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code> to the number of standby connections you want to support, and create a replication user.</p>
 
@@ -327,15 +345,208 @@ SELECT pg_promote(wait := true, wait_seconds := 60);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A <strong class="text-white">forced failover</strong> in SQL Server — used when the primary is unavailable — requires the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH DATA_LOSS</code> clause and should only be used with full understanding that any unconfirmed transactions from the old primary will be lost:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Force failover to an asynchronous secondary (accepts potential data loss)
+-- (Connect to the target secondary)
+ALTER AVAILABILITY GROUP [SalesAG] FORCE_FAILOVER_ALLOW_DATA_LOSS;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">After any failover, whether planned or forced, a checklist of post-failover tasks must be executed before the new topology can be considered stable.</p>
+
+<p class="text-gray-300 leading-relaxed">For PostgreSQL, the post-failover checklist includes:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Update connection strings</strong> — application connection strings, pgBouncer or other pooler configurations, and monitoring agents must point to the new primary.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Reconfigure or rebuild old standbys</strong> — use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_rewind</code> or a fresh base backup to bring old standbys into the new topology as followers of the new primary.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Advance sequences</strong> — if the old primary had sequences that outpaced the replica's last-replicated values, set them forward manually on the new primary to avoid duplicate key errors.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Drop and recreate replication slots</strong> — slots from the old primary are invalid. Any logical replication subscribers that were connected to the old primary need their subscriptions refreshed against the new primary.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Verify WAL archiving</strong> — if you use continuous archiving, ensure the archive_command or archive_library is correctly configured and functioning on the new primary.</p>
+<p class="text-gray-300 leading-relaxed">6. <strong class="text-white">Update monitoring and alerting</strong> — any metrics pointing at the old primary hostname need to be redirected.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, the post-failover checklist adds:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Reconnect the old primary as a secondary</strong> — once the old primary is recovered, add it back to the AG as a secondary replica and allow it to resynchronize.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Transfer AG-dependent jobs</strong> — SQL Server Agent jobs that were running on the primary do not automatically transfer. Jobs need to be enabled on the new primary if they are designed to run only on the current primary.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Verify linked server connections</strong> — linked servers that depended on the old primary's hostname or listener may need to be reconfigured if using a non-listener connection string.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Check AG listener DNS TTL</strong> — client applications connecting via the AG listener should reconnect automatically, but clients that cache DNS may briefly connect to the old primary. Ensure listener DNS TTL is low enough to resolve quickly.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Audit data loss</strong> — if a forced failover was performed, use the transaction log backup chain on the old primary to determine exactly which transactions were lost and notify application owners if any business data was affected.</p>
+
+<p class="text-gray-300 leading-relaxed">The most important operational practice for failover is <strong class="text-white">regular testing</strong>. A failover procedure that has never been rehearsed in production-like conditions is not a failover procedure — it is a hypothesis. Scheduled failover tests, sometimes called "chaos" exercises, force you to discover gaps in connection string management, session handling, queue-backed services that need reconnection logic, and all the other dependencies that are invisible until the primary disappears.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication and Schema Changes</h3>
+
+<p class="text-gray-300 leading-relaxed">Schema changes in a replicated environment deserve their own section because they are the source of a disproportionate number of replication outages. The behavior of DDL under replication is fundamentally different between physical and logical replication, and between PostgreSQL and SQL Server.</p>
+
+<p class="text-gray-300 leading-relaxed">Under <strong class="text-white">physical streaming replication</strong> in PostgreSQL, DDL is fully replicated — because physical replication copies WAL byte-for-byte and DDL is recorded in WAL just like DML. You can run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code> on the primary and it will automatically propagate to all physical standbys. There is no special handling required. The only subtlety is that long-running DDL on the primary may hold locks that block reads on the standby if the standby is being used for read queries, because the standby must replay the WAL including the lock acquisition.</p>
+
+<p class="text-gray-300 leading-relaxed">Under <strong class="text-white">logical replication</strong> in PostgreSQL, DDL is not replicated at all. The subscriber maintains its own schema independently. This means you must apply schema changes manually to the subscriber before the change is applied on the publisher — or at least before any DML arrives that references the new schema. The safe sequence for an additive change (adding a column) is:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Apply the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN</code> on the subscriber first.</p>
+<p class="text-gray-300 leading-relaxed">2. Apply the same change on the publisher.</p>
+<p class="text-gray-300 leading-relaxed">3. Verify the subscription is still running and applying changes.</p>
+
+<p class="text-gray-300 leading-relaxed">For destructive changes (dropping a column), reverse the order: drop on the publisher first, verify the replication stream is draining, then drop on the subscriber.</p>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server Transactional Replication, the behavior depends on how the publication is configured. By default, schema changes on the publisher <strong class="text-white">are</strong> propagated to subscribers, and SQL Server has a dedicated mechanism — the <strong class="text-white">Schema Change event</strong> — that the Log Reader detects and forwards through the distribution database. However, not all DDL is supported for automatic propagation, and you can disable schema change replication if your subscriber has a different schema intentionally. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@replicate_ddl</code> parameter on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_addpublication</code> controls this.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Check if schema changes are being replicated for a publication
+SELECT
+    publication,
+    replicate_ddl,
+    sync_method,
+    status
+FROM syspublications
+WHERE name = 'sales_pub';</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Check logical replication subscription status and errors
+SELECT
+    subname,
+    subenabled,
+    subslotname,
+    subpublications,
+    subconninfo
+FROM pg_subscription;
+
+-- Check for replication worker errors
+SELECT
+    pid,
+    relid::regclass AS target_table,
+    received_lsn,
+    last_msg_send_time,
+    last_msg_receipt_time,
+    latest_end_lsn,
+    latest_end_time
+FROM pg_stat_subscription;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The general principle across all replication types: schema changes need a plan that accounts for where the change must be applied, in what order, and what happens to in-flight replication if a mismatch exists even briefly. For zero-downtime deployments, expand-contract patterns work well — add the new column as nullable first, backfill it, make it non-nullable or add the constraint, and only then remove the old column — because each individual step can be replicated safely while the application continues running.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cascading Replication and Fan-Out Topologies</h3>
+
+<p class="text-gray-300 leading-relaxed">Not all replication topologies are simple primary-to-single-standby configurations. Production environments frequently need cascading replication — where a standby itself serves as the source for additional standbys downstream — or fan-out configurations where a single primary sends to many replicas simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL supports cascading streaming replication natively. A standby in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hot_standby</code> mode can itself act as a WAL sender to other standbys, as long as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = replica</code> (or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">logical</code>) is set on the upstream instance. This is particularly useful when the primary is bandwidth-constrained or geographically distant from a group of standbys: a single regional relay standby receives WAL from the primary and re-streams it locally to a cluster of readers, reducing the transcontinental bandwidth requirements.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: A cascading standby's primary_conninfo points to an intermediate standby,
+-- not the original primary. Check that the cascading standby is receiving WAL:
+SELECT
+    pg_is_in_recovery() AS is_standby,
+    pg_last_wal_receive_lsn() AS received_lsn,
+    pg_last_wal_replay_lsn() AS replayed_lsn,
+    pg_wal_lsn_diff(
+        pg_last_wal_receive_lsn(),
+        pg_last_wal_replay_lsn()
+    ) AS receive_replay_diff_bytes,
+    now() - pg_last_xact_replay_timestamp() AS replay_lag
+FROM pg_stat_replication -- run on the intermediate standby to see its downstreams
+LIMIT 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, Always On AGs do not natively support cascading in the same sense, but <strong class="text-white">Distributed Availability Groups</strong> (introduced in SQL Server 2016) allow one AG to act as the primary data source for a second AG in a different WSFC cluster or on Linux. This enables cross-cluster, cross-region topologies where the two AGs are independently manageable but synchronized through a global primary-to-global secondary relationship.</p>
+
+<p class="text-gray-300 leading-relaxed">Fan-out topologies — where many subscribers consume from a single publisher — are straightforward in PostgreSQL logical replication. Each subscriber opens its own replication slot on the publisher and receives the same change stream independently. The concern with large fan-out is that each active slot consumes a WAL sender process (controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code>) and that all active slots must be kept current to prevent WAL accumulation. A publication with fifty subscribers, all of which must stay reasonably current, requires careful sizing of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_replication_slots</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication for Zero-Downtime Upgrades</h3>
+
+<p class="text-gray-300 leading-relaxed">One of the most practically valuable applications of logical replication is enabling <strong class="text-white">zero-downtime major version upgrades</strong> of PostgreSQL. Because logical replication can stream changes between different major versions (subject to the subscriber running at least the minimum version that supports the relevant protocol), you can run the old and new versions in parallel and cut over with minimal downtime.</p>
+
+<p class="text-gray-300 leading-relaxed">The procedure in outline:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Set up the new-version PostgreSQL instance (e.g., PostgreSQL 16) alongside the existing instance (e.g., PostgreSQL 14).</p>
+<p class="text-gray-300 leading-relaxed">2. Copy the initial data to the new instance using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_restore</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> followed by a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_upgrade</code>.</p>
+<p class="text-gray-300 leading-relaxed">3. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code> on the old primary and create a publication covering all tables to be migrated.</p>
+<p class="text-gray-300 leading-relaxed">4. Create a subscription on the new instance pointing at the publication on the old instance.</p>
+<p class="text-gray-300 leading-relaxed">5. Allow the subscription to synchronize fully — the initial table sync copies all existing data, then streaming logical replication keeps the new instance current.</p>
+<p class="text-gray-300 leading-relaxed">6. Monitor replication lag until it is near zero.</p>
+<p class="text-gray-300 leading-relaxed">7. During a brief maintenance window, stop writes to the old instance, verify the new instance has consumed all remaining changes, advance sequences on the new instance, and redirect application traffic.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On old primary (v14): create migration publication
+CREATE PUBLICATION upgrade_pub FOR ALL TABLES;
+
+-- On new instance (v16): create subscription
+CREATE SUBSCRIPTION upgrade_sub
+    CONNECTION 'host=old-primary port=5432 dbname=mydb user=replicator password=strongpassword'
+    PUBLICATION upgrade_pub;
+
+-- Monitor sync progress on the new instance
+SELECT
+    subname,
+    received_lsn,
+    last_msg_receipt_time,
+    latest_end_lsn,
+    latest_end_time
+FROM pg_stat_subscription;
+
+-- After cutover: advance sequences on new primary
+-- (Run for each sequence; adjust start values based on old primary's sequence state)
+SELECT 'SELECT setval(' || quote_literal(sequence_schema || '.' || sequence_name) ||
+       ', (SELECT last_value FROM ' || sequence_schema || '.' || sequence_name || ') + 10000);'
+FROM information_schema.sequences
+WHERE sequence_schema NOT IN ('pg_catalog', 'information_schema');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">SQL Server handles major version upgrades differently, using <strong class="text-white">rolling upgrades</strong> within an AG. The procedure involves upgrading secondary replicas to the new SQL Server version first (while the primary remains on the old version), then failing over to an upgraded secondary, and finally upgrading the former primary. This is supported because SQL Server AG replication is backward-compatible for one major version during the upgrade window. The online documentation for each SQL Server release specifies the exact supported rolling upgrade path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Split-Brain and Network Partitions</h3>
+
+<p class="text-gray-300 leading-relaxed">The nightmare scenario in any replication topology is <strong class="text-white">split-brain</strong>: two nodes both believing they are the primary, both accepting writes, with no mechanism to reconcile the divergence. Split-brain is not merely a theoretical concern — it happens in real production environments due to network partitions, misconfigured fencing, and automation bugs.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's physical streaming replication by itself does not provide automatic failover. A standby will promote itself only if you tell it to (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_promote()</code> or a trigger file), which means that if you are doing manual failover, split-brain requires human error — running promotion on the standby while the primary is actually still alive and reachable by clients. With automated failover managers like <strong class="text-white">Patroni</strong>, <strong class="text-white">repmgr</strong>, or <strong class="text-white">pg_auto_failover</strong>, split-brain prevention depends on the fencing mechanism the tool uses. Patroni, for example, uses a distributed consensus store (etcd, Consul, or ZooKeeper) to ensure that only one node holds the primary lease at any given time. If a node cannot reach the consensus store, it will demote itself rather than risk split-brain.</p>
+
+<p class="text-gray-300 leading-relaxed">A critically important Patroni concept is <strong class="text-white">STONITH</strong> ("Shoot The Other Node In The Head") or more generally <strong class="text-white">fencing</strong>: the ability to forcibly shut down or isolate a node that might still believe it is primary. Without fencing, even with a consensus store, there is a window during which the old primary might continue to accept writes from clients who have not yet learned of the failover. Fencing closes that window by ensuring the old primary is definitively stopped before the new primary begins accepting writes.</p>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server with WSFC-based Availability Groups, split-brain is prevented by the quorum mechanism: the cluster requires a majority of quorum votes to remain operational, so a network partition that isolates a subset of nodes will cause that subset to lose quorum and stop accepting writes. The cluster configuration must be designed so that no minority partition can independently achieve quorum — this typically involves careful placement of the File Share Witness or Cloud Witness in a third failure domain.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Check WSFC quorum state and node votes
+SELECT
+    member_name,
+    member_type_desc,
+    member_state_desc,
+    number_of_quorum_votes
+FROM sys.dm_hadr_cluster_members;
+
+-- Check if current instance is part of the quorum-capable majority
+SELECT
+    cluster_name,
+    quorum_type_desc,
+    quorum_state_desc
+FROM sys.dm_hadr_cluster;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Check Patroni-managed cluster state (via REST API or patronictl)
+-- From SQL, you can check whether the instance believes it is primary:
+SELECT
+    pg_is_in_recovery() AS is_replica,
+    pg_postmaster_start_time() AS instance_start_time,
+    inet_server_addr() AS listening_addr,
+    current_setting('cluster_name') AS cluster_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The engineering principle underlying all split-brain prevention is the same: <strong class="text-white">no node should be able to promote itself to primary without first confirming that no other node currently holds the primary role</strong>, and that confirmation must come from a quorum or consensus mechanism that is itself partition-tolerant.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Physical replication** (PostgreSQL streaming replication, SQL Server AG log shipping) replicates byte-level changes and produces identical replicas automatically, including DDL — but requires the same major version and schema on all nodes. **Logical replication** replicates row-level changes selectively, enabling cross-version upgrades and partial replication, but requires explicit DDL management on subscribers and does not replicate sequences.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication lag** is the central operational metric for any replicated environment. Monitor it in time-based units (PostgreSQL's `write_lag`, `flush_lag`, `replay_lag`; SQL Server's `estimated_data_loss_seconds` and `redo_queue_size`), alert on thresholds appropriate for your RPO, and investigate systematically — spikes trace to write bursts, standby I/O saturation, or network bandwidth constraints.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication slots** in PostgreSQL guarantee WAL retention for downstream consumers but introduce a disk-filling risk if a slot consumer goes offline. Always monitor slot lag with alerting, and consider whether unmonitored slots should be dropped rather than left dormant indefinitely.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Failover is not complete at the moment of promotion.** Post-failover tasks — redirecting applications, reconfiguring or rebuilding old standbys, advancing sequences, transferring SQL Server Agent jobs, verifying AG listeners — are as important as the promotion itself. The only way to know your failover procedure is reliable is to test it regularly under realistic conditions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention requires a fencing or quorum mechanism** beyond replication itself. PostgreSQL deployments using automated failover tools like Patroni depend on a distributed consensus store and STONITH/fencing to ensure only one primary is active at any time. SQL Server AGs rely on WSFC quorum. Understanding how your specific tooling prevents split-brain — and what happens to it during a partial network partition — is not optional knowledge for a DBA responsible for a high-availability database.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 flex justify-between text-xs">
