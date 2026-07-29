@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 13: AI-Powered Threat Detection — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 13: AI-Powered Threat Detection. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -465,15 +469,721 @@ LEFT JOIN sensitivity_catalog sc ON rna.newly_accessed_object = sc.full_object_n
 ORDER BY new_object_count_24h DESC, rna.username;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect lateral movement via new schema access compared to 90-day baseline
+WITH HistoricalAccess AS (
+    SELECT DISTINCT
+        username,
+        database_name + '.' + schema_name + '.' + object_name AS full_object
+    FROM dbo.ExtendedEventAuditLog
+    WHERE timestamp &lt; DATEADD(HOUR, -24, GETUTCDATE())
+      AND timestamp &gt;= DATEADD(DAY, -90, GETUTCDATE())
+),
+RecentAccess AS (
+    SELECT DISTINCT
+        username,
+        database_name + '.' + schema_name + '.' + object_name AS full_object
+    FROM dbo.ExtendedEventAuditLog
+    WHERE timestamp &gt;= DATEADD(HOUR, -24, GETUTCDATE())
+),
+NewAccessEvents AS (
+    SELECT
+        r.username,
+        r.full_object,
+        CASE WHEN h.full_object IS NULL THEN 1 ELSE 0 END AS is_new_for_user
+    FROM RecentAccess r
+    LEFT JOIN HistoricalAccess h
+        ON r.username = h.username AND r.full_object = h.full_object
+    WHERE h.full_object IS NULL   -- Only objects not seen in 90-day history
+),
+UserNewObjectCounts AS (
+    SELECT
+        username,
+        COUNT(*) AS new_object_count
+    FROM NewAccessEvents
+    GROUP BY username
+)
+SELECT
+    nae.username,
+    nae.full_object                             AS newly_accessed_object,
+    uoc.new_object_count                        AS total_new_objects_24h,
+    sc.SensitivityLabel,
+    sc.InformationType
+FROM NewAccessEvents nae
+JOIN UserNewObjectCounts uoc ON nae.username = uoc.username
+LEFT JOIN sys.sensitivity_classifications sc
+    ON nae.full_object LIKE '%' + OBJECT_NAME(sc.major_id) + '%'
+WHERE uoc.new_object_count &gt;= 3    -- Threshold: 3+ new objects in 24h is suspicious
+ORDER BY uoc.new_object_count DESC, nae.username;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Privilege escalation specifically warrants monitoring the system catalog access pattern. An attacker who has obtained a low-privilege account will frequently probe the catalog to understand what they can reach — querying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_catalog</code>, or SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys</code> schema at unusual rates is a reliable reconnaissance indicator.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def detect_catalog_reconnaissance(audit_df: pd.DataFrame) -&gt; pd.DataFrame:
+    """
+    Identify sessions exhibiting catalog enumeration patterns
+    consistent with privilege escalation reconnaissance.
+    """
+    catalog_patterns = {
+        'postgresql': [
+            'pg_catalog', 'information_schema', 'pg_tables',
+            'pg_indexes', 'pg_roles', 'pg_user', 'pg_shadow',
+            'pg_stat_user_tables', 'pg_class', 'pg_namespace'
+        ],
+        'sqlserver': [
+            'information_schema', 'sys.tables', 'sys.columns',
+            'sys.database_principals', 'sys.server_principals',
+            'sys.objects', 'sys.schemas', 'sys.permissions',
+            'sys.database_permissions', 'sys.server_permissions'
+        ]
+    }
+
+    all_catalog_terms = (
+        catalog_patterns['postgresql'] + catalog_patterns['sqlserver']
+    )
+
+    # Flag queries touching catalog objects
+    audit_df['is_catalog_query'] = audit_df['query_text'].str.lower().apply(
+        lambda q: any(term in q for term in all_catalog_terms)
+    )
+
+    # Aggregate catalog access by user and hour
+    catalog_summary = (
+        audit_df.groupby(['username', 'hour_bucket'])
+        .agg(
+            total_queries=('query_text', 'count'),
+            catalog_queries=('is_catalog_query', 'sum'),
+            distinct_catalog_objects=('object_name', lambda x: x[
+                audit_df.loc[x.index, 'is_catalog_query']
+            ].nunique())
+        )
+        .reset_index()
+    )
+
+    catalog_summary['catalog_query_ratio'] = (
+        catalog_summary['catalog_queries'] / catalog_summary['total_queries']
+    )
+
+    # Flag sessions where catalog queries exceed 20% of total
+    # or where more than 10 distinct catalog objects were probed
+    suspicious = catalog_summary[
+        (catalog_summary['catalog_query_ratio'] &gt; 0.20) |
+        (catalog_summary['distinct_catalog_objects'] &gt; 10)
+    ].copy()
+
+    suspicious['recon_risk_score'] = (
+        suspicious['catalog_query_ratio'] * 0.5 +
+        (suspicious['distinct_catalog_objects'] / 20.0).clip(upper=0.5)
+    )
+
+    return suspicious.sort_values('recon_risk_score', ascending=False)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Real-Time Alert Routing and Response Hooks</h3>
+
+<p class="text-gray-300 leading-relaxed">Detection that doesn't produce actionable alerts in time to matter is just expensive logging. A production threat detection pipeline needs to route alerts to the right channel, at the right priority, with enough context for the recipient to act without needing to dig through raw logs themselves. It also needs response hooks — the ability to automatically take protective action for high-severity findings without waiting for a human in the loop.</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture for real-time alert routing has three layers. The first is the detection layer — your behavioral models running against streaming or near-real-time audit log data. The second is the enrichment and classification layer — the LLM classifier that adds threat category, severity, and explanation. The third is the routing and response layer — the system that decides who gets notified, through what channel, and whether any automated response should be triggered.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Audit log stream] --> B["Detection layer<br/>per-user Isolation Forest baselines"]
+    B -->|anomaly score below threshold| C["Enrichment layer<br/>LLM threat classification"]
+    C --> D{Severity}
+    D -->|LOW| E[Log to SIEM only]
+    D -->|MEDIUM| F[Alert DBA on-call]
+    D -->|HIGH| G[Alert DBA + security team]
+    D -->|CRITICAL| H[Alert security + terminate session + page]
+    E --> I[Analyst feedback]
+    F --> I
+    G --> I
+    H --> I
+    I -.retrain baseline.-> B</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The three-layer alert pipeline: detection produces a statistical anomaly score, the LLM enrichment layer turns it into a categorized threat assessment, and severity determines how far up the response chain the alert travels.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import smtplib
+import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from enum import Enum
+
+class ResponseAction(Enum):
+    LOG_ONLY = "log_only"
+    ALERT_DBA = "alert_dba"
+    ALERT_SECURITY = "alert_security"
+    TERMINATE_SESSION = "terminate_session"
+    LOCK_ACCOUNT = "lock_account"
+    EMERGENCY_ESCALATION = "emergency_escalation"
+
+SEVERITY_RESPONSE_MAP = {
+    'LOW':      [ResponseAction.LOG_ONLY],
+    'MEDIUM':   [ResponseAction.ALERT_DBA],
+    'HIGH':     [ResponseAction.ALERT_DBA, ResponseAction.ALERT_SECURITY],
+    'CRITICAL': [ResponseAction.ALERT_SECURITY, ResponseAction.TERMINATE_SESSION,
+                 ResponseAction.EMERGENCY_ESCALATION]
+}
+
+def route_alert(
+    assessment: ThreatAssessment,
+    session_context: dict,
+    config: dict
+) -&gt; list[str]:
+    """
+    Route a threat assessment to appropriate channels and trigger
+    automated responses based on severity. Returns list of actions taken.
+    """
+    actions_taken = []
+    response_actions = SEVERITY_RESPONSE_MAP.get(assessment.severity, [ResponseAction.LOG_ONLY])
+
+    for action in response_actions:
+        if action == ResponseAction.LOG_ONLY:
+            log_to_siem(assessment, session_context, config['siem_endpoint'])
+            actions_taken.append('logged_to_siem')
+
+        elif action == ResponseAction.ALERT_DBA:
+            send_slack_alert(
+                webhook_url=config['slack_dba_webhook'],
+                assessment=assessment,
+                session_context=session_context,
+                mention_group='@dba-oncall'
+            )
+            actions_taken.append('slack_dba_alerted')
+
+        elif action == ResponseAction.ALERT_SECURITY:
+            send_slack_alert(
+                webhook_url=config['slack_security_webhook'],
+                assessment=assessment,
+                session_context=session_context,
+                mention_group='@security-team'
+            )
+            send_email_alert(
+                smtp_config=config['smtp'],
+                recipients=config['security_email_list'],
+                assessment=assessment,
+                session_context=session_context
+            )
+            actions_taken.append('security_team_alerted')
+
+        elif action == ResponseAction.TERMINATE_SESSION:
+            terminated = terminate_suspicious_session(
+                db_conn=config['db_conn'],
+                username=session_context['username'],
+                db_type=config['db_type']
+            )
+            if terminated:
+                actions_taken.append('session_terminated')
+
+        elif action == ResponseAction.LOCK_ACCOUNT:
+            lock_database_account(
+                db_conn=config['db_conn'],
+                username=session_context['username'],
+                db_type=config['db_type']
+            )
+            actions_taken.append('account_locked')
+
+        elif action == ResponseAction.EMERGENCY_ESCALATION:
+            trigger_pagerduty(
+                integration_key=config['pagerduty_key'],
+                assessment=assessment,
+                session_context=session_context
+            )
+            actions_taken.append('pagerduty_incident_created')
+
+    return actions_taken
+
+
+def send_slack_alert(
+    webhook_url: str,
+    assessment: ThreatAssessment,
+    session_context: dict,
+    mention_group: str
+) -&gt; None:
+    severity_colors = {
+        'LOW': '#36a64f',
+        'MEDIUM': '#ffcc00',
+        'HIGH': '#ff6600',
+        'CRITICAL': '#ff0000'
+    }
+
+    payload = {
+        "text": f"{mention_group} :rotating_light: *Database Threat Detected*",
+        "attachments": [{
+            "color": severity_colors.get(assessment.severity, '#cccccc'),
+            "fields": [
+                {"title": "Threat Category", "value": assessment.threat_category, "short": True},
+                {"title": "Severity",         "value": assessment.severity,         "short": True},
+                {"title": "Username",          "value": session_context['username'], "short": True},
+                {"title": "Time Window",       "value": str(session_context.get('hour_bucket')), "short": True},
+                {"title": "Confidence",        "value": f"{assessment.confidence:.0%}", "short": True},
+                {"title": "Anomaly Score",     "value": f"{session_context.get('anomaly_score', 'N/A'):.4f}", "short": True},
+                {"title": "Explanation",       "value": assessment.explanation,      "short": False},
+                {"title": "IOC Summary",       "value": assessment.ioc_summary,      "short": False},
+                {"title": "Recommended Actions",
+                 "value": "\n".join(f"• {a}" for a in assessment.recommended_actions),
+                 "short": False}
+            ],
+            "footer": "AI Threat Detection Pipeline",
+            "ts": int(datetime.utcnow().timestamp())
+        }]
+    }
+
+    requests.post(webhook_url, json=payload, timeout=10)
+
+
+def terminate_suspicious_session(
+    db_conn: str,
+    username: str,
+    db_type: str
+) -&gt; bool:
+    """
+    Terminate active sessions for a suspicious user.
+    PostgreSQL uses pg_terminate_backend; SQL Server uses KILL.
+    """
+    if db_type == 'postgresql':
+        import psycopg2
+        conn = psycopg2.connect(db_conn)
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT pg_terminate_backend(pid)
+            FROM pg_stat_activity
+            WHERE usename = %s
+              AND pid &lt;&gt; pg_backend_pid()
+              AND state != 'idle'
+        """, (username,))
+        terminated = cur.rowcount &gt; 0
+        cur.close()
+        conn.close()
+        return terminated
+
+    elif db_type == 'sqlserver':
+        import pyodbc
+        conn = pyodbc.connect(db_conn)
+        cur = conn.cursor()
+        # Collect session IDs then KILL each one
+        cur.execute("""
+            SELECT session_id FROM sys.dm_exec_sessions
+            WHERE login_name = ? AND status != 'sleeping'
+              AND session_id != @@SPID
+        """, username)
+        session_ids = [row.session_id for row in cur.fetchall()]
+        for spid in session_ids:
+            try:
+                cur.execute(f"KILL {spid}")
+            except Exception:
+                pass   # Session may have ended naturally
+        conn.close()
+        return len(session_ids) &gt; 0
+
+    return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Automated session termination for CRITICAL threats is powerful but requires careful governance. Terminating a session that turns out to be a legitimate backup job or an ETL process during a critical business window can cause its own incident. The mitigations are: maintain an allowlist of service accounts that are exempt from automated termination, require that at least two independent signals agree before triggering termination (e.g., anomaly score plus LLM confidence both above threshold), and implement a short delay between detection and termination during which a human can intervene through a "cancel this action" webhook.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating with SIEM and Incident Management Systems</h3>
+
+<p class="text-gray-300 leading-relaxed">Most organizations already have a SIEM — whether that's Splunk, Microsoft Sentinel, IBM QRadar, or an open-source stack like the Elastic Security stack. Your AI-powered database threat detection pipeline should feed structured alert data into that SIEM rather than creating a parallel alerting silo. DBAs who resist integrating with the SIEM tend to find their alerts deprioritized by security teams who don't trust systems they can't see in their central dashboard.</p>
+
+<p class="text-gray-300 leading-relaxed">The integration pattern is straightforward: emit structured JSON events from your detection pipeline to a log aggregation endpoint, map your threat categories to the SIEM's taxonomy (typically MITRE ATT&CK for database threats), and configure correlation rules in the SIEM to group related database alerts into incidents.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+import socket
+from datetime import datetime, timezone
+
+def log_to_siem(
+    assessment: ThreatAssessment,
+    session_context: dict,
+    siem_endpoint: str,
+    siem_port: int = 514
+) -&gt; None:
+    """
+    Emit a structured CEF (Common Event Format) syslog message
+    to a SIEM endpoint. CEF is supported natively by Splunk,
+    QRadar, and Sentinel.
+    """
+    # Map threat categories to MITRE ATT&CK technique IDs
+    mitre_mapping = {
+        'DATA_EXFILTRATION':       'T1005',   # Data from Local System
+        'PRIVILEGE_ESCALATION':    'T1078',   # Valid Accounts
+        'SQL_INJECTION_PROBE':     'T1190',   # Exploit Public-Facing Application
+        'CREDENTIAL_ABUSE':        'T1078',   # Valid Accounts
+        'INSIDER_THREAT':          'T1078.004', # Cloud Accounts (closest analog)
+        'RECONNAISSANCE':          'T1592',   # Gather Victim Host Information
+        'RANSOMWARE_PRECURSOR':    'T1486',   # Data Encrypted for Impact (pre-stage)
+        'FALSE_POSITIVE':          None
+    }
+
+    severity_cef_map = {
+        'LOW': 3, 'MEDIUM': 5, 'HIGH': 8, 'CRITICAL': 10
+    }
+
+    mitre_id = mitre_mapping.get(assessment.threat_category, 'T0000')
+    cef_severity = severity_cef_map.get(assessment.severity, 5)
+
+    cef_header = (
+        f"CEF:0|AI-DBA-Platform|DBThreatDetection|1.0|"
+        f"{assessment.threat_category}|"
+        f"Database Threat: {assessment.threat_category}|"
+        f"{cef_severity}|"
+    )
+
+    cef_extensions = " ".join([
+        f"src={session_context.get('client_ip', 'unknown')}",
+        f"suser={session_context['username']}",
+        f"dhost={session_context.get('db_host', 'unknown')}",
+        f"dpt={session_context.get('db_port', 5432)}",
+        f"cs1={assessment.ioc_summary.replace(' ', '_')}",
+        f"cs1Label=IOCSummary",
+        f"cs2={mitre_id}",
+        f"cs2Label=MITRETechnique",
+        f"cs3={assessment.confidence:.2f}",
+        f"cs3Label=AIConfidence",
+        f"msg={assessment.explanation[:255]}",  # CEF msg field limit
+        f"rt={int(datetime.now(timezone.utc).timestamp() * 1000)}"
+    ])
+
+    cef_message = cef_header + cef_extensions
+
+    # Send via UDP syslog (RFC 3164)
+    syslog_priority = 134   # facility=local0 (16), severity=info (6): (16*8)+6
+    syslog_message = f"&lt;{syslog_priority}&gt;{cef_message}\n"
+
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.sendto(
+            syslog_message.encode('utf-8'),
+            (siem_endpoint, siem_port)
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Microsoft Sentinel specifically, the preferred integration path is through the Azure Monitor Log Analytics workspace using the Data Collection API — this gives you structured table ingestion rather than raw syslog parsing, and allows Sentinel's native KQL-based detection rules to query your AI threat data alongside other security signals.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+import hashlib
+import hmac
+import base64
+from datetime import datetime, timezone
+
+def send_to_sentinel(
+    workspace_id: str,
+    workspace_key: str,
+    assessment: ThreatAssessment,
+    session_context: dict,
+    log_type: str = "DBThreatDetection"
+) -&gt; int:
+    """
+    Send threat assessment to Microsoft Sentinel via
+    the HTTP Data Collector API (Log Analytics workspace).
+    Returns HTTP status code.
+    """
+    body = json.dumps([{
+        "TimeGenerated":     datetime.now(timezone.utc).isoformat(),
+        "Username":          session_context.get('username'),
+        "ClientIP":          session_context.get('client_ip', 'unknown'),
+        "DatabaseHost":      session_context.get('db_host', 'unknown'),
+        "ThreatCategory":    assessment.threat_category,
+        "Severity":          assessment.severity,
+        "Confidence":        assessment.confidence,
+        "AnomalyScore":      session_context.get('anomaly_score', 0.0),
+        "Explanation":       assessment.explanation,
+        "IOCSummary":        assessment.ioc_summary,
+        "RecommendedActions": "; ".join(assessment.recommended_actions),
+        "QueryCount":        session_context.get('query_count', 0),
+        "DistinctObjects":   session_context.get('distinct_objects', 0),
+        "TotalRows":         session_context.get('total_rows', 0),
+        "HourBucket":        str(session_context.get('hour_bucket'))
+    }])
+
+    content_length = len(body)
+    rfc1123_date = datetime.now(timezone.utc).strftime('%a, %d %b %Y %H:%M:%S GMT')
+
+    string_to_hash = f"POST\n{content_length}\napplication/json\nx-ms-date:{rfc1123_date}\n/api/logs"
+    hmac_sha256 = hmac.new(
+        base64.b64decode(workspace_key),
+        string_to_hash.encode('utf-8'),
+        hashlib.sha256
+    )
+    signature = base64.b64encode(hmac_sha256.digest()).decode('utf-8')
+
+    headers = {
+        'Content-Type':  'application/json',
+        'Authorization': f"SharedKey {workspace_id}:{signature}",
+        'Log-Type':      log_type,
+        'x-ms-date':     rfc1123_date
+    }
+
+    url = f"https://{workspace_id}.ods.opinsights.azure.com/api/logs?api-version=2016-04-01"
+    response = requests.post(url, headers=headers, data=body, timeout=30)
+    return response.status_code</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once your data is flowing into Sentinel, you can write KQL correlation rules that combine database threat signals with other data sources — Active Directory authentication events, network flow data, endpoint telemetry — to build multi-signal incident detection that no single-source tool can achieve:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// Sentinel KQL: Correlate DB threat alerts with AD authentication anomalies
+let DBAlerts = DBThreatDetection_CL
+| where TimeGenerated &gt;= ago(24h)
+| where Severity_s in ("HIGH", "CRITICAL")
+| project
+    DBAlertTime = TimeGenerated,
+    Username = Username_s,
+    ThreatCategory = ThreatCategory_s,
+    AnomalyScore = AnomalyScore_d,
+    Explanation = Explanation_s;
+
+let ADSignIns = SigninLogs
+| where TimeGenerated &gt;= ago(24h)
+| where ResultType != 0    // Failed sign-ins
+| summarize
+    FailedSignIns = count(),
+    DistinctIPs   = dcount(IPAddress)
+    by UserPrincipalName, bin(TimeGenerated, 1h);
+
+DBAlerts
+| join kind=inner ADSignIns
+    on $left.Username == $right.UserPrincipalName
+| where FailedSignIns &gt;= 3 or DistinctIPs &gt;= 2
+| extend RiskScore = AnomalyScore * -1 + (FailedSignIns * 0.1)
+| project
+    DBAlertTime,
+    Username,
+    ThreatCategory,
+    Explanation,
+    FailedSignIns,
+    DistinctIPs,
+    RiskScore
+| order by RiskScore desc</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Tuning Anomaly Thresholds and Managing False Positives</h3>
+
+<p class="text-gray-300 leading-relaxed">Any anomaly detection system deployed in production will produce false positives, and poorly managed false positives are the single most common reason these systems get turned off. When the DBA on call receives 40 HIGH-severity alerts per shift and 39 of them turn out to be legitimate batch jobs, they stop reading the alerts. The model becomes noise rather than signal.</p>
+
+<p class="text-gray-300 leading-relaxed">Threshold tuning is a continuous operational responsibility. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">contamination</code> parameter in Isolation Forest, the anomaly score cutoff used to decide what goes to the LLM classifier, and the severity-to-action routing logic all require calibration against real operational data from your environment.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from sklearn.metrics import precision_score, recall_score, f1_score
+import matplotlib.pyplot as plt
+import numpy as np
+
+def evaluate_threshold_sensitivity(
+    scores: np.ndarray,
+    labels: np.ndarray,   # 1=anomalous, 0=normal (from analyst feedback)
+    threshold_range: tuple = (-0.30, 0.0),
+    steps: int = 30
+) -&gt; pd.DataFrame:
+    """
+    Evaluate detection performance across a range of anomaly thresholds
+    using analyst-labeled feedback data. Helps identify the threshold
+    that balances precision and recall for your environment.
+    """
+    thresholds = np.linspace(threshold_range[0], threshold_range[1], steps)
+    results = []
+
+    for threshold in thresholds:
+        predicted = (scores &lt; threshold).astype(int)
+        if predicted.sum() == 0:
+            continue
+
+        results.append({
+            'threshold':       threshold,
+            'precision':       precision_score(labels, predicted, zero_division=0),
+            'recall':          recall_score(labels, predicted, zero_division=0),
+            'f1':              f1_score(labels, predicted, zero_division=0),
+            'alert_volume':    predicted.sum(),
+            'alert_rate_pct':  predicted.mean() * 100
+        })
+
+    return pd.DataFrame(results)
+
+
+def build_feedback_loop(
+    alert_id: str,
+    analyst_verdict: str,    # 'true_positive', 'false_positive', 'inconclusive'
+    analyst_notes: str,
+    feedback_store_conn: str
+) -&gt; None:
+    """
+    Store analyst feedback on alerts for threshold calibration
+    and model retraining. This is the human-in-the-loop component
+    that keeps the system accurate over time.
+    """
+    import psycopg2
+
+    conn = psycopg2.connect(feedback_store_conn)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    cur.execute("""
+        INSERT INTO threat_alert_feedback
+            (alert_id, analyst_verdict, analyst_notes, feedback_time)
+        VALUES (%s, %s, %s, NOW())
+        ON CONFLICT (alert_id)
+        DO UPDATE SET
+            analyst_verdict = EXCLUDED.analyst_verdict,
+            analyst_notes   = EXCLUDED.analyst_notes,
+            feedback_time   = NOW()
+    """, (alert_id, analyst_verdict, analyst_notes))
+
+    cur.close()
+    conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond threshold tuning, several operational patterns consistently reduce false positive rates in database threat detection:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scheduled job awareness</strong>: Batch ETL jobs, backup processes, and reporting runs all generate query patterns that look anomalous — high volume, broad object access, unusual hours. Maintain a schedule registry of known jobs and suppress alerts during their expected windows, or train per-job baseline models separately from human user baselines.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Change management integration</strong>: Deployments, schema migrations, and new application releases generate legitimate deviations from baseline. Integrate with your change management system (ServiceNow, Jira, etc.) to automatically suppress anomaly scoring during active change windows and in the hours immediately following a deployment.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Per-user minimum history requirements</strong>: Do not score users with fewer than 30 days of history. New employees, new service accounts, and recently onboarded applications have too little baseline data to distinguish real anomalies from normal ramp-up behavior. Flag them for manual monitoring instead.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Seasonal baseline adjustment</strong>: Many database environments have predictable seasonal patterns — quarter-end reporting surges, year-end batch processes, holiday traffic drops. A static 30-day baseline trained in January will generate false positives during March quarter-close. Use rolling baselines with seasonal decomposition, or maintain separate baseline models for each major operational period.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">End-to-End Pipeline Orchestration</h3>
+
+<p class="text-gray-300 leading-relaxed">Pulling the components together into a production pipeline requires an orchestration layer that handles scheduling, state management, model versioning, and operational observability. For most DBA teams, this means integrating with an existing workflow tool — Apache Airflow, Prefect, or a simple cron-driven Python service — rather than building a custom scheduler.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from prefect import flow, task
+from prefect.task_runners import ConcurrentTaskRunner
+from datetime import timedelta
+import logging
+
+logger = logging.getLogger(__name__)
+
+@task(retries=2, retry_delay_seconds=30)
+def extract_audit_features(db_conn: str, lookback_hours: int = 2) -&gt; pd.DataFrame:
+    """Extract and engineer behavioral features for the recent window."""
+    return extract_behavioral_features(db_conn, lookback_days=lookback_hours / 24)
+
+@task
+def load_behavioral_models(model_store_path: str) -&gt; dict:
+    """Load the current set of per-user behavioral models from the model store."""
+    import pickle
+    with open(model_store_path, 'rb') as f:
+        return pickle.load(f)
+
+@task(retries=1)
+def score_sessions(
+    features_df: pd.DataFrame,
+    models: dict,
+    threshold: float
+) -&gt; pd.DataFrame:
+    """Apply behavioral models to recent sessions and return anomalous ones."""
+    anomalous_rows = []
+
+    for username, user_df in features_df.groupby('username'):
+        if username not in models:
+            continue
+
+        model, scaler, feature_cols = models[username]
+        X = user_df[feature_cols].fillna(0).values
+        X_scaled = scaler.transform(X)
+        scores = model.score_samples(X_scaled)
+
+        mask = scores &lt; threshold
+        if mask.any():
+            flagged = user_df[mask].copy()
+            flagged['anomaly_score'] = scores[mask]
+            anomalous_rows.append(flagged)
+
+    if anomalous_rows:
+        return pd.concat(anomalous_rows, ignore_index=True)
+    return pd.DataFrame()
+
+@task(retries=1)
+def classify_and_route(
+    anomalous_sessions: pd.DataFrame,
+    audit_conn: str,
+    claude_api_key: str,
+    routing_config: dict
+) -&gt; list[dict]:
+    """Classify anomalous sessions via LLM and route alerts."""
+    dispatched = []
+
+    for _, session in anomalous_sessions.iterrows():
+        sample_queries = fetch_sample_queries(
+            audit_conn, session['username'], session['hour_bucket'], limit=10
+        )
+        assessment = classify_threat_with_claude(
+            session_context=session.to_dict(),
+            anomaly_score=session['anomaly_score'],
+            sample_queries=sample_queries,
+            api_key=claude_api_key
+        )
+        actions = route_alert(assessment, session.to_dict(), routing_config)
+        dispatched.append({
+            'username':        session['username'],
+            'severity':        assessment.severity,
+            'category':        assessment.threat_category,
+            'actions_taken':   actions
+        })
+
+    return dispatched
+
+@flow(
+    name="db-threat-detection",
+    task_runner=ConcurrentTaskRunner(),
+    description="AI-powered database threat detection pipeline"
+)
+def threat_detection_flow(config: dict) -&gt; None:
+    """
+    Main orchestration flow. Designed to run every 15 minutes
+    on a scheduler, processing the most recent 2-hour audit window
+    with a 30-minute overlap to avoid gaps.
+    """
+    features = extract_audit_features(
+        db_conn=config['audit_db_conn'],
+        lookback_hours=config.get('lookback_hours', 2)
+    )
+
+    if features.empty:
+        logger.info("No audit data in window — skipping detection run.")
+        return
+
+    models = load_behavioral_models(config['model_store_path'])
+
+    anomalous = score_sessions(
+        features_df=features,
+        models=models,
+        threshold=config.get('anomaly_threshold', -0.15)
+    )
+
+    if anomalous.empty:
+        logger.info("No anomalous sessions detected in this window.")
+        return
+
+    logger.info(f"Flagged {len(anomalous)} anomalous sessions for LLM classification.")
+
+    dispatched = classify_and_route(
+        anomalous_sessions=anomalous,
+        audit_conn=config['audit_db_conn'],
+        claude_api_key=config['claude_api_key'],
+        routing_config=config['routing']
+    )
+
+    logger.info(f"Detection run complete. Alerts dispatched: {len(dispatched)}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Model retraining should be scheduled separately from the detection flow — typically weekly or after a significant volume of analyst feedback has accumulated. Retrain on the most recent 90 days of data, validate the new model against labeled feedback before promoting it, and version your models so you can roll back if the new model shows degraded performance in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Behavioral baselines outperform signature rules** for detecting sophisticated threats like gradual data exfiltration, insider access abuse, and reconnaissance activity. Isolation Forest and Autoencoder models trained on per-user audit log features catch what rule-based systems miss.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLM classification adds the interpretability layer** that transforms a raw anomaly score into an actionable threat assessment. Structuring your LLM prompts with precise threat category definitions, quantified behavioral deviations, and sample query context produces assessments that DBA and security teams can act on immediately.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automated response actions require governance controls** — allowlists of exempt service accounts, dual-signal confirmation before session termination, and human-cancellable delays prevent the detection system from becoming a source of operational incidents when it misfires.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SIEM integration is not optional** for production deployments. Mapping your threat categories to MITRE ATT&CK, emitting CEF-structured syslog events, and correlating database alerts with Active Directory and network signals produces multi-source incident detection with far fewer false positives than any single data source alone.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **False positive management is continuous operational work**, not a one-time configuration task. Feedback loops that capture analyst verdicts, scheduled job suppression registries, change management integration, and seasonal baseline adjustment all need ongoing attention to keep alert quality high enough that on-call DBAs continue to trust and act on the system's output.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
