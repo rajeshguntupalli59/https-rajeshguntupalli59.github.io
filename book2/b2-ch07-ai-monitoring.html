@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 7: AI-Powered Monitoring — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 7: AI-Powered Monitoring. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -38,7 +42,7 @@
     <div class="space-y-4 text-sm">
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 7: AI-Powered Monitoring</h2>
 
-<p class="text-gray-300 leading-relaxed">Monitoring a database has always been more art than science. Experienced DBAs develop intuitions over years—learning which metrics matter at 2 AM, recognizing the early warning signs of a lock cascade, knowing that a sudden spike in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code> violations on a Tuesday morning usually means someone ran a batch job without coordination. But intuitions don't scale, they don't transfer between engineers, and they fail silently when production systems evolve in ways that outpace human pattern recognition. AI-powered monitoring changes this equation by turning those hard-won intuitions into codified, continuously learning detection systems. This chapter builds a complete picture of what AI monitoring looks like in a PostgreSQL and SQL Server environment: from anomaly detection over time-series metrics, to natural language interfaces for alert triage, to production-grade pipelines that route intelligence into the tools your team already uses.</p>
+<p class="text-gray-300 leading-relaxed">Monitoring a database has always been more art than science. Experienced DBAs develop intuitions over years—learning which metrics matter at 2 AM, recognizing the early warning signs of a lock cascade, knowing that a sudden spike in checkpoint-related I/O on a Tuesday morning usually means someone ran a batch job without coordination. But intuitions don't scale, they don't transfer between engineers, and they fail silently when production systems evolve in ways that outpace human pattern recognition. AI-powered monitoring changes this equation by turning those hard-won intuitions into codified, continuously learning detection systems. This chapter builds a complete picture of what AI monitoring looks like in a PostgreSQL and SQL Server environment: from anomaly detection over time-series metrics, to natural language interfaces for alert triage, to production-grade pipelines that route intelligence into the tools your team already uses.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -117,7 +121,7 @@ WHERE recorded_at &gt;= NOW() - INTERVAL '30 days'
 GROUP BY recorded_at
 ORDER BY recorded_at;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">STL works well for univariate metrics, but database health is inherently multivariate. As your monitoring matures, you will want models that can detect anomalies across correlated metrics simultaneously. Facebook's Prophet handles multivariate seasonality well and is widely used in infrastructure monitoring. For more complex correlation patterns, isolation forests and autoencoders are worth exploring.</p>
+<p class="text-gray-300 leading-relaxed">STL works well for univariate metrics, but database health is inherently multivariate. As your monitoring matures, you will want models that can detect anomalies across correlated metrics simultaneously. Facebook's Prophet is widely used in infrastructure monitoring and handles seasonality well, but it's fundamentally a univariate forecaster — you run one model per metric (optionally with extra regressors), not one model across many correlated metrics at once. For genuinely multivariate anomaly detection, isolation forests and autoencoders are worth exploring.</p>
 
 <p class="text-gray-300 leading-relaxed">An isolation forest implementation for multivariate database metrics:</p>
 
@@ -260,6 +264,24 @@ GROUP BY
 <p class="text-gray-300 leading-relaxed">Detecting an anomaly is only the first step. The harder problem is telling your on-call engineer not just that something is wrong, but what it likely means and what they should do first. This is where large language models earn their place in a monitoring stack.</p>
 
 <p class="text-gray-300 leading-relaxed">The pattern is straightforward: when an anomaly is detected, collect the relevant metric context—the anomaly score, which features contributed most, recent metric values, active queries, lock holders, replication status—and send it to a language model with a structured prompt asking for a diagnosis and recommended investigation steps. The response becomes the body of the alert that pages the engineer.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant M as Isolation Forest Model
+    participant C as Context Collector
+    participant L as LLM (Claude/GPT-4o)
+    participant A as Alert Channel (Slack/PagerDuty)
+    participant E as On-call Engineer
+
+    M->>C: anomaly detected (score, top features)
+    C->>C: query pg_stat_activity, wait events, lock waits
+    C->>L: structured prompt (score + context)
+    L-->>C: narrative (cause, severity, actions)
+    C->>A: alert with AI narrative attached
+    A->>E: page with diagnosis + recommended steps
+    E->>C: acknowledge (actionable / false positive)
+    C->>M: label feeds next retraining cycle</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The alert triage loop: an anomaly score alone never reaches the engineer — it is always enriched with live database context and an LLM-generated narrative first, and the engineer's disposition feeds back into retraining.*</p>
 
 <p class="text-gray-300 leading-relaxed">Here is a production-ready implementation using the OpenAI API:</p>
 
@@ -503,15 +525,466 @@ WHERE acknowledged_at IS NULL
 ORDER BY instance_id, detected_at DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE monitoring.ai_alert_narratives (
+    id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+    instance_id     NVARCHAR(255) NOT NULL,
+    detected_at     DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    anomaly_score   FLOAT NOT NULL,
+    narrative       NVARCHAR(MAX) NOT NULL,
+    top_features    NVARCHAR(MAX),  -- JSON stored as NVARCHAR
+    acknowledged_at DATETIMEOFFSET NULL,
+    acknowledged_by NVARCHAR(255) NULL,
+    root_cause_confirmed NVARCHAR(500) NULL
+);
+
+CREATE INDEX ix_ai_alert_narratives_instance_detected
+    ON monitoring.ai_alert_narratives (instance_id, detected_at DESC);
+
+-- View for most recent unacknowledged narrative per instance
+CREATE VIEW monitoring.current_ai_alerts AS
+SELECT
+    instance_id,
+    detected_at,
+    anomaly_score,
+    narrative,
+    top_features
+FROM (
+    SELECT
+        instance_id,
+        detected_at,
+        anomaly_score,
+        narrative,
+        top_features,
+        ROW_NUMBER() OVER (PARTITION BY instance_id ORDER BY detected_at DESC) AS rn
+    FROM monitoring.ai_alert_narratives
+    WHERE acknowledged_at IS NULL
+) ranked
+WHERE rn = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">root_cause_confirmed</code> column is not decoration. It is your feedback loop. When an engineer resolves an incident, they record what actually caused it. Your model retraining pipeline reads this column and uses confirmed incidents as labeled data to improve future anomaly detection. Without this loop, your models drift as your workloads evolve.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Natural Language Queries Against Live Database State</h3>
+
+<p class="text-gray-300 leading-relaxed">Beyond alert generation, LLMs open a second monitoring use case: letting engineers query database state in plain English without remembering the exact DMV syntax or pg_stat view column names. This is particularly valuable for less experienced team members who know what they want to know but not necessarily how to express it in SQL.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern is a natural language to SQL translation layer, executed against your monitoring database or directly against the target instance's system views. Chapter 3 covered the foundations of NL-to-SQL in detail. In a monitoring context, the key differences are:</p>
+
+<p class="text-gray-300 leading-relaxed">1. The target schema is fixed and well-known (system views have stable schemas)</p>
+<p class="text-gray-300 leading-relaxed">2. Safety is more critical—queries must be read-only with explicit timeouts</p>
+<p class="text-gray-300 leading-relaxed">3. The result should be narrated, not just tabulated</p>
+
+<p class="text-gray-300 leading-relaxed">A monitoring-specific NL-to-SQL implementation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import openai
+import psycopg2
+import psycopg2.extras
+from typing import Optional
+
+MONITORING_SCHEMA_CONTEXT = """
+You have read-only access to a PostgreSQL monitoring database and the following 
+system views on the target instance:
+
+pg_stat_activity: columns pid, usename, application_name, state, wait_event_type, 
+  wait_event, query_start, query (current queries and sessions)
+pg_stat_statements: columns userid, dbid, query, calls, total_exec_time, 
+  mean_exec_time, stddev_exec_time, rows (query performance statistics)
+pg_stat_user_tables: columns schemaname, relname, seq_scan, idx_scan, 
+  n_live_tup, n_dead_tup, last_autovacuum, last_analyze (table statistics)
+pg_locks: columns pid, locktype, relation, mode, granted (lock information)
+pg_stat_bgwriter: columns checkpoints_timed, checkpoints_req, 
+  buffers_checkpoint, buffers_clean, maxwritten_clean (background writer)
+pg_stat_replication: columns client_addr, state, sent_lsn, write_lsn, 
+  flush_lsn, replay_lsn, write_lag, flush_lag, replay_lag (replication status)
+
+Rules:
+- Generate only SELECT statements. Never generate INSERT, UPDATE, DELETE, DROP, 
+  ALTER, or any DDL/DML.
+- Always include a LIMIT clause (maximum 100 rows unless specifically asked for more).
+- For time-based filters, use NOW() and INTERVAL arithmetic.
+- Return only the SQL query, no explanation.
+"""
+
+def nl_to_monitoring_sql(question: str, client: openai.OpenAI) -&gt; str:
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": MONITORING_SCHEMA_CONTEXT},
+            {"role": "user", "content": question}
+        ],
+        temperature=0.0
+    )
+    return response.choices[0].message.content.strip()
+
+
+def execute_monitoring_query(sql: str, conn_string: str,
+                              timeout_ms: int = 5000) -&gt; list[dict]:
+    conn = psycopg2.connect(conn_string)
+    conn.set_session(readonly=True)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(f"SET statement_timeout = {timeout_ms}")
+
+    # Basic safety check: reject anything that isn't a SELECT
+    normalized = sql.strip().upper()
+    if not normalized.startswith("SELECT"):
+        raise ValueError(f"Generated SQL is not a SELECT statement: {sql[:100]}")
+
+    cur.execute(sql)
+    results = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(row) for row in results]
+
+
+def narrate_results(question: str, sql: str, results: list[dict],
+                    client: openai.OpenAI) -&gt; str:
+    if not results:
+        return "The query returned no results, which suggests the condition you asked about is not currently occurring."
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a DBA assistant. Given a question, the SQL that answered it, "
+                           "and the query results, provide a brief 2-4 sentence plain English summary "
+                           "of what the data shows. Be specific about numbers and names from the results."
+            },
+            {
+                "role": "user",
+                "content": f"Question: {question}\nSQL: {sql}\nResults: {results[:20]}"
+            }
+        ],
+        temperature=0.1
+    )
+    return response.choices[0].message.content
+
+
+def ask_monitoring(question: str, conn_string: str) -&gt; dict:
+    client = openai.OpenAI()
+    sql = nl_to_monitoring_sql(question, client)
+    results = execute_monitoring_query(sql, conn_string)
+    narrative = narrate_results(question, sql, results, client)
+
+    return {
+        "question": question,
+        "sql": sql,
+        "results": results,
+        "narrative": narrative
+    }
+
+
+# Example questions your team can now ask in plain English:
+# ask_monitoring("Which queries have been running for more than 5 minutes?", conn_str)
+# ask_monitoring("Are there any tables that haven't been vacuumed in the last week?", conn_str)
+# ask_monitoring("What is the current replication lag on all standbys?", conn_str)
+# ask_monitoring("Show me the top 10 queries by average execution time today", conn_str)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The equivalent capability against SQL Server targets uses the same LLM translation layer, but the schema context points at DMVs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SQL_SERVER_MONITORING_SCHEMA = """
+You have read-only access to a SQL Server instance via the following DMVs:
+
+sys.dm_exec_requests: columns session_id, status, command, sql_handle, 
+  start_time, total_elapsed_time, wait_type, wait_time, blocking_session_id
+sys.dm_exec_sessions: columns session_id, login_name, host_name, program_name,
+  status, last_request_start_time, reads, writes, logical_reads
+sys.dm_exec_query_stats: columns sql_handle, execution_count, 
+  total_elapsed_time, total_logical_reads, total_logical_writes, 
+  total_worker_time, last_execution_time
+sys.dm_os_wait_stats: columns wait_type, waiting_tasks_count, 
+  wait_time_ms, signal_wait_time_ms
+sys.dm_db_index_usage_stats: columns object_id, index_id, user_seeks, 
+  user_scans, user_lookups, user_updates, last_user_seek
+sys.dm_exec_sql_text(sql_handle): returns query text for a given sql_handle
+
+Rules:
+- Generate only SELECT statements.
+- Use CROSS APPLY for sys.dm_exec_sql_text when joining to get query text.
+- Always include TOP clause instead of LIMIT.
+- Return only the SQL query.
+"""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This natural language interface pays dividends in post-incident reviews. An engineer can ask "What were the top 5 longest-running queries between 2 AM and 3 AM yesterday?" against the historical snapshot tables in your monitoring database and get a plain-English answer without building a custom report. The cognitive overhead of the investigation drops significantly, which means more time on root cause analysis and less on constructing the right SQL.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Proactive Health Scoring: Moving from Reactive to Predictive</h3>
+
+<p class="text-gray-300 leading-relaxed">Individual anomaly alerts tell you when something has already gone wrong or is in the process of going wrong. A health score aggregates many signals into a single number that trends over time, giving teams an early warning indicator that precedes a specific anomaly.</p>
+
+<p class="text-gray-300 leading-relaxed">The concept is familiar from credit scoring or SRE's Service Level Indicators: reduce a complex system to a number between 0 and 100, where lower means more at risk. The difference in a database context is that the health score must capture both current state and trend—a score of 65 that is improving is very different from a score of 65 that has been falling for three days.</p>
+
+<p class="text-gray-300 leading-relaxed">A practical health score implementation combines rule-based components (hard signals that always matter) with ML-derived components (pattern-based signals that are instance-specific):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import numpy as np
+from dataclasses import dataclass
+
+@dataclass
+class HealthScoreComponents:
+    # Rule-based components (0-100 each, 100 = healthy)
+    replication_health: float
+    connection_headroom: float
+    vacuum_health: float
+    bloat_index: float
+
+    # ML-derived components
+    anomaly_score_normalized: float  # Convert isolation forest score to 0-100
+    query_pattern_stability: float   # How much have query plans changed recently?
+
+    # Weights
+    WEIGHTS = {
+        'replication_health': 0.25,
+        'connection_headroom': 0.15,
+        'vacuum_health': 0.20,
+        'bloat_index': 0.15,
+        'anomaly_score_normalized': 0.15,
+        'query_pattern_stability': 0.10
+    }
+
+    def composite_score(self) -&gt; float:
+        components = {
+            'replication_health': self.replication_health,
+            'connection_headroom': self.connection_headroom,
+            'vacuum_health': self.vacuum_health,
+            'bloat_index': self.bloat_index,
+            'anomaly_score_normalized': self.anomaly_score_normalized,
+            'query_pattern_stability': self.query_pattern_stability
+        }
+        return sum(
+            score * self.WEIGHTS[name]
+            for name, score in components.items()
+        )
+
+
+def compute_vacuum_health(conn) -&gt; float:
+    """Score 0-100: 100 means all tables are well-vacuumed"""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            COUNT(*) FILTER (
+                WHERE last_autovacuum &lt; NOW() - INTERVAL '7 days'
+                  OR last_autovacuum IS NULL
+            )::float / NULLIF(COUNT(*), 0) AS stale_fraction
+        FROM pg_stat_user_tables
+        WHERE n_live_tup &gt; 1000  -- Only care about non-trivial tables
+    """)
+    stale_fraction = cur.fetchone()[0] or 0.0
+    return max(0.0, 100.0 * (1.0 - stale_fraction * 2))  # 50% stale = score of 0
+
+
+def compute_connection_headroom(conn, max_connections: int) -&gt; float:
+    """Score 0-100: 100 means well below max connections"""
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM pg_stat_activity")
+    current = cur.fetchone()[0]
+    utilization = current / max_connections
+    # Nonlinear penalty: starts dropping at 70% utilization
+    if utilization &lt; 0.70:
+        return 100.0
+    elif utilization &lt; 0.90:
+        return 100.0 - ((utilization - 0.70) / 0.20) * 60.0
+    else:
+        return max(0.0, 40.0 - ((utilization - 0.90) / 0.10) * 40.0)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The health score is most useful as a trend line, not a snapshot. Store it every five minutes and plot its trajectory. A database that has gone from 92 to 78 over 48 hours without any individual anomaly alert deserves attention—something is degrading slowly. A gradient-based alerting rule that fires on the rate of change of the health score catches these slow degradations that threshold-based alerts miss entirely.</p>
+
+<p class="text-gray-300 leading-relaxed">For communicating health scores to stakeholders who are not database experts, use an LLM to generate weekly summaries:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def generate_weekly_health_summary(instance_id: str,
+                                   score_history: pd.DataFrame,
+                                   incident_log: list[dict],
+                                   client: openai.OpenAI) -&gt; str:
+    avg_score = score_history['composite_score'].mean()
+    min_score = score_history['composite_score'].min()
+    trend = score_history['composite_score'].iloc[-1] - \
+            score_history['composite_score'].iloc[0]
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a database reliability engineer writing a weekly health summary "
+                           "for a mixed technical and non-technical audience. Be direct and factual. "
+                           "Avoid jargon where possible. Use specific numbers."
+            },
+            {
+                "role": "user",
+                "content": f"""
+Instance: {instance_id}
+Week average health score: {avg_score:.1f}/100
+Week minimum health score: {min_score:.1f}/100
+7-day trend: {'improving' if trend &gt; 0 else 'declining'} by {abs(trend):.1f} points
+Incidents this week: {len(incident_log)}
+
+Incident summaries:
+{json.dumps(incident_log, indent=2)}
+
+Write a 3-4 paragraph weekly health summary. Cover: overall health status, 
+any incidents and their resolutions, areas of concern, and recommended actions 
+for the coming week.
+"""
+            }
+        ],
+        temperature=0.3
+    )
+    return response.choices[0].message.content</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Closing the Loop: Feedback, Retraining, and Drift Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">An AI monitoring system that cannot learn from its own mistakes is not a system—it is a one-time analysis. Production workloads change: applications get new features, user behavior shifts seasonally, infrastructure migrates, schemas evolve. Models trained on last quarter's data will generate increasing noise as they fall out of sync with current reality.</p>
+
+<p class="text-gray-300 leading-relaxed">The feedback loop has three parts:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Label collection.</strong> Every alert that fires should record whether it was acknowledged as actionable or closed as a false positive. This happens via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">root_cause_confirmed</code> column in your narrative table. Build a Slack workflow or a simple web form that lets on-call engineers classify alerts with two clicks—actionable, false positive, or uncertain. Uncertainty is valuable data; it often points to genuinely ambiguous situations that deserve a second look.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Scheduled retraining.</strong> Run model retraining weekly. Use the past 90 days of metric history as training data, weighted so that recent data contributes more than older data (use sample weights inversely proportional to age). Evaluate the retrained model against the labeled incidents from the previous week before promoting it to production.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import joblib
+from sklearn.ensemble import IsolationForest
+from sklearn.preprocessing import StandardScaler
+from datetime import datetime, timedelta
+import numpy as np
+
+def retrain_anomaly_model(conn, instance_id: str,
+                           feature_cols: list[str]) -&gt; tuple:
+    # Load 90 days of features, with recency weights
+    features = pd.read_sql(f"""
+        SELECT snapshot_time, {', '.join(feature_cols)}
+        FROM db_health_snapshots
+        WHERE instance_id = %s
+          AND snapshot_time &gt;= NOW() - INTERVAL '90 days'
+        ORDER BY snapshot_time
+    """, conn, params=[instance_id])
+
+    # Recency weights: linear ramp from 0.5 (90 days ago) to 1.0 (now)
+    max_time = features['snapshot_time'].max()
+    time_delta = (max_time - features['snapshot_time']).dt.total_seconds()
+    max_delta = time_delta.max()
+    weights = 1.0 - 0.5 * (time_delta / max_delta)
+
+    scaler = StandardScaler()
+    X = scaler.fit_transform(features[feature_cols].fillna(method='ffill'))
+
+    model = IsolationForest(
+        n_estimators=200,
+        contamination=0.02,
+        random_state=42
+    )
+    model.fit(X, sample_weight=weights.values)
+
+    # Evaluate against labeled incidents from the past 7 days
+    eval_precision, eval_recall = evaluate_against_labels(
+        model, scaler, conn, instance_id, feature_cols
+    )
+
+    return model, scaler, eval_precision, eval_recall
+
+
+def promote_model_if_better(instance_id: str, new_model, new_scaler,
+                             new_precision: float, new_recall: float,
+                             model_registry_path: str):
+    existing_path = f"{model_registry_path}/{instance_id}_current.pkl"
+    metadata_path = f"{model_registry_path}/{instance_id}_metadata.json"
+
+    try:
+        with open(metadata_path) as f:
+            current_metadata = json.load(f)
+        current_f1 = (2 * current_metadata['precision'] * current_metadata['recall'] /
+                      (current_metadata['precision'] + current_metadata['recall'] + 1e-9))
+    except FileNotFoundError:
+        current_f1 = 0.0  # No existing model; always promote
+
+    new_f1 = 2 * new_precision * new_recall / (new_precision + new_recall + 1e-9)
+
+    if new_f1 &gt;= current_f1 - 0.05:  # Allow up to 5% F1 regression before blocking
+        joblib.dump((new_model, new_scaler), existing_path)
+        with open(metadata_path, 'w') as f:
+            json.dump({
+                'instance_id': instance_id,
+                'trained_at': datetime.utcnow().isoformat(),
+                'precision': new_precision,
+                'recall': new_recall,
+                'f1': new_f1
+            }, f)
+        print(f"Promoted new model for {instance_id}: F1={new_f1:.3f}")
+    else:
+        print(f"Blocked model promotion for {instance_id}: "
+              f"new F1={new_f1:.3f} vs current F1={current_f1:.3f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Drift detection.</strong> Even without labeled incidents, you can detect when a model's output distribution has shifted significantly from its training-time distribution. Population Stability Index (PSI) is a simple and widely-used metric for this. If your anomaly score distribution today looks very different from what it looked like when the model was trained, the model is likely no longer calibrated correctly.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def compute_psi(expected: np.ndarray, actual: np.ndarray,
+                buckets: int = 10) -&gt; float:
+    """Population Stability Index. PSI &gt; 0.2 suggests significant drift."""
+    breakpoints = np.percentile(expected, np.linspace(0, 100, buckets + 1))
+    breakpoints[0] = -np.inf
+    breakpoints[-1] = np.inf
+
+    expected_counts = np.histogram(expected, bins=breakpoints)[0]
+    actual_counts = np.histogram(actual, bins=breakpoints)[0]
+
+    # Avoid division by zero
+    expected_pct = (expected_counts + 0.0001) / len(expected)
+    actual_pct = (actual_counts + 0.0001) / len(actual)
+
+    psi = np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
+    return psi
+
+
+def check_model_drift(model, scaler, conn, instance_id: str,
+                      feature_cols: list[str],
+                      training_scores: np.ndarray) -&gt; bool:
+    # Score the last 24 hours of data
+    recent = pd.read_sql(f"""
+        SELECT {', '.join(feature_cols)}
+        FROM db_health_snapshots
+        WHERE instance_id = %s
+          AND snapshot_time &gt;= NOW() - INTERVAL '24 hours'
+        ORDER BY snapshot_time
+    """, conn, params=[instance_id])
+
+    if len(recent) &lt; 50:
+        return False  # Not enough data to assess drift
+
+    X_recent = scaler.transform(recent[feature_cols].fillna(method='ffill'))
+    recent_scores = model.decision_function(X_recent)
+
+    psi = compute_psi(training_scores, recent_scores)
+    if psi &gt; 0.2:
+        print(f"Model drift detected for {instance_id}: PSI={psi:.3f}. "
+              f"Flagging for retraining.")
+        return True
+    return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These three components—label collection, retraining, and drift detection—are what make the difference between a monitoring system that degrades over time and one that improves. Build them from the start, not as an afterthought.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Static thresholds cannot adapt to workload reality.** Seasonal decomposition and multivariate anomaly detection (isolation forests, autoencoders) define "normal" from observed data rather than from manual configuration, eliminating the precision-recall tradeoff that makes threshold-based alerting either noisy or blind.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLMs turn anomaly scores into actionable intelligence.** By collecting incident context—wait events, long-running queries, lock holders—and passing it to a language model at alert time, you replace cryptic metric spikes with human-readable diagnoses that on-call engineers can act on immediately without deep database expertise.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Your metrics pipeline is the foundation everything else rests on.** High-resolution collection (15-second intervals for health-sensitive metrics), a reliable time-series store (TimescaleDB or VictoriaMetrics), and continuous feature aggregation are prerequisites for models that actually work in production.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Natural language interfaces lower the skill floor for database investigation.** An NL-to-SQL translation layer over system views and DMVs lets engineers of all experience levels interrogate database state in plain English, accelerating post-incident investigations and reducing the cognitive overhead of triage.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI monitoring systems must learn from their own outputs.** Labeled feedback on every alert, weekly model retraining with recency-weighted data, and PSI-based drift detection are the mechanisms that prevent model staleness and ensure the system improves over time rather than degrading as workloads evolve.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
