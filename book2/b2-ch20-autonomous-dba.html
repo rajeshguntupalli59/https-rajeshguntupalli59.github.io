@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 20: Building a Fully Autonomous DBA System — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 20: Building a Fully Autonomous DBA System. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -345,6 +349,23 @@ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">A proven framework is a three-tier risk model:</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Agent perceives state] --> B[LLM reasons + selects tool]
+    B --> C{dispatch_tool: risk tier}
+    C -->|Tier 1: AUTONOMOUS| D[Execute immediately]
+    C -->|Tier 2: REQUIRES_APPROVAL| E[Post proposal to Slack]
+    C -->|Tier 3: HUMAN_ONLY| F[Document only, never execute]
+    E --> G{Human responds within 15 min?}
+    G -->|approved| D
+    G -->|rejected or timeout| H[Log rejection, escalate]
+    D --> I[Write to append-only audit log]
+    H --> I
+    F --> I
+    I --> J[Measure outcome after delay]
+    J --> K[Feed back into knowledge base / prompt tuning]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The risk-tiered dispatch loop: the LLM only ever proposes an action — whether it runs immediately, waits for a human, or never runs at all is decided by code in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dispatch_tool</code>, not by the model's own judgment.*</p>
+
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 1 — Autonomous execution.</strong> The agent acts immediately and logs the action. These are operations with bounded blast radius, easy reversibility, and well-understood side effects. Examples: creating an index <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code>, updating a statistics target, calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cancel_backend()</code> (cancel, not terminate) on a query that has been running more than a configurable threshold, running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on a table with stale statistics, adjusting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> for a specific session.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Propose and await approval.</strong> The agent writes a structured proposal to a Slack channel or ticketing system, including its reasoning and the exact command it would run. A human approves or rejects within a configurable window (typically 15 minutes). If no response arrives, the agent escalates to the on-call escalation path. Examples: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> on a bloated table during a low-traffic window, adding a column with a default value (lock implications), killing a session with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_terminate_backend()</code>, changing a GUC parameter that requires reload, enabling query parallelism for a specific user.</p>
@@ -353,15 +374,569 @@ FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This tiering is enforced in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dispatch_tool</code> function, not in the agent's reasoning. LLMs can be persuaded; code cannot (easily).</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import hashlib
+import time
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Optional
+import psycopg2
+import pyodbc
+import redis
+import requests
+
+class RiskTier(Enum):
+    AUTONOMOUS = 1
+    REQUIRES_APPROVAL = 2
+    HUMAN_ONLY = 3
+
+@dataclass
+class ActionRecord:
+    tool_name: str
+    inputs: dict
+    risk_tier: RiskTier
+    executed: bool
+    execution_result: Optional[str]
+    reasoning: str
+    timestamp: float = field(default_factory=time.time)
+    action_id: str = field(default="")
+
+    def __post_init__(self):
+        if not self.action_id:
+            payload = f"{self.tool_name}{self.timestamp}{str(self.inputs)}"
+            self.action_id = hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+# Risk classification registry
+TOOL_RISK_MAP = {
+    "get_slow_queries": RiskTier.AUTONOMOUS,
+    "analyze_query_plan": RiskTier.AUTONOMOUS,
+    "run_analyze": RiskTier.AUTONOMOUS,
+    "cancel_query": RiskTier.AUTONOMOUS,         # pg_cancel_backend
+    "create_index_concurrent": RiskTier.AUTONOMOUS,
+    "update_stats_target": RiskTier.AUTONOMOUS,
+    "create_index_blocking": RiskTier.REQUIRES_APPROVAL,
+    "terminate_session": RiskTier.REQUIRES_APPROVAL,  # pg_terminate_backend
+    "vacuum_full": RiskTier.REQUIRES_APPROVAL,
+    "alter_guc_reload": RiskTier.REQUIRES_APPROVAL,
+    "drop_index": RiskTier.HUMAN_ONLY,
+    "drop_table": RiskTier.HUMAN_ONLY,
+    "alter_primary_key": RiskTier.HUMAN_ONLY,
+    "promote_standby": RiskTier.HUMAN_ONLY,
+    "modify_replication_config": RiskTier.HUMAN_ONLY,
+}
+
+def dispatch_tool(tool_name: str, inputs: dict) -&gt; dict:
+    """
+    Central dispatcher. Enforces risk tiers before execution.
+    All actions are recorded to the audit log regardless of outcome.
+    """
+    tier = TOOL_RISK_MAP.get(tool_name, RiskTier.HUMAN_ONLY)
+    record = ActionRecord(
+        tool_name=tool_name,
+        inputs=inputs,
+        risk_tier=tier,
+        executed=False,
+        execution_result=None,
+        reasoning=inputs.get("_agent_reasoning", "No reasoning captured")
+    )
+
+    if tier == RiskTier.HUMAN_ONLY:
+        msg = (
+            f"🔴 HUMAN_ONLY action requested: `{tool_name}`\n"
+            f"Inputs: {inputs}\n"
+            f"Agent reasoning: {record.reasoning}\n"
+            f"Action ID: {record.action_id}\n"
+            "This action requires manual execution by an authorized DBA."
+        )
+        post_to_slack(msg, channel="#dba-autonomous-agent", severity="critical")
+        record.execution_result = "Blocked: HUMAN_ONLY tier"
+        write_audit_log(record)
+        return {"status": "blocked", "reason": "HUMAN_ONLY tier", "action_id": record.action_id}
+
+    if tier == RiskTier.REQUIRES_APPROVAL:
+        approval_response = request_human_approval(record)
+        if not approval_response.get("approved"):
+            record.execution_result = f"Rejected: {approval_response.get('reason', 'No approval received')}"
+            write_audit_log(record)
+            return {"status": "rejected", "action_id": record.action_id}
+
+    # AUTONOMOUS tier or approved REQUIRES_APPROVAL
+    try:
+        result = execute_tool_impl(tool_name, inputs)
+        record.executed = True
+        record.execution_result = str(result)
+        write_audit_log(record)
+        return {"status": "success", "result": result, "action_id": record.action_id}
+    except Exception as e:
+        record.execution_result = f"Execution error: {str(e)}"
+        write_audit_log(record)
+        post_to_slack(
+            f"⚠️ Agent action `{tool_name}` failed: {str(e)}\nAction ID: {record.action_id}",
+            channel="#dba-autonomous-agent",
+            severity="warning"
+        )
+        return {"status": "error", "error": str(e), "action_id": record.action_id}
+
+def write_audit_log(record: ActionRecord):
+    """Write every action to the audit table, regardless of execution outcome."""
+    r = redis.Redis(host='localhost', port=6379, db=2)
+    r.lpush(
+        "dba_agent:audit_log",
+        json.dumps({
+            "action_id": record.action_id,
+            "tool": record.tool_name,
+            "tier": record.risk_tier.name,
+            "executed": record.executed,
+            "result": record.execution_result,
+            "ts": record.timestamp
+        })
+    )
+    # Also write to a persistent audit table in the management database
+    # using a separate, append-only connection
+    _write_audit_to_db(record)</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def _write_audit_to_db(record: ActionRecord):
+    """Persist audit record to the management PostgreSQL database."""
+    conn = psycopg2.connect(dsn="host=mgmt-db dbname=dba_ops user=audit_writer")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO dba_agent_audit_log
+                    (action_id, tool_name, risk_tier, inputs_json,
+                     executed, execution_result, reasoning, action_ts)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, to_timestamp(%s))
+                """,
+                (
+                    record.action_id,
+                    record.tool_name,
+                    record.risk_tier.name,
+                    json.dumps(record.inputs),
+                    record.executed,
+                    record.execution_result,
+                    record.reasoning,
+                    record.timestamp
+                )
+            )
+            conn.commit()
+    finally:
+        conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The management database audit table itself should be created with append-only permissions for the agent's write role—the agent writer can <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> but not <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code>. This is not just good practice; it is a tamper-evidence guarantee that matters when you are explaining an autonomous action to an engineering director at 2 a.m.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent audit table:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Management database audit schema (SQL Server)
+CREATE TABLE dba_agent_audit_log (
+    audit_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
+    action_id       CHAR(16)        NOT NULL,
+    tool_name       NVARCHAR(128)   NOT NULL,
+    risk_tier       NVARCHAR(32)    NOT NULL,
+    inputs_json     NVARCHAR(MAX)   NOT NULL,
+    executed        BIT             NOT NULL DEFAULT 0,
+    execution_result NVARCHAR(MAX)  NULL,
+    reasoning       NVARCHAR(MAX)   NULL,
+    action_ts       DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    operator_login  NVARCHAR(128)   NOT NULL DEFAULT SUSER_SNAME()
+);
+
+-- Deny UPDATE and DELETE to the agent service account
+DENY UPDATE ON dba_agent_audit_log TO [dba_agent_writer];
+DENY DELETE ON dba_agent_audit_log TO [dba_agent_writer];
+
+-- Index for operational queries
+CREATE INDEX ix_audit_log_action_ts
+    ON dba_agent_audit_log (action_ts DESC)
+    INCLUDE (tool_name, risk_tier, executed);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL equivalent:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Management database audit schema (PostgreSQL)
+CREATE TABLE dba_agent_audit_log (
+    audit_id         BIGSERIAL PRIMARY KEY,
+    action_id        CHAR(16)     NOT NULL,
+    tool_name        TEXT         NOT NULL,
+    risk_tier        TEXT         NOT NULL
+                     CHECK (risk_tier IN ('AUTONOMOUS','REQUIRES_APPROVAL','HUMAN_ONLY')),
+    inputs_json      JSONB        NOT NULL,
+    executed         BOOLEAN      NOT NULL DEFAULT FALSE,
+    execution_result TEXT,
+    reasoning        TEXT,
+    action_ts        TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    operator_login   TEXT         NOT NULL DEFAULT current_user
+);
+
+-- Revoke mutation rights from the agent writer role
+REVOKE UPDATE, DELETE, TRUNCATE
+    ON dba_agent_audit_log
+    FROM dba_agent_writer;
+
+-- Allow only INSERT
+GRANT INSERT ON dba_agent_audit_log TO dba_agent_writer;
+GRANT USAGE ON SEQUENCE dba_agent_audit_log_audit_id_seq TO dba_agent_writer;
+
+-- Partial index for recent unexecuted proposals (approvals dashboard)
+CREATE INDEX ix_audit_log_pending
+    ON dba_agent_audit_log (action_ts DESC)
+    WHERE executed = FALSE
+      AND risk_tier = 'REQUIRES_APPROVAL';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Human Approval Workflow</h3>
+
+<p class="text-gray-300 leading-relaxed">The approval workflow for Tier 2 actions is not a fire-and-forget notification. It is a structured, time-bounded conversation between the agent and the on-call DBA. The agent must present enough context that a human can make an informed decision in under two minutes—the typical window before an on-call engineer starts to resent the interruption.</p>
+
+<p class="text-gray-300 leading-relaxed">The proposal message posted to Slack should include: what problem was observed, what the agent intends to do and why, the exact command that will be executed (no paraphrasing), estimated risk and reversibility, and a time limit after which the agent will escalate.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def request_human_approval(record: ActionRecord) -&gt; dict:
+    """
+    Post a structured approval request to Slack and poll for a response.
+    Returns {"approved": True/False, "approver": str, "reason": str}.
+    """
+    approve_token = f"approve:{record.action_id}"
+    reject_token  = f"reject:{record.action_id}"
+
+    slack_message = {
+        "text": f"🟡 *DBA Agent — Approval Required* (Action ID: `{record.action_id}`)",
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*Action:* `{record.tool_name}`\n"
+                        f"*Risk Tier:* REQUIRES_APPROVAL\n"
+                        f"*Reasoning:*\n{record.reasoning}"
+                    )
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*Proposed Command:*\n```{json.dumps(record.inputs, indent=2)}```\n"
+                        f"*Reversible:* {TOOL_REVERSIBILITY.get(record.tool_name, 'Unknown')}"
+                    )
+                }
+            },
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "✅ Approve"},
+                        "style": "primary",
+                        "value": approve_token,
+                        "action_id": approve_token
+                    },
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "❌ Reject"},
+                        "style": "danger",
+                        "value": reject_token,
+                        "action_id": reject_token
+                    }
+                ]
+            },
+            {
+                "type": "context",
+                "elements": [
+                    {
+                        "type": "mrkdwn",
+                        "text": f"⏱ Auto-escalates to on-call lead in *15 minutes* if no response."
+                    }
+                ]
+            }
+        ]
+    }
+
+    r = redis.Redis(host='localhost', port=6379, db=2)
+    # Clear any stale key
+    r.delete(f"approval:{record.action_id}")
+
+    post_to_slack(slack_message, channel="#dba-approvals")
+
+    # Poll Redis for the button callback (set by the Slack event handler)
+    deadline = time.time() + 900  # 15 minutes
+    while time.time() &lt; deadline:
+        result = r.get(f"approval:{record.action_id}")
+        if result:
+            payload = json.loads(result)
+            return payload
+        time.sleep(5)
+
+    # Timeout — escalate and treat as rejected for safety
+    post_to_slack(
+        f"⏰ Approval timeout for action `{record.action_id}` (`{record.tool_name}`). "
+        f"Escalating to on-call lead. Action NOT executed.",
+        channel="#dba-approvals",
+        severity="warning"
+    )
+    return {"approved": False, "reason": "Approval timeout — action not executed"}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Slack event handler that receives button clicks writes the decision back to Redis, which the polling loop above picks up:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># In your Slack Bolt / Flask webhook handler
+from flask import Flask, request, jsonify
+import hmac, hashlib
+
+app = Flask(__name__)
+
+@app.route("/slack/actions", methods=["POST"])
+def handle_slack_action():
+    payload = json.loads(request.form["payload"])
+    action  = payload["actions"][0]
+    action_id_raw = action["value"]          # e.g. "approve:a1b2c3d4e5f6g7h8"
+    decision, action_id = action_id_raw.split(":", 1)
+    approver = payload["user"]["name"]
+
+    r = redis.Redis(host='localhost', port=6379, db=2)
+    r.setex(
+        f"approval:{action_id}",
+        3600,   # expire after 1 hour
+        json.dumps({
+            "approved": decision == "approve",
+            "approver": approver,
+            "reason": f"{'Approved' if decision == 'approve' else 'Rejected'} by {approver}"
+        })
+    )
+    return jsonify({"text": f"Response recorded by {approver}. Thank you."})</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern gives the autonomous system a clean interface to human judgment without requiring a custom web application. The on-call DBA receives a rich, actionable notification and can approve or reject from their phone in seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Continuous Learning: Closing the Feedback Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous system that does not learn from its actions will repeat the same mistakes indefinitely. The feedback loop that makes the system genuinely adaptive has three components: outcome measurement, preference fine-tuning signals, and periodic knowledge base updates.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Outcome measurement</strong> means verifying whether a Tier 1 or approved Tier 2 action actually improved the metric it was targeting. After creating a concurrent index to address a slow query, the agent should re-query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> for that query's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mean_exec_time</code> five minutes later and record whether latency improved. This creates a ground-truth labeled dataset of (action, context, outcome) triples.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def measure_action_outcome(action_id: str, target_metric: dict,
+                            delay_seconds: int = 300) -&gt; dict:
+    """
+    Called by the scheduler 'delay_seconds' after a Tier 1/2 action completes.
+    Compares the target metric before and after the action.
+    Writes the outcome back to the audit record.
+    """
+    time.sleep(delay_seconds)
+
+    r = redis.Redis(host='localhost', port=6379, db=2)
+    current_state_raw = r.get(f"db_state:{target_metric['instance']}:latest")
+    if not current_state_raw:
+        return {"outcome": "unknown", "reason": "State snapshot unavailable"}
+
+    current_state = json.loads(current_state_raw)
+    before_value = target_metric["before_value"]
+    metric_path  = target_metric["metric_path"]   # e.g. "query_stats.p95_ms"
+
+    # Navigate the nested state dict using the dotted path
+    after_value = current_state
+    for key in metric_path.split("."):
+        after_value = after_value.get(key, {})
+
+    if not isinstance(after_value, (int, float)):
+        return {"outcome": "unmeasurable", "reason": f"Metric {metric_path} not numeric"}
+
+    pct_change = (after_value - before_value) / max(abs(before_value), 1e-9) * 100
+
+    outcome = {
+        "action_id": action_id,
+        "metric": metric_path,
+        "before": before_value,
+        "after": after_value,
+        "pct_change": round(pct_change, 2),
+        "improved": pct_change &lt; -5.0  # negative means metric decreased (latency)
+    }
+
+    # Update the audit record
+    _update_audit_outcome(action_id, outcome)
+    # Append to the training signal stream
+    r.lpush("dba_agent:training_signals", json.dumps(outcome))
+    r.ltrim("dba_agent:training_signals", 0, 9999)   # keep last 10k signals
+
+    return outcome</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Preference fine-tuning signals</strong> are generated when a human rejects an agent proposal. Every rejection carries implicit information: the agent misjudged either the necessity of the action, its timing, or its risk level. These rejections should be logged with the full conversation context and periodically reviewed to update the system prompt's heuristics or, for teams with the volume and infrastructure for it, to contribute to fine-tuning runs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Knowledge base updates</strong> address the other direction: when the agent successfully handles a novel situation it had not encountered before, the pattern should be encoded into a retrieval-augmented knowledge base so future invocations can reference it without needing to rediscover the solution through multiple tool calls. This is the mechanism by which the system accumulates institutional knowledge that would otherwise walk out the door when a senior DBA leaves.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def add_to_knowledge_base(
+    situation_description: str,
+    resolution_steps: list[str],
+    outcome_summary: str,
+    tags: list[str]
+) -&gt; str:
+    """
+    Embed and store a resolved incident into the vector knowledge base.
+    Retrieved at agent startup to augment the system prompt with relevant precedents.
+    """
+    document = (
+        f"SITUATION: {situation_description}\n\n"
+        f"RESOLUTION STEPS:\n" +
+        "\n".join(f"  {i+1}. {step}" for i, step in enumerate(resolution_steps)) +
+        f"\n\nOUTCOME: {outcome_summary}\n"
+        f"TAGS: {', '.join(tags)}"
+    )
+
+    # Use the embeddings API for semantic retrieval
+    embed_response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=256,
+        messages=[{
+            "role": "user",
+            "content": f"Summarize this DBA incident for embedding:\n{document}"
+        }]
+    )
+    # In practice, use a dedicated embedding model endpoint here
+    # This illustrates the pattern; replace with your embedding provider
+
+    doc_id = hashlib.sha256(document.encode()).hexdigest()[:24]
+    r = redis.Redis(host='localhost', port=6379, db=3)
+    r.hset(f"kb:{doc_id}", mapping={
+        "document": document,
+        "tags": json.dumps(tags),
+        "created_at": time.time()
+    })
+    r.sadd("kb:all_ids", doc_id)
+    return doc_id</code></pre>
+
+<p class="text-gray-300 leading-relaxed">At agent startup, the orchestrator queries the knowledge base with the current health snapshot as the query vector, retrieves the top-five most semantically similar past incidents, and injects them into the system prompt as examples. This gives the agent grounded institutional memory without requiring it to invent solutions from first principles each time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The System Prompt: Engineering the Agent's Judgment</h3>
+
+<p class="text-gray-300 leading-relaxed">Every autonomous capability discussed in this chapter is only as reliable as the reasoning the agent brings to bear. That reasoning is shaped substantially by the system prompt. Treating the system prompt as boilerplate is the single most common mistake teams make when deploying LLM-based agents in production. It deserves the same engineering attention as the tool definitions and risk tier registry.</p>
+
+<p class="text-gray-300 leading-relaxed">A production DBA agent system prompt should cover five areas: role definition and scope, reasoning protocol, risk and caution heuristics, output format requirements, and escalation triggers. The following is a representative production template—adapt it to your environment, your database versions, and your specific risk appetite:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>You are an autonomous PostgreSQL and SQL Server DBA agent operating in a production
+environment. Your role is to monitor database health, diagnose problems, and take
+corrective actions within the boundaries defined by the risk tier system.
+
+REASONING PROTOCOL
+- Before proposing any action, explicitly state: (1) the observation that motivated
+  it, (2) the hypothesis about root cause, (3) the action and why it addresses the
+  root cause, (4) the expected outcome, and (5) the risk tier classification.
+- If two plausible diagnoses exist, state both and explain which you are proceeding
+  with and why. Do not silently pick one.
+- Never take the most aggressive available action when a less aggressive option
+  exists that addresses the same root cause. Prefer canceling a query over
+  terminating a session. Prefer CONCURRENTLY index builds over blocking ones.
+
+CAUTION HEURISTICS
+- A single anomalous metric reading is not sufficient justification for a Tier 2
+  action. Wait for confirmation from a second signal or a second polling cycle.
+- If the pg_stat_statements reset counter has changed since the last snapshot,
+  treat query statistics as unreliable and do not base index recommendations on them.
+- Replication lag above 60 seconds requires immediate notification to the on-call
+  DBA regardless of trend direction. Do not wait for the next polling cycle.
+- Connection pool saturation above 85% of max_connections is a Tier 2 alert
+  regardless of current query latency.
+- Do not recommend VACUUM FULL without first checking whether the table has active
+  long-running transactions. A VACUUM FULL on a table held by an open transaction
+  will block indefinitely.
+
+OUTPUT FORMAT
+- Structure every response as: OBSERVATION → DIAGNOSIS → PROPOSED ACTION → RISK TIER
+- If invoking a tool, explain in one sentence what you expect it to return before
+  calling it. This makes the audit log interpretable by humans reviewing it later.
+- If no action is warranted, state "No action required" with a brief justification.
+  Never silently do nothing.
+
+ESCALATION TRIGGERS — immediately invoke notify_human for any of the following,
+regardless of tier:
+- Any error message containing "PANIC", "FATAL", or "corruption"
+- Replication slot lag exceeding 10 GB
+- More than 20 blocked sessions simultaneously
+- Any query running longer than 3600 seconds (1 hour)
+- Lock waits involving the pg_catalog schema
+- Available disk space below 15% on any data volume</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The caution heuristics section is where operational experience gets encoded. Every line in that section should correspond to a real incident that either you or your team has encountered. A system prompt that was written before the system went to production will be missing most of the heuristics that matter; plan to iterate on it aggressively in the first three months.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operational Runbook for the Autonomous Agent</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying an autonomous DBA system is not a one-time event. It is an ongoing operational practice with its own maintenance requirements. Teams that treat the agent as a set-and-forget appliance will find it drifting out of calibration as their database workloads evolve.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weekly review cadence.</strong> Every week, a senior DBA should spend thirty minutes reviewing the audit log from the prior seven days. The review has three objectives: confirm that Tier 1 actions taken autonomously were appropriate; identify any near-misses where the agent reached a correct conclusion via questionable reasoning; and spot emerging patterns (e.g., the same index being created and dropped repeatedly because workload changes invalidated it) that suggest a system prompt update is needed.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Drift detection for the state collector.</strong> The health snapshot query depends on DMVs and system catalog tables whose behavior can change across PostgreSQL minor versions and SQL Server CUs. After any version upgrade, run the state collector query manually and validate its output before re-enabling autonomous operation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model version pinning.</strong> If your agent uses a hosted LLM API, pin the model version explicitly—do not use a floating alias like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">claude-latest</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gpt-4o</code>. Model updates can subtly shift reasoning behavior in ways that only manifest under unusual database conditions. When you choose to upgrade the model version, treat it as a code deployment: test it against a staging environment, review the audit log for the first 72 hours, and have a rollback plan.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chaos testing the approval workflow.</strong> At least quarterly, deliberately submit a Tier 2 proposal outside business hours and verify that the escalation path fires correctly. Approval workflows have a way of silently breaking when Slack webhook URLs rotate, Redis credentials expire, or on-call schedules are not updated.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Circuit breaker for autonomous execution.</strong> Implement a global kill switch that suspends all Tier 1 autonomous execution without stopping monitoring or notifications. This should be operable by any on-call engineer without requiring a deployment—a single Redis key that the dispatcher checks at the start of every tool execution is sufficient. Activate it whenever your team is operating in a heightened-risk window: major deployments, Black Friday, end-of-quarter batch runs.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def is_autonomous_execution_enabled() -&gt; bool:
+    """
+    Check the global circuit breaker before executing any Tier 1 action.
+    Set Redis key 'dba_agent:autonomous_enabled' to '0' to suspend.
+    Defaults to enabled if the key is absent.
+    """
+    r = redis.Redis(host='localhost', port=6379, db=2)
+    val = r.get("dba_agent:autonomous_enabled")
+    if val is None:
+        return True   # Default: enabled
+    return val.decode() == "1"
+
+# Modified dispatch for AUTONOMOUS tier
+if tier == RiskTier.AUTONOMOUS:
+    if not is_autonomous_execution_enabled():
+        # Downgrade to REQUIRES_APPROVAL during suspended window
+        post_to_slack(
+            f"ℹ️ Autonomous execution suspended. Tier 1 action `{tool_name}` "
+            f"routed to approval queue.\nAction ID: `{record.action_id}`",
+            channel="#dba-autonomous-agent",
+            severity="info"
+        )
+        tier = RiskTier.REQUIRES_APPROVAL</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Where Human Judgment Remains Irreplaceable</h3>
+
+<p class="text-gray-300 leading-relaxed">This book has argued throughout that AI augmentation makes DBAs more effective. This final section makes the complementary argument: there are categories of database operation where the current generation of autonomous AI systems should not be the final decision-maker, and where the responsible position is to keep a human in the loop indefinitely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Ambiguous business context.</strong> An autonomous agent can observe that a query is slow, identify the missing index, and create it. What it cannot reliably determine is whether that query is part of a deprecated feature being sunset next quarter, whether the table it touches is being replaced by a new data model, or whether the index will conflict with a migration the application team is planning to run tomorrow. Business context that lives in heads, Confluence pages, and Jira tickets is largely invisible to the agent. Decisions that hinge on that context require a human.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Novel failure modes.</strong> The agent's knowledge of failure patterns is bounded by its training data and the institutional knowledge encoded in its system prompt. A corruption scenario involving an obscure PostgreSQL extension, a previously unseen SQL Server bug, or a failure mode introduced by a new cloud storage layer is likely to produce confident but incorrect reasoning. When the agent encounters a situation it explicitly flags as outside its experience—which a well-designed system prompt will instruct it to do—that flag should be taken seriously and a human should take ownership.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Risk-significant timing decisions.</strong> Deciding to run a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> is not just a technical decision; it is also a business decision about which workload to trade against the maintenance window. The agent can reason about database load; it has no visibility into a product launch happening tomorrow or a board presentation that makes this afternoon the worst possible time for any disruption. Tier 2 approval exists partly to give a human the chance to apply this kind of context.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Regulatory and compliance boundaries.</strong> In environments subject to SOX, HIPAA, PCI-DSS, or similar frameworks, certain database actions carry audit and compliance implications that extend well beyond their technical effects. Schema changes that affect data retention, access control modifications, and changes to encryption configuration should route to compliance-aware reviewers, not just on-call DBAs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Irreversible large-scale operations.</strong> The risk tier system already handles the most obvious cases: dropping tables is HUMAN_ONLY. But there is a subtler category—operations that are technically reversible but operationally irreversible at scale. Purging ten million rows from a history table can technically be undone, but not practically, not quickly, and not without significant risk. Any operation whose undo cost exceeds the cost of the original operation by an order of magnitude should be treated as effectively irreversible and kept in human hands.</p>
+
+<p class="text-gray-300 leading-relaxed">The honest summary is that an autonomous DBA system handles high-frequency, low-complexity, well-characterized operational work exceptionally well—and that category covers a substantial fraction of what DBA teams actually spend their time on. The remainder—ambiguous, novel, consequential, contextually complex situations—is precisely where human expertise remains not just valuable but necessary.</p>
+
+<p class="text-gray-300 leading-relaxed">The goal of the autonomous DBA system is not to replace that expertise. It is to make sure human experts are spending their time on problems that actually require them.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The ReAct loop is the right architectural foundation** for an autonomous DBA agent: perceive state, reason with an LLM, select and execute a typed tool, observe the result, iterate. The agent should never issue raw SQL directly to a database connection; all database operations flow through typed, risk-classified tools that enforce constraints regardless of what the LLM reasons.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Risk-tiered execution is non-negotiable.** Autonomous operation without a clearly enforced boundary between actions the system can take unilaterally, actions that require human approval, and actions that are permanently off-limits will eventually produce an outage. The tiers should be enforced in code, not in the system prompt, because prompts can be reasoned around and code cannot.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The perception layer quality determines agent quality.** A rich, current, multi-domain state snapshot—query latency, wait events, replication health, bloat candidates, cache ratios—gives the agent the grounding it needs to reason correctly. A sparse or stale snapshot produces confident but misdirected actions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Continuous learning closes the loop.** Measuring whether each autonomous action improved its target metric, logging rejections as preference signals, and building a vector knowledge base of resolved incidents are what separate a system that gets better over time from one that ossifies at the quality level it had on day one.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Human judgment is a feature, not a deficiency.** The cases where autonomous systems should defer to humans—ambiguous business context, novel failure modes, compliance-sensitive operations, effectively irreversible large-scale changes—are precisely the cases where the cost of a wrong decision is highest. Building a system that routes those cases cleanly to human experts is not a limitation of the autonomous approach; it is the mature expression of it.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
