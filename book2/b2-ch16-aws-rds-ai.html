@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 16: AI Features in AWS RDS and Aurora — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 16: AI Features in AWS RDS and Aurora. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -409,15 +413,663 @@ SELECT
 
 <p class="text-gray-300 leading-relaxed">The most immediate use case is autonomous wait event diagnosis. Your monitoring pipeline collects the top-10 wait events from Performance Insights, the top-5 queries by mean execution time from RDS Query Insights, and the current connection distribution from pg_stat_activity or sys.dm_exec_sessions. You pass this as a structured prompt to Bedrock and get back a hypothesis with recommended actions.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import json
+import psycopg2
+
+bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+pi_client      = boto3.client('pi', region_name='us-east-1')
+
+def collect_diagnostic_snapshot(rds_resource_id: str, pg_conn) -&gt; dict:
+    """Collect a structured diagnostic snapshot from RDS and the database itself."""
+    from datetime import datetime, timedelta, timezone
+    
+    end_time   = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(minutes=15)
+    
+    # Pull top wait events from Performance Insights
+    pi_response = pi_client.get_resource_metrics(
+        ServiceType='RDS',
+        Identifier=rds_resource_id,
+        StartTime=start_time,
+        EndTime=end_time,
+        PeriodInSeconds=300,
+        MetricQueries=[{
+            'Metric': 'db.load.avg',
+            'GroupBy': {'Group': 'db.wait_event', 'Limit': 10}
+        }]
+    )
+    
+    wait_events = []
+    for metric in pi_response.get('MetricList', []):
+        event_name = metric['Key'].get('Dimensions', {}).get('db.wait_event.name', 'unknown')
+        avg_load   = sum(p['Value'] for p in metric.get('DataPoints', []) if 'Value' in p)
+        wait_events.append({'event': event_name, 'avg_load': round(avg_load, 3)})
+    wait_events.sort(key=lambda x: x['avg_load'], reverse=True)
+    
+    # Pull active queries and lock state from pg_stat_activity
+    with pg_conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                pid,
+                state,
+                wait_event_type,
+                wait_event,
+                LEFT(query, 200) AS query_snippet,
+                EXTRACT(EPOCH FROM (NOW() - query_start))::int AS duration_seconds
+            FROM pg_stat_activity
+            WHERE state != 'idle'
+              AND query_start &lt; NOW() - INTERVAL '5 seconds'
+            ORDER BY duration_seconds DESC
+            LIMIT 10
+        """)
+        active_queries = [
+            {
+                'pid': row[0], 'state': row[1],
+                'wait_event_type': row[2], 'wait_event': row[3],
+                'query_snippet': row[4], 'duration_seconds': row[5]
+            }
+            for row in cur.fetchall()
+        ]
+    
+    return {
+        'top_wait_events_15min': wait_events,
+        'long_running_queries': active_queries
+    }
+
+def diagnose_with_bedrock(snapshot: dict) -&gt; str:
+    """Pass the diagnostic snapshot to Claude via Bedrock for analysis."""
+    snapshot_json = json.dumps(snapshot, indent=2, default=str)
+    
+    prompt = f"""You are an expert PostgreSQL DBA analyzing a live performance snapshot from an Amazon RDS Aurora PostgreSQL cluster.
+
+Below is a structured diagnostic snapshot collected over the last 15 minutes. Analyze it and provide:
+1. The most likely root cause of any performance issue you see.
+2. The immediate mitigation steps the on-call DBA should take.
+3. Any longer-term schema or configuration changes to prevent recurrence.
+
+Be specific. Reference the wait events and query snippets in the data. Do not suggest checking things that are not evidenced in the data.
+
+DIAGNOSTIC SNAPSHOT:
+{snapshot_json}
+
+ANALYSIS:"""
+
+    response = bedrock_client.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": prompt}]
+        }),
+        contentType="application/json",
+        accept="application/json"
+    )
+    
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']
+
+# Usage
+pg_conn = psycopg2.connect(
+    host="your-aurora-cluster.cluster-xyz.us-east-1.rds.amazonaws.com",
+    database="prod_db",
+    user="monitoring_user",
+    password="...",
+    sslmode="require"
+)
+
+snapshot = collect_diagnostic_snapshot(
+    rds_resource_id='db-ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    pg_conn=pg_conn
+)
+diagnosis = diagnose_with_bedrock(snapshot)
+print(diagnosis)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server on RDS, the collection side changes but the Bedrock call stays identical:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python (SQL Server via pyodbc):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+import json
+import boto3
+
+bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+def collect_sqlserver_snapshot(sql_conn) -&gt; dict:
+    """Collect equivalent diagnostic data from SQL Server DMVs."""
+    cursor = sql_conn.cursor()
+    
+    # Active requests with wait info
+    cursor.execute("""
+        SELECT TOP 10
+            r.session_id,
+            r.status,
+            r.wait_type,
+            r.wait_time / 1000.0          AS wait_time_seconds,
+            r.cpu_time / 1000.0           AS cpu_time_seconds,
+            r.total_elapsed_time / 1000.0 AS elapsed_seconds,
+            LEFT(st.text, 200)            AS query_snippet,
+            DB_NAME(r.database_id)        AS database_name
+        FROM sys.dm_exec_requests r
+        CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+        WHERE r.session_id != @@SPID
+          AND r.total_elapsed_time &gt; 5000
+        ORDER BY r.total_elapsed_time DESC
+    """)
+    
+    columns = [col[0] for col in cursor.description]
+    active_requests = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    
+    # Top wait types over recent history from sys.dm_os_wait_stats
+    cursor.execute("""
+        SELECT TOP 10
+            wait_type,
+            waiting_tasks_count,
+            wait_time_ms,
+            signal_wait_time_ms,
+            wait_time_ms - signal_wait_time_ms AS resource_wait_time_ms
+        FROM sys.dm_os_wait_stats
+        WHERE wait_type NOT IN (
+            'SLEEP_TASK','BROKER_TO_FLUSH','BROKER_TASK_STOP','CLR_AUTO_EVENT',
+            'DISPATCHER_QUEUE_SEMAPHORE','FT_IFTS_SCHEDULER_IDLE_WAIT',
+            'HADR_FILESTREAM_IOMGR_IOCOMPLETION','HADR_WORK_QUEUE',
+            'LAZYWRITER_SLEEP','LOGMGR_QUEUE','ONDEMAND_TASK_QUEUE',
+            'REQUEST_FOR_DEADLOCK_MONITOR','RESOURCE_QUEUE','SERVER_IDLE_CHECK',
+            'SLEEP_DBSTARTUP','SLEEP_DCOMSTARTUP','SLEEP_MASTERDBREADY',
+            'SLEEP_MASTERMDREADY','SLEEP_MASTERUPGRADED','SLEEP_MSDBSTARTUP',
+            'SLEEP_TEMPDBSTARTUP','SNI_HTTP_ACCEPT','SP_SERVER_DIAGNOSTICS_SLEEP',
+            'SQLTRACE_BUFFER_FLUSH','WAITFOR','XE_DISPATCHER_WAIT',
+            'XE_TIMER_EVENT'
+        )
+        ORDER BY wait_time_ms DESC
+    """)
+    
+    columns = [col[0] for col in cursor.description]
+    wait_stats = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    
+    return {
+        'engine': 'SQL Server',
+        'active_requests': active_requests,
+        'cumulative_wait_stats': wait_stats
+    }
+
+def diagnose_sqlserver_with_bedrock(snapshot: dict) -&gt; str:
+    snapshot_json = json.dumps(snapshot, indent=2, default=str)
+    
+    prompt = f"""You are an expert SQL Server DBA analyzing a live performance snapshot from Amazon RDS for SQL Server.
+
+Analyze the diagnostic snapshot below and provide:
+1. The most likely root cause of any performance issue visible in the data.
+2. Immediate T-SQL or configuration steps the on-call DBA should take right now.
+3. Any index, statistics, or configuration changes to prevent recurrence.
+
+Reference specific wait types and query snippets from the data. Do not speculate beyond what the data shows.
+
+DIAGNOSTIC SNAPSHOT:
+{snapshot_json}
+
+ANALYSIS:"""
+
+    response = bedrock_client.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 2048,
+            "messages": [{"role": "user", "content": prompt}]
+        }),
+        contentType="application/json",
+        accept="application/json"
+    )
+    
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']
+
+# Usage
+sql_conn = pyodbc.connect(
+    "DRIVER={ODBC Driver 18 for SQL Server};"
+    "SERVER=your-rds-sqlserver.xyz.us-east-1.rds.amazonaws.com,1433;"
+    "DATABASE=prod_db;"
+    "UID=monitoring_user;"
+    "PWD=...;"
+    "Encrypt=yes;"
+    "TrustServerCertificate=no;"
+)
+
+snapshot  = collect_sqlserver_snapshot(sql_conn)
+diagnosis = diagnose_sqlserver_with_bedrock(snapshot)
+print(diagnosis)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key discipline in both cases is context quality. Bedrock models are only as useful as the context you give them. Passing a raw CloudWatch metrics dump or an unfiltered pg_stat_activity output with hundreds of idle connections produces vague, unhelpful responses. The collection functions above are opinionated about filtering: they exclude idle sessions, they cap query snippets to 200 characters, they exclude benign wait types from SQL Server. That specificity is what allows the model to reason precisely rather than narrate.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated Index Recommendations Using AWS and Bedrock</h3>
+
+<p class="text-gray-300 leading-relaxed">Index management is one of the highest-leverage areas for AI assistance because the signal set — slow query logs, execution plans, table statistics — is well-structured and the action space — CREATE INDEX, DROP INDEX, rebuild — is finite and verifiable. AWS provides some native tooling here (Query Insights on Aurora, Performance Insights top queries), but it stops short of generating DDL. Bedrock fills that gap.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern is a three-stage pipeline:</p>
+<p class="text-gray-300 leading-relaxed">1. Collect candidate slow queries from the Performance Insights API or from the slow query log via CloudWatch Logs Insights.</p>
+<p class="text-gray-300 leading-relaxed">2. For each candidate query, retrieve the execution plan from the database.</p>
+<p class="text-gray-300 leading-relaxed">3. Pass the slow query and its plan to Bedrock with a prompt that requests index recommendations in the form of executable DDL.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Retrieve execution plan for a slow query
+-- In production, you'd get the query text from Performance Insights or pg_stat_statements
+EXPLAIN (FORMAT JSON, ANALYZE FALSE, BUFFERS FALSE)
+SELECT
+    o.order_id,
+    o.customer_id,
+    o.total_amount,
+    c.email
+FROM orders o
+JOIN customers c ON c.customer_id = o.customer_id
+WHERE o.status = 'pending'
+  AND o.created_at &gt; NOW() - INTERVAL '7 days'
+ORDER BY o.total_amount DESC
+LIMIT 100;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">T-SQL (SQL Server):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Retrieve execution plan for a slow query
+SET SHOWPLAN_XML ON;
+GO
+
+SELECT
+    o.order_id,
+    o.customer_id,
+    o.total_amount,
+    c.email
+FROM dbo.orders o
+JOIN dbo.customers c ON c.customer_id = o.customer_id
+WHERE o.status = 'pending'
+  AND o.created_at &gt; DATEADD(DAY, -7, GETUTCDATE())
+ORDER BY o.total_amount DESC;
+GO
+
+SET SHOWPLAN_XML OFF;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With the plan captured, the Bedrock call generates actionable DDL:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import json
+import psycopg2
+
+bedrock_client = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+def get_query_plan_postgres(conn, query: str) -&gt; str:
+    """Return EXPLAIN (FORMAT JSON) output as a string."""
+    explain_sql = f"EXPLAIN (FORMAT JSON, ANALYZE FALSE) {query}"
+    with conn.cursor() as cur:
+        cur.execute(explain_sql)
+        plan = cur.fetchone()[0]
+    return json.dumps(plan, indent=2)
+
+def recommend_indexes(query: str, plan_json: str, engine: str = "PostgreSQL") -&gt; str:
+    prompt = f"""You are a senior {engine} DBA and query optimization expert.
+
+A slow query has been identified in production. Your task is to recommend the minimum set of indexes needed to improve its performance. Follow these rules:
+- Recommend only indexes that are directly evidenced by the execution plan (seq scans on large tables, missing index hints, sort operations that could be eliminated).
+- Write complete, executable CREATE INDEX statements using the correct syntax for {engine}.
+- For each index, write one sentence explaining which part of the plan it addresses.
+- Do not recommend dropping existing indexes without evidence they are unused.
+- If the plan shows the query is already optimal, say so explicitly.
+
+SLOW QUERY:</code></pre>
+<p class="text-gray-300 leading-relaxed">{query}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+EXECUTION PLAN (JSON):</code></pre>
+<p class="text-gray-300 leading-relaxed">{plan_json}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+INDEX RECOMMENDATIONS (as executable DDL with explanations):"""
+
+    response = bedrock_client.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": prompt}]
+        }),
+        contentType="application/json",
+        accept="application/json"
+    )
+    
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']
+
+# Usage — PostgreSQL
+pg_conn = psycopg2.connect(
+    host="your-aurora-cluster.cluster-xyz.us-east-1.rds.amazonaws.com",
+    database="prod_db",
+    user="monitoring_user",
+    sslmode="require",
+    password="..."
+)
+
+slow_query = """
+SELECT o.order_id, o.customer_id, o.total_amount, c.email
+FROM orders o
+JOIN customers c ON c.customer_id = o.customer_id
+WHERE o.status = 'pending'
+  AND o.created_at &gt; NOW() - INTERVAL '7 days'
+ORDER BY o.total_amount DESC
+LIMIT 100
+"""
+
+plan = get_query_plan_postgres(pg_conn, slow_query)
+recommendations = recommend_indexes(slow_query, plan, engine="PostgreSQL")
+print(recommendations)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A typical response from the model for the orders query above would identify that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(status, created_at, total_amount)</code> is a strong composite index candidate because the plan shows a sequential scan filtered on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">created_at</code> followed by an in-memory sort on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_amount</code>. It would generate:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Addresses the sequential scan on orders filtered by status and created_at,
+-- and includes total_amount as a covering column to eliminate the sort.
+CREATE INDEX CONCURRENTLY idx_orders_pending_recent
+    ON orders (status, created_at DESC, total_amount DESC)
+    WHERE status = 'pending';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The partial index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'pending'</code> is the kind of nuance a good model picks up on because the WHERE clause makes the selectivity obvious. It is not universal — you would not use a partial index if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pending</code> orders represent 80% of the table — but the model's reasoning about the plan structure is sound and the DDL it generates is executable.</p>
+
+<p class="text-gray-300 leading-relaxed">What you should not do is apply model-generated index recommendations without review. The model does not know your table sizes, your existing index set, your write amplification tolerance, or your storage budget on the RDS instance class. Treat the output as a starting point: validate the recommended index against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_indexes</code> (PostgreSQL) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_usage_stats</code> (SQL Server) to confirm the target columns are not already indexed, then use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> (PostgreSQL) or the online rebuild option (SQL Server) to build it without blocking.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Vacuum and Maintenance Tuning with AI Assistance</h3>
+
+<p class="text-gray-300 leading-relaxed">Aurora PostgreSQL inherits PostgreSQL's MVCC model and with it the autovacuum dependency. Autovacuum is self-tuning to a degree, but the defaults were designed for moderate workloads and small tables. When you are running high-throughput OLTP on Aurora with hundreds of millions of rows per table, autovacuum misconfiguration leads to table bloat, transaction ID wraparound risk, and degraded query performance from stale planner statistics.</p>
+
+<p class="text-gray-300 leading-relaxed">The AI-assisted approach to autovacuum tuning uses the same pattern as index recommendations: collect the signal (table bloat estimates, autovacuum activity from pg_stat_user_tables, wraparound age from pg_class), pass it to Bedrock, get back recommended storage parameters as executable SQL.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collect autovacuum health signals for tables at risk
+SELECT
+    schemaname,
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_tuple_pct,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+    autovacuum_count,
+    autoanalyze_count,
+    -- Age of the oldest transaction ID in this table's visibility map
+    age(relfrozenxid)                                                   AS xid_age,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||relname))    AS total_size
+FROM pg_stat_user_tables
+JOIN pg_class ON pg_class.relname = pg_stat_user_tables.relname
+WHERE n_dead_tup &gt; 10000
+   OR age(relfrozenxid) &gt; 100000000
+ORDER BY n_dead_tup DESC, age(relfrozenxid) DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Feed this output to Bedrock with a prompt that specifies the current autovacuum configuration and asks for per-table storage parameter overrides:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def recommend_vacuum_settings(bloat_data: list, current_guc: dict) -&gt; str:
+    """Generate per-table autovacuum parameter recommendations via Bedrock."""
+    
+    prompt = f"""You are an expert PostgreSQL DBA specializing in autovacuum tuning for high-throughput Aurora PostgreSQL workloads.
+
+CURRENT GLOBAL AUTOVACUUM SETTINGS (from pg_settings):
+{json.dumps(current_guc, indent=2)}
+
+TABLE BLOAT AND VACUUM ACTIVITY REPORT:
+{json.dumps(bloat_data, indent=2)}
+
+For each table that shows significant bloat (dead_tuple_pct &gt; 10%) or high transaction ID age (xid_age &gt; 150,000,000), provide:
+1. An ALTER TABLE statement setting appropriate per-table storage parameters to make autovacuum more aggressive.
+2. A one-sentence justification referencing the specific metric that drove the recommendation.
+3. Whether an immediate manual VACUUM ANALYZE is warranted before the next autovacuum cycle.
+
+Write only the ALTER TABLE statements and justifications. Do not repeat the input data back."""
+
+    response = bedrock_client.invoke_model(
+        modelId="anthropic.claude-3-5-sonnet-20241022-v2:0",
+        body=json.dumps({
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 1536,
+            "messages": [{"role": "user", "content": prompt}]
+        }),
+        contentType="application/json",
+        accept="application/json"
+    )
+    
+    result = json.loads(response['body'].read())
+    return result['content'][0]['text']</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The model reliably generates output like this for tables with high dead tuple percentages:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- orders table: dead_tuple_pct = 34.7%, last_autovacuum = 18 hours ago.
+-- Reducing autovacuum_vacuum_scale_factor to trigger vacuum at 1% dead tuples
+-- instead of the default 20%, and increasing cost delay to 0 to allow faster completion.
+ALTER TABLE orders SET (
+    autovacuum_vacuum_scale_factor = 0.01,
+    autovacuum_vacuum_cost_delay   = 0,
+    autovacuum_vacuum_threshold    = 1000
+);
+
+-- Immediate manual vacuum is warranted given the 34.7% dead tuple ratio.
+VACUUM (ANALYZE, VERBOSE) orders;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">SQL Server on RDS does not have autovacuum because it does not use MVCC in the same way. The equivalent maintenance concern is index fragmentation and statistics staleness. The AI-assisted pattern for SQL Server is to query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_stats_properties</code>, pass the results to Bedrock, and get back a maintenance script with targeted REBUILD or REORGANIZE statements and UPDATE STATISTICS calls prioritized by fragmentation level and last-updated age.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">T-SQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Collect index fragmentation data for AI-assisted maintenance planning
+SELECT
+    DB_NAME()                                   AS database_name,
+    OBJECT_NAME(ips.object_id)                  AS table_name,
+    i.name                                      AS index_name,
+    ips.index_type_desc,
+    ips.avg_fragmentation_in_percent,
+    ips.page_count,
+    ips.avg_page_space_used_in_percent,
+    STATS_DATE(ips.object_id, ips.index_id)     AS stats_last_updated,
+    DATEDIFF(DAY,
+        STATS_DATE(ips.object_id, ips.index_id),
+        GETUTCDATE())                            AS stats_age_days
+FROM sys.dm_db_index_physical_stats(
+    DB_ID(), NULL, NULL, NULL, 'LIMITED'
+) ips
+JOIN sys.indexes i
+    ON i.object_id = ips.object_id
+    AND i.index_id = ips.index_id
+WHERE ips.page_count &gt; 1000           -- Only meaningful indexes
+  AND ips.avg_fragmentation_in_percent &gt; 5
+ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating AWS Secrets Manager and IAM for Secure AI Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">Every AI pipeline in this chapter involves credentials: database passwords, API keys, IAM role ARNs. On RDS, the correct pattern is to store database credentials in AWS Secrets Manager, rotate them automatically using the RDS Secrets Manager integration, and have your application code retrieve credentials at runtime rather than baking them into configuration files or environment variables.</p>
+
+<p class="text-gray-300 leading-relaxed">The RDS Secrets Manager integration supports automatic rotation for PostgreSQL, MySQL, SQL Server, and Aurora engines. Enable it when you create the instance or attach it afterward:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import json
+import psycopg2
+
+secrets_client = boto3.client('secretsmanager', region_name='us-east-1')
+
+def get_db_credentials(secret_name: str) -&gt; dict:
+    """Retrieve database credentials from Secrets Manager."""
+    response = secrets_client.get_secret_value(SecretId=secret_name)
+    return json.loads(response['SecretString'])
+
+def get_connection(secret_name: str) -&gt; psycopg2.extensions.connection:
+    """Return a psycopg2 connection using credentials from Secrets Manager."""
+    creds = get_db_credentials(secret_name)
+    return psycopg2.connect(
+        host=creds['host'],
+        port=creds.get('port', 5432),
+        database=creds['dbname'],
+        user=creds['username'],
+        password=creds['password'],
+        sslmode='require'
+    )
+
+# Usage — no hardcoded credentials anywhere in the codebase
+conn = get_connection('prod/aurora-postgres/app-user')</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Bedrock calls, use IAM role-based authentication rather than API keys. When your Lambda function or EC2 instance has an IAM role with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bedrock:InvokeModel</code> permission scoped to the specific model ARNs you need, the boto3 client picks up credentials automatically from the instance metadata service. You never need to store a Bedrock API key.</p>
+
+<p class="text-gray-300 leading-relaxed">The principle of least privilege applies to Aurora ML as well. The IAM role attached to your Aurora cluster for SageMaker invocation should be scoped to specific endpoint ARNs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sagemaker:InvokeEndpoint",
+      "Resource": [
+        "arn:aws:sagemaker:us-east-1:123456789012:endpoint/churn-prediction-endpoint-v2"
+      ]
+    }
+  ]
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Do not use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"Resource": "*"</code> for SageMaker invocation from Aurora ML. A misconfigured or compromised database session with wildcard IAM permissions could invoke arbitrary SageMaker endpoints, which has both security and cost implications.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Your AI Pipelines: CloudWatch, Costs, and Guardrails</h3>
+
+<p class="text-gray-300 leading-relaxed">AI-augmented database operations introduce a new category of operational risk: a runaway enrichment job that calls Comprehend on every row in a 50-million-row table, a Lambda function that enters a retry loop calling Bedrock at maximum rate, or a pgvector query that performs a full table scan because the IVFFlat index was not yet built when the query ran. These are real failure modes, and you need monitoring to catch them before they produce a surprise AWS bill.</p>
+
+<p class="text-gray-300 leading-relaxed">For Comprehend and SageMaker invocations via Aurora ML, the call volume is visible in CloudWatch under the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AWS/SageMaker</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AWS/Comprehend</code> namespaces. Set an alarm on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">InvocationCount</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Throttles</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+
+cw_client = boto3.client('cloudwatch', region_name='us-east-1')
+
+cw_client.put_metric_alarm(
+    AlarmName='AuroraML-SageMaker-InvocationSpike',
+    AlarmDescription='SageMaker invocations from Aurora ML exceeded expected rate',
+    Namespace='AWS/SageMaker',
+    MetricName='InvocationsPerInstance',
+    Dimensions=[{'Name': 'EndpointName', 'Value': 'churn-prediction-endpoint-v2'}],
+    Statistic='Sum',
+    Period=300,
+    EvaluationPeriods=2,
+    Threshold=50000,          # Tune to your expected batch size
+    ComparisonOperator='GreaterThanThreshold',
+    AlarmActions=['arn:aws:sns:us-east-1:123456789012:rds-ops-alerts'],
+    TreatMissingData='notBreaching'
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Bedrock calls, AWS bills per input and output token. The CloudWatch namespace <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AWS/Bedrock</code> exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">InputTokenCount</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OutputTokenCount</code> metrics per model ID. Build a Cost Explorer budget alert scoped to the Bedrock service alongside your operational CloudWatch alarms so that a cost anomaly surfaces at the billing layer as well as the metrics layer.</p>
+
+<p class="text-gray-300 leading-relaxed">For pgvector query performance, the risk is a similarity search that bypasses the ANN index and performs an exact scan. This happens when the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> parameter in an IVFFlat index is too high relative to your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ivfflat.probes</code> session variable, or when the index was created after rows were already loaded but before <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> ran to update the visibility map. Catch this in your slow query log:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify pgvector queries that performed sequential scans (no index used)
+-- Requires pg_stat_statements
+SELECT
+    LEFT(query, 300)                    AS query_snippet,
+    calls,
+    mean_exec_time                      AS mean_ms,
+    total_exec_time / 1000.0           AS total_seconds,
+    rows
+FROM pg_stat_statements
+WHERE query ILIKE '%&lt;=&gt;%'              -- cosine distance operator
+   OR query ILIKE '%&lt;-&gt;%'             -- L2 distance operator
+   OR query ILIKE '%&lt;#&gt;%'             -- inner product operator
+ORDER BY mean_exec_time DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If mean execution time for your vector similarity queries is unexpectedly high, run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN ANALYZE</code> on a representative query and look for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Seq Scan</code> on your embedding table. If you see it, confirm the index exists, that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET ivfflat.probes = N</code> is set appropriately in your session, and that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code> has run on the table since the index was created.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Putting It Together: A Reference Architecture for AI-Augmented RDS Operations</h3>
+
+<p class="text-gray-300 leading-relaxed">The components described in this chapter compose into a coherent architecture. Here is a reference design that a small operations team can deploy and maintain without a dedicated ML engineering function.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    subgraph "Data plane"
+        A[Aurora PostgreSQL<br/>OLTP + pgvector store]
+        B[RDS SQL Server]
+    end
+    subgraph "Observability plane"
+        C[Performance Insights<br/>15s Enhanced Monitoring]
+        D[DevOps Guru for RDS]
+        E[CloudWatch Logs Insights<br/>slow query candidates]
+    end
+    subgraph "AI plane"
+        F[Step Functions: diagnosis workflow<br/>snapshot -> Bedrock -> Slack]
+        G[Step Functions: index recommendation<br/>plan -> Bedrock -> DDL to S3]
+        H[Nightly Lambda: autovacuum health<br/>bloat query -> Bedrock -> S3]
+    end
+    subgraph "Security plane"
+        I[Secrets Manager<br/>30-day rotation]
+        J[IAM roles scoped to model/endpoint ARNs]
+    end
+    A --> C
+    B --> C
+    C --> D
+    D -->|SNS| F
+    E --> G
+    A --> H
+    F --> K[Human review]
+    G --> K
+    H --> K
+    I -.credentials.-> F
+    J -.auth.-> F</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The reference architecture's four planes: data and observability feed the AI plane, every AI-generated recommendation lands in front of a human reviewer, and the security plane underlies every call.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data plane:</strong>  </p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Aurora PostgreSQL as the primary OLTP store and vector store (via pgvector).  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> RDS for SQL Server (if required by the application) for structured relational workloads.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Aurora ML enabled on the Aurora cluster for inline SageMaker and Comprehend calls where enrichment latency is acceptable.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Observability plane:</strong>  </p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Performance Insights enabled on all instances, with Enhanced Monitoring at 15-second granularity.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> DevOps Guru for RDS enabled and routing HIGH and MEDIUM insights to an SNS topic.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> CloudWatch Logs Insights queries scheduled hourly against the slow query log, feeding a DynamoDB table of candidate slow queries.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AI plane:</strong>  </p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A Step Functions state machine that runs on a configurable schedule (or triggered by a DevOps Guru SNS notification) to: collect a diagnostic snapshot → call Bedrock for diagnosis → write the result to a DynamoDB table → post a summary to a Slack channel via a Lambda webhook.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A separate Step Functions workflow for the index recommendation pipeline: pull top-10 slow queries from DynamoDB → get execution plans from Aurora → call Bedrock → write DDL recommendations to an S3 bucket with a timestamp prefix → notify the DBA team for review.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A nightly Lambda function that checks autovacuum health via the bloat query above, calls Bedrock for recommendations, and writes ALTER TABLE statements to S3 for next-day review.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Security plane:</strong>  </p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> All database credentials in Secrets Manager with 30-day automatic rotation.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Bedrock access via IAM roles scoped to specific model ARNs.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Aurora ML IAM role scoped to specific SageMaker endpoint ARNs.  </li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> VPC endpoints for Bedrock, Secrets Manager, and Comprehend so that API traffic does not traverse the public internet.</li>
+
+<p class="text-gray-300 leading-relaxed">This architecture is deliberately conservative about automation. Recommendations from Bedrock are written to S3 and reviewed by a human before any DDL runs. The only autonomous actions are: posting a diagnosis to Slack (read-only), enabling a CloudWatch alarm (configuration change only), and publishing to SNS (notification only). The reason for this conservatism is not distrust of the models — the models are often correct — but accountability. When a CREATE INDEX statement causes a production incident because it was built on the wrong table due to a name collision, you need a human in that decision chain.</p>
+
+<p class="text-gray-300 leading-relaxed">As your team builds confidence in the pipeline's recommendations over time, you can move specific action categories to autonomous execution. A reasonable progression is:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Month 1–3:</strong> All recommendations reviewed manually. Track the accept/reject rate and the accuracy of diagnoses.  </p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Month 4–6:</strong> Autovacuum parameter changes (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET (autovacuum_*)</code>) applied automatically after a 2-hour human review window, since they are low-risk and easily reverted.  </p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Month 7+:</strong> Index creation via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> executed automatically during off-peak windows for indexes on tables under a threshold size, with automatic rollback if the index build fails.</p>
+
+<p class="text-gray-300 leading-relaxed">The progression matters because it builds institutional knowledge about where the model's recommendations are reliable and where they need qualification. That knowledge is what separates a durable AI-augmented operations practice from a demo that impresses at a conference and causes a P1 incident three months later.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AWS AI capabilities for RDS span four distinct layers** — Aurora ML for inline inference, Performance Insights ML and DevOps Guru for anomaly detection and root cause hypothesis, pgvector for vector search and RAG pipelines, and Bedrock for generative reasoning — and each layer is suited to a different operational task. Conflating them leads to architectures that are both over-engineered and under-performing.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Aurora ML is powerful but latency-sensitive.** Calling SageMaker or Comprehend from inside a SQL statement adds network round-trip latency to your query. Route Aurora ML calls to reader instances or batch enrichment jobs; never put them on a write-critical OLTP path.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pgvector turns your Aurora or RDS PostgreSQL instance into a production-grade vector store** that eliminates the synchronization complexity of a standalone vector database. Use HNSW indexes for workloads where the embedding table grows continuously; use IVFFlat where you can tolerate periodic index rebuilds in exchange for lower memory overhead.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Bedrock-powered diagnosis and index recommendation pipelines are most valuable when context quality is high.** Filter your diagnostic snapshots aggressively — exclude idle sessions, cap query snippets, remove benign wait types — before passing data to the model. Garbage context produces garbage hypotheses, regardless of model capability.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate conservatively and progressively.** Start with Bedrock recommendations flowing to human reviewers, track accuracy, and expand the automation boundary only for action categories where model reliability is demonstrated. The goal is a feedback loop that builds institutional trust in the AI pipeline, not a system that acts autonomously from day one and erodes trust the first time it makes a consequential mistake.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
