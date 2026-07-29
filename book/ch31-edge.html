@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 31: Edge Computing — The DBA Handbook</title>
   <meta name="description" content="The DBA Handbook Chapter 31: Edge Computing. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -19,8 +23,8 @@
       <div class="flex items-center gap-1 text-xs">
         <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
         <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
-        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
-        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../book.html"      class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Books</a>
+        <a href="index.html"        class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Chapters</a>
         <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
         <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
         <a href="../products.html"
@@ -169,6 +173,19 @@ WHERE OBJECT_NAME(p.object_id) = 'sensor_readings';</code></pre>
 <p class="text-gray-300 leading-relaxed">The synchronization strategy you choose depends on answers to three questions: Does data flow one direction (edge to center only), or must data flow both ways? How long can the edge node be disconnected before data loss becomes a business problem? And can conflicts occur — that is, can the same row be modified at both edge and center while disconnected?</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Unidirectional upload</strong> is the simplest case. Edge nodes collect telemetry data that is never modified by the central system. In this pattern, the edge node buffers rows locally and periodically flushes them upstream. PostgreSQL logical replication handles this natively. Configure the edge as a publication and the central server as a subscriber. When the connection is interrupted, the replication slot on the edge retains WAL until the subscriber reconnects. When connectivity resumes, the central server catches up automatically.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    subgraph Edge["Edge Node (intermittent connectivity)"]
+        EdgeDB[("Edge Database\nlocal buffer / outbox")]
+    end
+    subgraph Central["Central / Cloud"]
+        CentralDB[("Central Database")]
+    end
+    Sensors["Sensors / Devices"] --> EdgeDB
+    EdgeDB -.->|"sync when connected\n(replication slot or checkpoint poll)"| CentralDB
+    CentralDB -->|"config / reference data\n(center-owned tables)"| EdgeDB</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Figure: Edge-to-central synchronization — the edge node buffers locally during disconnection and drains to the central database once connectivity resumes, while ownership of each table is fixed to one side to avoid write conflicts.*</p>
 
 <p class="text-gray-300 leading-relaxed">The risk here is slot bloat. A replication slot that cannot drain will cause WAL to accumulate indefinitely on the edge node. On a constrained disk, this is fatal. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_keep_size</code> conservatively and monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code> for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">restart_lsn</code> lag. If lag exceeds your storage budget, you must either expand storage, reduce the outage tolerance, or switch to a polling-based sync approach that does not use slots.</p>
 
@@ -398,15 +415,194 @@ SELECT
      FROM pg_stat_user_tables);</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Local health metrics table on SQL Edge node
+CREATE TABLE node_health_metrics (
+    captured_at         DATETIME2       NOT NULL DEFAULT GETUTCDATE(),
+    active_connections  SMALLINT,
+    longest_query_sec   REAL,
+    buffer_cache_ratio  REAL,
+    pending_log_kb      BIGINT,
+    free_disk_mb        INTEGER,
+    synced_to_central   BIT             NOT NULL DEFAULT 0
+);
+
+-- Populate via SQL Server Agent job or external scheduler
+INSERT INTO node_health_metrics (
+    active_connections,
+    longest_query_sec,
+    buffer_cache_ratio,
+    pending_log_kb
+)
+SELECT
+    (SELECT COUNT(*) FROM sys.dm_exec_requests
+     WHERE status = 'running'),
+    (SELECT ISNULL(MAX(total_elapsed_time / 1000.0), 0)
+     FROM sys.dm_exec_requests
+     WHERE status = 'running'),
+    (SELECT ROUND(cntr_value, 2)
+     FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Buffer cache hit ratio'
+       AND object_name LIKE '%Buffer Manager%'),
+    (SELECT SUM(cntr_value)
+     FROM sys.dm_os_performance_counters
+     WHERE counter_name = 'Log File(s) Used Size (KB)'
+       AND instance_name NOT IN ('_Total', 'mssqlsystemresource'));</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Alerting at the edge must be self-contained. A monitoring agent that sends alerts to a central system cannot alert you when the central connection is unavailable — precisely the situation where alerts are most needed. Build a local alert table and a local response mechanism. A simple pattern is a scheduled job that evaluates thresholds against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">node_health_metrics</code> and writes records to a local <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">node_alerts</code> table. When connectivity resumes and metrics sync, the alerts sync with them. Pair this with a watchdog process on the edge device itself — outside the database — that monitors for conditions like disk full or database process crash, and can take local remediation actions such as dropping the oldest partition or restarting the service.</p>
+
+<p class="text-gray-300 leading-relaxed">Remote administration, when connectivity is available, should happen over an encrypted tunnel. Direct database port exposure over a cellular or satellite WAN link is not acceptable. The standard pattern is a VPN (WireGuard is common in edge deployments for its low overhead and reliability) combined with a jump host. All DBA connections route through the jump host. Credentials are never stored on the edge device in plaintext; use certificate-based authentication for PostgreSQL (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssl_cert_file</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssl_key_file</code>) or SQL Server's certificate-based login, provisioned at deployment time.</p>
+
+<p class="text-gray-300 leading-relaxed">Upgrade management for edge databases is its own discipline. You cannot roll out a PostgreSQL major version upgrade to hundreds of field devices the way you upgrade a cloud instance. The practical approach is to:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Build database upgrades into device firmware update packages, tested thoroughly in a lab with representative data volumes.</p>
+<p class="text-gray-300 leading-relaxed">2. Stage rollouts across a small percentage of the fleet first, monitoring for failures before wider deployment.</p>
+<p class="text-gray-300 leading-relaxed">3. Maintain a rollback package that can revert the database version if the upgrade fails.</p>
+<p class="text-gray-300 leading-relaxed">4. Accept that some devices in the field will run older versions for longer than you would prefer, and ensure your sync protocol is version-tolerant.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_upgrade</code> can run on edge hardware for major version upgrades, but it requires the old and new binaries to coexist temporarily, which may be a storage concern on constrained devices. Dump-and-restore through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_restore</code> is slower but has a simpler failure mode. For SQL Server Edge, in-place upgrades of the container image are the standard mechanism.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Security Considerations Specific to Edge</h3>
+
+<p class="text-gray-300 leading-relaxed">Edge nodes present a different threat model than data center servers. Physical access by unauthorized parties is a realistic possibility — a retail store database server in a back room, an industrial controller in an unlocked electrical cabinet. Encryption at rest is not optional in these environments.</p>
+
+<p class="text-gray-300 leading-relaxed">On Linux with PostgreSQL, full disk encryption via LUKS (Linux Unified Key Setup) is the standard approach. The encryption key can be stored in a TPM (Trusted Platform Module) chip on the device, which binds decryption to that specific hardware and prevents drive removal attacks. Key rotation and TPM provisioning should be part of your device deployment runbook.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server Edge on Linux supports Transparent Data Encryption (TDE), which encrypts data files and backups at the storage layer without requiring application changes. Enable TDE during initial deployment, not after — enabling it on an existing database requires re-encrypting all data pages, which is I/O intensive and time-consuming on edge hardware.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable TDE on an Azure SQL Edge database
+-- Step 1: Create master key in master database
+USE master;
+CREATE MASTER KEY ENCRYPTION BY PASSWORD = 'StrongPassphr@se1!';
+
+-- Step 2: Create certificate protected by master key
+CREATE CERTIFICATE EdgeNodeCert
+    WITH SUBJECT = 'Edge Node TDE Certificate',
+    EXPIRY_DATE = '2030-01-01';
+
+-- Step 3: Create database encryption key in target database
+USE EdgeSensorDB;
+CREATE DATABASE ENCRYPTION KEY
+    WITH ALGORITHM = AES_256
+    ENCRYPTION BY SERVER CERTIFICATE EdgeNodeCert;
+
+-- Step 4: Enable encryption
+ALTER DATABASE EdgeSensorDB
+    SET ENCRYPTION ON;
+
+-- Verify encryption status
+SELECT
+    db.name,
+    dek.encryption_state,
+    dek.encryption_state_desc,
+    dek.percent_complete,
+    dek.key_algorithm,
+    dek.key_length
+FROM sys.dm_database_encryption_keys dek
+JOIN sys.databases db ON db.database_id = dek.database_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Network-level security at the edge extends beyond VPN tunnels. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> should be configured to reject all connections except from localhost and the VPN interface. Reject password authentication in favor of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scram-sha-256</code> or certificate authentication. SQL Server should have all unnecessary protocols disabled — only TCP/IP over the VPN interface should be active, and the SQL Server Browser service should be disabled.</p>
+
+<p class="text-gray-300 leading-relaxed">Audit logging at the edge is important, but log volume must be managed. Enable logging of connection attempts, privilege escalations, and DDL statements. Do not log every SELECT or INSERT — on a high-ingestion edge node, that will overwhelm disk I/O. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_statement = 'ddl'</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_connections = on</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_disconnections = on</code> is a practical starting point. SQL Server Audit configured to capture server-level events and DDL changes gives equivalent coverage.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Connectivity Loss Gracefully</h3>
+
+<p class="text-gray-300 leading-relaxed">Connectivity loss is not an exception in edge deployments — it is a normal operating condition. Your database architecture must accommodate it as a first-class concern rather than a rare failure mode.</p>
+
+<p class="text-gray-300 leading-relaxed">The most important design pattern for handling disconnection is local-first operation. The edge database must be able to accept writes and serve reads without any connection to the central system. This sounds obvious, but it fails in practice when applications are designed to validate lookups against a central database, or when identity sequences are centrally coordinated, or when synchronous replication is configured so that the edge cannot commit without central acknowledgment.</p>
+
+<p class="text-gray-300 leading-relaxed">Sequence management deserves specific attention. If both the edge database and the central database use a shared sequence for primary keys, disconnection makes that sequence unavailable. Use UUID primary keys generated locally (PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gen_random_uuid()</code>, SQL Server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NEWSEQUENTIALID()</code> for index-friendly UUIDs) or allocate sequence ranges to each edge node at deployment time. The range allocation approach — where edge node 47 uses IDs 47000000000 to 47999999999 — is simple and guarantees no collisions without any connectivity.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- UUID primary key for fully offline-capable edge table
+CREATE TABLE device_events (
+    event_id        UUID            NOT NULL DEFAULT gen_random_uuid(),
+    device_id       SMALLINT        NOT NULL,
+    event_type      VARCHAR(50)     NOT NULL,
+    occurred_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    payload         JSONB,
+    CONSTRAINT pk_device_events PRIMARY KEY (event_id)
+);
+
+-- Pre-allocated BIGINT range approach (alternative)
+-- Edge node ID is encoded in the high bits
+CREATE SEQUENCE device_events_seq
+    START WITH 4700000000000  -- node 47, range start
+    INCREMENT BY 1
+    MAXVALUE 4799999999999    -- node 47, range end
+    CYCLE OFF;                -- error rather than wrap</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- UUID primary key using NEWSEQUENTIALID for index efficiency
+CREATE TABLE device_events (
+    event_id        UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID(),
+    device_id       SMALLINT        NOT NULL,
+    event_type      NVARCHAR(50)    NOT NULL,
+    occurred_at     DATETIME2       NOT NULL DEFAULT GETUTCDATE(),
+    payload         NVARCHAR(MAX),
+    CONSTRAINT pk_device_events PRIMARY KEY (event_id)
+);
+
+-- Pre-allocated BIGINT range using SEQUENCE object
+CREATE SEQUENCE dbo.device_events_seq
+    AS BIGINT
+    START WITH 4700000000000
+    INCREMENT BY 1
+    MINVALUE 4700000000000
+    MAXVALUE 4799999999999
+    NO CYCLE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Application-level retry and queue behavior must also be designed for disconnection. When the edge application cannot reach the central API or message broker, it must buffer events locally. The edge database is a natural buffer. A local outbound queue table — rows written by the application, read by the sync process, deleted after confirmed central delivery — is more durable than an in-memory queue and survives process restarts and system reboots.</p>
+
+<p class="text-gray-300 leading-relaxed">Backpressure management becomes important when the edge node reconnects after an extended outage. A node that was isolated for 72 hours may attempt to upload millions of rows to the central system simultaneously. If dozens of edge nodes reconnect at the same time — common after a network infrastructure outage — the central system faces a thundering herd problem. Build rate limiting into your sync process: upload a bounded batch, confirm receipt, wait a short interval, upload the next batch. This smooths reconnection load and prevents the central database from being overwhelmed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Testing Edge Deployments in a Lab Environment</h3>
+
+<p class="text-gray-300 leading-relaxed">Testing edge database deployments requires simulating the conditions that make edge environments challenging: limited resources, intermittent connectivity, unexpected power loss, and hardware degradation. A deployment that works in ideal conditions but fails under realistic edge conditions is not production-ready.</p>
+
+<p class="text-gray-300 leading-relaxed">Connectivity simulation can be done with Linux traffic control (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tc</code>) commands that add latency, limit bandwidth, and introduce packet loss between your test edge node and the central test system. Before validating your sync mechanism, establish a baseline with perfect connectivity, then repeat the tests with 500ms latency and 5% packet loss, then with complete connectivity blackouts of varying duration.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Simulate 500ms latency and 5% packet loss on the sync interface
+tc qdisc add dev eth0 root netem delay 500ms loss 5%
+
+# Simulate complete outage
+tc qdisc add dev eth0 root netem loss 100%
+
+# Remove simulation
+tc qdisc del dev eth0 root</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Power loss simulation is harder to automate but essential. An edge database that loses power mid-write must recover cleanly on restart. Test this by literally cutting power to your test device at random intervals during a write-heavy load test. PostgreSQL's WAL guarantees crash recovery, but only if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fsync</code> is enabled (it is, by default — do not disable it on edge hardware to chase write performance). SQL Server's write-ahead logging provides the same guarantee. After each simulated power loss, verify row counts, check for corruption with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC CHECKDB</code>, and validate that the sync checkpoint is consistent.</p>
+
+<p class="text-gray-300 leading-relaxed">Load testing at the hardware limits reveals where memory pressure or I/O saturation causes database behavior to change. Run pgbench (PostgreSQL) or the equivalent against your edge hardware at ingest rates that exceed your expected production peak by 50%. Watch for: shared_buffers eviction causing blks_read to spike, autovacuum triggering during the peak and competing for I/O, WAL write latency growing until commit latency becomes user-visible. These failure modes in a lab are far preferable to discovering them on a device a thousand miles away.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Edge databases operate under four distinct pressures** that data center assumptions cannot address: unreliable connectivity, hardware constraints, limited physical access, and dependency on a central system of record. Every architectural decision must account for all four simultaneously.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Schema design for the edge prioritizes storage efficiency and write throughput** over query flexibility. Time-partitioned tables, minimal indexes, appropriate data types, and compression (TimescaleDB for PostgreSQL, page compression for SQL Server) are the primary tools for staying within constrained disk and I/O budgets.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Synchronization strategy is the most complex aspect of edge database architecture.** The simplest correct approach is partition ownership — define at design time which system owns each table, eliminating the possibility of write conflicts. When bidirectional ownership of the same data is unavoidable, checkpoint-based polling with `ROWVERSION` (SQL Server) or trigger-maintained `modified_at` timestamps (PostgreSQL) is more robust during extended outages than replication slot-based approaches.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Local-first operation must be a hard requirement**, not an aspiration. UUID or range-allocated primary keys, local outbound queue tables, and architectures that never require central connectivity for a commit to succeed are the building blocks of a genuinely resilient edge deployment.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability and security require edge-specific design.** Metrics must persist locally and sync to central monitoring, not depend on continuous connectivity to a remote collector. Encryption at rest (LUKS or TDE), certificate-based authentication, and restricted network access are baseline requirements when physical security of the device cannot be guaranteed.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 flex justify-between text-xs">
