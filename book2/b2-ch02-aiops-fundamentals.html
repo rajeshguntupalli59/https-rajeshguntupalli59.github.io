@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 2: Understanding AIOps for Databases — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 2: Understanding AIOps for Databases. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -411,15 +415,361 @@ Be specific. Reference the actual metric values. Do not hedge with generic advic
 
 <p class="text-gray-300 leading-relaxed">The integration of AWS Bedrock follows the same pattern with a different client initialization, making it straightforward to swap providers depending on your cloud environment:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import json
+
+def diagnose_with_bedrock(prompt_text: str, region: str = "us-east-1") -&gt; str:
+    """Call Claude via AWS Bedrock for environments where direct API access is restricted."""
+    bedrock = boto3.client(service_name="bedrock-runtime", region_name=region)
+    
+    body = json.dumps({
+        "anthropic_version": "bedrock-2023-05-31",
+        "max_tokens": 1500,
+        "messages": [{"role": "user", "content": prompt_text}]
+    })
+    
+    response = bedrock.invoke_model(
+        body=body,
+        modelId="anthropic.claude-opus-4-5",
+        accept="application/json",
+        contentType="application/json"
+    )
+    
+    response_body = json.loads(response.get("body").read())
+    return response_body["content"][0]["text"]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Azure AI users follow an equivalent pattern using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure-ai-inference</code> SDK, pointing at a deployed Claude or GPT-4 endpoint. The prompt structure remains identical — only the client initialization and model identifier change. This portability is intentional architecture: your diagnostic logic should never be tightly coupled to a single model provider.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Query Plan Analysis with AI</h3>
+
+<p class="text-gray-300 leading-relaxed">One of the highest-value applications of the LLM reasoning layer is query plan interpretation. Execution plans from both PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (ANALYZE, BUFFERS)</code> and SQL Server's actual execution plans are rich, structured documents that encode exactly the information needed to diagnose a slow query. They are also notoriously difficult for less experienced team members to read, and even experienced DBAs benefit from a second opinion when plans become complex.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern here is identical to the diagnostic context pattern: extract the plan, format it into a prompt, get back an interpretation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture a plan with full runtime statistics for AI analysis
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT o.order_id, c.customer_name, SUM(oi.quantity * oi.unit_price) AS order_total
+FROM orders o
+JOIN customers c ON c.customer_id = o.customer_id
+JOIN order_items oi ON oi.order_id = o.order_id
+WHERE o.order_date &gt;= current_date - interval '30 days'
+  AND c.region = 'NORTHEAST'
+GROUP BY o.order_id, c.customer_name
+ORDER BY order_total DESC
+LIMIT 100;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture estimated plan XML for AI analysis (use SET STATISTICS XML ON for actual)
+SET SHOWPLAN_XML ON;
+GO
+SELECT o.order_id, c.customer_name, SUM(oi.quantity * oi.unit_price) AS order_total
+FROM orders o
+JOIN customers c ON c.customer_id = o.customer_id
+JOIN order_items oi ON oi.order_id = o.order_id
+WHERE o.order_date &gt;= DATEADD(DAY, -30, CAST(GETDATE() AS date))
+  AND c.region = 'NORTHEAST'
+GROUP BY o.order_id, c.customer_name
+ORDER BY order_total DESC
+OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY;
+GO
+SET SHOWPLAN_XML OFF;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once you have the plan output, the analysis function follows this structure:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def analyze_query_plan(
+    plan_json: str,
+    query_text: str,
+    table_stats: dict,
+    model_client  # anthropic.Anthropic() or Bedrock client
+) -&gt; str:
+    """
+    Send a captured query plan to an LLM for interpretation and optimization advice.
+    table_stats should contain row counts and index information for referenced tables.
+    """
+    prompt = f"""You are a PostgreSQL query optimization expert. Analyze the following 
+execution plan and provide specific, actionable recommendations.
+
+## Original Query</code></pre>
+<p class="text-gray-300 leading-relaxed">{query_text}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+## Execution Plan (JSON format)</code></pre>
+<p class="text-gray-300 leading-relaxed">{plan_json}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+## Table Statistics
+{json.dumps(table_stats, indent=2)}
+
+## Analysis Required
+1. Identify the most expensive nodes in the plan tree and explain why they are expensive.
+2. Check for sequential scans on large tables — are they justified or should indexes exist?
+3. Evaluate join order and join method choices against the row count estimates.
+4. Identify any significant estimate vs. actual row count divergence that indicates stale statistics.
+5. Recommend specific index changes (include the exact CREATE INDEX statement).
+6. If a query rewrite would improve performance, provide the rewritten SQL.
+7. Estimate the likely impact of each recommendation (high/medium/low).
+
+Reference specific node costs and row counts from the plan in your analysis.
+"""
+
+    if hasattr(model_client, 'messages'):  # Anthropic direct client
+        response = model_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.content[0].text
+    else:
+        raise ValueError("Unsupported model client type")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The instruction to "reference specific node costs and row counts" is load-bearing. Without it, models tend to give structural advice ("consider adding an index on the join column") without grounding the recommendation in the actual plan data. With it, the response will read more like a skilled DBA's notes: "The Hash Join at node 3 processes an estimated 2.4 million rows but the Seq Scan feeding it shows actual rows of 180,000 — statistics on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">order_items</code> are likely stale and need <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code>."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The AIOps Tool Ecosystem</h3>
+
+<p class="text-gray-300 leading-relaxed">Understanding which tools occupy which layer of the AIOps stack prevents architectural confusion and avoids reinventing components that already exist as mature open-source or commercial offerings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Telemetry Collection:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `postgres_exporter` (Prometheus community): Exposes dozens of PostgreSQL metrics in Prometheus format with minimal configuration. Essential starting point.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `sql_exporter` (Prometheus community): T-SQL-based collector for SQL Server, highly configurable through YAML-defined queries against DMVs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Custom Python collectors (psycopg2, pyodbc): Necessary for any signal not exposed by the standard exporters — specific wait event breakdowns, plan cache statistics, replication slot lag detail.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Storage and Querying:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prometheus**: Time-series storage optimized for metrics, with a powerful query language (PromQL). Retention is typically weeks to months depending on configuration. Not suitable for raw log or trace storage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **TimescaleDB**: PostgreSQL extension that turns a PostgreSQL instance into a time-series database. Ideal when you want SQL semantics over your telemetry data and are already invested in the PostgreSQL ecosystem.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **InfluxDB**: Purpose-built time-series database with Flux query language. Performs well at high ingest rates and handles tag-based filtering efficiently.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Loki**: Log aggregation designed to integrate with Prometheus and Grafana, indexing log metadata rather than full text. Efficient for structured log storage at scale.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Visualization and Alerting:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Grafana**: The de facto standard for database telemetry dashboards. Connects natively to Prometheus, Loki, InfluxDB, TimescaleDB, and directly to PostgreSQL and SQL Server as data sources. Alert rules can trigger HTTP webhooks that feed your AI analysis pipeline.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Alertmanager**: Prometheus's alert routing and deduplication layer. Routes firing alerts to PagerDuty, Slack, or custom webhook receivers that can invoke your LLM diagnosis functions.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">ML and AI:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **scikit-learn**: Production-ready implementations of Isolation Forest, DBSCAN, and dozens of other algorithms. Low overhead, well-documented, straightforward to serialize with joblib.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prophet**: Seasonality-aware forecasting and anomaly detection. Particularly well-suited to database workloads that follow business calendar patterns.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PyTorch / TensorFlow**: Required for LSTM and transformer-based sequence models when statistical approaches are insufficient. Higher training cost, higher capability ceiling.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anthropic Claude / OpenAI GPT-4 / AWS Bedrock / Azure AI**: LLM reasoning layer. Claude tends to perform well on structured data interpretation tasks and follows complex, multi-part instructions reliably, which is important when your prompt includes several distinct analysis requirements.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Workflow Orchestration:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Apache Airflow**: DAG-based orchestration for scheduled ML training jobs, telemetry aggregation pipelines, and periodic diagnostic report generation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prefect**: A more modern alternative to Airflow with better Python-native ergonomics and a simpler deployment model for teams not already invested in Airflow.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Celery**: Task queue suitable for event-driven diagnostic invocations where an anomaly detection result triggers an immediate LLM analysis call without a scheduled job framework.</li>
+
+<p class="text-gray-300 leading-relaxed">The key architectural principle is that none of these tools are monolithic — you combine them in layers. Telemetry collection feeds storage, storage feeds ML training and real-time inference, inference results feed LLM prompts, LLM responses feed human operators and ticketing systems. Each layer is independently replaceable.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Avoiding the Common Failure Modes</h3>
+
+<p class="text-gray-300 leading-relaxed">AIOps projects for databases fail in recognizable patterns. Understanding them before you build is cheaper than encountering them after deployment.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Alert fatigue from over-sensitive anomaly detection.</strong> A model trained on two weeks of data does not have enough history to recognize monthly batch job patterns. When the month-end job runs and the model hasn't seen it before, it fires anomaly alerts that the DBA knows are false positives. Repeated false positives destroy team trust in the system faster than any technical failure. Mitigation: train on at least one full business cycle's worth of data before enabling production alerting, and implement a feedback mechanism where the DBA can mark an alert as expected behavior, retraining the model to incorporate that event class.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LLM responses that are plausible but wrong.</strong> Language models do not have access to your database's actual execution plans, schema, or configuration — they reason from what you provide in the prompt. If the prompt is incomplete or ambiguous, the model will fill in gaps with plausible-sounding but incorrect details. Mitigation: always include schema-relevant context (table sizes, index definitions for referenced objects, current PostgreSQL or SQL Server version), and treat LLM output as a hypothesis to be verified with diagnostic queries, not as a confirmed diagnosis.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Telemetry gaps during incidents.</strong> The moments when you most need telemetry — during a degradation or outage — are precisely when your collection infrastructure may be overwhelmed or failing. If your Python collector connects to the database to pull DMV data, and the database is under extreme lock contention, the collector may queue or fail. Mitigation: use push-based collection (pg_statspack style) where the database pushes aggregated statistics to the collection store, and ensure your Prometheus scrape interval is short enough that you have multiple data points per minute during normal operation so gaps are quickly detectable.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data leakage in LLM prompts.</strong> When you send query text and table names to an external LLM API, you are potentially exposing sensitive business information about your schema and data patterns. In regulated industries or environments with strict data residency requirements, sending the actual query text to a cloud API may not be permissible. Mitigation: consider sanitizing or parameterizing query text before including it in prompts (replace literal values with bind variable placeholders), or use a self-hosted model via a platform like Ollama for analysis tasks that involve sensitive query patterns. AWS Bedrock and Azure AI deployments provide additional data governance controls compared to direct API access.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Runaway automation without human approval gates.</strong> AIOps systems that can autonomously execute schema changes, index creation, or configuration modifications without human approval introduce blast radius that no detection system can fully mitigate. Even a highly accurate model will occasionally recommend a destructive action. Mitigation: structure your automation in two tiers — tier one actions (ANALYZE, index creation on non-production hours, connection pool adjustments) can be automated with post-execution logging; tier two actions (schema changes, autovacuum configuration changes, replication topology modifications) require explicit DBA approval before execution, with the AI providing the recommendation and the DBA providing the execution authorization.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building Your First AIOps Pipeline: A Practical Walkthrough</h3>
+
+<p class="text-gray-300 leading-relaxed">This section assembles the components covered above into a minimal but functional AIOps pipeline that a single engineer can deploy in a day. It is intentionally simple — the goal is a working system from which you can iterate, not a complete production platform delivered at once.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[PostgreSQL / SQL Server] --> B[postgres_exporter / sql_exporter]
+    B --> C[Prometheus]
+    C --> D[Isolation Forest scoring]
+    D -->|anomaly detected| E[Build diagnostic context]
+    E --> F[Claude API diagnosis]
+    F --> G[Slack / PagerDuty alert]
+    G --> H[DBA review & approval]
+    H -->|tier one| I[Automated action]
+    H -->|tier two| J[Manual execution]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The five-step pipeline this section builds: telemetry flows from the database through collection, storage, anomaly scoring, and LLM diagnosis to a human-approved action.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Deploy telemetry collection.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For PostgreSQL, deploy <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> against your target instance. For SQL Server, deploy <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql_exporter</code> with a minimal query configuration targeting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>. Both should expose metrics on HTTP endpoints that Prometheus scrapes every 15 seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">Configure Prometheus retention to 30 days minimum. You need sufficient history for the anomaly model to learn weekly seasonality patterns.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Build the feature extraction layer.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Write a Python script that queries Prometheus's HTTP API to pull the last 30 days of relevant metrics as a DataFrame. This is your training data.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+import pandas as pd
+from datetime import datetime, timedelta
+
+def fetch_prometheus_range(
+    prometheus_url: str,
+    metric_name: str,
+    start: datetime,
+    end: datetime,
+    step: str = "1m"
+) -&gt; pd.DataFrame:
+    """Fetch a metric range from Prometheus and return as a time-indexed DataFrame."""
+    url = f"{prometheus_url}/api/v1/query_range"
+    params = {
+        "query": metric_name,
+        "start": start.timestamp(),
+        "end": end.timestamp(),
+        "step": step
+    }
+    response = requests.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    
+    records = []
+    for result in data["data"]["result"]:
+        labels = result["metric"]
+        for ts, value in result["values"]:
+            records.append({
+                "timestamp": datetime.fromtimestamp(ts),
+                "value": float(value),
+                **labels
+            })
+    return pd.DataFrame(records)
+
+def build_training_dataset(
+    prometheus_url: str,
+    days_back: int = 30
+) -&gt; pd.DataFrame:
+    """
+    Assemble a multi-metric training dataset from Prometheus.
+    Returns a wide-format DataFrame with one row per minute.
+    """
+    end = datetime.utcnow()
+    start = end - timedelta(days=days_back)
+    
+    metrics = {
+        'pg_active_connections': 'pg_stat_activity_count{state="active"}',
+        'pg_cache_hit_ratio': 'pg_stat_database_blks_hit / (pg_stat_database_blks_hit + pg_stat_database_blks_read)',
+        'pg_deadlocks': 'rate(pg_stat_database_deadlocks[5m])',
+        'pg_temp_bytes': 'rate(pg_stat_database_temp_bytes[5m])',
+        'pg_rollbacks': 'rate(pg_stat_database_xact_rollback[5m])',
+    }
+    
+    dfs = []
+    for col_name, query in metrics.items():
+        df = fetch_prometheus_range(prometheus_url, query, start, end)
+        if not df.empty:
+            df = df.groupby('timestamp')['value'].mean().reset_index()
+            df.columns = ['timestamp', col_name]
+            dfs.append(df)
+    
+    if not dfs:
+        return pd.DataFrame()
+    
+    result = dfs[0]
+    for df in dfs[1:]:
+        result = result.merge(df, on='timestamp', how='outer')
+    
+    result = result.sort_values('timestamp').set_index('timestamp')
+    result['hour_sin'] = pd.to_numeric(result.index.hour, errors='coerce')
+    result['hour_sin'] = result['hour_sin'].apply(lambda h: __import__('numpy').sin(2 * 3.14159 * h / 24))
+    result['hour_cos'] = result.index.hour.map(lambda h: __import__('numpy').cos(2 * 3.14159 * h / 24))
+    result['dow_sin'] = result.index.dayofweek.map(lambda d: __import__('numpy').sin(2 * 3.14159 * d / 7))
+    result['dow_cos'] = result.index.dayofweek.map(lambda d: __import__('numpy').cos(2 * 3.14159 * d / 7))
+    
+    return result.fillna(method='ffill').dropna()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: Train the anomaly model.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">train_isolation_forest</code> from the earlier section, passing the DataFrame produced by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">build_training_dataset</code>. Save the trained model artifact. Schedule a weekly retraining job using Airflow or a cron-triggered Prefect flow to keep the model current as workload patterns evolve.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 4: Wire the detection loop.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Deploy a lightweight service that runs the scoring function every minute, and on a positive anomaly detection, calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">build_pg_diagnostic_context</code> followed by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">diagnose_with_claude</code>. Route the result to a Slack channel or PagerDuty alert with the LLM's diagnostic summary included in the notification body.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
+import requests
+import os
+from datetime import datetime
+
+SLACK_WEBHOOK = os.environ.get("SLACK_WEBHOOK_URL")
+
+def send_slack_alert(diagnosis: str, anomaly_score: float) -&gt; None:
+    """Post an AI-generated diagnostic summary to a Slack channel."""
+    if not SLACK_WEBHOOK:
+        return
+    payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "⚠️ Database Anomaly Detected"}
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Anomaly Score:* `{anomaly_score:.4f}`\n"
+                            f"*Detected at:* {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}"
+                }
+            },
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"*AI Diagnosis:*\n{diagnosis[:2800]}"}
+            }
+        ]
+    }
+    requests.post(SLACK_WEBHOOK, json=payload, timeout=10)
+
+def run_detection_loop(
+    pg_conn_string: str,
+    model_path: str,
+    check_interval_seconds: int = 60
+) -&gt; None:
+    """Main detection loop: score, diagnose if anomalous, alert."""
+    import anthropic
+    client = anthropic.Anthropic()
+    
+    while True:
+        try:
+            result = score_current_state(pg_conn_string, model_path)
+            if result['is_anomaly']:
+                context = build_pg_diagnostic_context(pg_conn_string)
+                diagnosis = diagnose_with_claude(result, context, "PostgreSQL 16", client)
+                send_slack_alert(diagnosis, result['anomaly_score'])
+        except Exception as e:
+            print(f"Detection loop error: {e}")
+        time.sleep(check_interval_seconds)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This loop is intentionally simple. It has no deduplication logic — if an anomaly persists across multiple check intervals, it will fire multiple alerts. In a production deployment you would add a state machine that tracks ongoing anomalies and alerts only on transitions (anomaly onset, anomaly resolution). That refinement is covered in Chapter 7 when we discuss stateful incident management. For now, the goal is a working end-to-end signal path from database to operator.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 5: Validate before trusting.</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Spend the first two weeks of deployment in observation mode — the model scores current state, logs the results, but does not send alerts. Review the logs daily. Identify whether the model is scoring genuine anomalies as anomalous and whether expected events (batch jobs, maintenance windows) are being correctly scored as normal. Adjust the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">contamination</code> parameter upward if too many normal states are scored as anomalous, or downward if the model is missing real incidents. Only enable live alerting after you have validated that the false positive rate is low enough that your team will not begin ignoring the alerts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> AIOps for databases is not a monitoring product or a dashboard layer. It is a pipeline that transforms raw database telemetry — metrics, logs, traces, and events — into ML-scored anomaly signals and LLM-generated diagnostic context that DBAs can act on immediately.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Database metrics are seasonal by nature. Any anomaly detection system that does not account for daily, weekly, and business-calendar patterns will generate false positives that erode team trust. Cyclical encoding of time features and seasonality-aware models like Prophet or Isolation Forest with time features are non-negotiable for production deployments.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> LLMs function best as the reasoning layer that converts anomaly signals into actionable hypotheses. The quality of their output is directly proportional to the specificity of the prompt — include actual metric values, actual query text, table statistics, and recent events to get diagnostically useful responses rather than generic advice.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The open-source stack (postgres_exporter / sql_exporter → Prometheus → Grafana → Python ML pipeline → LLM API) is sufficient for a functional AIOps system. The components are independently replaceable, which means you can start with the simplest viable configuration and extend each layer as your operational needs grow.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Human approval gates are not optional. Anomaly detection and diagnosis should be automated; remediation actions that modify schema, configuration, or data should require explicit DBA authorization. The AI reduces the cognitive load of diagnosis; the DBA retains responsibility for execution decisions.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
