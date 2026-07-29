@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 5: Machine Learning for Performance Forecasting — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 5: Machine Learning for Performance Forecasting. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -419,16 +423,362 @@ def score_current_snapshot(snapshot_features: dict,
                          "medium" if score &lt; threshold else "normal"
     }</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The anomaly score becomes a first-class feature in your production inference pipeline. When the Isolation Forest returns a score below threshold, that event</p>
+<p class="text-gray-300 leading-relaxed">The anomaly score becomes a first-class feature in your production inference pipeline. When the Isolation Forest returns a score below threshold, that event gets logged with full feature context and fed as an additional input to the latency forecasting model. The combined signal — "the system is in an anomalous state *and* the trend line is pointing toward a latency ceiling" — gives the automated response layer a much firmer basis for taking action than either signal alone would justify.</p>
+
+<p class="text-gray-300 leading-relaxed">A critical operational consideration: Isolation Forest trained on one workload profile will drift as the application evolves. A new batch job, a schema migration, or a major application release can shift what "normal" looks like permanently. Track your anomaly rate as a metric. If the daily anomaly rate climbs from 2% to 8% over three weeks without corresponding incidents, it is a signal to retrain on a more recent baseline — not necessarily a sign that the database is degrading.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server-Specific Forecasting Features</h3>
+
+<p class="text-gray-300 leading-relaxed">Everything described so far applies to both PostgreSQL and SQL Server, but SQL Server offers a few native mechanisms worth weaving into the forecasting pipeline.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query Store's built-in regression detection</strong> (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_tuning_recommendations</code>) surfaces queries where the engine has detected a plan regression. Rather than waiting for your ML model to catch the latency signal, you can poll this DMV on a schedule and treat each recommendation row as a structured anomaly event — a high-quality, database-engine-certified signal that something changed. Feed it directly into your incident feature log:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pull active tuning recommendations for forecasting integration
+SELECT 
+    tr.name,
+    JSON_VALUE(tr.details, '$.implementationDetails.script')  AS fix_script,
+    JSON_VALUE(tr.details, '$.planForceDetails.queryId')      AS query_id,
+    JSON_VALUE(tr.details, '$.planForceDetails.regressedPlanId') 
+                                                              AS regressed_plan_id,
+    JSON_VALUE(tr.details, '$.planForceDetails.recommendedPlanId') 
+                                                              AS recommended_plan_id,
+    CAST(JSON_VALUE(tr.details, 
+        '$.planForceDetails.regressedPlanExecutionCount') AS BIGINT)
+                                                              AS regressed_exec_count,
+    CAST(JSON_VALUE(tr.details, 
+        '$.planForceDetails.regressedPlanAbortedCount') AS BIGINT)
+                                                              AS regressed_abort_count,
+    tr.score,
+    tr.reason,
+    tr.valid_since,
+    tr.last_refresh
+FROM sys.dm_db_tuning_recommendations tr
+WHERE tr.state = JSON_VALUE(tr.state_transition_reason, '$.currentValue')
+  AND tr.score &gt; 20   -- filter out low-confidence recommendations
+ORDER BY tr.score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Resource Governor workload groups</strong> expose per-group wait statistics through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_resource_governor_workload_groups</code>. If you use Resource Governor to separate OLTP from reporting workloads, forecasting per-group CPU and memory grant pressure gives you much finer-grained predictions than server-level metrics:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Resource Governor group metrics for forecasting features
+SELECT 
+    wg.name                                                   AS workload_group,
+    wg.total_request_count,
+    wg.total_queued_request_count,
+    wg.total_cpu_usage_ms,
+    wg.total_cpu_limit_violation_count,
+    wg.total_lock_wait_count,
+    wg.total_lock_wait_time_ms,
+    wg.total_reduced_memgrant_count,
+    wg.total_query_optimization_count,
+    wg.active_request_count,
+    wg.queued_request_count,
+    wg.active_parallel_thread_count,
+    rp.name                                                   AS resource_pool,
+    rp.min_cpu_percent,
+    rp.max_cpu_percent,
+    rp.min_memory_percent,
+    rp.cap_cpu_percent
+FROM sys.dm_resource_governor_workload_groups wg
+JOIN sys.dm_resource_governor_resource_pools  rp 
+  ON rp.pool_id = wg.pool_id
+WHERE wg.name NOT IN ('internal', 'default');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Collecting these every minute and engineering the delta of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_cpu_limit_violation_count</code> is one of the strongest leading indicators of impending user-visible latency on mixed-workload SQL Server instances. When reporting queries start hitting their CPU cap, OLTP latency follows within minutes as I/O and memory grant pressure builds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Wiring Predictions into Automated Response Workflows</h3>
+
+<p class="text-gray-300 leading-relaxed">A model that sits in a Jupyter notebook forecasting latency into a chart is a science project. A model that triggers a workflow which pre-warms connection pool headroom, re-routes reporting queries to a read replica, or pages an on-call DBA with actionable context is operational infrastructure. This final section covers the architecture for making predictions actionable.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern is a <strong class="text-white">prediction-action loop</strong>: a scheduled inference job runs every N minutes, evaluates the latest forecasts and anomaly scores against action thresholds, and dispatches structured action events to a workflow engine. The inference job itself should be lightweight and stateless — it loads the model artifacts from object storage (S3, Azure Blob), pulls the latest feature snapshot from the time-series store, runs inference, and writes structured output to a queue. The workflow engine (Airflow, Temporal, AWS Step Functions, or even a simple Python service with apscheduler) handles the action logic with appropriate rate limiting and escalation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+import boto3
+import joblib
+import logging
+from datetime import datetime, timezone
+from dataclasses import dataclass, asdict
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class ForecastAction:
+    timestamp:        str
+    db_host:          str
+    metric:           str
+    forecasted_value: float
+    threshold:        float
+    horizon_minutes:  int
+    anomaly_score:    float
+    action_type:      str           # "alert" | "scale" | "reroute" | "maintenance"
+    confidence:       float
+    top_features:     dict
+    recommended_sql:  Optional[str] = None
+
+
+THRESHOLDS = {
+    "p95_latency_ms":   2000.0,    # alert if P95 forecast breaches 2 seconds
+    "active_conns":     180.0,     # alert at 90% of max_connections=200
+    "cache_hit_ratio":  0.90,      # alert if cache hit forecast drops below 90%
+}
+
+ACTION_MAP = {
+    "p95_latency_ms":  "alert",
+    "active_conns":    "scale",     # trigger connection pool or read-replica reroute
+    "cache_hit_ratio": "maintenance"
+}
+
+
+def run_inference_cycle(db_host: str,
+                        feature_snapshot: dict,
+                        model_artifacts: dict,
+                        sqs_queue_url: str) -&gt; list[ForecastAction]:
+    """
+    Runs all loaded models against the current feature snapshot,
+    emits ForecastAction events to SQS for any threshold breaches.
+    model_artifacts: dict of metric_name -&gt; (model, threshold, top_features)
+    """
+    actions = []
+    sqs = boto3.client("sqs")
+
+    for metric, (model, iso_result, top_feats) in model_artifacts.items():
+        try:
+            features = [feature_snapshot.get(f, 0.0) 
+                        for f in model.feature_names_in_]
+            pred = float(model.predict([features])[0])
+            thresh = THRESHOLDS.get(metric)
+
+            # Determine if forecast breaches threshold
+            breaches = (
+                pred &gt; thresh if metric != "cache_hit_ratio"
+                else pred &lt; thresh
+            )
+
+            if breaches or iso_result.get("is_anomalous"):
+                action = ForecastAction(
+                    timestamp        = datetime.now(timezone.utc).isoformat(),
+                    db_host          = db_host,
+                    metric           = metric,
+                    forecasted_value = round(pred, 3),
+                    threshold        = thresh,
+                    horizon_minutes  = 30,
+                    anomaly_score    = iso_result.get("anomaly_score", 0.0),
+                    action_type      = ACTION_MAP.get(metric, "alert"),
+                    confidence       = _estimate_confidence(pred, thresh),
+                    top_features     = top_feats,
+                    recommended_sql  = _build_recommended_sql(metric, pred)
+                )
+                actions.append(action)
+                sqs.send_message(
+                    QueueUrl    = sqs_queue_url,
+                    MessageBody = json.dumps(asdict(action)),
+                    MessageAttributes={
+                        "action_type": {
+                            "StringValue": action.action_type,
+                            "DataType":    "String"
+                        }
+                    }
+                )
+                logger.info(f"Action dispatched: {metric} forecast={pred:.1f} "
+                            f"threshold={thresh} action={action.action_type}")
+
+        except Exception as e:
+            logger.error(f"Inference failed for metric={metric}: {e}")
+            continue
+
+    return actions
+
+
+def _estimate_confidence(predicted: float, threshold: float) -&gt; float:
+    """Simple margin-based confidence: how far past the threshold is the prediction?"""
+    margin = abs(predicted - threshold) / max(abs(threshold), 1.0)
+    return round(min(margin * 100, 99.0), 1)
+
+
+def _build_recommended_sql(metric: str, predicted_value: float) -&gt; Optional[str]:
+    """Return a copy-pasteable diagnostic SQL for the on-call DBA."""
+    if metric == "p95_latency_ms":
+        return """
+-- Identify queries likely contributing to P95 latency elevation
+-- Run on the affected instance
+SELECT 
+    queryid,
+    calls,
+    ROUND(mean_exec_time::numeric, 1) AS mean_ms,
+    ROUND(stddev_exec_time::numeric, 1) AS stddev_ms,
+    ROUND(total_exec_time::numeric / 1000, 1) AS total_sec,
+    LEFT(query, 120) AS query_preview
+FROM pg_stat_statements
+WHERE mean_exec_time &gt; 500
+ORDER BY total_exec_time DESC
+LIMIT 20;
+""".strip()
+    elif metric == "active_conns":
+        return """
+-- Check connection distribution before scaling decision
+SELECT 
+    application_name,
+    state,
+    wait_event_type,
+    COUNT(*) AS conn_count,
+    MAX(EXTRACT(EPOCH FROM (NOW() - backend_start))) AS oldest_conn_sec
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY application_name, state, wait_event_type
+ORDER BY conn_count DESC;
+""".strip()
+    return None</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recommended_sql</code> field in the action payload deserves special attention. When an on-call DBA receives a PagerDuty alert, they typically spend the first three to five minutes running diagnostics to understand *why* they were paged. Embedding the right diagnostic query directly in the alert payload — one tailored to the specific metric that triggered the action — compresses that triage phase significantly. This is a small detail with outsized operational impact.</p>
+
+<p class="text-gray-300 leading-relaxed">For the <strong class="text-white">automated action</strong> side (not just alerting), the most defensible patterns for DBAs to automate without manual approval are:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Increasing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> temporarily for a session</strong> — when a forecast predicts that temp file growth will spike in the next 30 minutes, the workflow can issue a session-scoped <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET work_mem = '...'</code> on the affected connection, or apply the override at the connection-pooler level so it never touches the server-wide default (an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM SET</code> would persist the change for every session, which is a much larger blast radius than intended here).</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Routing read traffic to replicas</strong> — when active connection forecasts approach a threshold, a workflow can update PgBouncer or ProxySQL routing rules to shift reporting traffic away from the primary.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Pausing non-critical background jobs</strong> — when P95 latency is forecast to breach its threshold, the workflow can pause <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> or SQL Server Agent scheduled jobs that are tagged as deferrable, clearing headroom before the peak arrives.</p>
+
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Pre-fetching index statistics</strong> — when a specific query's plan instability anomaly detector fires, triggering an immediate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on the relevant tables is a safe, idempotent operation that can resolve plan regressions before users notice.</p>
+
+<p class="text-gray-300 leading-relaxed">Actions that require human approval in all cases include: changing max connections, adding or dropping indexes, killing long-running sessions (unless they have exceeded a policy-defined timeout and are confirmed lock holders), and any schema changes. The golden rule for automated database actions is that they must be reversible, idempotent, and bounded — they should never make a situation worse than it was before the automation ran.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Model Lifecycle Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying a forecasting model is not a one-time event. Database workloads evolve continuously: applications ship new features, business cycles shift, data volumes grow, and infrastructure changes alter the baseline. A model trained six months ago on pre-migration telemetry will gradually lose accuracy on post-migration data, and a monitoring system that tracks only business metrics will miss the model drift until forecasts are already badly wrong.</p>
+
+<p class="text-gray-300 leading-relaxed">The minimum viable model lifecycle process for a production DBA environment has four stages:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Production model scoring] --> B[1. Drift Detection<br/>rolling 7-day MAPE]
+    B -->|MAPE > 1.5x validation| C[2. Automated Retraining<br/>trailing 90 days]
+    B -->|stable| A
+    C --> D[3. Versioned Model Registry<br/>metrics + Git SHA + rollback]
+    D --> E[4. Shadow Mode Evaluation<br/>24-48h, no live actions]
+    E -->|divergence < 10%| A
+    E -->|divergence > 10%| F[Manual DBA review]
+    F --> A</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The four-stage model lifecycle loop: drift triggers retraining, retraining is versioned, and every new model proves itself in shadow mode before it can take live actions.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Drift Detection</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Track model prediction error continuously. For each inference cycle, record the forecast alongside the eventual actual value (with a lag equal to the forecast horizon). Compute a rolling 7-day MAPE. When it exceeds 1.5× the validation-time MAPE, trigger a retraining job automatically.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def check_forecast_drift(forecast_log_df: pd.DataFrame,
+                          validation_mape: float,
+                          drift_multiplier: float = 1.5) -&gt; dict:
+    """
+    forecast_log_df: DataFrame with columns ['forecasted', 'actual', 'timestamp']
+    Computed over the trailing 7 days of resolved forecasts.
+    """
+    recent = forecast_log_df[
+        forecast_log_df["timestamp"] &gt;= 
+        pd.Timestamp.now() - pd.Timedelta(days=7)
+    ].dropna(subset=["actual"])
+
+    if len(recent) &lt; 50:
+        return {"status": "insufficient_data", "rolling_mape": None}
+
+    mape = (
+        (recent["forecasted"] - recent["actual"]).abs() /
+        recent["actual"].clip(lower=1)
+    ).mean() * 100
+
+    return {
+        "rolling_mape":       round(float(mape), 2),
+        "validation_mape":    round(validation_mape, 2),
+        "drift_threshold":    round(validation_mape * drift_multiplier, 2),
+        "retraining_required": mape &gt; validation_mape * drift_multiplier,
+        "status": "drift_detected" if mape &gt; validation_mape * drift_multiplier
+                  else "stable"
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Automated Retraining</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When drift is detected, the retraining job pulls the trailing 90 days of feature data, retrains with the same hyperparameter configuration, and evaluates against a fresh holdout window. If the new model's validation MAPE is better than the current production model's rolling MAPE, it replaces the production artifact. If it is not — which can happen when the trailing 90 days includes an unusual event like a major migration — the job logs the outcome and escalates to a DBA for review rather than deploying automatically.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Versioned Model Registry</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Store every trained model artifact with its metadata: training date range, validation metrics, feature importance snapshot, and the Git SHA of the training code. A simple implementation uses MLflow or a plain S3 prefix with a JSON manifest. The critical requirement is that you can roll back to any previous model in under two minutes if a newly deployed model starts producing bad forecasts. Forecast errors that trigger false positive alerts erode team trust quickly, and that trust is hard to rebuild.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Shadow Mode Evaluation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Before promoting a retrained model to active inference, run it in shadow mode for 24–48 hours: it produces forecasts and computes what actions it would have taken, but does not emit those actions to the workflow queue. Compare its decisions against the production model's decisions. If the shadow model would have taken substantively different actions on more than 10% of inference cycles, review those divergences manually before promoting. This catches cases where retraining on a skewed data window produces a model with qualitatively different behavior — not just different numbers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Practical Deployment Considerations</h3>
+
+<p class="text-gray-300 leading-relaxed">Several operational realities shape how ML forecasting systems get deployed and maintained in production DBA environments.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Resource isolation.</strong> The inference and feature engineering jobs must not compete with the database workload they are monitoring. Run collectors as lightweight read-only connections. Feature engineering and model training should run on a separate compute instance — never on the database server itself. Even read-only queries against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> can cause minor cache pollution under heavy load.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cold start handling.</strong> When a new database instance spins up (in an autoscaling environment or after a blue-green deployment), the forecasting models trained on the old instance's telemetry are immediately stale. Have a defined cold-start policy: for the first 72 hours on a new instance, disable automated actions and use a wider anomaly detection threshold, falling back to static alert thresholds. After 72 hours of telemetry collection, resume ML-based scoring with conservative confidence requirements.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Multi-tenant environments.</strong> If you manage dozens or hundreds of database instances, you cannot hand-tune a separate model per instance. The practical answer is a two-tier approach: train a *base model* on aggregated telemetry from all instances, then fine-tune per-instance models using transfer learning or instance-specific feature offsets. The base model captures universal patterns (business-hour peaks, week-of-month effects); the per-instance model captures idiosyncratic behavior (specific batch jobs, tenant-specific query mixes).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Explainability for stakeholders.</strong> When an automated action fires — say, a read-replica reroute triggers at 9:47 AM on a Tuesday — someone will ask why. SHAP (SHapley Additive exPlanations) values on the XGBoost model provide feature-level attribution for each prediction, and they translate well into plain language:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import shap
+import pandas as pd
+
+def explain_prediction(model, feature_snapshot: dict, 
+                        feature_cols: list) -&gt; str:
+    """
+    Returns a plain-language explanation of the top drivers 
+    behind a latency forecast.
+    """
+    X = pd.DataFrame([feature_snapshot])[feature_cols]
+    explainer   = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+
+    contributions = pd.Series(
+        shap_values[0], index=feature_cols
+    ).abs().sort_values(ascending=False)
+
+    top = contributions.head(3)
+    lines = []
+    for feat, impact in top.items():
+        direction = "elevated" if shap_values[0][feature_cols.index(feat)] &gt; 0 \
+                    else "suppressed"
+        lines.append(f"  • {feat} is {direction} (impact: {impact:.1f} ms)")
+
+    return (
+        f"Forecast P95 latency: {model.predict(X)[0]:.0f} ms\n"
+        f"Primary drivers:\n" + "\n".join(lines)
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An explanation like *"Forecast P95 latency: 2,340 ms. Primary drivers: exec\_ms\_std\_30m is elevated (impact: 412 ms), lock\_waiters is elevated (impact: 287 ms), cache\_hit\_ratio\_delta is suppressed (impact: 195 ms)"* gives an on-call DBA an immediate mental model of what is happening, even before they open a monitoring dashboard.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Forecasting transforms operational posture from reactive to anticipatory.** ML models trained on 90+ days of telemetry can predict resource saturation and query degradation tens of minutes to hours before users experience impact, replacing binary threshold alerts with probability-weighted signals that have time and direction.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feature engineering determines model quality more than algorithm selection.** Delta features, rolling window statistics, lag features at 1-hour and 24-hour horizons, and calendar flags collectively give models the context to distinguish a transient spike from an accelerating trend — raw metric values alone cannot do this.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Use the right model family for the right problem.** Seasonal infrastructure metrics (CPU, connections, I/O) fit univariate time-series models like Prophet; multivariate prediction of query latency outcomes from system state fits gradient-boosted tree models like XGBoost, trained with `TimeSeriesSplit` to prevent data leakage.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anomaly detection and forecasting are complementary layers.** Isolation Forest scores computed from multivariate system state provide the earliest deviation signal, and those scores should feed into the latency forecasting model as features, creating a composite signal stronger than either approach alone.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automated actions must be reversible, idempotent, and bounded.** Routing traffic to replicas, pausing deferrable background jobs, triggering statistics refreshes, and adjusting session-level memory settings are safe candidates for full automation; dropping indexes, killing sessions, and changing global configuration require human approval — and every automated decision should emit a structured audit record with SHAP-based attribution for post-incident review.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
