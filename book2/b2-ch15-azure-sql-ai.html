@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 15: AI Features in Azure SQL — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 15: AI Features in Azure SQL. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -109,6 +113,23 @@ FROM sys.database_automatic_tuning_options;</code></pre>
 <p class="text-gray-300 leading-relaxed">1. Queries the audit log to extract the full session context</p>
 <p class="text-gray-300 leading-relaxed">2. Calls an AI API (OpenAI or Claude) to classify the query and generate a human-readable incident summary</p>
 <p class="text-gray-300 leading-relaxed">3. Posts the enriched alert to a PagerDuty or Slack channel with the AI-generated context</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant D as Azure Defender for SQL
+    participant EG as Event Grid
+    participant F as Azure Function
+    participant L as Audit Log
+    participant AI as Claude / OpenAI
+    participant S as Slack / PagerDuty
+
+    D->>EG: High-severity alert (behavioral baseline deviation)
+    EG->>F: EventGridEvent
+    F->>L: Query session context (query, IP, login, database)
+    F->>AI: Alert context + prompt
+    AI-->>F: Plain-language incident summary
+    F->>S: Enriched alert with AI analysis</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The Defender alert enrichment pattern this section builds: a raw behavioral alert is never sent to the on-call channel by itself — it is always paired with session context and an AI-generated explanation first.*</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
 import logging
@@ -414,15 +435,380 @@ LIMIT 10;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The inline approach is operationally simplest but creates problems when the AI model is retrained or swapped — you face a full table scan to re-enrich. The separate enrichment table approach is more maintainable: the source table is append-only, the enrichment table has a foreign key back to the source, and re-enrichment is a targeted batch operation against the enrichment table without touching the source.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+import os
+from azure.ai.textanalytics import TextAnalyticsClient
+from azure.core.credentials import AzureKeyCredential
+from concurrent.futures import ThreadPoolExecutor
+import time
+
+ta_client = TextAnalyticsClient(
+    endpoint=os.environ["AZURE_LANGUAGE_ENDPOINT"],
+    credential=AzureKeyCredential(os.environ["AZURE_LANGUAGE_KEY"])
+)
+
+CONN_STRING = os.environ["AZURE_SQL_CONN_STRING"]
+
+def enrich_batch(batch: list[tuple]) -&gt; None:
+    """Process a batch of (review_id, review_text) and write enrichment results."""
+    ids = [str(row[0]) for row in batch]
+    texts = [row[1] for row in batch]
+    
+    # Call Azure AI Language for sentiment and key phrases
+    sentiment_results = ta_client.analyze_sentiment(
+        documents=[{"id": i, "text": t} for i, t in zip(ids, texts)],
+        show_opinion_mining=True
+    )
+    
+    enriched_rows = []
+    for result in sentiment_results:
+        if not result.is_error:
+            enriched_rows.append((
+                int(result.id),
+                result.sentiment,
+                result.confidence_scores.positive,
+                result.confidence_scores.neutral,
+                result.confidence_scores.negative
+            ))
+    
+    if not enriched_rows:
+        return
+    
+    conn = pyodbc.connect(CONN_STRING)
+    cursor = conn.cursor()
+    
+    cursor.executemany("""
+        MERGE dbo.review_enrichments AS target
+        USING (VALUES (?, ?, ?, ?, ?)) 
+            AS source (review_id, sentiment_label, score_positive, score_neutral, score_negative)
+        ON target.review_id = source.review_id
+        WHEN MATCHED THEN UPDATE SET
+            sentiment_label = source.sentiment_label,
+            score_positive  = source.score_positive,
+            score_neutral   = source.score_neutral,
+            score_negative  = source.score_negative,
+            enriched_at     = SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN INSERT 
+            (review_id, sentiment_label, score_positive, score_neutral, score_negative, enriched_at)
+        VALUES 
+            (source.review_id, source.sentiment_label, source.score_positive,
+             source.score_neutral, source.score_negative, SYSUTCDATETIME());
+    """, enriched_rows)
+    
+    conn.commit()
+    conn.close()
+
+def run_enrichment_pipeline(batch_size: int = 100, max_workers: int = 4) -&gt; None:
+    """Pull unenriched reviews in batches and process them in parallel."""
+    conn = pyodbc.connect(CONN_STRING)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT r.review_id, r.review_text
+        FROM dbo.customer_reviews r
+        WHERE NOT EXISTS (
+            SELECT 1 FROM dbo.review_enrichments e
+            WHERE e.review_id = r.review_id
+        )
+        AND LEN(r.review_text) &gt; 10
+        ORDER BY r.created_at DESC
+    """)
+    
+    all_rows = cursor.fetchall()
+    conn.close()
+    
+    batches = [
+        all_rows[i:i + batch_size]
+        for i in range(0, len(all_rows), batch_size)
+    ]
+    
+    print(f"Processing {len(all_rows)} reviews in {len(batches)} batches with {max_workers} workers.")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(enrich_batch, batch) for batch in batches]
+        for i, future in enumerate(futures):
+            try:
+                future.result()
+            except Exception as e:
+                print(f"Batch {i} failed: {e}")
+            # Respect Azure AI Language rate limits
+            time.sleep(0.1)
+
+if __name__ == "__main__":
+    run_enrichment_pipeline()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The equivalent PostgreSQL pattern for Azure Database for PostgreSQL uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure_ai</code> extension's built-in language service integration to push this work directly into SQL without requiring an external pipeline process:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (Azure Database for PostgreSQL Flexible Server):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Configure the Azure AI Language endpoint once
+SELECT azure_ai.set_setting('azure_cognitive.endpoint', 'https://your-language-resource.cognitiveservices.azure.com/');
+SELECT azure_ai.set_setting('azure_cognitive.subscription_key', 'your-subscription-key');
+
+-- Create the enrichment table
+CREATE TABLE review_enrichments (
+    review_id       INT PRIMARY KEY REFERENCES customer_reviews(review_id),
+    sentiment_label TEXT,
+    score_positive  NUMERIC(5,4),
+    score_neutral   NUMERIC(5,4),
+    score_negative  NUMERIC(5,4),
+    enriched_at     TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Batch enrich using the built-in azure_cognitive.analyze_sentiment function
+INSERT INTO review_enrichments (review_id, sentiment_label, score_positive, score_neutral, score_negative)
+SELECT 
+    r.review_id,
+    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).sentiment,
+    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).positive_score,
+    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).neutral_score,
+    (azure_cognitive.analyze_sentiment(r.review_text, 'en')).negative_score
+FROM customer_reviews r
+WHERE NOT EXISTS (
+    SELECT 1 FROM review_enrichments e WHERE e.review_id = r.review_id
+)
+LIMIT 500
+ON CONFLICT (review_id) DO UPDATE SET
+    sentiment_label = EXCLUDED.sentiment_label,
+    score_positive  = EXCLUDED.score_positive,
+    score_neutral   = EXCLUDED.score_neutral,
+    score_negative  = EXCLUDED.score_negative,
+    enriched_at     = NOW();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One performance note on the in-SQL approach: calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure_cognitive.analyze_sentiment()</code> four times per row (once per column in the SELECT list) results in four API calls per row rather than one. In practice, you should call it once into a CTE or lateral join and then decompose the composite type result:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- More efficient: call analyze_sentiment once per row using a lateral join
+INSERT INTO review_enrichments (review_id, sentiment_label, score_positive, score_neutral, score_negative)
+SELECT 
+    r.review_id,
+    sa.sentiment,
+    sa.positive_score,
+    sa.neutral_score,
+    sa.negative_score
+FROM customer_reviews r
+CROSS JOIN LATERAL azure_cognitive.analyze_sentiment(r.review_text, 'en') sa
+WHERE NOT EXISTS (
+    SELECT 1 FROM review_enrichments e WHERE e.review_id = r.review_id
+)
+LIMIT 500
+ON CONFLICT (review_id) DO UPDATE SET
+    sentiment_label = EXCLUDED.sentiment_label,
+    score_positive  = EXCLUDED.score_positive,
+    score_neutral   = EXCLUDED.score_neutral,
+    score_negative  = EXCLUDED.score_negative,
+    enriched_at     = NOW();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Recommendations and the Azure Advisor Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure Advisor surfaces index recommendations derived from the missing index DMV data we explored in earlier chapters, but with an additional layer of scoring and cross-database comparison that goes beyond what you see locally in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code>. The recommendations include estimated performance impact expressed as a percentage improvement and are ranked by Azure's internal model against similar workload patterns across the fleet — though Microsoft does not expose the fleet-level signals directly.</p>
+
+<p class="text-gray-300 leading-relaxed">From a DBA workflow perspective, Azure Advisor recommendations should be treated as a starting point, not a final answer. The system does not account for:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index maintenance costs**: A recommended index may improve read performance significantly but create write amplification on a high-INSERT table that outweighs the read gain.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Overlapping indexes**: Advisor does not deduplicate against existing indexes that could be extended with an additional included column rather than creating a new index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Transaction isolation interaction**: On tables with heavy concurrent writes, a new index may exacerbate lock contention that the baseline DMV data does not surface.</li>
+
+<p class="text-gray-300 leading-relaxed">The recommended workflow is to treat each Azure Advisor index suggestion as an input to your AI-assisted tuning analysis rather than applying it directly. Feed the recommendation alongside the actual table DDL, existing index inventory, and Query Store workload profile into your LLM layer for a secondary evaluation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def evaluate_advisor_recommendation(
+    recommendation: dict,
+    table_ddl: str,
+    existing_indexes: list[str],
+    workload_summary: str
+) -&gt; str:
+    """Use an LLM to critically evaluate an Azure Advisor index recommendation."""
+    
+    prompt = f"""You are a senior Azure SQL DBA reviewing an index recommendation from Azure Advisor.
+Evaluate this recommendation critically — do not simply endorse it.
+
+AZURE ADVISOR RECOMMENDATION:
+Table: {recommendation['table_name']}
+Recommended Index: CREATE INDEX {recommendation['index_name']} ON {recommendation['table_name']} ({recommendation['columns']}) INCLUDE ({recommendation['include_columns']})
+Estimated Impact: {recommendation['estimated_impact']}
+
+CURRENT TABLE DDL:
+{table_ddl}
+
+EXISTING INDEXES ON THIS TABLE:
+{chr(10).join(existing_indexes)}
+
+WORKLOAD PROFILE (from Query Store, last 7 days):
+{workload_summary}
+
+Evaluate:
+1. Is this index actually needed, or can an existing index be modified to cover this pattern?
+2. What is the estimated write amplification cost on INSERT/UPDATE/DELETE operations?
+3. Are there overlapping indexes that should be consolidated?
+4. Does the include column set look correct, or are there columns missing or unnecessary?
+5. Should this recommendation be applied, modified, or rejected? Explain your reasoning.
+
+Produce a concrete recommendation with final T-SQL if the index should be created or an existing index modified."""
+
+    response = azure_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": "You are a critical, detail-oriented Azure SQL performance engineer. You identify index redundancy and write amplification problems that automated tools miss."},
+            {"role": "user", "content": prompt}
+        ],
+        max_tokens=1200,
+        temperature=0.1
+    )
+    
+    return response.choices[0].message.content</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated Performance Baselining with Azure Monitor and AI Analysis</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure Monitor collects a rich set of Azure SQL metrics: DTU or vCore utilization, storage utilization, connection counts, deadlock counts, tempdb usage, and query duration percentiles. The standard dashboarding experience is adequate for human eyeball monitoring, but it does not identify slow-moving degradation trends or correlate metrics across dimensions automatically.</p>
+
+<p class="text-gray-300 leading-relaxed">Building an automated baselining layer on top of Azure Monitor — one that uses an LLM to interpret metric trends and generate natural language health summaries — closes this gap. The pattern uses the Azure Monitor REST API or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure-monitor-query</code> SDK to pull metric time series, computes rolling baselines, and flags anomalies for AI interpretation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from azure.monitor.query import MetricsQueryClient, MetricAggregationType
+from azure.identity import DefaultAzureCredential
+from datetime import datetime, timedelta, timezone
+import statistics
+
+credential = DefaultAzureCredential()
+metrics_client = MetricsQueryClient(credential)
+
+RESOURCE_ID = "/subscriptions/{sub}/resourceGroups/{rg}/providers/Microsoft.Sql/servers/{server}/databases/{db}"
+
+def pull_metric_baseline(metric_name: str, days_back: int = 14) -&gt; dict:
+    """Pull a metric time series and compute a rolling statistical baseline."""
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(days=days_back)
+    
+    response = metrics_client.query_resource(
+        RESOURCE_ID,
+        metric_names=[metric_name],
+        timespan=(start_time, end_time),
+        granularity=timedelta(hours=1),
+        aggregations=[MetricAggregationType.AVERAGE, MetricAggregationType.MAXIMUM]
+    )
+    
+    hourly_values = []
+    for metric in response.metrics:
+        for ts in metric.timeseries:
+            for point in ts.data:
+                if point.average is not None:
+                    hourly_values.append({
+                        "timestamp": point.timestamp.isoformat(),
+                        "average": point.average,
+                        "maximum": point.maximum or point.average
+                    })
+    
+    if len(hourly_values) &lt; 24:
+        return {"metric": metric_name, "values": hourly_values, "baseline": None}
+    
+    avg_values = [v["average"] for v in hourly_values]
+    baseline = {
+        "mean": statistics.mean(avg_values),
+        "stdev": statistics.stdev(avg_values),
+        "p95": sorted(avg_values)[int(len(avg_values) * 0.95)],
+        "p99": sorted(avg_values)[int(len(avg_values) * 0.99)],
+        "last_24h_mean": statistics.mean(avg_values[-24:]),
+        "last_1h": avg_values[-1] if avg_values else 0
+    }
+    
+    return {"metric": metric_name, "values": hourly_values[-48:], "baseline": baseline}
+
+def generate_health_summary(database_name: str) -&gt; str:
+    """Pull multiple metrics, detect anomalies, and generate an AI health summary."""
+    
+    metrics_to_check = [
+        "cpu_percent",
+        "dtu_consumption_percent", 
+        "storage_percent",
+        "connection_failed",
+        "deadlock",
+        "workers_percent"
+    ]
+    
+    metric_summaries = {}
+    anomalies = []
+    
+    for metric in metrics_to_check:
+        data = pull_metric_baseline(metric)
+        if data["baseline"]:
+            b = data["baseline"]
+            metric_summaries[metric] = b
+            
+            # Flag if last hour is more than 2 standard deviations above mean
+            if b["stdev"] &gt; 0:
+                z_score = (b["last_1h"] - b["mean"]) / b["stdev"]
+                if z_score &gt; 2.0:
+                    anomalies.append({
+                        "metric": metric,
+                        "current": b["last_1h"],
+                        "mean": b["mean"],
+                        "z_score": round(z_score, 2)
+                    })
+    
+    prompt = f"""You are an Azure SQL database health analyst. 
+Analyze these 14-day metric baselines and the detected anomalies for database '{database_name}'.
+Generate a concise health summary for the DBA team's morning briefing.
+
+METRIC BASELINES (14-day statistics):
+{json.dumps(metric_summaries, indent=2, default=str)}
+
+DETECTED ANOMALIES (metrics currently &gt; 2 standard deviations above baseline):
+{json.dumps(anomalies, indent=2)}
+
+Provide:
+1. An overall health assessment (Healthy / Degraded / Critical)
+2. A 2-3 sentence plain-English summary of current status
+3. The most important anomaly to investigate if any exist
+4. Recommended immediate actions if any
+
+Keep the summary under 200 words. Be direct."""
+
+    response = azure_client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
+        temperature=0.1
+    )
+    
+    return response.choices[0].message.content</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern scales well when wrapped as an Azure Function on a timer trigger, with results posted to a Teams or Slack channel each morning. Over time, you accumulate a natural language log of database health that is easier to review in incident retrospectives than raw metric charts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Responsible AI Considerations for Production Azure SQL Deployments</h3>
+
+<p class="text-gray-300 leading-relaxed">Embedding AI into database operations introduces risks that deserve explicit treatment. Three categories are worth naming for Azure SQL deployments specifically.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query generation risk</strong>: AI-generated T-SQL can be syntactically correct and semantically wrong. A query that returns results without error is not necessarily returning the right results. Any AI-generated query that touches production data — especially writes, deletes, or aggregations used for reporting — should go through a human review gate. In automated pipelines, consider routing AI-generated SQL to a read replica for validation before execution on the primary.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Prompt injection through data</strong>: If your AI integration passes database content directly into LLM prompts — customer review text, support tickets, user-generated content — a malicious user can embed instructions in that content designed to manipulate the AI's output. The review enrichment pipeline shown earlier is one example of this risk. Sanitize or clearly delimit user-generated content in prompts, and treat AI output that processes untrusted data with additional skepticism.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Defender alert fatigue</strong>: If the AI enrichment layer on your Defender alerts is too permissive in its analysis — generating reassuring explanations for genuinely suspicious activity — it can create a false sense of security that causes real threats to be dismissed. The LLM analysis should surface reasons to investigate further, not reasons to close alerts quickly. Review the prompt framing in your alert enrichment functions regularly to ensure the AI is calibrated toward caution, not efficiency.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Intelligent Query Processing and Automatic Tuning are closed-loop learning systems baked into the Azure SQL engine.** Memory Grant Feedback, CE Feedback, and DOP Feedback persist recommendations in Query Store and influence future plan compilations. Understanding this feedback loop is necessary for diagnosing unexplained plan regressions and oscillation cycles between IQP adjustments and plan correction reversions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure Defender's threat detection uses behavioral baselines, not signatures.** It requires a calibration period after deployment or major workload changes, and its alerts can be enriched with AI analysis to produce incident summaries that give on-call DBAs immediate context rather than raw JSON alert payloads.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure OpenAI and the `azure_ai` PostgreSQL extension enable in-database AI enrichment at two levels.** Python application-layer pipelines give fine-grained control over batching, error handling, and rate limits. In-SQL enrichment using the `azure_ai` extension simplifies the architecture but requires careful attention to how many API calls are generated per row — use `CROSS JOIN LATERAL` patterns to avoid redundant calls.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector search in Azure SQL (Disk-ANN) and Azure Database for PostgreSQL (pgvector HNSW) both require careful operational sizing.** High-dimensional embeddings consume substantial storage, index build operations have non-trivial memory requirements, and autovacuum configuration for PostgreSQL vector tables needs to be tuned for bulk-insert access patterns rather than OLTP defaults.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI-generated SQL and AI-enriched security alerts both carry risks that require explicit mitigation.** Query generation should include human review gates before production writes; prompt injection through user data must be anticipated in enrichment pipelines; and Defender alert enrichment prompts should be calibrated toward investigation rather than dismissal to avoid creating a false sense of security.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
