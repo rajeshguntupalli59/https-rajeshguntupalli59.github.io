@@ -1,0 +1,537 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 22: Building a Text-to-SQL Layer on Your Schema — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 22: Building a Text-to-SQL Layer on Your Schema. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 22 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 22: Building a Text-to-SQL Layer on Your Schema</h2>
+
+<p class="text-gray-300 leading-relaxed">Natural language database querying has moved from research curiosity to production requirement. When your product manager asks "why can't users just ask questions about their data?", the answer used to be "it's too hard." With modern LLMs, the hard part shifts from generating syntactically valid SQL to generating *semantically correct* SQL — queries that do what the user actually meant, against your specific schema, with proper filters, joins, and aggregations. This chapter builds a complete Text-to-SQL layer: schema introspection and serialization, prompt engineering for SQL generation, result validation, query execution safety, caching, and a FastAPI endpoint that ties it all together. PostgreSQL's rich metadata system, row-level security, and JSONB capabilities make it uniquely suited to be both the query target and the operational backbone of this architecture.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Anatomy of a Text-to-SQL System</h3>
+
+<p class="text-gray-300 leading-relaxed">Text-to-SQL is not a single model call. It's a pipeline with several moving parts, each of which can fail independently:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Schema understanding</strong> — the LLM needs to know your table names, column names, types, relationships, and constraints. Without this, it generates plausible-looking SQL that references columns that don't exist.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Intent extraction</strong> — "show me the top customers last month" contains temporal ambiguity, aggregation intent, and an undefined metric ("top" by revenue? order count?).</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">SQL generation</strong> — the LLM produces a candidate query.</p>
+
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">SQL validation</strong> — syntactic check, safety check (no DDL, no writes), and optionally a dry-run EXPLAIN.</p>
+
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Result rendering</strong> — turning rows into something a user can read.</p>
+
+<p class="text-gray-300 leading-relaxed">6. <strong class="text-white">Feedback loop</strong> — storing query history so you can improve your prompts and catch systematic errors.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL sits at the center of every step. Your schema lives there. Your users' data lives there. And your query history, embeddings for few-shot examples, and audit logs live there too.</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture looks like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>User question
+     │
+     ▼
+Schema context builder (pg_catalog, information_schema)
+     │
+     ▼
+Few-shot retriever (pgvector similarity search on past Q→SQL pairs)
+     │
+     ▼
+LLM (Claude or GPT-4) generates SQL
+     │
+     ▼
+Validator (syntax, safety, EXPLAIN)
+     │
+     ▼
+Executor (read-only role, RLS enforced)
+     │
+     ▼
+Result formatter
+     │
+     ▼
+Audit log (query_history table)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Before writing any Python, get this schema in place.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Design: Metadata, History, and Few-Shot Storage</h3>
+
+<p class="text-gray-300 leading-relaxed">A Text-to-SQL system needs its own operational tables. These live in a dedicated schema alongside your application data.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema for the Text-to-SQL system itself
+CREATE SCHEMA IF NOT EXISTS text2sql;
+
+-- Cache of schema introspection results
+-- Rebuilt on schema changes via pg_notify or periodic refresh
+CREATE TABLE text2sql.schema_snapshots (
+    id               BIGSERIAL PRIMARY KEY,
+    snapshot_hash    TEXT NOT NULL,
+    schema_names     TEXT[] NOT NULL,
+    serialized_ddl   TEXT NOT NULL,           -- compact DDL string sent to LLM
+    table_count      INTEGER NOT NULL,
+    column_count     INTEGER NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_current       BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE UNIQUE INDEX idx_schema_snapshots_current
+    ON text2sql.schema_snapshots (is_current)
+    WHERE is_current = TRUE;
+
+-- Query history: every question asked, every SQL generated
+CREATE TABLE text2sql.query_history (
+    id               BIGSERIAL PRIMARY KEY,
+    session_id       UUID NOT NULL,
+    user_id          TEXT,                    -- application-level user identifier
+    question         TEXT NOT NULL,
+    generated_sql    TEXT,
+    normalized_sql   TEXT,                    -- lowercased, whitespace-normalized
+    execution_status TEXT NOT NULL            -- 'success', 'sql_error', 'safety_blocked', 'llm_error'
+        CHECK (execution_status IN ('success', 'sql_error', 'safety_blocked', 'llm_error', 'timeout')),
+    row_count        INTEGER,
+    execution_ms     INTEGER,
+    error_message    TEXT,
+    model_used       TEXT NOT NULL,
+    prompt_tokens    INTEGER,
+    completion_tokens INTEGER,
+    schema_snapshot_id BIGINT REFERENCES text2sql.schema_snapshots(id),
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_query_history_session   ON text2sql.query_history (session_id);
+CREATE INDEX idx_query_history_user      ON text2sql.query_history (user_id);
+CREATE INDEX idx_query_history_status    ON text2sql.query_history (execution_status);
+CREATE INDEX idx_query_history_created   ON text2sql.query_history (created_at DESC);
+
+-- Few-shot examples: verified Q→SQL pairs used in prompts
+-- The embedding allows semantic retrieval of relevant examples
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE text2sql.few_shot_examples (
+    id               BIGSERIAL PRIMARY KEY,
+    question         TEXT NOT NULL,
+    sql_query        TEXT NOT NULL,
+    explanation      TEXT,                    -- why this SQL answers this question
+    tags             TEXT[],                  -- 'aggregation', 'time_filter', 'join', etc.
+    is_verified      BOOLEAN NOT NULL DEFAULT FALSE,
+    source           TEXT NOT NULL DEFAULT 'manual'
+        CHECK (source IN ('manual', 'promoted_from_history', 'synthetic')),
+    question_embedding VECTOR(1536),          -- OpenAI text-embedding-3-small
+    upvotes          INTEGER NOT NULL DEFAULT 0,
+    downvotes        INTEGER NOT NULL DEFAULT 0,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_few_shot_embedding
+    ON text2sql.few_shot_examples
+    USING hnsw (question_embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX idx_few_shot_verified
+    ON text2sql.few_shot_examples (is_verified)
+    WHERE is_verified = TRUE;
+
+-- Column metadata: human-readable descriptions to supplement information_schema
+-- Critical for columns with non-obvious names like "rev_adj_12m" or "status_cd"
+CREATE TABLE text2sql.column_descriptions (
+    id               BIGSERIAL PRIMARY KEY,
+    schema_name      TEXT NOT NULL,
+    table_name       TEXT NOT NULL,
+    column_name      TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    example_values   TEXT[],                  -- 2-3 representative values shown in prompt
+    is_sensitive     BOOLEAN NOT NULL DEFAULT FALSE,  -- exclude from LLM context
+    UNIQUE (schema_name, table_name, column_name)
+);
+
+-- Audit log: what queries actually ran, separate from query_history
+-- Append-only, never updated
+CREATE TABLE text2sql.execution_audit (
+    id               BIGSERIAL PRIMARY KEY,
+    query_history_id BIGINT REFERENCES text2sql.query_history(id),
+    executed_sql     TEXT NOT NULL,
+    execution_plan   JSONB,                   -- from EXPLAIN (FORMAT JSON)
+    rows_returned    INTEGER,
+    execution_ms     INTEGER,
+    pg_user          TEXT NOT NULL DEFAULT current_user,
+    client_addr      INET,
+    executed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+) PARTITION BY RANGE (executed_at);
+
+CREATE TABLE text2sql.execution_audit_2024
+    PARTITION OF text2sql.execution_audit
+    FOR VALUES FROM ('2024-01-01') TO ('2025-01-01');
+
+CREATE TABLE text2sql.execution_audit_2025
+    PARTITION OF text2sql.execution_audit
+    FOR VALUES FROM ('2025-01-01') TO ('2026-01-01');
+
+-- Read-only role for query execution
+-- This role is what the Text-to-SQL runner connects as
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'text2sql_reader') THEN
+        CREATE ROLE text2sql_reader NOLOGIN;
+    END IF;
+END
+$$;
+
+-- Grant SELECT on application schemas only — never text2sql schema itself
+GRANT USAGE ON SCHEMA public TO text2sql_reader;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO text2sql_reader;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO text2sql_reader;
+
+-- Create login user that uses the reader role
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'text2sql_app') THEN
+        CREATE USER text2sql_app PASSWORD 'use_a_real_secret_here';
+    END IF;
+END
+$$;
+
+GRANT text2sql_reader TO text2sql_app;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The separation between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_history</code> (what users asked and what SQL was generated) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execution_audit</code> (what actually executed against the database) is intentional. Query history is writeable by the application. The audit table is append-only and should have a separate, more privileged writer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Introspection: Giving the LLM Your DDL</h3>
+
+<p class="text-gray-300 leading-relaxed">The most common failure mode in Text-to-SQL is the LLM hallucinating column names or table structures it wasn't told about. The fix is thorough schema serialization — extracting your actual DDL from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_catalog</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">information_schema</code> and including it in every prompt.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Function to extract compact DDL for Text-to-SQL prompts
+-- Returns a text block suitable for direct inclusion in an LLM prompt
+CREATE OR REPLACE FUNCTION text2sql.get_schema_ddl(
+    target_schemas TEXT[] DEFAULT ARRAY['public']
+)
+RETURNS TEXT
+LANGUAGE plpgsql
+STABLE
+AS $$
+DECLARE
+    result TEXT := '';
+    rec RECORD;
+    col_rec RECORD;
+    fk_rec RECORD;
+    table_ddl TEXT;
+    col_list TEXT;
+BEGIN
+    FOR rec IN
+        SELECT
+            n.nspname AS schema_name,
+            c.relname AS table_name,
+            obj_description(c.oid, 'pg_class') AS table_comment
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = ANY(target_schemas)
+          AND c.relkind IN ('r', 'v', 'm')  -- tables, views, materialized views
+          AND c.relname NOT LIKE 'pg_%'
+        ORDER BY n.nspname, c.relname
+    LOOP
+        col_list := '';
+
+        FOR col_rec IN
+            SELECT
+                a.attname AS column_name,
+                pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
+                a.attnotnull AS not_null,
+                pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
+                col_description(a.attrelid, a.attnum) AS col_comment,
+                -- Check if this column is part of a primary key
+                EXISTS (
+                    SELECT 1 FROM pg_constraint con
+                    JOIN pg_attribute att ON att.attrelid = con.conrelid
+                        AND att.attnum = ANY(con.conkey)
+                    WHERE con.conrelid = a.attrelid
+                      AND con.contype = 'p'
+                      AND att.attname = a.attname
+                ) AS is_pk,
+                -- Check for text2sql column description
+                cd.description AS custom_description,
+                cd.example_values,
+                cd.is_sensitive
+            FROM pg_attribute a
+            LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum
+            LEFT JOIN text2sql.column_descriptions cd
+                ON cd.schema_name = rec.schema_name
+                AND cd.table_name = rec.table_name
+                AND cd.column_name = a.attname
+            WHERE a.attrelid = (
+                SELECT oid FROM pg_class
+                WHERE relname = rec.table_name
+                  AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = rec.schema_name)
+            )
+              AND a.attnum &gt; 0
+              AND NOT a.attisdropped
+              AND (cd.is_sensitive IS NULL OR cd.is_sensitive = FALSE)
+            ORDER BY a.attnum
+        LOOP
+            col_list := col_list ||
+                '  ' || col_rec.column_name ||
+                ' ' || col_rec.data_type ||
+                CASE WHEN col_rec.is_pk THEN ' PRIMARY KEY' ELSE '' END ||
+                CASE WHEN col_rec.not_null AND NOT col_rec.is_pk THEN ' NOT NULL' ELSE '' END ||
+                CASE
+                    WHEN col_rec.custom_description IS NOT NULL THEN
+                        ' -- ' || col_rec.custom_description ||
+                        CASE
+                            WHEN col_rec.example_values IS NOT NULL THEN
+                                ' (e.g., ' || array_to_string(col_rec.example_values, ', ') || ')'
+                            ELSE ''
+                        END
+                    WHEN col_rec.col_comment IS NOT NULL THEN
+                        ' -- ' || col_rec.col_comment
+                    ELSE ''
+                END ||
+                E',\n';
+        END LOOP;
+
+        -- Remove trailing comma+newline from last column
+        col_list := rtrim(col_list, E',\n');
+
+        table_ddl := 'CREATE TABLE ' || rec.schema_name || '.' || rec.table_name || ' (\n' ||
+                     col_list || E'\n);\n';
+
+        IF rec.table_comment IS NOT NULL THEN
+            table_ddl := '-- ' || rec.table_comment || E'\n' || table_ddl;
+        END IF;
+
+        result := result || table_ddl || E'\n';
+    END LOOP;
+
+    -- Append foreign key relationships
+    result := result || E'\n-- FOREIGN KEY RELATIONSHIPS\n';
+
+    FOR fk_rec IN
+        SELECT
+            tc.table_schema,
+            tc.table_name,
+            kcu.column_name,
+            ccu.table_schema AS foreign_table_schema,
+            ccu.table_name AS foreign_table_name,
+            ccu.column_name AS foreign_column_name,
+            tc.constraint_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.key_column_usage kcu
+            ON tc.constraint_name = kcu.constraint_name
+            AND tc.table_schema = kcu.table_schema
+        JOIN information_schema.constraint_column_usage ccu
+            ON ccu.constraint_name = tc.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = ANY(target_schemas)
+        ORDER BY tc.table_name, kcu.column_name
+    LOOP
+        result := result ||
+            '-- ' || fk_rec.table_name || '.' || fk_rec.column_name ||
+            ' → ' || fk_rec.foreign_table_name || '.' || fk_rec.foreign_column_name || E'\n';
+    END LOOP;
+
+    RETURN result;
+END;
+$$;
+
+-- Quick view for monitoring schema snapshot freshness
+CREATE OR REPLACE VIEW text2sql.schema_status AS
+SELECT
+    ss.id,
+    ss.snapshot_hash,
+    ss.table_count,
+    ss.column_count,
+    ss.created_at,
+    ss.is_current,
+    qh.question_count,
+    qh.success_rate
+FROM text2sql.schema_snapshots ss
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*) AS question_count,
+        ROUND(
+            100.0 * SUM(CASE WHEN execution_status = 'success' THEN 1 ELSE 0 END) / COUNT(*),
+            1
+        ) AS success_rate
+    FROM text2sql.query_history
+    WHERE schema_snapshot_id = ss.id
+) qh ON TRUE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now call this from Python to get the DDL string that goes into your prompt:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># schema_builder.py — Schema introspection and serialization for Text-to-SQL prompts
+
+import hashlib
+import asyncpg
+import asyncio
+from dataclasses import dataclass
+from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SchemaSnapshot:
+    snapshot_id: int
+    snapshot_hash: str
+    serialized_ddl: str
+    table_count: int
+    column_count: int
+
+
+async def get_or_refresh_schema_snapshot(
+    pool: asyncpg.Pool,
+    target_schemas: list[str] = None,
+    force_refresh: bool = False
+) -&gt; SchemaSnapshot:
+    """
+    Returns the current schema snapshot, refreshing if the schema has changed.
+    Uses a hash of the raw DDL to detect changes without storing redundant snapshots.
+    """
+    if target_schemas is None:
+        target_schemas = ["public"]
+
+    async with pool.acquire() as conn:
+        # Get fresh DDL from pg_catalog
+        raw_ddl = await conn.fetchval(
+            "SELECT text2sql.get_schema_ddl($1::text[])",
+            target_schemas
+        )
+
+        # Count tables and columns for metadata
+        counts = await conn.fetchrow("""
+            SELECT
+                COUNT(DISTINCT table_name)::int AS table_count,
+                COUNT(*)::int AS column_count
+            FROM information_schema.columns
+            WHERE table_schema = ANY($1::text[])
+        """, target_schemas)
+
+        current_hash = hashlib.sha256(raw_ddl.encode()).hexdigest()[:16]
+
+        # Check if current snapshot matches
+        if not force_refresh:
+            existing = await conn.fetchrow("""
+                SELECT id, snapshot_hash, serialized_ddl, table_count, column_count
+                FROM text2sql.schema_snapshots
+                WHERE is_current = TRUE
+            """)
+
+            if existing and existing["snapshot_hash"] == current_hash:
+                return SchemaSnapshot(
+                    snapshot_id=existing["id"],
+                    snapshot_hash=existing["snapshot_hash"],
+                    serialized_ddl=existing["serialized_ddl"],
+                    table_count=existing["table_count"],
+                    column_count=existing["column_count"]
+                )
+
+        # Schema has changed or no snapshot exists — create new one
+        async with conn.transaction():
+            # Mark all existing snapshots as not current
+            await conn.execute("""
+                UPDATE text2sql.schema_snapshots
+                SET is_current = FALSE
+                WHERE is_current = TRUE
+            """)
+
+            # Insert new snapshot
+            new_id = await conn.fetchval("""
+                INSERT INTO text2sql.schema_snapshots
+                    (snapshot_hash, schema_names, serialized_ddl, table_count, column_count, is_current)
+                VALUES ($1, $2, $3, $4, $5, TRUE)
+                RETURNING id
+            """, current_hash, target_schemas, raw_ddl,
+                counts["table_count"], counts["column_count"])
+
+            logger.info(
+                f"Schema snapshot refreshed: {current_hash} "
+                f"({counts['table_count']} tables, {counts['column_count']} columns)"
+            )
+
+            return SchemaSnapshot(
+                snapshot_id=new_id,
+                snapshot_hash=current_hash,
+                serialized_ddl=raw_ddl,
+                table_count=counts["table_count"],
+                column_count=counts["column_count"]
+            )
+
+
+async def get_relevant_few_shots(
+    pool: asyncpg.Pool,
+    question_embedding: list[float],
+    limit: int = 5
+) -&gt; list[dict]:
+    """
+    Retrieve semantically similar verified Q→SQL pairs for few-shot prompting.
+    Uses cosine similarity on the question_embedding column.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                question,
+                sql_query,
+                explanation,
+                1 - (question_embedding &lt;=&gt; $1::vector) AS similarity
+            FROM text2sql.few_shot_examples
+            WHERE is_verified = TRUE
+              AND question_embedding IS NOT NULL
+            ORDER BY question_embedding &lt;=&gt; $1::vector
+            LIMIT $2
+        """, question_embedding, limit)
+
+        return [dict(row) for row in rows]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Generation: Prompt Engineering and the LLM Call</h3>
+
+<p class="text-gray-300 leading-relaxed">The quality of your SQL output depends heavily on prompt structure. You need to tell the LLM: what dialect it's working in, what your schema looks like, relevant examples, and what constraints apply. You also need to handle the case where the question can't be answered from the available schema.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,523 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 6: Storing Conversation History in PostgreSQL — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 6: Storing Conversation History in PostgreSQL. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 6 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 6: Storing Conversation History in PostgreSQL</h2>
+
+<p class="text-gray-300 leading-relaxed">Every LLM-powered application eventually confronts the same challenge: the model has no memory. Each API call starts cold, with no awareness of what was said five minutes ago, let alone last Tuesday. Conversation history is how you manufacture continuity — and the database you choose to store it in determines how far you can take that continuity before it breaks under production load. This chapter covers the full architecture of conversation history storage in PostgreSQL: schema design that handles multi-turn dialogues, token budgeting, semantic search over past exchanges, real-time streaming, and the operational concerns that surface when thousands of users are talking to your system simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.1 Why Conversation History Belongs in PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">The naive implementation puts conversation history in Redis, a file, or an application dictionary. These work fine for demos. They fail in production for the same reasons they always fail: no durability guarantee, no relational queries across conversations, no audit trail, and no way to ask questions like "which users are stuck in a loop asking the same thing?" or "what's the 95th percentile conversation length for our premium tier?"</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL gives you something vector-only stores cannot: the full relational model alongside your conversation data. You can join conversation turns against user subscription records to enforce message limits. You can run window functions to compute per-session token consumption. You can use row-level security so users only ever see their own history — without any application-layer filtering. You can attach pgvector embeddings to individual messages and do semantic search over a user's conversation history without leaving the database.</p>
+
+<p class="text-gray-300 leading-relaxed">The argument for PostgreSQL as your conversation store is not that it's faster than Redis for a single cache read. It's that your conversation data is fundamentally relational — it has users, sessions, turns, metadata, attachments, and policies — and that relational structure is precisely what makes AI applications intelligent rather than merely interactive.</p>
+
+<p class="text-gray-300 leading-relaxed">#### The Anatomy of a Conversation</p>
+
+<p class="text-gray-300 leading-relaxed">Before writing any SQL, clarify the data model. A conversation is a tree, not a flat list:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A **user** has many **sessions** (one session per browser tab, mobile app launch, or logical conversation thread)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A session contains ordered **turns** (a user message followed by an assistant message)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Each turn has **content** (text, possibly multimodal), **token counts**, **latency metrics**, and optionally **embeddings** for semantic retrieval</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Sessions have **metadata** — the model used, temperature, system prompt hash, application context</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Some turns produce **tool calls** or **function invocations** that need their own storage</li>
+
+<p class="text-gray-300 leading-relaxed">This shapes the schema in section 6.2.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.2 Schema Design for Conversation Storage</h3>
+
+<p class="text-gray-300 leading-relaxed">The schema below is production-ready. It handles multi-turn conversations, token accounting, semantic search, and audit requirements. It is not a starting point to simplify — it is the actual thing.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable required extensions
+CREATE EXTENSION IF NOT EXISTS pgvector;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pg_trgm; -- for text search on content
+
+-- ─────────────────────────────────────────────
+-- Users (minimal; join to your existing users table)
+-- ─────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS ai_users (
+    user_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    external_id     TEXT UNIQUE NOT NULL,   -- your app's user identifier
+    tier            TEXT NOT NULL DEFAULT 'free' CHECK (tier IN ('free', 'pro', 'enterprise')),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- ─────────────────────────────────────────────
+-- Sessions — one per logical conversation thread
+-- ─────────────────────────────────────────────
+CREATE TABLE conversation_sessions (
+    session_id          UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id             UUID NOT NULL REFERENCES ai_users(user_id) ON DELETE CASCADE,
+    title               TEXT,                      -- auto-generated or user-set
+    model_name          TEXT NOT NULL,             -- e.g. 'claude-3-5-sonnet-20241022'
+    system_prompt_hash  TEXT,                      -- SHA-256 of system prompt for change detection
+    system_prompt       TEXT,                      -- the actual system prompt
+    context_window_used INTEGER NOT NULL DEFAULT 0, -- running token total
+    max_context_tokens  INTEGER NOT NULL DEFAULT 200000,
+    session_metadata    JSONB NOT NULL DEFAULT '{}', -- temperature, top_p, app-specific keys
+    is_archived         BOOLEAN NOT NULL DEFAULT FALSE,
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_active_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ended_at            TIMESTAMPTZ
+);
+
+CREATE INDEX idx_sessions_user_id     ON conversation_sessions(user_id);
+CREATE INDEX idx_sessions_last_active ON conversation_sessions(last_active_at DESC);
+CREATE INDEX idx_sessions_metadata    ON conversation_sessions USING GIN(session_metadata);
+
+-- ─────────────────────────────────────────────
+-- Turns — individual messages in a session
+-- ─────────────────────────────────────────────
+CREATE TABLE conversation_turns (
+    turn_id             UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id          UUID NOT NULL REFERENCES conversation_sessions(session_id) ON DELETE CASCADE,
+    user_id             UUID NOT NULL REFERENCES ai_users(user_id) ON DELETE CASCADE,
+    turn_index          INTEGER NOT NULL,           -- 0-based ordering within session
+    role                TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content             TEXT NOT NULL,
+    content_tokens      INTEGER,                    -- tokens in this message
+    -- For assistant turns
+    input_tokens        INTEGER,                    -- tokens sent to model
+    output_tokens       INTEGER,                    -- tokens received from model
+    latency_ms          INTEGER,                    -- time to first token (streaming) or full response
+    total_latency_ms    INTEGER,                    -- wall time for complete response
+    finish_reason       TEXT,                       -- 'end_turn', 'max_tokens', 'stop_sequence', etc.
+    -- Cost tracking
+    cost_usd            NUMERIC(12, 8),
+    -- Tool calls (stored inline for simple cases)
+    tool_calls          JSONB,                      -- array of {tool_name, arguments, result}
+    -- Metadata
+    turn_metadata       JSONB NOT NULL DEFAULT '{}',
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Embedding (populated asynchronously)
+    embedding           vector(1536),              -- or 3072 for text-embedding-3-large
+    embedding_model     TEXT,
+    embedded_at         TIMESTAMPTZ,
+    UNIQUE (session_id, turn_index)
+);
+
+CREATE INDEX idx_turns_session_id  ON conversation_turns(session_id, turn_index);
+CREATE INDEX idx_turns_user_id     ON conversation_turns(user_id, created_at DESC);
+CREATE INDEX idx_turns_role        ON conversation_turns(role);
+CREATE INDEX idx_turns_embedding   ON conversation_turns
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+-- Full-text search on conversation content
+CREATE INDEX idx_turns_content_fts ON conversation_turns
+    USING GIN(to_tsvector('english', content));
+
+-- ─────────────────────────────────────────────
+-- Tool executions — detailed record for agent traces
+-- ─────────────────────────────────────────────
+CREATE TABLE tool_executions (
+    execution_id    UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    turn_id         UUID NOT NULL REFERENCES conversation_turns(turn_id) ON DELETE CASCADE,
+    session_id      UUID NOT NULL,
+    tool_name       TEXT NOT NULL,
+    tool_version    TEXT,
+    input_params    JSONB NOT NULL,
+    output_result   JSONB,
+    error_message   TEXT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at    TIMESTAMPTZ,
+    duration_ms     INTEGER GENERATED ALWAYS AS (
+        EXTRACT(MILLISECONDS FROM (completed_at - started_at))::INTEGER
+    ) STORED
+);
+
+CREATE INDEX idx_tool_exec_turn    ON tool_executions(turn_id);
+CREATE INDEX idx_tool_exec_session ON tool_executions(session_id);
+CREATE INDEX idx_tool_exec_name    ON tool_executions(tool_name);
+
+-- ─────────────────────────────────────────────
+-- Audit log — immutable record of all API calls
+-- ─────────────────────────────────────────────
+CREATE TABLE conversation_audit_log (
+    log_id          BIGSERIAL PRIMARY KEY,
+    session_id      UUID NOT NULL,
+    turn_id         UUID,
+    event_type      TEXT NOT NULL,   -- 'turn_created', 'session_started', 'context_truncated', etc.
+    event_data      JSONB NOT NULL DEFAULT '{}',
+    logged_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Partition by month for manageable table sizes
+-- (In production, use declarative partitioning from day one)
+CREATE INDEX idx_audit_session    ON conversation_audit_log(session_id);
+CREATE INDEX idx_audit_logged_at  ON conversation_audit_log(logged_at DESC);
+
+-- ─────────────────────────────────────────────
+-- Row-Level Security
+-- ─────────────────────────────────────────────
+ALTER TABLE conversation_sessions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversation_turns    ENABLE ROW LEVEL SECURITY;
+
+-- Application connects as 'app_user', sets session variable to current user
+CREATE POLICY sessions_user_isolation ON conversation_sessions
+    USING (user_id = (current_setting('app.current_user_id', TRUE))::UUID);
+
+CREATE POLICY turns_user_isolation ON conversation_turns
+    USING (user_id = (current_setting('app.current_user_id', TRUE))::UUID);
+
+-- Admin role bypasses RLS
+CREATE ROLE ai_app_user;
+CREATE ROLE ai_admin;
+ALTER TABLE conversation_sessions FORCE ROW LEVEL SECURITY;
+ALTER TABLE conversation_turns    FORCE ROW LEVEL SECURITY;
+ALTER ROLE ai_admin BYPASSRLS;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema is intentionally denormalized in one place: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_id</code> is stored on both <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">conversation_sessions</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">conversation_turns</code>. This is deliberate — it allows direct user-scoped queries on turns without always joining through sessions, which matters for RLS policy performance and for semantic search queries that span sessions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.3 Reading and Writing Conversation History</h3>
+
+<p class="text-gray-300 leading-relaxed">The conversation loop in an LLM application is simple in concept: load history, append new user message, call model, save response. The implementation details are where production systems diverge from tutorials.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Writing Turns Efficiently</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># conversation_store.py
+import asyncpg
+import anthropic
+import hashlib
+import time
+from uuid import UUID, uuid4
+from typing import Optional
+from datetime import datetime, timezone
+
+client = anthropic.Anthropic()
+
+async def get_db_pool() -&gt; asyncpg.Pool:
+    return await asyncpg.create_pool(
+        dsn="postgresql://app_user:password@localhost:5432/ai_app",
+        min_size=5,
+        max_size=20,
+        command_timeout=30,
+    )
+
+async def create_session(
+    pool: asyncpg.Pool,
+    user_id: str,
+    model_name: str,
+    system_prompt: str,
+    metadata: dict = None,
+) -&gt; UUID:
+    """Create a new conversation session and return its ID."""
+    system_hash = hashlib.sha256(system_prompt.encode()).hexdigest()
+    session_id = uuid4()
+
+    async with pool.acquire() as conn:
+        # Set RLS context
+        await conn.execute(
+            "SELECT set_config('app.current_user_id', $1, TRUE)", user_id
+        )
+        await conn.execute(
+            """
+            INSERT INTO conversation_sessions
+                (session_id, user_id, model_name, system_prompt_hash,
+                 system_prompt, session_metadata)
+            VALUES ($1,
+                    (SELECT user_id FROM ai_users WHERE external_id = $2),
+                    $3, $4, $5, $6)
+            """,
+            session_id,
+            user_id,
+            model_name,
+            system_hash,
+            system_prompt,
+            metadata or {},
+        )
+
+    return session_id
+
+
+async def load_conversation_history(
+    pool: asyncpg.Pool,
+    session_id: UUID,
+    user_id: str,
+    max_turns: int = 50,
+    max_tokens: int = 150000,
+) -&gt; list[dict]:
+    """
+    Load conversation history with token budget enforcement.
+    Returns messages in the format expected by Anthropic/OpenAI APIs.
+    """
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "SELECT set_config('app.current_user_id', $1, TRUE)", user_id
+        )
+        rows = await conn.fetch(
+            """
+            SELECT role, content, content_tokens, turn_index
+            FROM conversation_turns
+            WHERE session_id = $1
+              AND role IN ('user', 'assistant')
+            ORDER BY turn_index ASC
+            LIMIT $2
+            """,
+            session_id,
+            max_turns,
+        )
+
+    # Apply token budget from the end (keep most recent turns)
+    messages = []
+    token_count = 0
+    for row in reversed(rows):
+        turn_tokens = row["content_tokens"] or len(row["content"]) // 4  # rough estimate
+        if token_count + turn_tokens &gt; max_tokens:
+            break
+        messages.insert(0, {"role": row["role"], "content": row["content"]})
+        token_count += turn_tokens
+
+    return messages
+
+
+async def save_turn(
+    pool: asyncpg.Pool,
+    session_id: UUID,
+    user_id: str,
+    role: str,
+    content: str,
+    turn_index: int,
+    input_tokens: int = None,
+    output_tokens: int = None,
+    latency_ms: int = None,
+    total_latency_ms: int = None,
+    finish_reason: str = None,
+    cost_usd: float = None,
+) -&gt; UUID:
+    """Persist a single conversation turn."""
+    turn_id = uuid4()
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "SELECT set_config('app.current_user_id', $1, TRUE)", user_id
+        )
+        await conn.execute(
+            """
+            INSERT INTO conversation_turns (
+                turn_id, session_id, user_id, turn_index, role, content,
+                input_tokens, output_tokens, latency_ms, total_latency_ms,
+                finish_reason, cost_usd
+            ) VALUES ($1,$2,
+                      (SELECT user_id FROM ai_users WHERE external_id = $3),
+                      $4,$5,$6,$7,$8,$9,$10,$11,$12)
+            """,
+            turn_id, session_id, user_id, turn_index, role, content,
+            input_tokens, output_tokens, latency_ms, total_latency_ms,
+            finish_reason, cost_usd,
+        )
+
+        # Update session last_active and token counter
+        await conn.execute(
+            """
+            UPDATE conversation_sessions
+            SET last_active_at = now(),
+                context_window_used = context_window_used + COALESCE($1, 0) + COALESCE($2, 0)
+            WHERE session_id = $3
+            """,
+            input_tokens, output_tokens, session_id,
+        )
+
+    return turn_id
+
+
+async def chat_turn(
+    pool: asyncpg.Pool,
+    session_id: UUID,
+    user_id: str,
+    user_message: str,
+) -&gt; str:
+    """Execute one complete turn: save user message, call Claude, save response."""
+
+    # Get current turn index
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "SELECT set_config('app.current_user_id', $1, TRUE)", user_id
+        )
+        result = await conn.fetchrow(
+            "SELECT COALESCE(MAX(turn_index), -1) + 1 AS next_index "
+            "FROM conversation_turns WHERE session_id = $1",
+            session_id,
+        )
+        next_index = result["next_index"]
+
+        session = await conn.fetchrow(
+            "SELECT system_prompt, model_name FROM conversation_sessions "
+            "WHERE session_id = $1",
+            session_id,
+        )
+
+    # Save user turn
+    await save_turn(pool, session_id, user_id, "user", user_message, next_index)
+
+    # Load history (includes the turn we just saved)
+    history = await load_conversation_history(pool, session_id, user_id)
+
+    # Call Claude
+    t_start = time.time()
+    response = client.messages.create(
+        model=session["model_name"],
+        max_tokens=4096,
+        system=session["system_prompt"],
+        messages=history,
+    )
+    elapsed_ms = int((time.time() - t_start) * 1000)
+
+    assistant_content = response.content[0].text
+
+    # Claude pricing (claude-3-5-sonnet): $3/M input, $15/M output
+    cost = (response.usage.input_tokens / 1_000_000 * 3.0) + \
+           (response.usage.output_tokens / 1_000_000 * 15.0)
+
+    # Save assistant turn
+    await save_turn(
+        pool=pool,
+        session_id=session_id,
+        user_id=user_id,
+        role="assistant",
+        content=assistant_content,
+        turn_index=next_index + 1,
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+        total_latency_ms=elapsed_ms,
+        finish_reason=response.stop_reason,
+        cost_usd=cost,
+    )
+
+    return assistant_content</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Querying Conversation History for Analytics</p>
+
+<p class="text-gray-300 leading-relaxed">The relational model pays dividends here. These queries are impossible in a vector-only store without exporting data:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Token consumption by user and tier this month
+SELECT
+    u.external_id,
+    u.tier,
+    COUNT(DISTINCT s.session_id)                    AS sessions,
+    COUNT(t.turn_id)                                AS total_turns,
+    SUM(t.output_tokens)                            AS output_tokens,
+    ROUND(SUM(t.cost_usd)::NUMERIC, 4)             AS total_cost_usd,
+    ROUND(AVG(t.total_latency_ms))                  AS avg_latency_ms
+FROM ai_users u
+JOIN conversation_sessions s ON s.user_id = u.user_id
+JOIN conversation_turns t    ON t.session_id = s.session_id
+WHERE t.created_at &gt;= date_trunc('month', now())
+  AND t.role = 'assistant'
+GROUP BY u.external_id, u.tier
+ORDER BY total_cost_usd DESC;
+
+-- Sessions where context window is &gt;80% consumed (approaching truncation)
+SELECT
+    s.session_id,
+    u.external_id,
+    s.model_name,
+    s.context_window_used,
+    s.max_context_tokens,
+    ROUND(100.0 * s.context_window_used / s.max_context_tokens, 1) AS pct_used,
+    s.last_active_at
+FROM conversation_sessions s
+JOIN ai_users u ON u.user_id = s.user_id
+WHERE s.context_window_used::FLOAT / s.max_context_tokens &gt; 0.8
+  AND s.is_archived = FALSE
+ORDER BY pct_used DESC;
+
+-- Detect users who are looping (sending very similar messages repeatedly)
+WITH turn_pairs AS (
+    SELECT
+        session_id,
+        content,
+        LAG(content) OVER (PARTITION BY session_id ORDER BY turn_index) AS prev_content,
+        turn_index
+    FROM conversation_turns
+    WHERE role = 'user'
+)
+SELECT
+    session_id,
+    count(*) AS repeated_messages
+FROM turn_pairs
+WHERE similarity(content, COALESCE(prev_content, '')) &gt; 0.85
+GROUP BY session_id
+HAVING count(*) &gt; 2
+ORDER BY repeated_messages DESC;
+
+-- Average turns per session by model (helps evaluate model effectiveness)
+SELECT
+    model_name,
+    COUNT(DISTINCT s.session_id)                            AS sessions,
+    ROUND(AVG(turn_count), 1)                              AS avg_turns_per_session,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY turn_count) AS median_turns
+FROM conversation_sessions s
+JOIN LATERAL (
+    SELECT COUNT(*) AS turn_count
+    FROM conversation_turns t
+    WHERE t.session_id = s.session_id
+) tc ON TRUE
+WHERE s.started_at &gt;= now() - INTERVAL '30 days'
+GROUP BY model_name
+ORDER BY avg_turns_per_session DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.4 Context Window Management and Summarization</h3>
+
+<p class="text-gray-300 leading-relaxed">The 200K context window in Claude 3.5 Sonnet sounds enormous until you have a power user with 400 conversation turns. Token budget management is not optional — it's the difference between a working product and one that silently starts dropping the beginning of conversations without telling anyone.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Automatic Context Summarization</p>
+
+<p class="text-gray-300 leading-relaxed">When a session approaches its token limit, you have three options: truncate old turns, compress with summarization, or start a new session. Summarization is the most user-friendly. Here is a pattern that does this automatically using a Celery task.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

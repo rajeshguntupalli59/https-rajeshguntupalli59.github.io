@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 26: Caching Embeddings: Avoiding Redundant API Calls — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 26: Caching Embeddings: Avoiding Redundant API Calls. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 26 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 26: Caching Embeddings: Avoiding Redundant API Calls</h2>
+
+<p class="text-gray-300 leading-relaxed">Every production RAG pipeline has a hidden cost center that rarely shows up in architecture diagrams: redundant embedding API calls. When a user asks "what is our refund policy?" for the tenth time today, your application may be paying OpenAI or Cohere to embed that string ten times. At $0.00002 per token, that sounds trivial until you're handling 500,000 queries per day across a customer support platform and discover that 40% of your embedding API spend goes toward strings you've already processed. Embedding caching is the database professional's answer to this problem — and it turns out that DBAs are uniquely well-positioned to implement it correctly, because the patterns are closer to query result caching and materialized views than to anything exotic. This chapter covers how embeddings are cached at multiple layers, how to choose the right storage backend, how to handle cache invalidation when models change, and how to measure whether your cache is actually working.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Embeddings Are Unusually Cacheable</h3>
+
+<p class="text-gray-300 leading-relaxed">Most API responses are not good caching candidates because the output depends on mutable state. A REST call to fetch a user's account balance is stale the moment the balance changes. Embeddings are different: they are a deterministic, stateless function of two inputs — the text string and the model version. Given the same string and the same model, you will always get the same floating-point vector back. This is a strong guarantee you can exploit.</p>
+
+<p class="text-gray-300 leading-relaxed">This property puts embeddings in the same category as computed columns and deterministic scalar functions in relational databases. Just as you would materialize <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOWER(email)</code> into a generated column rather than recomputing it on every query, you can materialize embeddings into a cache rather than calling the API on every request.</p>
+
+<p class="text-gray-300 leading-relaxed">The economics reinforce the case. Embedding API pricing is typically token-based:</p>
+
+<p class="text-gray-300 leading-relaxed">| Provider | Model | Price (per 1M tokens) |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| OpenAI | text-embedding-3-small | $0.02 |</p>
+<p class="text-gray-300 leading-relaxed">| OpenAI | text-embedding-3-large | $0.13 |</p>
+<p class="text-gray-300 leading-relaxed">| Cohere | embed-english-v3.0 | $0.10 |</p>
+<p class="text-gray-300 leading-relaxed">| AWS Bedrock | Titan Embed Text v2 | $0.02 |</p>
+<p class="text-gray-300 leading-relaxed">| Google Vertex AI | text-embedding-004 | $0.00002 per 1K chars |</p>
+
+<p class="text-gray-300 leading-relaxed">At 500,000 daily queries averaging 20 tokens each, you're processing 10 million tokens per day. If 40% of those are cache-able repeated queries, you're looking at $29–$52/month in avoidable OpenAI costs for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>. That's before you account for latency: a cache hit from Redis takes under 1ms; a round-trip to OpenAI's API takes 50–200ms.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">What is worth caching?</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Not all text is equally cacheable. Query strings from users tend to cluster heavily around common questions — support tickets, product searches, FAQ lookups. Document chunks in a RAG corpus are almost always worth caching because they are embedded once during ingestion and repeatedly compared against at query time. If you are already storing document embeddings in pgvector or Pinecone, the document side of the cache is essentially already solved. The query side is where the additional caching layer pays off.</p>
+
+<p class="text-gray-300 leading-relaxed">A rough heuristic from production systems: if your query cache hit rate (QHR) is below 20%, caching overhead may not justify the complexity. If QHR is above 35%, caching will deliver measurable cost and latency reduction. Most user-facing search and Q&A applications land between 30% and 60% QHR once the system is warmed up.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cache Architecture: Where Embeddings Live</h3>
+
+<p class="text-gray-300 leading-relaxed">Embedding caches can be implemented at four distinct layers, and production systems often use two or three simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 1: In-process memory cache</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The fastest option — a Python dictionary or LRU cache living inside the application process. Zero network overhead. Appropriate for high-frequency, low-cardinality queries (think: the ten most common support questions). Dies on process restart, not shared across instances.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 2: Distributed in-memory cache (Redis, Memcached)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Shared across application instances, survives process restarts, sub-millisecond latency over a local network. The standard workhorse for embedding caches in multi-instance deployments. Redis is preferred because it supports structured data types and can store binary blobs for embedding vectors efficiently.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3: Persistent database cache (PostgreSQL, SQLite)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Survives server restarts and infrastructure events. Slower than Redis but queryable. Useful when you need to audit which embeddings have been generated, track model versions, or join embedding cache data with other relational data. pgvector is a natural fit here because the cache table can double as a lightweight vector store.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 4: Vector store with metadata (Pinecone, Weaviate, Qdrant)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For cases where the cached embedding is also the search target. The vector store itself becomes the cache — if you indexed the document chunk, you already have its embedding. Querying the cache and querying the vector store are the same operation.</p>
+
+<p class="text-gray-300 leading-relaxed">The following diagram shows a typical layered architecture:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>User Query
+    │
+    ▼
+[L1: In-process LRU cache]  ──hit──▶ Return embedding
+    │ miss
+    ▼
+[L2: Redis cache]           ──hit──▶ Return embedding + backfill L1
+    │ miss
+    ▼
+[L3: PostgreSQL cache table] ─hit──▶ Return embedding + backfill L1, L2
+    │ miss
+    ▼
+[Embedding API]             ──────▶ Store in L1, L2, L3 + return embedding</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Implementing a Redis Embedding Cache</h3>
+
+<p class="text-gray-300 leading-relaxed">Redis is the most common choice for production embedding caches. The key design decisions are: how to structure the cache key, how to serialize the vector, and how to set TTLs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cache key design</strong> is the same problem as cache key design in any application layer: the key must uniquely identify the cache entry without collisions. For embeddings, the natural key is a hash of the input text combined with the model identifier:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>cache_key = f"emb:{model_id}:{sha256(text.strip().lower())}"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Normalizing the text (stripping whitespace, lowercasing) before hashing collapses trivial variations. Whether you want to normalize depends on whether your embedding model treats "What is the refund policy?" and "what is the refund policy?" as identical — most models produce vectors that are nearly identical for such pairs, so normalization increases cache hit rate at the cost of slight semantic imprecision.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Vector serialization</strong> choices affect storage size and deserialization speed. A 1536-dimension float32 vector (OpenAI <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code>) is 6,144 bytes as raw binary. JSON serialization of the same vector runs roughly 15,000–18,000 bytes. Use binary serialization (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">numpy.tobytes()</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">struct.pack</code>) unless you have tooling constraints that require JSON.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import hashlib
+import numpy as np
+import redis
+import openai
+import os
+from typing import Optional
+
+client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+r = redis.Redis(host="localhost", port=6379, db=0, decode_responses=False)
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 1536
+CACHE_TTL_SECONDS = 86400 * 7  # 7 days
+
+
+def _cache_key(text: str, model: str) -&gt; str:
+    """Build a deterministic cache key from text and model identifier."""
+    normalized = text.strip().lower()
+    text_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"emb:{model}:{text_hash}"
+
+
+def _serialize_vector(vector: list[float]) -&gt; bytes:
+    """Pack a float32 vector to compact binary."""
+    return np.array(vector, dtype=np.float32).tobytes()
+
+
+def _deserialize_vector(data: bytes) -&gt; list[float]:
+    """Unpack binary bytes back to a float list."""
+    return np.frombuffer(data, dtype=np.float32).tolist()
+
+
+def get_embedding(text: str, model: str = EMBEDDING_MODEL) -&gt; list[float]:
+    """
+    Return the embedding for `text`, hitting Redis cache first.
+    Falls through to OpenAI API on cache miss.
+    """
+    key = _cache_key(text, model)
+
+    # L2: Check Redis
+    cached = r.get(key)
+    if cached is not None:
+        return _deserialize_vector(cached)
+
+    # Cache miss — call the API
+    response = client.embeddings.create(input=[text], model=model)
+    vector = response.data[0].embedding
+
+    # Write to Redis with TTL
+    serialized = _serialize_vector(vector)
+    r.setex(key, CACHE_TTL_SECONDS, serialized)
+
+    return vector
+
+
+def get_embeddings_batch(
+    texts: list[str], model: str = EMBEDDING_MODEL
+) -&gt; list[list[float]]:
+    """
+    Batch embedding with partial cache hits.
+    Only calls the API for texts not found in cache.
+    """
+    results: list[Optional[list[float]]] = [None] * len(texts)
+    uncached_indices: list[int] = []
+    uncached_texts: list[str] = []
+
+    # Check cache for all texts
+    for i, text in enumerate(texts):
+        key = _cache_key(text, model)
+        cached = r.get(key)
+        if cached is not None:
+            results[i] = _deserialize_vector(cached)
+        else:
+            uncached_indices.append(i)
+            uncached_texts.append(text)
+
+    # Call API only for uncached texts
+    if uncached_texts:
+        response = client.embeddings.create(input=uncached_texts, model=model)
+        for batch_i, api_result in enumerate(response.data):
+            original_i = uncached_indices[batch_i]
+            vector = api_result.embedding
+            results[original_i] = vector
+
+            # Populate cache
+            key = _cache_key(uncached_texts[batch_i], model)
+            r.setex(key, CACHE_TTL_SECONDS, _serialize_vector(vector))
+
+    cache_hit_rate = (len(texts) - len(uncached_texts)) / len(texts) * 100
+    print(
+        f"Batch: {len(texts)} total, {len(uncached_texts)} API calls, "
+        f"{cache_hit_rate:.1f}% cache hit rate"
+    )
+
+    return results  # type: ignore[return-value]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The batch function is important for production throughput. If your application receives 50 simultaneous search queries, you want to resolve cache hits immediately and then fire a single batched API call for the misses — not 50 individual API calls.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory sizing for Redis</strong>: A 1536-dim float32 vector at 6 KB per entry, plus ~100 bytes of Redis key overhead, is roughly 6.2 KB per cached embedding. One million cached embeddings consume approximately 6.2 GB of Redis memory. Factor this into your cluster sizing. For <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> (3072 dimensions), double those figures.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">PostgreSQL as a Persistent Embedding Cache</h3>
+
+<p class="text-gray-300 leading-relaxed">When you need durability, auditability, or the ability to query cache contents alongside relational data, PostgreSQL with pgvector is a natural fit. The same table that stores cached embeddings can participate in vector similarity queries, making it a dual-purpose structure.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Create the embedding cache table
+CREATE TABLE embedding_cache (
+    id              BIGSERIAL PRIMARY KEY,
+    cache_key       TEXT NOT NULL,
+    input_text      TEXT NOT NULL,
+    model_id        TEXT NOT NULL,
+    model_version   TEXT,
+    embedding       VECTOR(1536),
+    token_count     INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_accessed   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    access_count    INTEGER NOT NULL DEFAULT 1,
+    CONSTRAINT uq_embedding_cache_key UNIQUE (cache_key)
+);
+
+-- Index for cache key lookups (primary access pattern)
+CREATE INDEX idx_embedding_cache_key
+    ON embedding_cache (cache_key);
+
+-- Index for cache maintenance queries
+CREATE INDEX idx_embedding_cache_model_created
+    ON embedding_cache (model_id, created_at);
+
+-- Index for LRU-style eviction queries
+CREATE INDEX idx_embedding_cache_last_accessed
+    ON embedding_cache (last_accessed);
+
+-- Optional: HNSW index if you want to do similarity search
+-- on the cache itself (e.g., find semantically similar cached queries)
+CREATE INDEX idx_embedding_cache_hnsw
+    ON embedding_cache
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Upsert a new cache entry (insert or update on conflict)
+INSERT INTO embedding_cache
+    (cache_key, input_text, model_id, model_version, embedding, token_count)
+VALUES
+    ($1, $2, $3, $4, $5::VECTOR, $6)
+ON CONFLICT (cache_key) DO UPDATE SET
+    last_accessed = NOW(),
+    access_count  = embedding_cache.access_count + 1;
+
+-- Cache lookup with access tracking
+WITH cache_lookup AS (
+    UPDATE embedding_cache
+    SET
+        last_accessed = NOW(),
+        access_count  = access_count + 1
+    WHERE cache_key = $1
+    RETURNING embedding, model_id
+)
+SELECT embedding, model_id FROM cache_lookup;
+
+-- Cache utilization report
+SELECT
+    model_id,
+    COUNT(*)                                    AS total_entries,
+    SUM(access_count)                           AS total_accesses,
+    AVG(access_count)                           AS avg_accesses_per_entry,
+    COUNT(*) FILTER (WHERE access_count = 1)    AS single_use_entries,
+    MAX(created_at)                             AS newest_entry,
+    MIN(created_at)                             AS oldest_entry,
+    pg_size_pretty(
+        COUNT(*) * 1536 * 4
+    )                                           AS estimated_vector_storage
+FROM embedding_cache
+GROUP BY model_id;
+
+-- Evict entries not accessed in 30 days (LRU eviction)
+DELETE FROM embedding_cache
+WHERE last_accessed &lt; NOW() - INTERVAL '30 days'
+  AND access_count &lt; 3
+RETURNING id, input_text, last_accessed;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">access_count</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_accessed</code> columns let you implement proper LRU eviction policies and identify which cache entries are worth keeping. Entries with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">access_count = 1</code> that are more than 30 days old are candidates for eviction — they were embedded once and never reused, which means caching them didn't pay off.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is a Python integration layer that uses the PostgreSQL cache with a Redis L2 in front of it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import hashlib
+import asyncio
+import numpy as np
+import asyncpg
+import redis.asyncio as aioredis
+import openai
+import os
+from typing import Optional
+
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379")
+PG_DSN = os.environ.get("PG_DSN", "postgresql://user:pass@localhost/vectordb")
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+CACHE_TTL_SECONDS = 86400 * 7
+
+
+class TieredEmbeddingCache:
+    """
+    Two-tier embedding cache: Redis (fast) → PostgreSQL (persistent).
+    Falls through to OpenAI API on full cache miss.
+    """
+
+    def __init__(self):
+        self.openai_client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+        self.redis: Optional[aioredis.Redis] = None
+        self.pg_pool: Optional[asyncpg.Pool] = None
+
+    async def initialize(self):
+        self.redis = await aioredis.from_url(REDIS_URL, decode_responses=False)
+        self.pg_pool = await asyncpg.create_pool(PG_DSN, min_size=2, max_size=10)
+
+    async def close(self):
+        if self.redis:
+            await self.redis.aclose()
+        if self.pg_pool:
+            await self.pg_pool.close()
+
+    def _cache_key(self, text: str, model: str) -&gt; str:
+        normalized = text.strip().lower()
+        h = hashlib.sha256(normalized.encode()).hexdigest()
+        return f"emb:{model}:{h}"
+
+    async def get(self, text: str, model: str = EMBEDDING_MODEL) -&gt; list[float]:
+        key = self._cache_key(text, model)
+
+        # L1: Redis check
+        cached_bytes = await self.redis.get(key)
+        if cached_bytes:
+            return np.frombuffer(cached_bytes, dtype=np.float32).tolist()
+
+        # L2: PostgreSQL check
+        async with self.pg_pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE embedding_cache
+                SET last_accessed = NOW(), access_count = access_count + 1
+                WHERE cache_key = $1
+                RETURNING embedding
+                """,
+                key,
+            )
+        if row:
+            vector = list(row["embedding"])
+            # Backfill Redis
+            await self.redis.setex(
+                key,
+                CACHE_TTL_SECONDS,
+                np.array(vector, dtype=np.float32).tobytes(),
+            )
+            return vector
+
+        # Full cache miss — call API
+        response = await self.openai_client.embeddings.create(
+            input=[text], model=model
+        )
+        vector = response.data[0].embedding
+        token_count = response.usage.total_tokens
+
+        # Write to both cache layers
+        vector_bytes = np.array(vector, dtype=np.float32).tobytes()
+        await self.redis.setex(key, CACHE_TTL_SECONDS, vector_bytes)
+
+        async with self.pg_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO embedding_cache
+                    (cache_key, input_text, model_id, embedding, token_count)
+                VALUES ($1, $2, $3, $4::VECTOR, $5)
+                ON CONFLICT (cache_key) DO UPDATE SET
+                    last_accessed = NOW(),
+                    access_count  = embedding_cache.access_count + 1
+                """,
+                key,
+                text,
+                model,
+                vector,
+                token_count,
+            )
+
+        return vector
+
+
+# Usage
+async def main():
+    cache = TieredEmbeddingCache()
+    await cache.initialize()
+
+    queries = [
+        "What is your return policy?",
+        "How do I track my order?",
+        "What is your return policy?",  # duplicate — should hit cache
+        "Where is my refund?",
+    ]
+
+    for q in queries:
+        vec = await cache.get(q)
+        print(f"Query: {q[:40]:&lt;40} | Vector dim: {len(vec)}")
+
+    await cache.close()
+
+
+asyncio.run(main())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cache Invalidation: The Hard Part</h3>
+
+<p class="text-gray-300 leading-relaxed">The classic database aphorism — there are only two hard things in computer science, cache invalidation and naming things — applies directly to embedding caches, but the domain gives you a concrete trigger for invalidation: <strong class="text-white">model version changes</strong>.</p>
+
+<p class="text-gray-300 leading-relaxed">When OpenAI releases <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> and you migrate from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code>, every cached embedding is now stale. A vector from ada-002 is not semantically comparable to a vector from 3-small — the embedding spaces are different. Querying a Pinecone index of 3-small vectors using an ada-002 cached query embedding will return nonsense rankings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model version tagging</strong> is the primary defense. Every cache entry must include the model identifier as part of the cache key and as a stored attribute. The examples above use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model_id</code> in both the Redis key and the PostgreSQL row. A model migration procedure looks like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Step 1: Identify how many entries need migration
+SELECT
+    model_id,
+    COUNT(*) AS entry_count,
+    MIN(created_at) AS oldest,
+    MAX(created_at) AS newest
+FROM embedding_cache
+GROUP BY model_id
+ORDER BY entry_count DESC;
+
+-- Step 2: Mark old model entries for re-embedding
+-- (Rather than deleting immediately, flag them so the application
+--  can re-embed on next access — a lazy migration pattern)
+ALTER TABLE embedding_cache
+    ADD COLUMN IF NOT EXISTS needs_refresh BOOLEAN NOT NULL DEFAULT FALSE;
+
+UPDATE embedding_cache
+SET needs_refresh = TRUE
+WHERE model_id = 'text-embedding-ada-002';
+
+-- Step 3: After confirming new model entries are populating,
+-- remove the old model cache entries
+DELETE FROM embedding_cache
+WHERE model_id = 'text-embedding-ada-002'
+  AND needs_refresh = TRUE
+  AND created_at &lt; NOW() - INTERVAL '7 days';
+
+-- Step 4: Verify cache health after migration
+SELECT
+    model_id,
+    needs_refresh,
+    COUNT(*) AS entries,
+    AVG(access_count) AS avg_hits
+FROM embedding_cache
+GROUP BY model_id, needs_refresh
+ORDER BY model_id, needs_refresh;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Content-based invalidation</strong> is trickier. If the underlying document changes, its cached embedding is stale. For document embeddings in RAG pipelines, the standard approach is to tie cache invalidation to the document's content hash: when the document changes, the content hash changes, the cache key changes, and the old entry is simply orphaned (and eventually evicted by your TTL or LRU policy).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import hashlib
+
+
+def document_cache_key(content: str, model: str) -&gt; str:
+    """
+    Cache key for document embeddings.
+    Key changes automatically when content changes —
+    old entries expire via TTL without explicit invalidation.
+    """
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return f"doc_emb:{model}:{content_hash}"
+
+
+def query_cache_key(query: str, model: str) -&gt; str:
+    """
+    Cache key for user query embeddings.
+    Normalized to improve hit rate across minor variations.
+    """
+    normalized = query.strip().lower()
+    # Remove punctuation that doesn't affect semantic meaning
+    normalized = "".join(c for c in normalized if c.isalnum() or c.isspace())
+    normalized = " ".join(normalized.split())  # collapse whitespace
+    query_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return f"query_emb:{model}:{query_hash}"
+
+
+# Demonstrate key stability and collision avoidance
+tests = [
+    ("What is your return policy?", "query_cache_key"),
+    ("what is your return policy?", "query_cache_key"),   # same after normalize
+    ("What is your return policy?  ", "query_cache_key"), # same after normalize
+    ("What is your RETURN policy?", "query_cache_key"),   # same after lowercase
+    ("What is your refund policy?", "query_cache_key"),   # different — should differ
+]
+
+for text, fn in tests:
+    key = query_cache_key(text, "text-embedding-3-small")
+    print(f"{text:&lt;45} → {key[-16:]}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The output of normalizing the first four queries produces the same hash, maximizing cache reuse for trivially different user inputs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">LangChain and LlamaIndex Cache Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">Production RAG pipelines are typically built on LangChain or LlamaIndex, and both frameworks have built-in mechanisms for embedding caching that connect to the architecture patterns above.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LangChain CacheBackedEmbeddings</strong> wraps any embedding model with a cache layer and supports multiple storage backends:</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 17: Knowledge Base Updates: Incremental Indexing — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 17: Knowledge Base Updates: Incremental Indexing. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 17 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 17: Knowledge Base Updates: Incremental Indexing</h2>
+
+<p class="text-gray-300 leading-relaxed">A knowledge base that never changes is a liability. Documents get updated, records become stale, new content arrives continuously, and the embeddings that power your RAG pipeline need to reflect the current state of your data — not last Tuesday's snapshot. This chapter covers how to build an incremental indexing system where PostgreSQL drives change detection, queuing, re-embedding, and vector store maintenance without full reprocessing. You will build pipelines that are correct under concurrent load, cost-efficient with embedding API calls, and observable enough that you know exactly what your knowledge base contains and when it was last synchronized.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.1 The Problem with Batch Re-indexing</h3>
+
+<p class="text-gray-300 leading-relaxed">Most RAG systems start with a one-time indexing script. You dump your documents, call the embeddings API in batches, insert rows into a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chunks</code> table with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector</code> column, and ship. This works fine for a static corpus. The moment your content changes — a support article is revised, a product is discontinued, a policy document is superseded — you face a choice: re-index everything or build something smarter.</p>
+
+<p class="text-gray-300 leading-relaxed">Re-indexing everything is expensive in three ways: embedding API costs scale linearly with corpus size, indexing jobs consume database I/O that affects production queries, and there is always a window where your search results return stale or contradictory information. A 500,000-chunk corpus at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> pricing costs roughly $10 per full re-index. Run that nightly and it adds up; run it hourly and it becomes untenable.</p>
+
+<p class="text-gray-300 leading-relaxed">The smarter approach treats knowledge base updates as a stream of events. Each time a source document changes, only the affected chunks get re-embedded. The rest of the corpus remains intact. This is incremental indexing, and PostgreSQL is unusually well-suited to implement it because it already owns your source data, has native change notification via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code>, and supports the row-level bookkeeping you need through triggers, audit tables, and JSONB metadata.</p>
+
+<p class="text-gray-300 leading-relaxed">The schema design starts with separating concerns cleanly.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core tables for an incremental indexing system
+
+CREATE EXTENSION IF NOT EXISTS pgvector;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Source documents: the raw content before chunking
+CREATE TABLE documents (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    source_uri      TEXT NOT NULL UNIQUE,          -- file path, URL, S3 key, etc.
+    title           TEXT,
+    content_hash    TEXT NOT NULL,                  -- SHA-256 of raw content
+    raw_content     TEXT NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    indexed_at      TIMESTAMPTZ,                    -- NULL = never indexed
+    index_version   INTEGER NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'indexing', 'indexed', 'failed', 'deleted'))
+);
+
+CREATE INDEX idx_documents_status ON documents (status);
+CREATE INDEX idx_documents_content_hash ON documents (content_hash);
+CREATE INDEX idx_documents_indexed_at ON documents (indexed_at) WHERE indexed_at IS NOT NULL;
+
+-- Chunks: the indexed units your retrieval system searches
+CREATE TABLE document_chunks (
+    id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index     INTEGER NOT NULL,               -- position within document
+    chunk_text      TEXT NOT NULL,
+    chunk_hash      TEXT NOT NULL,                  -- SHA-256 of chunk_text
+    embedding       VECTOR(1536),                   -- OpenAI text-embedding-3-small
+    token_count     INTEGER,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    embedded_at     TIMESTAMPTZ,
+    embedding_model TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (document_id, chunk_index)
+);
+
+CREATE INDEX idx_chunks_document_id ON document_chunks (document_id);
+CREATE INDEX idx_chunks_embedding ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+CREATE INDEX idx_chunks_chunk_hash ON document_chunks (chunk_hash);
+
+-- Indexing queue: work items for the ingestion worker
+CREATE TABLE indexing_queue (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    operation       TEXT NOT NULL CHECK (operation IN ('index', 'reindex', 'delete')),
+    priority        INTEGER NOT NULL DEFAULT 5,     -- lower = higher priority
+    payload         JSONB NOT NULL DEFAULT '{}',
+    scheduled_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    last_error      TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'cancelled'))
+);
+
+CREATE INDEX idx_queue_status_priority ON indexing_queue (status, priority, scheduled_at)
+    WHERE status = 'pending';
+CREATE INDEX idx_queue_document_id ON indexing_queue (document_id);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema separates the source document (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">documents</code>), the indexed chunks (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code>), and the work queue (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">indexing_queue</code>). The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content_hash</code> column on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">documents</code> is what makes incremental indexing possible: you compare the incoming hash against the stored hash, and only queue a reindex when they differ.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.2 Change Detection with Triggers and pg_notify</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL triggers give you change detection at the database layer, below the application. Any process that updates a document — a sync job, a CMS webhook, a user edit — automatically fires the trigger without the application needing to know about the indexing system.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Trigger function: detect changes and queue indexing work
+CREATE OR REPLACE FUNCTION fn_document_change_trigger()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_operation TEXT;
+    v_queue_id  BIGINT;
+    v_payload   JSONB;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        -- Document deleted: queue a cleanup operation
+        INSERT INTO indexing_queue (document_id, operation, priority, payload)
+        VALUES (OLD.id, 'delete', 1, jsonb_build_object(
+            'source_uri', OLD.source_uri,
+            'deleted_at', NOW()
+        ));
+
+        -- Notify workers immediately
+        PERFORM pg_notify(
+            'indexing_events',
+            jsonb_build_object(
+                'operation', 'delete',
+                'document_id', OLD.id,
+                'source_uri', OLD.source_uri
+            )::text
+        );
+        RETURN OLD;
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        v_operation := 'index';
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Only reindex if content actually changed
+        IF OLD.content_hash = NEW.content_hash THEN
+            RETURN NEW;  -- metadata-only update, no reindex needed
+        END IF;
+        v_operation := 'reindex';
+        -- Cancel any pending queue items for this document
+        UPDATE indexing_queue
+        SET status = 'cancelled'
+        WHERE document_id = NEW.id
+          AND status = 'pending';
+    END IF;
+
+    v_payload := jsonb_build_object(
+        'source_uri',     NEW.source_uri,
+        'content_hash',   NEW.content_hash,
+        'operation',      v_operation,
+        'triggered_at',   NOW()
+    );
+
+    INSERT INTO indexing_queue (document_id, operation, priority, payload)
+    VALUES (NEW.id, v_operation, 5, v_payload)
+    RETURNING id INTO v_queue_id;
+
+    -- Update document status
+    UPDATE documents SET status = 'pending' WHERE id = NEW.id;
+
+    -- Notify async workers via pg_notify
+    PERFORM pg_notify(
+        'indexing_events',
+        jsonb_build_object(
+            'queue_id',    v_queue_id,
+            'operation',   v_operation,
+            'document_id', NEW.id
+        )::text
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach triggers to the documents table
+CREATE TRIGGER trg_document_insert
+    AFTER INSERT ON documents
+    FOR EACH ROW EXECUTE FUNCTION fn_document_change_trigger();
+
+CREATE TRIGGER trg_document_update
+    AFTER UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION fn_document_change_trigger();
+
+CREATE TRIGGER trg_document_delete
+    BEFORE DELETE ON documents
+    FOR EACH ROW EXECUTE FUNCTION fn_document_change_trigger();
+
+-- Function to auto-update updated_at
+CREATE OR REPLACE FUNCTION fn_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at := NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_documents_updated_at
+    BEFORE UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+-- View to monitor queue health at a glance
+CREATE VIEW v_indexing_queue_stats AS
+SELECT
+    operation,
+    status,
+    COUNT(*) AS count,
+    MIN(scheduled_at) AS oldest_item,
+    AVG(EXTRACT(EPOCH FROM (completed_at - started_at)))
+        FILTER (WHERE completed_at IS NOT NULL) AS avg_processing_seconds
+FROM indexing_queue
+GROUP BY operation, status
+ORDER BY operation, status;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The trigger has one subtle but important behavior: when a document is updated, it cancels any existing pending queue items before inserting a new one. Without this, a document that changes five times in quick succession will generate five reindex jobs when only the final state matters.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> call is what makes the system responsive. Workers listening on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">indexing_events</code> channel wake up within milliseconds of a change rather than polling the queue table on a fixed interval.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.3 The Ingestion Worker</h3>
+
+<p class="text-gray-300 leading-relaxed">The ingestion worker is where the actual embedding work happens. It listens for notifications, claims queue items using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT ... FOR UPDATE SKIP LOCKED</code> to prevent concurrent workers from double-processing, chunks the document text, calls the embeddings API, and writes results back to PostgreSQL. Celery handles distribution and retries.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># worker/ingestion_worker.py
+# Celery-based ingestion worker with pg_notify listener
+
+import asyncio
+import hashlib
+import json
+import logging
+import os
+import select
+import textwrap
+from datetime import datetime, timezone
+from typing import Generator
+
+import psycopg2
+import psycopg2.extras
+from celery import Celery
+from openai import OpenAI
+import tiktoken
+
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = os.environ["DATABASE_URL"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIMENSIONS = 1536
+MAX_CHUNK_TOKENS = 512
+CHUNK_OVERLAP_TOKENS = 64
+
+# Celery setup with Redis as broker
+celery_app = Celery(
+    "ingestion",
+    broker=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+    backend=os.environ.get("REDIS_URL", "redis://localhost:6379/0"),
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+    task_acks_late=True,           # Only ack after successful completion
+    worker_prefetch_multiplier=1,  # One task at a time per worker
+    task_max_retries=3,
+)
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
+
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+
+
+def chunk_text(text: str, max_tokens: int = MAX_CHUNK_TOKENS,
+               overlap_tokens: int = CHUNK_OVERLAP_TOKENS) -&gt; Generator[str, None, None]:
+    """
+    Split text into overlapping chunks by token count.
+    Tries to split on sentence boundaries within the token budget.
+    """
+    tokens = tokenizer.encode(text)
+    total_tokens = len(tokens)
+
+    if total_tokens &lt;= max_tokens:
+        yield text
+        return
+
+    start = 0
+    while start &lt; total_tokens:
+        end = min(start + max_tokens, total_tokens)
+        chunk_tokens = tokens[start:end]
+        chunk_text_decoded = tokenizer.decode(chunk_tokens)
+
+        # Try to end on a sentence boundary if we're not at the end
+        if end &lt; total_tokens:
+            last_period = chunk_text_decoded.rfind(". ")
+            last_newline = chunk_text_decoded.rfind("\n\n")
+            boundary = max(last_period, last_newline)
+            if boundary &gt; len(chunk_text_decoded) * 0.5:
+                chunk_text_decoded = chunk_text_decoded[: boundary + 1]
+
+        yield chunk_text_decoded.strip()
+        # Advance by max_tokens minus overlap
+        start += max_tokens - overlap_tokens
+
+
+def compute_hash(text: str) -&gt; str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def embed_texts(texts: list[str]) -&gt; list[list[float]]:
+    """Call OpenAI embeddings API with batching."""
+    all_embeddings = []
+    batch_size = 100  # OpenAI allows up to 2048 inputs but we keep batches small
+
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        response = openai_client.embeddings.create(
+            input=batch,
+            model=EMBEDDING_MODEL,
+            dimensions=EMBEDDING_DIMENSIONS,
+        )
+        batch_embeddings = [item.embedding for item in response.data]
+        all_embeddings.extend(batch_embeddings)
+
+    return all_embeddings
+
+
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def process_indexing_job(self, queue_id: int):
+    """
+    Main indexing task. Claims a queue item, processes the document,
+    and updates the database with results.
+    """
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Claim the queue item atomically
+                cur.execute(
+                    """
+                    UPDATE indexing_queue
+                    SET status = 'processing',
+                        started_at = NOW(),
+                        attempts = attempts + 1
+                    WHERE id = %s
+                      AND status IN ('pending', 'failed')
+                    RETURNING id, document_id, operation, payload
+                    """,
+                    (queue_id,),
+                )
+                row = cur.fetchone()
+
+                if not row:
+                    logger.warning(f"Queue item {queue_id} not claimable (already processing or done)")
+                    return
+
+                document_id = str(row["document_id"])
+                operation = row["operation"]
+
+                if operation == "delete":
+                    _handle_delete(cur, document_id)
+                elif operation in ("index", "reindex"):
+                    _handle_index(cur, document_id, operation)
+
+                # Mark queue item complete
+                cur.execute(
+                    """
+                    UPDATE indexing_queue
+                    SET status = 'completed', completed_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (queue_id,),
+                )
+
+    except Exception as exc:
+        logger.exception(f"Failed to process queue item {queue_id}: {exc}")
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE indexing_queue
+                    SET status = 'failed',
+                        last_error = %s
+                    WHERE id = %s
+                    """,
+                    (str(exc), queue_id),
+                )
+        # Retry with exponential backoff
+        raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
+    finally:
+        conn.close()
+
+
+def _handle_delete(cur, document_id: str):
+    """Remove all chunks for a deleted document."""
+    cur.execute(
+        "DELETE FROM document_chunks WHERE document_id = %s",
+        (document_id,)
+    )
+    deleted = cur.rowcount
+    logger.info(f"Deleted {deleted} chunks for document {document_id}")
+
+
+def _handle_index(cur, document_id: str, operation: str):
+    """Chunk a document and embed only the chunks that changed."""
+    # Fetch the document
+    cur.execute(
+        "SELECT id, raw_content, content_hash, metadata FROM documents WHERE id = %s",
+        (document_id,),
+    )
+    doc = cur.fetchone()
+    if not doc:
+        raise ValueError(f"Document {document_id} not found")
+
+    # Fetch existing chunk hashes for diffing
+    cur.execute(
+        """
+        SELECT chunk_index, chunk_hash, id
+        FROM document_chunks
+        WHERE document_id = %s
+        ORDER BY chunk_index
+        """,
+        (document_id,),
+    )
+    existing_chunks = {row["chunk_index"]: row for row in cur.fetchall()}
+
+    # Generate new chunks
+    new_chunks = list(chunk_text(doc["raw_content"]))
+    new_chunk_hashes = [compute_hash(c) for c in new_chunks]
+
+    # Determine which chunks actually changed
+    chunks_to_embed = []
+    chunks_to_embed_indices = []
+    for idx, (text, hash_val) in enumerate(zip(new_chunks, new_chunk_hashes)):
+        existing = existing_chunks.get(idx)
+        if existing is None or existing["chunk_hash"] != hash_val:
+            chunks_to_embed.append(text)
+            chunks_to_embed_indices.append(idx)
+
+    logger.info(
+        f"Document {document_id}: {len(new_chunks)} chunks total, "
+        f"{len(chunks_to_embed)} need embedding"
+    )
+
+    # Embed only changed chunks
+    if chunks_to_embed:
+        embeddings = embed_texts(chunks_to_embed)
+    else:
+        embeddings = []
+
+    embedding_map = dict(zip(chunks_to_embed_indices, embeddings))
+
+    # Delete chunks that no longer exist (document got shorter)
+    indices_to_keep = list(range(len(new_chunks)))
+    if existing_chunks:
+        cur.execute(
+            """
+            DELETE FROM document_chunks
+            WHERE document_id = %s
+              AND chunk_index &gt; %s
+            """,
+            (document_id, len(new_chunks) - 1),
+        )
+
+    # Upsert each chunk
+    for idx, (text, hash_val) in enumerate(zip(new_chunks, new_chunk_hashes)):
+        token_count = len(tokenizer.encode(text))
+        embedding = embedding_map.get(idx)
+        embedding_str = f"[{','.join(str(v) for v in embedding)}]" if embedding else None
+
+        cur.execute(
+            """
+            INSERT INTO document_chunks
+                (document_id, chunk_index, chunk_text, chunk_hash,
+                 embedding, token_count, embedded_at, embedding_model, metadata)
+            VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s, %s)
+            ON CONFLICT (document_id, chunk_index) DO UPDATE SET
+                chunk_text      = EXCLUDED.chunk_text,
+                chunk_hash      = EXCLUDED.chunk_hash,
+                embedding       = COALESCE(EXCLUDED.embedding, document_chunks.embedding),
+                token_count     = EXCLUDED.token_count,
+                embedded_at     = COALESCE(EXCLUDED.embedded_at, document_chunks.embedded_at),
+                embedding_model = COALESCE(EXCLUDED.embedding_model, document_chunks.embedding_model),
+                metadata        = EXCLUDED.metadata
+            """,
+            (
+                document_id,
+                idx,
+                text,
+                hash_val,
+                embedding_str,
+                token_count,
+                datetime.now(timezone.utc) if embedding else None,
+                EMBEDDING_MODEL if embedding else None,
+                json.dumps(doc["metadata"]),
+            ),
+        )
+
+    # Mark document as indexed
+    cur.execute(
+        """
+        UPDATE documents
+        SET status = 'indexed',
+            indexed_at = NOW(),
+            index_version = index_version + 1
+        WHERE id = %s
+        """,
+        (document_id,),
+    )
+
+
+# pg_notify listener that dispatches Celery tasks
+def run_notify_listener():
+    """
+    Long-running process that listens for pg_notify events
+    and dispatches Celery tasks in response.
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
+
+    with conn.cursor() as cur:
+        cur.execute("LISTEN indexing_events;")
+
+    logger.info("Listening for indexing events on channel 'indexing_events'")
+
+    while True:
+        # Wait up to 30 seconds for a notification
+        if select.select([conn], [], [], 30) == ([], [], []):
+            # Timeout: poll for any missed queue items
+            _poll_missed_items()
+        else:
+            conn.poll()
+            while conn.notifies:
+                notify = conn.notifies.pop(0)
+                try:
+                    payload = json.loads(notify.payload)
+                    queue_id = payload.get("queue_id")
+                    if queue_id:
+                        process_indexing_job.apply_async(
+                            args=[queue_id],
+                            priority=payload.get("priority", 5),
+                        )
+                        logger.info(f"Dispatched task for queue_id={queue_id}")
+                except Exception as exc:
+                    logger.exception(f"Failed to dispatch task: {exc}")
+
+
+def _poll_missed_items():
+    """Catch any queue items that were missed (worker restart, etc.)."""
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT id FROM indexing_queue
+                    WHERE status = 'pending'
+                      AND scheduled_at &lt; NOW() - INTERVAL '5 minutes'
+                    ORDER BY priority, scheduled_at
+                    LIMIT 50
+                    """
+                )
+                for row in cur.fetchall():
+                    process_indexing_job.apply_async(args=[row["id"]])
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    run_notify_listener()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO UPDATE SET embedding = COALESCE(EXCLUDED.embedding, document_chunks.embedding)</code> pattern is worth explaining. When a chunk's text has not changed, the upsert preserves the existing embedding rather than writing NULL. This means that if you need to update chunk metadata without touching the text, the embedding survives.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Conflict-Free Re-indexing Under Concurrent Load</h3>
+
+<p class="text-gray-300 leading-relaxed">Production knowledge bases see concurrent writes. Multiple sync jobs, webhook handlers, and user actions can modify documents simultaneously. The naive queue approach fails here: two workers might both claim the same document, embed it twice, and race to write results. PostgreSQL's locking primitives solve this cleanly.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

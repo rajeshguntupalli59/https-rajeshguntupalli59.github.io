@@ -1,0 +1,686 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 29: Streaming Results from AI Back into PostgreSQL — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 29: Streaming Results from AI Back into PostgreSQL. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 29 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 29: Streaming Results from AI Back into PostgreSQL</h2>
+
+<p class="text-gray-300 leading-relaxed">Streaming is where AI applications stop feeling like batch jobs and start feeling alive. When a user sends a message to your LLM-powered application, they don't want to stare at a spinner for eight seconds — they want tokens to appear as the model generates them. But streaming creates a genuine engineering challenge: you're receiving a response as a river of partial chunks, and PostgreSQL stores complete, consistent records. Bridging that gap — capturing streamed AI output incrementally, persisting it reliably, and making it available to downstream systems in real time — is what this chapter is about. You'll learn how to wire together server-sent events, async Python, pg_notify, and PostgreSQL's own JSONB and logical replication machinery so that streaming AI responses become first-class database objects, not ephemeral byproducts of an API call.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.1 Understanding the Streaming Architecture</h3>
+
+<p class="text-gray-300 leading-relaxed">Before writing a single line of code, you need a clear mental model of what actually moves through the system when an LLM streams a response.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The token lifecycle</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When you call the OpenAI or Anthropic API with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stream=True</code>, the response comes back as a series of server-sent events (SSE). Each event carries a delta — typically one to three tokens — along with metadata like finish reason, model name, and usage statistics. Your application receives these chunks in an async generator loop, and it has several responsibilities simultaneously:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Forward chunks to the client (WebSocket, SSE endpoint, gRPC stream)</p>
+<p class="text-gray-300 leading-relaxed">2. Accumulate chunks into a coherent buffer</p>
+<p class="text-gray-300 leading-relaxed">3. Persist the buffer to PostgreSQL at appropriate intervals</p>
+<p class="text-gray-300 leading-relaxed">4. Signal completion and write final metadata</p>
+
+<p class="text-gray-300 leading-relaxed">The naive approach — buffer everything in memory, write once at the end — breaks when users close their browser tab mid-stream, when network errors interrupt the connection, or when you need audit trails of partial responses. The robust approach writes to PostgreSQL incrementally, using PostgreSQL itself as the coordination layer.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema first</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Every conversation in a production AI system needs a persistent record. Here's the schema that anchors the rest of this chapter:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core conversation tables for streaming AI responses
+CREATE TABLE conversations (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    session_id      UUID NOT NULL,
+    title           TEXT,
+    model           TEXT NOT NULL DEFAULT 'gpt-4o',
+    system_prompt   TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE messages (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content         TEXT,                     -- final assembled content
+    content_chunks  JSONB NOT NULL DEFAULT '[]', -- raw streaming chunks
+    token_count     INTEGER,
+    finish_reason   TEXT,
+    model           TEXT,
+    stream_started_at  TIMESTAMPTZ,
+    stream_completed_at TIMESTAMPTZ,
+    is_complete     BOOLEAN NOT NULL DEFAULT FALSE,
+    error           JSONB,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Partial chunks table for high-frequency incremental writes
+CREATE TABLE message_stream_chunks (
+    id              BIGSERIAL PRIMARY KEY,
+    message_id      UUID NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    chunk_index     INTEGER NOT NULL,
+    chunk_content   TEXT NOT NULL,
+    chunk_raw       JSONB NOT NULL,           -- full API response delta
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+
+CREATE INDEX idx_message_stream_chunks_message_id 
+    ON message_stream_chunks(message_id, chunk_index);
+
+CREATE INDEX idx_messages_conversation_created 
+    ON messages(conversation_id, created_at);
+
+CREATE INDEX idx_conversations_user_session 
+    ON conversations(user_id, session_id);
+
+-- Function to auto-update updated_at
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER messages_updated_at
+    BEFORE UPDATE ON messages
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+
+CREATE TRIGGER conversations_updated_at
+    BEFORE UPDATE ON conversations
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The design gives you two levels of persistence: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">message_stream_chunks</code> captures every delta as it arrives (useful for debugging, replay, and billing verification), while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">messages.content</code> holds the assembled final string. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content_chunks</code> JSONB array on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">messages</code> stores the raw API deltas, preserving finish reasons, usage data, and any tool call fragments that arrived during the stream.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.2 Streaming from OpenAI and Anthropic into PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">The implementation splits into three concerns: receiving the stream, writing to PostgreSQL asynchronously, and notifying downstream consumers. Here's a complete async pattern using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">asyncpg</code> and the OpenAI streaming API.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># stream_writer.py — captures OpenAI streaming responses into PostgreSQL
+import asyncio
+import json
+import uuid
+from datetime import datetime, timezone
+from typing import AsyncGenerator, Optional
+
+import asyncpg
+from openai import AsyncOpenAI
+
+openai_client = AsyncOpenAI()
+
+class StreamWriter:
+    """
+    Captures an OpenAI streaming response into PostgreSQL incrementally.
+    Writes chunks to message_stream_chunks in real time, then assembles
+    the final content into messages once streaming completes.
+    """
+
+    def __init__(self, pool: asyncpg.Pool):
+        self.pool = pool
+
+    async def create_message_record(
+        self,
+        conversation_id: str,
+        role: str = "assistant",
+        model: str = "gpt-4o",
+    ) -&gt; str:
+        """Creates a placeholder message row before streaming begins."""
+        message_id = str(uuid.uuid4())
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO messages (
+                    id, conversation_id, role, model,
+                    stream_started_at, is_complete
+                ) VALUES ($1, $2, $3, $4, $5, FALSE)
+                """,
+                message_id,
+                conversation_id,
+                role,
+                model,
+                datetime.now(timezone.utc),
+            )
+        return message_id
+
+    async def write_chunk(
+        self,
+        conn: asyncpg.Connection,
+        message_id: str,
+        chunk_index: int,
+        content: str,
+        raw_delta: dict,
+    ) -&gt; None:
+        """Writes a single streaming chunk to the chunks table."""
+        await conn.execute(
+            """
+            INSERT INTO message_stream_chunks (
+                message_id, chunk_index, chunk_content, chunk_raw
+            ) VALUES ($1, $2, $3, $4)
+            """,
+            message_id,
+            chunk_index,
+            content,
+            json.dumps(raw_delta),
+        )
+
+    async def finalize_message(
+        self,
+        conn: asyncpg.Connection,
+        message_id: str,
+        full_content: str,
+        all_chunks: list,
+        finish_reason: Optional[str],
+        usage: Optional[dict],
+    ) -&gt; None:
+        """Assembles final content and marks the message complete."""
+        token_count = usage.get("completion_tokens") if usage else None
+        await conn.execute(
+            """
+            UPDATE messages SET
+                content = $1,
+                content_chunks = $2,
+                token_count = $3,
+                finish_reason = $4,
+                stream_completed_at = $5,
+                is_complete = TRUE,
+                metadata = metadata || $6
+            WHERE id = $7
+            """,
+            full_content,
+            json.dumps(all_chunks),
+            token_count,
+            finish_reason,
+            datetime.now(timezone.utc),
+            json.dumps({"usage": usage} if usage else {}),
+            message_id,
+        )
+
+    async def notify_stream_progress(
+        self,
+        conn: asyncpg.Connection,
+        message_id: str,
+        chunk_index: int,
+        content_so_far: str,
+    ) -&gt; None:
+        """Fires pg_notify so subscribers can follow along in real time."""
+        payload = json.dumps({
+            "message_id": message_id,
+            "chunk_index": chunk_index,
+            "content_length": len(content_so_far),
+        })
+        # pg_notify payload is limited to 8000 bytes
+        await conn.execute(
+            "SELECT pg_notify('stream_progress', $1)", payload
+        )
+
+    async def stream_and_persist(
+        self,
+        conversation_id: str,
+        messages: list[dict],
+        model: str = "gpt-4o",
+        notify_every_n_chunks: int = 5,
+    ) -&gt; AsyncGenerator[str, None]:
+        """
+        Main entry point. Streams from OpenAI, persists every chunk,
+        and yields content tokens so the caller can forward them downstream.
+        """
+        message_id = await self.create_message_record(
+            conversation_id, model=model
+        )
+
+        accumulated_content = []
+        all_raw_chunks = []
+        finish_reason = None
+        usage = None
+        chunk_index = 0
+
+        async with self.pool.acquire() as conn:
+            stream = await openai_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            async for chunk in stream:
+                choice = chunk.choices[0] if chunk.choices else None
+                delta_content = ""
+
+                if choice and choice.delta and choice.delta.content:
+                    delta_content = choice.delta.content
+                    accumulated_content.append(delta_content)
+
+                if choice and choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = {
+                        "prompt_tokens": chunk.usage.prompt_tokens,
+                        "completion_tokens": chunk.usage.completion_tokens,
+                        "total_tokens": chunk.usage.total_tokens,
+                    }
+
+                raw_delta = {
+                    "id": chunk.id,
+                    "model": chunk.model,
+                    "delta_content": delta_content,
+                    "finish_reason": finish_reason,
+                }
+                all_raw_chunks.append(raw_delta)
+
+                if delta_content:
+                    await self.write_chunk(
+                        conn, message_id, chunk_index,
+                        delta_content, raw_delta
+                    )
+
+                    if chunk_index % notify_every_n_chunks == 0:
+                        content_so_far = "".join(accumulated_content)
+                        await self.notify_stream_progress(
+                            conn, message_id, chunk_index, content_so_far
+                        )
+
+                    chunk_index += 1
+                    yield delta_content  # forward to the caller
+
+            # Write the assembled final message
+            full_content = "".join(accumulated_content)
+            await self.finalize_message(
+                conn, message_id, full_content,
+                all_raw_chunks, finish_reason, usage
+            )
+
+            # Final notification — stream is complete
+            final_payload = json.dumps({
+                "message_id": message_id,
+                "event": "complete",
+                "finish_reason": finish_reason,
+                "token_count": usage.get("completion_tokens") if usage else None,
+            })
+            await conn.execute(
+                "SELECT pg_notify('stream_complete', $1)", final_payload
+            )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key design decision here is using a persistent connection for the entire streaming session rather than acquiring a new connection per chunk. Connection acquisition has overhead — with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">asyncpg</code> and PgBouncer in transaction mode, you'd lose your connection between chunks anyway. Holding one connection for the duration of a stream keeps the write path fast and consistent.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Anthropic version</strong> uses the same structure with a different SDK surface:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># anthropic_stream_writer.py
+import anthropic
+import asyncio
+import json
+from typing import AsyncGenerator
+
+import asyncpg
+
+anthropic_client = anthropic.AsyncAnthropic()
+
+async def stream_claude_to_postgres(
+    pool: asyncpg.Pool,
+    conversation_id: str,
+    messages: list[dict],
+    system_prompt: str = "",
+    model: str = "claude-opus-4-5",
+) -&gt; AsyncGenerator[str, None]:
+    """
+    Streams a Claude response and writes it incrementally to PostgreSQL.
+    Claude's streaming API uses a context manager pattern.
+    """
+    message_id = str(uuid.uuid4())
+
+    async with pool.acquire() as conn:
+        # Pre-insert the message shell
+        await conn.execute(
+            """
+            INSERT INTO messages (
+                id, conversation_id, role, model,
+                stream_started_at, is_complete
+            ) VALUES ($1, $2, 'assistant', $3, NOW(), FALSE)
+            """,
+            message_id, conversation_id, model,
+        )
+
+        accumulated = []
+        input_tokens = 0
+        output_tokens = 0
+        chunk_index = 0
+        stop_reason = None
+
+        async with anthropic_client.messages.stream(
+            model=model,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=messages,
+        ) as stream:
+
+            async for event in stream:
+                # Anthropic uses typed events rather than raw deltas
+                if event.type == "content_block_delta":
+                    if hasattr(event.delta, "text"):
+                        token = event.delta.text
+                        accumulated.append(token)
+
+                        await conn.execute(
+                            """
+                            INSERT INTO message_stream_chunks
+                                (message_id, chunk_index, chunk_content, chunk_raw)
+                            VALUES ($1, $2, $3, $4)
+                            """,
+                            message_id,
+                            chunk_index,
+                            token,
+                            json.dumps({
+                                "type": "text_delta",
+                                "text": token,
+                                "index": event.index,
+                            }),
+                        )
+                        chunk_index += 1
+                        yield token
+
+                elif event.type == "message_delta":
+                    if hasattr(event.usage, "output_tokens"):
+                        output_tokens = event.usage.output_tokens
+                    if hasattr(event.delta, "stop_reason"):
+                        stop_reason = event.delta.stop_reason
+
+                elif event.type == "message_start":
+                    if hasattr(event.message, "usage"):
+                        input_tokens = event.message.usage.input_tokens
+
+        # Finalize
+        full_content = "".join(accumulated)
+        await conn.execute(
+            """
+            UPDATE messages SET
+                content = $1,
+                token_count = $2,
+                finish_reason = $3,
+                stream_completed_at = NOW(),
+                is_complete = TRUE,
+                metadata = metadata || $4
+            WHERE id = $5
+            """,
+            full_content,
+            output_tokens,
+            stop_reason,
+            json.dumps({
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            }),
+            message_id,
+        )
+
+        await conn.execute(
+            "SELECT pg_notify('stream_complete', $1)",
+            json.dumps({
+                "message_id": message_id,
+                "event": "complete",
+                "stop_reason": stop_reason,
+            }),
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.3 FastAPI SSE Endpoints and pg_notify Consumers</h3>
+
+<p class="text-gray-300 leading-relaxed">Having the data in PostgreSQL is only half the picture. Your frontend needs a way to receive the stream in real time. The standard approach is Server-Sent Events — a unidirectional HTTP stream that's simpler than WebSockets and natively handled by browsers.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># api/stream_endpoint.py — FastAPI endpoint with SSE forwarding
+import asyncio
+import json
+from typing import AsyncGenerator
+
+import asyncpg
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# Dependency: get connection pool
+async def get_pool() -&gt; asyncpg.Pool:
+    return app.state.pool
+
+class ChatRequest(BaseModel):
+    conversation_id: str
+    content: str
+    model: str = "gpt-4o"
+
+async def sse_event(data: str, event: str = "chunk") -&gt; str:
+    """Format a server-sent event."""
+    return f"event: {event}\ndata: {data}\n\n"
+
+@app.post("/api/v1/chat/stream")
+async def stream_chat(
+    request: ChatRequest,
+    pool: asyncpg.Pool = Depends(get_pool),
+):
+    """
+    Accepts a chat message, streams the LLM response via SSE,
+    and persists every chunk to PostgreSQL.
+    """
+    # Verify conversation exists and user has access
+    async with pool.acquire() as conn:
+        conv = await conn.fetchrow(
+            """
+            SELECT id, system_prompt, model
+            FROM conversations
+            WHERE id = $1
+            """,
+            request.conversation_id,
+        )
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+
+        # Persist the user message first
+        await conn.execute(
+            """
+            INSERT INTO messages (
+                id, conversation_id, role, content,
+                is_complete, stream_completed_at
+            ) VALUES (gen_random_uuid(), $1, 'user', $2, TRUE, NOW())
+            """,
+            request.conversation_id,
+            request.content,
+        )
+
+        # Load conversation history for context
+        history = await conn.fetch(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE conversation_id = $1
+              AND is_complete = TRUE
+              AND role IN ('user', 'assistant')
+            ORDER BY created_at ASC
+            LIMIT 20
+            """,
+            request.conversation_id,
+        )
+
+    messages_payload = [
+        {"role": row["role"], "content": row["content"]}
+        for row in history
+        if row["content"]  # exclude empty/incomplete messages
+    ]
+
+    system_prompt = conv["system_prompt"] or ""
+    if system_prompt:
+        messages_payload.insert(0, {"role": "system", "content": system_prompt})
+
+    writer = StreamWriter(pool)
+
+    async def generate() -&gt; AsyncGenerator[str, None]:
+        try:
+            async for token in writer.stream_and_persist(
+                conversation_id=request.conversation_id,
+                messages=messages_payload,
+                model=request.model or conv["model"],
+            ):
+                yield await sse_event(
+                    json.dumps({"token": token}),
+                    event="chunk",
+                )
+        except Exception as e:
+            yield await sse_event(
+                json.dumps({"error": str(e)}),
+                event="error",
+            )
+        finally:
+            yield await sse_event(
+                json.dumps({"done": True}),
+                event="done",
+            )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # critical for nginx
+            "Connection": "keep-alive",
+        },
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">pg_notify as a coordination bus</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Beyond the SSE endpoint, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> lets other parts of your system react to stream events without polling. A background worker listening on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stream_complete</code> channel can trigger embedding generation, audit logging, or cache invalidation the moment an AI response finishes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># workers/stream_listener.py — pg_notify listener for post-stream processing
+import asyncio
+import json
+import logging
+
+import asyncpg
+
+logger = logging.getLogger(__name__)
+
+async def on_stream_complete(
+    conn: asyncpg.Connection,
+    pid: int,
+    channel: str,
+    payload: str,
+) -&gt; None:
+    """
+    Callback fired when a stream_complete notification arrives.
+    Triggers embedding generation and cache invalidation.
+    """
+    try:
+        data = json.loads(payload)
+        message_id = data.get("message_id")
+        if not message_id:
+            return
+
+        logger.info(f"Stream complete for message {message_id}, "
+                    f"tokens={data.get('token_count')}")
+
+        # Dispatch to Celery for async embedding + cache work
+        from workers.tasks import generate_message_embedding, invalidate_conversation_cache
+        generate_message_embedding.delay(message_id)
+        invalidate_conversation_cache.delay(data.get("conversation_id"))
+
+    except Exception as e:
+        logger.error(f"Error handling stream_complete: {e}")
+
+async def on_stream_error(
+    conn: asyncpg.Connection,
+    pid: int,
+    channel: str,
+    payload: str,
+) -&gt; None:
+    data = json.loads(payload)
+    logger.error(f"Stream error: {data}")
+    # write to an errors table for monitoring
+    await conn.execute(
+        """
+        INSERT INTO stream_errors (message_id, error, occurred_at)
+        VALUES ($1, $2, NOW())
+        """,
+        data.get("message_id"),
+        json.dumps(data),
+    )
+
+async def run_listener(dsn: str) -&gt; None:
+    """
+    Long-running listener process. Uses a dedicated connection
+    (not from the pool) for LISTEN/NOTIFY.
+    """
+    conn = await asyncpg.connect(dsn)
+
+    await conn.add_listener("stream_complete", on_stream_complete)
+    await conn.add_listener("stream_progress", lambda *a: None)  # no-op for now
+
+    logger.info("Listening on stream_complete channel...")
+
+    try:
+        # Keep the connection alive indefinitely
+        while True:
+            await asyncio.sleep(1)
+    finally:
+        await conn.remove_listener("stream_complete", on_stream_complete)
+        await conn.close()
+
+if __name__ == "__main__":
+    import os
+    asyncio.run(run_listener(os.environ["DATABASE_URL"]))</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One subtlety: LISTEN/NOTIFY connections must *not* come from PgBouncer in transaction-mode pooling. PgBouncer returns connections to the pool between transactions, and a connection that was listening won't be the same one your backend code holds after a new transaction starts. For listener processes, always connect directly to PostgreSQL.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.4 Celery Workers for Async Post-Stream Processing</h3>
+
+<p class="text-gray-300 leading-relaxed">Stream completion triggers a cascade of downstream work: embedding the assistant's response for RAG retrieval, updating the conversation summary, writing to audit logs, and invalidating Redis caches. Doing this synchronously in the streaming path adds latency. Celery absorbs it asynchronously.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

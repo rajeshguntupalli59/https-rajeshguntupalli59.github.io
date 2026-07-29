@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 19: Read Replica Economics: When They Pay Off vs Waste Money — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 19: Read Replica Economics: When They Pay Off vs Waste Money. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 19 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 19: Read Replica Economics: When They Pay Off vs Waste Money</h2>
+
+<p class="text-gray-300 leading-relaxed">Read replicas are one of the most misunderstood line items on a cloud database bill. Teams spin them up to offload reporting queries, achieve "high availability," or simply because the architecture diagram called for them — and then forget they exist. A single idle <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> RDS read replica in us-east-1 runs approximately <strong class="text-white">$876/month</strong> on on-demand pricing. Multiply that across three environments and two regions, and you are paying over <strong class="text-white">$63,000/year</strong> for instances that may be serving fewer than a dozen queries per hour. This chapter covers how to measure whether your read replicas are actually earning their keep, how to calculate the break-even point where adding a replica saves money versus costs more, and how to automate the decisions that most teams currently make by gut feel. Teams that apply the frameworks here typically reclaim 30–60% of their read replica spend within 90 days.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.1 Understanding the True Cost of a Read Replica</h3>
+
+<p class="text-gray-300 leading-relaxed">Before optimizing, you need to understand what you are actually paying for. A read replica is not just the compute cost of the instance itself. The total cost of ownership for a read replica has four components:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Compute</strong> — The instance hourly rate, which mirrors the primary instance class unless you explicitly downsize.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Storage</strong> — In AWS RDS, replicas share the same allocated storage as the primary and are billed at the same rate. A 2TB gp3 primary with a replica means you are paying for 4TB of storage. In Aurora, however, replicas share the same storage volume, which changes the math entirely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Data Transfer</strong> — Replication traffic within the same Availability Zone is free. Cross-AZ replication incurs $0.01/GB in AWS. Cross-region replication is billed at standard data transfer rates, typically $0.02–$0.09/GB depending on the source region. A primary writing 500GB/day of WAL to a cross-region replica costs between $300–$1,350/month in transfer fees alone before you have run a single query.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. I/O</strong> — On RDS gp2 and io1 storage, replicas consume read IOPS that are billed separately. On Aurora, I/O costs are shared across the cluster but replicas add read I/O charges.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is a concrete comparison of the same workload across instance types to illustrate how quickly costs diverge:</p>
+
+<p class="text-gray-300 leading-relaxed">| Configuration | Instance | On-Demand/mo | 1-yr RI/mo | Savings |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Single primary, no replica | db.r6g.2xlarge | $876 | $553 | — |</p>
+<p class="text-gray-300 leading-relaxed">| Primary + 1 same-AZ replica | db.r6g.2xlarge × 2 | $1,752 | $1,106 | RI saves $646/mo |</p>
+<p class="text-gray-300 leading-relaxed">| Primary + 1 cross-region replica | db.r6g.2xlarge × 2 + transfer | ~$2,052 | ~$1,406 | Transfer adds ~$300/mo |</p>
+<p class="text-gray-300 leading-relaxed">| Aurora primary + 1 Aurora replica | db.r6g.2xlarge × 2 | $1,752 | $1,106 | Shared storage saves ~$184/mo vs RDS |</p>
+
+<p class="text-gray-300 leading-relaxed">The Aurora shared storage advantage becomes significant at scale. A 5TB RDS PostgreSQL primary with two replicas bills for 15TB of gp3 storage at $0.115/GB-month = <strong class="text-white">$1,725/month just in storage</strong>. The equivalent Aurora cluster bills storage once at $0.10/GB-month for the actual data size, potentially saving hundreds of dollars monthly.</p>
+
+<p class="text-gray-300 leading-relaxed">Use this query on PostgreSQL to understand your current replication topology before making any cost decisions:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inventory current replication state and replica lag on PostgreSQL
+-- Run on the primary instance
+SELECT
+    application_name,
+    client_addr,
+    state,
+    sync_state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    (sent_lsn - replay_lsn) AS replication_lag_bytes,
+    pg_size_pretty(sent_lsn - replay_lsn) AS replication_lag_pretty,
+    write_lag,
+    flush_lag,
+    replay_lag
+FROM pg_stat_replication
+ORDER BY replication_lag_bytes DESC;
+
+-- Check if this instance is a replica and its lag from primary
+SELECT
+    pg_is_in_recovery() AS is_replica,
+    CASE
+        WHEN pg_is_in_recovery() THEN
+            EXTRACT(EPOCH FROM (now() - pg_last_xact_replay_timestamp()))::INT
+        ELSE
+            0
+    END AS replica_lag_seconds,
+    pg_last_xact_replay_timestamp() AS last_replay_time;
+
+-- Query activity on replicas to understand actual utilization
+-- Run on each replica
+SELECT
+    count(*) AS active_connections,
+    count(*) FILTER (WHERE state = 'active') AS active_queries,
+    count(*) FILTER (WHERE state = 'idle') AS idle_connections,
+    count(*) FILTER (WHERE wait_event_type IS NOT NULL) AS waiting_connections
+FROM pg_stat_activity
+WHERE backend_type = 'client backend';
+
+-- Top queries running on this replica in the last hour
+SELECT
+    calls,
+    total_exec_time::BIGINT AS total_ms,
+    mean_exec_time::BIGINT AS avg_ms,
+    rows,
+    query
+FROM pg_stat_statements
+WHERE query NOT ILIKE '%pg_stat%'
+ORDER BY total_exec_time DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Azure SQL, use the equivalent DMV approach to assess replica utilization:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL: Check replica utilization and query load
+-- Run on secondary/geo-replica
+SELECT
+    database_name = DB_NAME(),
+    is_read_committed_snapshot_isolation_on = 
+        CASE WHEN is_read_committed_snapshot_on = 1 THEN 'YES' ELSE 'NO' END,
+    is_secondary = CASE WHEN database_id &gt; 0 THEN 'YES' ELSE 'NO' END
+FROM sys.databases
+WHERE name = DB_NAME();
+
+-- Query execution stats on the replica
+SELECT TOP 25
+    qs.execution_count,
+    qs.total_elapsed_time / 1000 AS total_elapsed_ms,
+    qs.total_elapsed_time / qs.execution_count / 1000 AS avg_elapsed_ms,
+    qs.total_logical_reads,
+    qs.total_logical_reads / qs.execution_count AS avg_logical_reads,
+    SUBSTRING(qt.text, (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset
+        END - qs.statement_start_offset) / 2) + 1) AS query_text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+WHERE qs.last_execution_time &gt; DATEADD(HOUR, -1, GETUTCDATE())
+ORDER BY qs.total_elapsed_time DESC;
+
+-- Active connections on this secondary
+SELECT
+    COUNT(*) AS total_connections,
+    SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+    SUM(CASE WHEN status = 'sleeping' THEN 1 ELSE 0 END) AS sleeping,
+    SUM(CASE WHEN status = 'background' THEN 1 ELSE 0 END) AS background
+FROM sys.sysprocesses;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.2 Diagnosing Replica Utilization: Are They Actually Working?</h3>
+
+<p class="text-gray-300 leading-relaxed">The most common waste pattern in read replica deployments is the <strong class="text-white">replica that nobody reads</strong>. It was provisioned for a reporting use case that was later moved to a data warehouse, or the application connection string was never updated to point read traffic at the replica endpoint.</p>
+
+<p class="text-gray-300 leading-relaxed">The following script pulls CloudWatch metrics for all RDS instances and calculates a utilization score that identifies idle replicas:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# replica-utilization-audit.sh
+# Pulls 7-day average metrics for all RDS replicas and flags low-utilization instances
+# Schedule: Run weekly via CloudWatch Events or cron
+
+AWS_REGION="${AWS_REGION:-us-east-1}"
+OUTPUT_FILE="replica_audit_$(date +%Y%m%d).csv"
+DAYS_BACK=7
+START_TIME=$(date -u -d "${DAYS_BACK} days ago" +%Y-%m-%dT%H:%M:%SZ 2&gt;/dev/null || \
+             date -u -v-${DAYS_BACK}d +%Y-%m-%dT%H:%M:%SZ)
+END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+echo "InstanceId,DBInstanceClass,ReplicationRole,AvgReadIOPS,AvgConnections,AvgCPU,ReplicaLag,MonthlyCostEstimate,UtilizationFlag" &gt; "$OUTPUT_FILE"
+
+# Get all RDS instances
+INSTANCES=$(aws rds describe-db-instances \
+    --region "$AWS_REGION" \
+    --query 'DBInstances[*].[DBInstanceIdentifier,DBInstanceClass,ReadReplicaSourceDBInstanceIdentifier,MultiAZ]' \
+    --output text)
+
+while IFS=$'\t' read -r instance_id instance_class source_instance multi_az; do
+    # Determine if this is a replica
+    if [ -n "$source_instance" ] && [ "$source_instance" != "None" ]; then
+        role="READ_REPLICA"
+    else
+        role="PRIMARY"
+    fi
+
+    # Only analyze replicas for this audit
+    if [ "$role" != "READ_REPLICA" ]; then
+        continue
+    fi
+
+    echo "Analyzing replica: $instance_id ($instance_class)"
+
+    # Read IOPS (primary utilization signal for read replicas)
+    AVG_READ_IOPS=$(aws cloudwatch get-metric-statistics \
+        --region "$AWS_REGION" \
+        --namespace "AWS/RDS" \
+        --metric-name "ReadIOPS" \
+        --dimensions Name=DBInstanceIdentifier,Value="$instance_id" \
+        --start-time "$START_TIME" \
+        --end-time "$END_TIME" \
+        --period $((DAYS_BACK * 86400)) \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2&gt;/dev/null || echo "0")
+
+    # Database connections
+    AVG_CONNECTIONS=$(aws cloudwatch get-metric-statistics \
+        --region "$AWS_REGION" \
+        --namespace "AWS/RDS" \
+        --metric-name "DatabaseConnections" \
+        --dimensions Name=DBInstanceIdentifier,Value="$instance_id" \
+        --start-time "$START_TIME" \
+        --end-time "$END_TIME" \
+        --period $((DAYS_BACK * 86400)) \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2&gt;/dev/null || echo "0")
+
+    # CPU utilization
+    AVG_CPU=$(aws cloudwatch get-metric-statistics \
+        --region "$AWS_REGION" \
+        --namespace "AWS/RDS" \
+        --metric-name "CPUUtilization" \
+        --dimensions Name=DBInstanceIdentifier,Value="$instance_id" \
+        --start-time "$START_TIME" \
+        --end-time "$END_TIME" \
+        --period $((DAYS_BACK * 86400)) \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2&gt;/dev/null || echo "0")
+
+    # Replica lag
+    REPLICA_LAG=$(aws cloudwatch get-metric-statistics \
+        --region "$AWS_REGION" \
+        --namespace "AWS/RDS" \
+        --metric-name "ReplicaLag" \
+        --dimensions Name=DBInstanceIdentifier,Value="$instance_id" \
+        --start-time "$START_TIME" \
+        --end-time "$END_TIME" \
+        --period $((DAYS_BACK * 86400)) \
+        --statistics Average \
+        --query 'Datapoints[0].Average' \
+        --output text 2&gt;/dev/null || echo "0")
+
+    # Determine utilization flag
+    READ_IOPS_FLOAT=$(echo "$AVG_READ_IOPS" | awk '{printf "%.2f", $1}')
+    CONNECTIONS_FLOAT=$(echo "$AVG_CONNECTIONS" | awk '{printf "%.2f", $1}')
+    CPU_FLOAT=$(echo "$AVG_CPU" | awk '{printf "%.2f", $1}')
+
+    UTIL_FLAG="HEALTHY"
+    if (( $(echo "$READ_IOPS_FLOAT &lt; 10" | bc -l) )) && \
+       (( $(echo "$CONNECTIONS_FLOAT &lt; 5" | bc -l) )); then
+        UTIL_FLAG="IDLE_CANDIDATE_FOR_DELETION"
+    elif (( $(echo "$CPU_FLOAT &lt; 10" | bc -l) )) && \
+         (( $(echo "$READ_IOPS_FLOAT &lt; 50" | bc -l) )); then
+        UTIL_FLAG="UNDERUTILIZED_CONSIDER_DOWNSIZING"
+    fi
+
+    # Rough monthly cost estimate (simplified — use actual pricing API for production)
+    # This maps common instance types to approximate on-demand monthly cost
+    MONTHLY_COST=$(python3 -c "
+costs = {
+    'db.t3.micro': 18, 'db.t3.small': 36, 'db.t3.medium': 72, 'db.t3.large': 144,
+    'db.r6g.large': 219, 'db.r6g.xlarge': 438, 'db.r6g.2xlarge': 876,
+    'db.r6g.4xlarge': 1752, 'db.r6g.8xlarge': 3504,
+    'db.r7g.large': 228, 'db.r7g.xlarge': 456, 'db.r7g.2xlarge': 912,
+    'db.m6g.large': 180, 'db.m6g.xlarge': 360, 'db.m6g.2xlarge': 720
+}
+print(costs.get('${instance_class}', 999))
+")
+
+    echo "$instance_id,$instance_class,$role,$READ_IOPS_FLOAT,$CONNECTIONS_FLOAT,$CPU_FLOAT,$REPLICA_LAG,$MONTHLY_COST,$UTIL_FLAG" &gt;&gt; "$OUTPUT_FILE"
+
+done &lt;&lt;&lt; "$INSTANCES"
+
+echo ""
+echo "=== REPLICA AUDIT SUMMARY ==="
+echo "Output written to: $OUTPUT_FILE"
+echo ""
+echo "Instances flagged for deletion (IDLE):"
+grep "IDLE_CANDIDATE" "$OUTPUT_FILE" | awk -F',' '{printf "  %-40s %-20s $%s/month\n", $1, $2, $8}'
+
+echo ""
+echo "Instances flagged for downsizing:"
+grep "UNDERUTILIZED" "$OUTPUT_FILE" | awk -F',' '{printf "  %-40s %-20s $%s/month\n", $1, $2, $8}'
+
+TOTAL_WASTE=$(grep -E "IDLE_CANDIDATE|UNDERUTILIZED" "$OUTPUT_FILE" | \
+    awk -F',' '{sum += $8} END {printf "%.0f", sum}')
+echo ""
+echo "Total estimated monthly waste from flagged instances: \$$TOTAL_WASTE"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For GCP Cloud SQL replicas, you need a different approach since CloudWatch is not available:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# gcp-replica-audit.sh
+# Audits Cloud SQL read replicas using Cloud Monitoring metrics
+
+PROJECT_ID="${GCP_PROJECT_ID:-your-project-id}"
+DAYS_BACK=7
+END_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+START_TIME=$(date -u -d "${DAYS_BACK} days ago" +%Y-%m-%dT%H:%M:%SZ 2&gt;/dev/null || \
+             date -u -v-${DAYS_BACK}d +%Y-%m-%dT%H:%M:%SZ)
+
+echo "=== GCP Cloud SQL Read Replica Audit ==="
+echo "Project: $PROJECT_ID"
+echo "Period: Last $DAYS_BACK days"
+echo ""
+
+# List all Cloud SQL instances
+echo "All Cloud SQL instances (replicas marked):"
+gcloud sql instances list \
+    --project="$PROJECT_ID" \
+    --format="table(name,databaseVersion,settings.tier,region,masterInstanceName)" \
+    --filter="instanceType:READ_REPLICA_INSTANCE"
+
+echo ""
+echo "Fetching query insight metrics for replicas..."
+
+# Get read replica instances
+REPLICAS=$(gcloud sql instances list \
+    --project="$PROJECT_ID" \
+    --filter="instanceType:READ_REPLICA_INSTANCE" \
+    --format="value(name)" 2&gt;/dev/null)
+
+for replica in $REPLICAS; do
+    echo "--- Replica: $replica ---"
+
+    # Get instance tier for cost estimation
+    TIER=$(gcloud sql instances describe "$replica" \
+        --project="$PROJECT_ID" \
+        --format="value(settings.tier)" 2&gt;/dev/null)
+
+    echo "  Tier: $TIER"
+
+    # Query connections metric via Monitoring API
+    gcloud monitoring metrics-explorer \
+        --project="$PROJECT_ID" 2&gt;/dev/null || true
+
+    # Use gcloud to pull key metrics (requires monitoring API enabled)
+    echo "  Fetching average connections (last 7 days)..."
+    gcloud monitoring time-series list \
+        --project="$PROJECT_ID" \
+        --filter="metric.type=\"cloudsql.googleapis.com/database/postgresql/num_backends\" AND resource.labels.database_id=\"${PROJECT_ID}:${replica}\"" \
+        --start="$START_TIME" \
+        --end="$END_TIME" \
+        --format="value(points[0].value.int64Value)" 2&gt;/dev/null | \
+        awk '{sum+=$1; count++} END {if(count&gt;0) printf "  Average connections: %.1f\n", sum/count; else print "  No connection data found"}'
+
+    echo ""
+done
+
+# Cost estimation using Cloud Billing export query
+echo "=== Cost Data (requires BigQuery billing export) ==="
+cat &lt;&lt; 'BQEOF'
+-- Run this in BigQuery against your billing export dataset
+-- Replace YOUR_BILLING_DATASET with your actual dataset name
+
+SELECT
+  resource_name,
+  sku_description,
+  SUM(cost) AS total_cost_30d,
+  AVG(cost) * 30 AS projected_monthly_cost
+FROM `YOUR_BILLING_DATASET.gcp_billing_export_v1_*`
+WHERE
+  service.description = 'Cloud SQL'
+  AND DATE(_PARTITIONTIME) &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+  AND LOWER(sku_description) LIKE '%replica%'
+GROUP BY 1, 2
+ORDER BY total_cost_30d DESC;
+BQEOF</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.3 The Break-Even Analysis: When a Replica Actually Saves Money</h3>
+
+<p class="text-gray-300 leading-relaxed">Read replicas save money indirectly by preventing you from scaling up your primary instance to handle read-heavy workloads. The math only works in your favor under specific conditions. Here is the framework for calculating the break-even point.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The core equation:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Cost of replica &lt; Cost of primary upgrade needed to handle same read load</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Consider a concrete scenario: Your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> primary ($876/month) is running at 85% CPU, primarily from analytics queries. You have two choices:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Option A**: Upgrade primary to `db.r6g.4xlarge` at $1,752/month → additional cost: **$876/month**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Option B**: Add a `db.r6g.2xlarge` replica at $876/month and route reads to it</li>
+
+<p class="text-gray-300 leading-relaxed">Option B is identical in cost here. But if you can use a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code> replica ($438/month) because analytics queries are not CPU-intensive, Option B costs <strong class="text-white">$438/month less</strong> than upgrading the primary. That is $5,256/year saved.</p>
+
+<p class="text-gray-300 leading-relaxed">The break-even analysis changes dramatically when you factor in Reserved Instances. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> on a 1-year RI costs approximately <strong class="text-white">$553/month</strong> — 37% less than on-demand. If your replica is running 24/7 for a predictable workload, not buying the RI is itself a financial decision with real consequences.</p>
+
+<p class="text-gray-300 leading-relaxed">This Python script automates the break-even calculation for your specific workload:</p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>

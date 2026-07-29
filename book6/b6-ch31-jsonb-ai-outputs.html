@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 31: JSONB for Flexible AI Output Storage — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 31: JSONB for Flexible AI Output Storage. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 31 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 31: JSONB for Flexible AI Output Storage</h2>
+
+<p class="text-gray-300 leading-relaxed">AI models produce output in shapes that evolve constantly. A function-calling response from GPT-4o looks nothing like a streaming delta chunk from Claude, and neither resembles the structured JSON you'll get from a fine-tuned extraction model next quarter. Rigid relational schemas crack under this pressure — you either over-provision columns that stay NULL most of the time, or you serialize everything into TEXT and lose queryability entirely. PostgreSQL's JSONB column type threads this needle cleanly: you get schema flexibility without sacrificing the ability to index, query, aggregate, and join against the data stored inside. This chapter shows how to design JSONB-backed storage for every major category of AI output — completions, tool calls, structured extractions, agent traces, and evaluation results — and how to keep that storage fast, consistent, and observable in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.1 Why JSONB Is the Right Primitive for AI Output</h3>
+
+<p class="text-gray-300 leading-relaxed">The core tension in AI application storage is this: you need structure to query, but AI output structure is unstable. A model's response schema changes when you upgrade model versions, add tools, change prompts, or switch providers. JSONB lets you commit to a stable outer envelope — known columns like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">session_id</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">created_at</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code> — while keeping the inner payload flexible.</p>
+
+<p class="text-gray-300 leading-relaxed">JSONB differs from JSON in one important way: PostgreSQL parses and stores it as a binary decomposition, not as raw text. This means:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Duplicate keys are removed at write time (last-value-wins)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Key order is not preserved</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Containment operators (`@>`, `<@`) work without full row scans when backed by GIN indexes</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Path extraction (`->`, `->>`, `#>`, `#>>`) returns typed values</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Expression indexes can be built over extracted paths</li>
+
+<p class="text-gray-300 leading-relaxed">For AI output, the practical wins are substantial. You can write a raw LLM response as-is, then later query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE response_body->>'finish_reason' = 'tool_calls'</code> or aggregate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AVG((usage->>'total_tokens')::int)</code> without a schema migration.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The envelope pattern</strong> is the foundational design decision. Every AI output row should have a stable relational envelope that carries metadata the application always knows at write time, plus one or more JSONB columns that carry the variable payload:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core envelope pattern for all AI output storage
+CREATE TABLE ai_outputs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id      UUID NOT NULL REFERENCES sessions(id),
+    request_id      UUID NOT NULL UNIQUE,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    model           TEXT NOT NULL,
+    provider        TEXT NOT NULL CHECK (provider IN ('openai', 'anthropic', 'google', 'local')),
+    output_type     TEXT NOT NULL CHECK (output_type IN ('completion', 'tool_call', 'extraction', 'embedding', 'evaluation')),
+    status          TEXT NOT NULL DEFAULT 'success' CHECK (status IN ('success', 'error', 'partial', 'filtered')),
+
+    -- Stable cost/usage data — always present, always queried
+    prompt_tokens   INT,
+    completion_tokens INT,
+    total_tokens    INT,
+    latency_ms      INT,
+
+    -- Variable payload — shape depends on output_type and model
+    response_body   JSONB NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+
+    -- For error cases
+    error_detail    JSONB
+);
+
+-- GIN index for containment queries across response_body
+CREATE INDEX idx_ai_outputs_response_gin
+    ON ai_outputs USING GIN (response_body);
+
+-- GIN index for metadata filtering (tags, pipeline IDs, experiment labels)
+CREATE INDEX idx_ai_outputs_metadata_gin
+    ON ai_outputs USING GIN (metadata);
+
+-- B-tree indexes on the envelope columns used in WHERE clauses
+CREATE INDEX idx_ai_outputs_session_created
+    ON ai_outputs (session_id, created_at DESC);
+
+CREATE INDEX idx_ai_outputs_model_type
+    ON ai_outputs (model, output_type, created_at DESC);
+
+-- Expression index for finish_reason — frequently filtered
+CREATE INDEX idx_ai_outputs_finish_reason
+    ON ai_outputs ((response_body-&gt;&gt;'finish_reason'));
+
+-- Expression index for tool name in tool_call outputs
+CREATE INDEX idx_ai_outputs_tool_name
+    ON ai_outputs ((response_body-&gt;'tool_calls'-&gt;0-&gt;'function'-&gt;&gt;'name'))
+    WHERE output_type = 'tool_call';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema handles every output type from every provider without a single ALTER TABLE as your AI stack evolves.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.2 Storing LLM Completion and Tool Call Responses</h3>
+
+<p class="text-gray-300 leading-relaxed">Different providers return completion payloads with different shapes. OpenAI wraps everything in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">choices</code> array; Anthropic returns a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content</code> array with typed blocks; local models via Ollama or vLLM return yet another shape. Rather than normalizing these at write time — which introduces lossy transformation and makes debugging harder — store the raw response and extract at query time.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Completion storage with provider-native shapes preserved
+CREATE TABLE completions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id      UUID NOT NULL UNIQUE,
+    session_id      UUID REFERENCES sessions(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    -- Envelope: always populated, always relational
+    model           TEXT NOT NULL,
+    provider        TEXT NOT NULL,
+    prompt_tokens   INT GENERATED ALWAYS AS
+                        (COALESCE(
+                            (response_body-&gt;'usage'-&gt;&gt;'prompt_tokens')::int,
+                            (response_body-&gt;'usage'-&gt;&gt;'input_tokens')::int
+                        )) STORED,
+    completion_tokens INT GENERATED ALWAYS AS
+                        (COALESCE(
+                            (response_body-&gt;'usage'-&gt;&gt;'completion_tokens')::int,
+                            (response_body-&gt;'usage'-&gt;&gt;'output_tokens')::int
+                        )) STORED,
+    finish_reason   TEXT GENERATED ALWAYS AS
+                        (COALESCE(
+                            response_body-&gt;'choices'-&gt;0-&gt;&gt;'finish_reason',
+                            response_body-&gt;&gt;'stop_reason'
+                        )) STORED,
+
+    -- Raw provider response — zero transformation
+    response_body   JSONB NOT NULL,
+
+    -- Extracted content for fast retrieval without path expressions
+    content_text    TEXT GENERATED ALWAYS AS
+                        (COALESCE(
+                            response_body-&gt;'choices'-&gt;0-&gt;'message'-&gt;&gt;'content',
+                            response_body-&gt;'content'-&gt;0-&gt;&gt;'text'
+                        )) STORED,
+
+    -- Tool calls extracted as normalized array
+    has_tool_calls  BOOLEAN GENERATED ALWAYS AS
+                        (
+                            (response_body-&gt;'choices'-&gt;0-&gt;'message'-&gt;'tool_calls') IS NOT NULL
+                            OR
+                            (response_body-&gt;&gt;'stop_reason' = 'tool_use')
+                        ) STORED,
+
+    -- Application metadata
+    pipeline_id     TEXT,
+    prompt_version  TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+-- Generated column indexes are just normal B-tree indexes
+CREATE INDEX idx_completions_finish_reason
+    ON completions (finish_reason, created_at DESC);
+
+CREATE INDEX idx_completions_has_tool_calls
+    ON completions (has_tool_calls, created_at DESC)
+    WHERE has_tool_calls = TRUE;
+
+CREATE INDEX idx_completions_session
+    ON completions (session_id, created_at DESC);
+
+-- Full GIN on response_body for ad-hoc exploration
+CREATE INDEX idx_completions_response_gin
+    ON completions USING GIN (response_body);
+
+-- View that normalizes both provider shapes into a common interface
+CREATE OR REPLACE VIEW completions_normalized AS
+SELECT
+    id,
+    request_id,
+    session_id,
+    created_at,
+    model,
+    provider,
+    finish_reason,
+    content_text,
+    has_tool_calls,
+    prompt_tokens,
+    completion_tokens,
+
+    -- OpenAI tool calls
+    CASE WHEN provider = 'openai' THEN
+        response_body-&gt;'choices'-&gt;0-&gt;'message'-&gt;'tool_calls'
+    -- Anthropic tool use
+    WHEN provider = 'anthropic' THEN
+        (
+            SELECT jsonb_agg(
+                jsonb_build_object(
+                    'id', block-&gt;&gt;'id',
+                    'type', 'function',
+                    'function', jsonb_build_object(
+                        'name', block-&gt;&gt;'name',
+                        'arguments', block-&gt;'input'
+                    )
+                )
+            )
+            FROM jsonb_array_elements(response_body-&gt;'content') AS block
+            WHERE block-&gt;&gt;'type' = 'tool_use'
+        )
+    END AS tool_calls,
+
+    pipeline_id,
+    prompt_version,
+    metadata
+FROM completions;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now write the actual responses from both providers using Python:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># storage/completion_store.py
+import uuid
+import time
+import json
+import asyncpg
+import anthropic
+from openai import AsyncOpenAI
+from typing import Optional
+
+openai_client = AsyncOpenAI()
+anthropic_client = anthropic.AsyncAnthropic()
+
+
+async def store_openai_completion(
+    pool: asyncpg.Pool,
+    session_id: str,
+    messages: list[dict],
+    tools: Optional[list[dict]] = None,
+    pipeline_id: Optional[str] = None,
+    prompt_version: Optional[str] = None,
+) -&gt; dict:
+    request_id = str(uuid.uuid4())
+    start_ts = time.monotonic()
+
+    kwargs = {
+        "model": "gpt-4o",
+        "messages": messages,
+    }
+    if tools:
+        kwargs["tools"] = tools
+
+    response = await openai_client.chat.completions.create(**kwargs)
+    latency_ms = int((time.monotonic() - start_ts) * 1000)
+
+    # Store the raw response dict — no transformation
+    response_dict = response.model_dump()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO completions (
+                request_id, session_id, model, provider,
+                response_body, pipeline_id, prompt_version, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING id, prompt_tokens, completion_tokens, finish_reason, has_tool_calls
+            """,
+            request_id,
+            uuid.UUID(session_id) if session_id else None,
+            response.model,
+            "openai",
+            json.dumps(response_dict),
+            pipeline_id,
+            prompt_version,
+            json.dumps({"latency_ms": latency_ms, "request_id": request_id}),
+        )
+
+    return {
+        "id": str(row["id"]),
+        "request_id": request_id,
+        "content": response.choices[0].message.content,
+        "tool_calls": response.choices[0].message.tool_calls,
+        "finish_reason": row["finish_reason"],
+        "tokens": {
+            "prompt": row["prompt_tokens"],
+            "completion": row["completion_tokens"],
+        },
+    }
+
+
+async def store_anthropic_completion(
+    pool: asyncpg.Pool,
+    session_id: str,
+    messages: list[dict],
+    system: Optional[str] = None,
+    tools: Optional[list[dict]] = None,
+    pipeline_id: Optional[str] = None,
+) -&gt; dict:
+    request_id = str(uuid.uuid4())
+    start_ts = time.monotonic()
+
+    kwargs = {
+        "model": "claude-opus-4-5",
+        "max_tokens": 4096,
+        "messages": messages,
+    }
+    if system:
+        kwargs["system"] = system
+    if tools:
+        kwargs["tools"] = tools
+
+    response = await anthropic_client.messages.create(**kwargs)
+    latency_ms = int((time.monotonic() - start_ts) * 1000)
+
+    response_dict = response.model_dump()
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO completions (
+                request_id, session_id, model, provider,
+                response_body, pipeline_id, metadata
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id, prompt_tokens, completion_tokens, finish_reason, has_tool_calls
+            """,
+            request_id,
+            uuid.UUID(session_id) if session_id else None,
+            response.model,
+            "anthropic",
+            json.dumps(response_dict),
+            pipeline_id,
+            json.dumps({"latency_ms": latency_ms}),
+        )
+
+    # Extract text content from Anthropic's content block array
+    text_content = next(
+        (block.text for block in response.content if block.type == "text"),
+        None,
+    )
+    tool_use_blocks = [
+        block for block in response.content if block.type == "tool_use"
+    ]
+
+    return {
+        "id": str(row["id"]),
+        "request_id": request_id,
+        "content": text_content,
+        "tool_calls": tool_use_blocks if tool_use_blocks else None,
+        "finish_reason": row["finish_reason"],
+        "tokens": {
+            "prompt": row["prompt_tokens"],
+            "completion": row["completion_tokens"],
+        },
+    }
+
+
+async def get_tool_call_stats(
+    pool: asyncpg.Pool,
+    pipeline_id: str,
+    since_hours: int = 24,
+) -&gt; list[dict]:
+    """Aggregate tool usage from stored JSONB — no separate tool_calls table needed."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            WITH tool_calls_expanded AS (
+                SELECT
+                    pipeline_id,
+                    jsonb_array_elements(
+                        CASE provider
+                            WHEN 'openai' THEN
+                                response_body-&gt;'choices'-&gt;0-&gt;'message'-&gt;'tool_calls'
+                            WHEN 'anthropic' THEN
+                                (
+                                    SELECT jsonb_agg(b)
+                                    FROM jsonb_array_elements(response_body-&gt;'content') b
+                                    WHERE b-&gt;&gt;'type' = 'tool_use'
+                                )
+                        END
+                    ) AS tool_call
+                FROM completions
+                WHERE pipeline_id = $1
+                  AND has_tool_calls = TRUE
+                  AND created_at &gt; now() - ($2 || ' hours')::interval
+            )
+            SELECT
+                COALESCE(
+                    tool_call-&gt;'function'-&gt;&gt;'name',
+                    tool_call-&gt;&gt;'name'
+                ) AS tool_name,
+                COUNT(*) AS call_count
+            FROM tool_calls_expanded
+            GROUP BY 1
+            ORDER BY 2 DESC
+            """,
+            pipeline_id,
+            str(since_hours),
+        )
+    return [dict(r) for r in rows]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">31.3 Structured Extraction and Schema Validation</h3>
+
+<p class="text-gray-300 leading-relaxed">One of the highest-value patterns in AI applications is structured extraction: feeding unstructured text to a model and getting back a JSON object conforming to a known schema. Resume parsing, contract analysis, medical note structuring, product catalog enrichment — all follow this pattern. PostgreSQL can enforce schema constraints on the extracted output using CHECK constraints against JSONB, giving you a validation layer that lives in the database regardless of what application code produces the data.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Structured extraction results with in-database schema validation
+CREATE TABLE extraction_results (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id       UUID NOT NULL,          -- FK to whatever was parsed
+    source_type     TEXT NOT NULL,          -- 'document', 'email', 'transcript'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    model           TEXT NOT NULL,
+    extraction_schema TEXT NOT NULL,        -- 'resume_v2', 'contract_v1', etc.
+    schema_version  INT NOT NULL DEFAULT 1,
+
+    -- The extracted payload
+    extracted       JSONB NOT NULL,
+
+    -- Confidence scores if model provides them
+    confidence      JSONB,
+
+    -- Validation state
+    validation_status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (validation_status IN ('pending', 'valid', 'invalid', 'manual_review')),
+    validation_errors JSONB,
+
+    -- Human correction tracking
+    corrected       JSONB,
+    corrected_by    UUID REFERENCES users(id),
+    corrected_at    TIMESTAMPTZ,
+
+    raw_response    JSONB NOT NULL,
+    latency_ms      INT
+);
+
+-- Constraint: resume extractions must have at minimum name and email
+ALTER TABLE extraction_results ADD CONSTRAINT chk_resume_required_fields
+    CHECK (
+        extraction_schema NOT LIKE 'resume%'
+        OR (
+            extracted ? 'name'
+            AND extracted ? 'email'
+        )
+    );
+
+-- Constraint: contract extractions must have parties and effective_date
+ALTER TABLE extraction_results ADD CONSTRAINT chk_contract_required_fields
+    CHECK (
+        extraction_schema NOT LIKE 'contract%'
+        OR (
+            extracted ? 'parties'
+            AND extracted ? 'effective_date'
+            AND jsonb_typeof(extracted-&gt;'parties') = 'array'
+        )
+    );
+
+-- GIN index for querying inside extracted fields
+CREATE INDEX idx_extraction_extracted_gin
+    ON extraction_results USING GIN (extracted);
+
+-- Find all extractions where a specific company appears as a party
+CREATE INDEX idx_extraction_schema_status
+    ON extraction_results (extraction_schema, validation_status, created_at DESC);
+
+-- Function to run basic JSON schema validation and record errors
+CREATE OR REPLACE FUNCTION validate_extraction(
+    p_id UUID,
+    p_schema TEXT
+) RETURNS VOID AS $$
+DECLARE
+    v_extracted JSONB;
+    v_errors    JSONB := '[]'::JSONB;
+    v_status    TEXT := 'valid';
+BEGIN
+    SELECT extracted INTO v_extracted
+    FROM extraction_results WHERE id = p_id;
+
+    IF p_schema LIKE 'resume%' THEN
+        IF NOT (v_extracted ? 'name') THEN
+            v_errors := v_errors || '["missing required field: name"]'::JSONB;
+        END IF;
+        IF NOT (v_extracted ? 'email') THEN
+            v_errors := v_errors || '["missing required field: email"]'::JSONB;
+        END IF;
+        IF (v_extracted ? 'years_experience')
+           AND NOT (jsonb_typeof(v_extracted-&gt;'years_experience') = 'number') THEN
+            v_errors := v_errors || '["years_experience must be numeric"]'::JSONB;
+        END IF;
+    END IF;
+
+    IF jsonb_array_length(v_errors) &gt; 0 THEN
+        v_status := 'invalid';
+    END IF;
+
+    UPDATE extraction_results
+    SET validation_status = v_status,
+        validation_errors = v_errors
+    WHERE id = p_id;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Python side uses OpenAI's structured output mode or Anthropic's tool-use pattern to guarantee JSON conformance before it even hits PostgreSQL:</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

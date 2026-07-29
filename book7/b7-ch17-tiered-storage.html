@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 17: Tiered Storage: Moving Cold Data Cheaply — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 17: Tiered Storage: Moving Cold Data Cheaply. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 17 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 17: Tiered Storage: Moving Cold Data Cheaply</h2>
+
+<p class="text-gray-300 leading-relaxed">Organizations that audit their cloud database storage seriously almost always find the same thing: 60–80% of the data sitting on expensive SSD-backed block storage has not been touched in months. That data costs the same per gigabyte as the hot rows your application reads thousands of times per second. Moving cold data to cheaper storage tiers—S3, Azure Blob, GCS, or archival-class object storage—routinely reduces total database storage costs by 40–70%, and on multi-terabyte databases that translates directly to $8,000–$50,000 per year in avoided spend. This chapter walks through how to identify cold data, classify it systematically, move it to the right storage tier, and automate the entire lifecycle so it keeps paying dividends without manual intervention every quarter.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.1 Understanding the Storage Cost Stack</h3>
+
+<p class="text-gray-300 leading-relaxed">Before moving anything, you need to understand what you are paying for and why the pricing spread across tiers is so dramatic.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS RDS storage pricing (us-east-1, 2024):</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Storage Type | Cost per GB-month |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| gp2 SSD | $0.115 |</p>
+<p class="text-gray-300 leading-relaxed">| gp3 SSD | $0.092 |</p>
+<p class="text-gray-300 leading-relaxed">| io1 / io2 SSD | $0.125–$0.138 |</p>
+<p class="text-gray-300 leading-relaxed">| S3 Standard | $0.023 |</p>
+<p class="text-gray-300 leading-relaxed">| S3 Standard-IA | $0.0125 |</p>
+<p class="text-gray-300 leading-relaxed">| S3 Glacier Instant | $0.004 |</p>
+<p class="text-gray-300 leading-relaxed">| S3 Glacier Deep Archive | $0.00099 |</p>
+
+<p class="text-gray-300 leading-relaxed">The math is straightforward. A 1 TB volume on gp2 costs $117.76/month. That same 1 TB on S3 Glacier Deep Archive costs $1.01/month. The gap is 116x. Even moving to S3 Standard-IA costs 10x less than gp2.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL / Blob pricing (East US, 2024):</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Storage Type | Cost per GB-month |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Azure SQL Premium (P-series) | $0.114 |</p>
+<p class="text-gray-300 leading-relaxed">| Azure SQL General Purpose | $0.115 |</p>
+<p class="text-gray-300 leading-relaxed">| Azure Blob Hot | $0.018 |</p>
+<p class="text-gray-300 leading-relaxed">| Azure Blob Cool | $0.01 |</p>
+<p class="text-gray-300 leading-relaxed">| Azure Blob Archive | $0.00099 |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud (us-central1, 2024):</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Storage Type | Cost per GB-month |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Cloud SQL SSD | $0.17 |</p>
+<p class="text-gray-300 leading-relaxed">| Cloud SQL HDD | $0.09 |</p>
+<p class="text-gray-300 leading-relaxed">| GCS Standard | $0.020 |</p>
+<p class="text-gray-300 leading-relaxed">| GCS Nearline | $0.010 |</p>
+<p class="text-gray-300 leading-relaxed">| GCS Coldline | $0.004 |</p>
+<p class="text-gray-300 leading-relaxed">| GCS Archive | $0.0012 |</p>
+
+<p class="text-gray-300 leading-relaxed">The pricing structure across all three clouds tells the same story: object storage is an order of magnitude cheaper than block storage attached to your database instances. The technical challenge is not the pricing—it is designing the data movement pipeline so that cold data moves gracefully and retrieval remains possible when needed.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Worked example: 10 TB audit log table on AWS RDS (gp3)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Current: 10,000 GB × $0.092 = $920/month = $11,040/year
+After archiving 8 TB to S3 Glacier Instant:
+  Hot tier (2 TB on gp3):  2,000 × $0.092 =  $184/month
+  Cold tier (8 TB on Glacier Instant): 8,000 × $0.004 = $32/month
+  Total: $216/month = $2,592/year
+Annual savings: $8,448 (76% reduction)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.2 Diagnosing Cold Data: Finding What You Can Archive</h3>
+
+<p class="text-gray-300 leading-relaxed">You cannot archive what you cannot identify. The first step is building a clear picture of data age, access patterns, and business rules for retention.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Identifying table-level age distribution in PostgreSQL:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find tables with the oldest average tuple age
+-- Run on each RDS PostgreSQL / Aurora PostgreSQL instance
+SELECT
+    schemaname,
+    relname AS table_name,
+    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS total_size,
+    pg_total_relation_size(schemaname || '.' || relname) AS total_bytes,
+    n_live_tup AS live_rows,
+    n_dead_tup AS dead_rows,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze,
+    last_autoanalyze,
+    -- Estimate staleness: tables not analyzed in 90 days are candidates
+    CASE
+        WHEN COALESCE(last_autoanalyze, last_analyze) &lt; NOW() - INTERVAL '90 days'
+          OR COALESCE(last_autoanalyze, last_analyze) IS NULL
+        THEN 'Cold candidate'
+        WHEN COALESCE(last_autoanalyze, last_analyze) &lt; NOW() - INTERVAL '30 days'
+        THEN 'Warm - monitor'
+        ELSE 'Active'
+    END AS access_classification
+FROM
+    pg_stat_user_tables
+ORDER BY
+    total_bytes DESC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find the date range of data in each table that has a created_at column
+-- This query generates dynamic SQL for inspection
+SELECT
+    'SELECT '''
+    || table_schema || '.' || table_name
+    || ''' AS tbl, MIN(' || column_name || ') AS oldest_row, '
+    || 'MAX(' || column_name || ') AS newest_row, '
+    || 'COUNT(*) AS total_rows '
+    || 'FROM ' || table_schema || '.' || table_name || ';' AS inspection_sql
+FROM
+    information_schema.columns
+WHERE
+    column_name IN ('created_at', 'created_date', 'inserted_at', 'event_time', 'timestamp')
+    AND table_schema NOT IN ('pg_catalog', 'information_schema')
+ORDER BY
+    table_schema, table_name;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- For SQL Server / Azure SQL: find table age distribution
+-- using sys.dm_db_index_usage_stats
+SELECT
+    OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name,
+    ius.user_seeks,
+    ius.user_scans,
+    ius.user_lookups,
+    ius.user_updates,
+    ius.last_user_seek,
+    ius.last_user_scan,
+    ius.last_user_lookup,
+    -- Total read activity
+    (ius.user_seeks + ius.user_scans + ius.user_lookups) AS total_reads,
+    CASE
+        WHEN ius.last_user_seek &lt; GETDATE() - 90
+          OR ius.last_user_seek IS NULL
+        THEN 'Archive candidate'
+        WHEN ius.last_user_seek &lt; GETDATE() - 30
+        THEN 'Monitor'
+        ELSE 'Active'
+    END AS recommendation
+FROM
+    sys.indexes i
+    LEFT JOIN sys.dm_db_index_usage_stats ius
+        ON i.object_id = ius.object_id
+        AND i.index_id = ius.index_id
+        AND ius.database_id = DB_ID()
+WHERE
+    OBJECTPROPERTY(i.object_id, 'IsUserTable') = 1
+ORDER BY
+    total_reads ASC,
+    table_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond table-level statistics, you need CloudWatch or Azure Monitor metrics to confirm that the storage IOPS consumption is actually coming from a small subset of tables. A table that shows up as large in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> but consumes zero IOPS is a clean archival candidate. A large table with high IOPS is not—even if most rows are old.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pulling CloudWatch RDS storage and IOPS metrics via AWS CLI:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Pull RDS IOPS and storage metrics for the last 30 days
+# to identify instances with underutilized storage capacity
+
+DB_INSTANCE="prod-postgres-01"
+START_DATE=$(date -u -d '30 days ago' +%Y-%m-%dT%H:%M:%SZ)
+END_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+REGION="us-east-1"
+
+echo "=== Read IOPS (avg over 30 days) ==="
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name ReadIOPS \
+  --dimensions Name=DBInstanceIdentifier,Value=$DB_INSTANCE \
+  --start-time $START_DATE \
+  --end-time $END_DATE \
+  --period 86400 \
+  --statistics Average \
+  --region $REGION \
+  --output table \
+  --query 'sort_by(Datapoints, &Timestamp)[*].{Date:Timestamp,AvgReadIOPS:Average}'
+
+echo ""
+echo "=== Write IOPS (avg over 30 days) ==="
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name WriteIOPS \
+  --dimensions Name=DBInstanceIdentifier,Value=$DB_INSTANCE \
+  --start-time $START_DATE \
+  --end-time $END_DATE \
+  --period 86400 \
+  --statistics Average \
+  --region $REGION \
+  --output table \
+  --query 'sort_by(Datapoints, &Timestamp)[*].{Date:Timestamp,AvgWriteIOPS:Average}'
+
+echo ""
+echo "=== Free Storage Space (min over 30 days) ==="
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name FreeStorageSpace \
+  --dimensions Name=DBInstanceIdentifier,Value=$DB_INSTANCE \
+  --start-time $START_DATE \
+  --end-time $END_DATE \
+  --period 86400 \
+  --statistics Minimum \
+  --region $REGION \
+  --output table \
+  --query 'sort_by(Datapoints, &Timestamp)[*].{Date:Timestamp,FreeGB:Minimum}' \
+  | awk '{if ($0 ~ /[0-9]/) {split($0,a,"|"); printf "%-25s %10.2f GB\n", a[2], a[3]/1073741824} else print}'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.3 Classifying and Partitioning Data for Tiered Movement</h3>
+
+<p class="text-gray-300 leading-relaxed">The most reliable pattern for tiered storage is range partitioning by time. Once you know which tables have archivable data, you restructure them so that cold partitions can be detached and exported cleanly without touching active data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating a partitioned table in PostgreSQL for future tiering:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Convert an existing unpartitioned table to a partitioned structure
+-- This example handles an audit_events table with 3 years of history
+
+-- Step 1: Create the new partitioned parent table
+CREATE TABLE audit_events_partitioned (
+    id          BIGSERIAL,
+    user_id     BIGINT       NOT NULL,
+    event_type  VARCHAR(100) NOT NULL,
+    event_data  JSONB,
+    ip_address  INET,
+    created_at  TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Step 2: Create partitions for each quarter going back 2 years
+-- Current quarter stays hot; older quarters become archive candidates
+DO $$
+DECLARE
+    start_date DATE := DATE_TRUNC('quarter', NOW() - INTERVAL '2 years');
+    end_date   DATE;
+    part_name  TEXT;
+BEGIN
+    WHILE start_date &lt; DATE_TRUNC('quarter', NOW()) LOOP
+        end_date  := start_date + INTERVAL '3 months';
+        part_name := 'audit_events_'
+                     || TO_CHAR(start_date, 'YYYY_Q"Q"');
+
+        EXECUTE FORMAT(
+            'CREATE TABLE IF NOT EXISTS %I
+             PARTITION OF audit_events_partitioned
+             FOR VALUES FROM (%L) TO (%L)',
+            part_name,
+            start_date,
+            end_date
+        );
+
+        RAISE NOTICE 'Created partition: % covering % to %',
+                     part_name, start_date, end_date;
+
+        start_date := end_date;
+    END LOOP;
+END $$;
+
+-- Step 3: Create the current active partition
+CREATE TABLE audit_events_current
+    PARTITION OF audit_events_partitioned
+    FOR VALUES FROM (DATE_TRUNC('quarter', NOW()))
+               TO   (DATE_TRUNC('quarter', NOW()) + INTERVAL '3 months');
+
+-- Step 4: Create a default partition for future inserts outside expected range
+CREATE TABLE audit_events_future
+    PARTITION OF audit_events_partitioned
+    DEFAULT;
+
+-- Step 5: View partition sizes to understand archival opportunity
+SELECT
+    child.relname                                             AS partition_name,
+    pg_size_pretty(pg_total_relation_size(child.oid))        AS total_size,
+    pg_total_relation_size(child.oid)                        AS bytes,
+    parent.relname                                            AS parent_table
+FROM
+    pg_inherits
+    JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+    JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
+WHERE
+    parent.relname = 'audit_events_partitioned'
+ORDER BY
+    child.relname;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once partitions exist, the archival workflow is clean: detach a partition, export it to S3/GCS/Blob as Parquet or CSV, verify the export, then drop the partition. The table keeps serving queries with no downtime.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detach, export, and verify workflow for PostgreSQL on AWS RDS:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Detach the oldest partition (run during maintenance window or off-peak)
+-- Detached partition remains queryable as a standalone table
+ALTER TABLE audit_events_partitioned
+    DETACH PARTITION audit_events_2022_q1;
+
+-- Step 2: Confirm row counts match before export
+SELECT COUNT(*) FROM audit_events_2022_q1;
+-- Save this number for post-export validation
+
+-- Step 3: Export the detached partition via COPY to S3
+-- (Use aws_s3 extension on RDS PostgreSQL)
+SELECT aws_s3.query_export_to_s3(
+    'SELECT * FROM audit_events_2022_q1',
+    aws_commons.create_s3_uri(
+        'your-archive-bucket',
+        'database-archive/audit_events/2022/Q1/audit_events_2022_q1.csv',
+        'us-east-1'
+    ),
+    options := 'FORMAT CSV, HEADER true'
+);
+
+-- Step 4: Verify export row count by querying S3 via Athena (run separately)
+-- SELECT COUNT(*) FROM archive_audit_events WHERE year=2022 AND quarter=1;
+
+-- Step 5: After verification, drop the partition
+-- Only run after confirming S3 export matches row count
+DROP TABLE audit_events_2022_q1;
+
+-- Step 6: Record the archival in your metadata tracking table
+INSERT INTO archive_metadata (
+    original_table,
+    partition_name,
+    archive_path,
+    row_count,
+    archived_at,
+    archived_by,
+    verified
+) VALUES (
+    'audit_events_partitioned',
+    'audit_events_2022_q1',
+    's3://your-archive-bucket/database-archive/audit_events/2022/Q1/',
+    (SELECT COUNT(*) FROM audit_events_2022_q1),  -- captured before DROP
+    NOW(),
+    CURRENT_USER,
+    false  -- set to true after Athena validation
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Automated Tiering with S3 Lifecycle Policies and AWS Glue</h3>
+
+<p class="text-gray-300 leading-relaxed">Manual archival runs once. Automation runs forever. The goal is a pipeline that identifies cold partitions on a schedule, exports them, validates the export, and transitions the objects through S3 storage classes automatically as they age further.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">S3 lifecycle policy to transition archived database exports through storage tiers:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Apply a lifecycle policy to the database archive bucket
+# Transitions: Standard → Standard-IA (30d) → Glacier Instant (90d) → Deep Archive (365d)
+
+BUCKET="your-archive-bucket"
+
+cat &gt; /tmp/lifecycle-policy.json &lt;&lt; 'EOF'
+{
+  "Rules": [
+    {
+      "ID": "DatabaseArchiveTiering",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "database-archive/"
+      },
+      "Transitions": [
+        {
+          "Days": 30,
+          "StorageClass": "STANDARD_IA"
+        },
+        {
+          "Days": 90,
+          "StorageClass": "GLACIER_IR"
+        },
+        {
+          "Days": 365,
+          "StorageClass": "DEEP_ARCHIVE"
+        }
+      ],
+      "NoncurrentVersionTransitions": [
+        {
+          "NoncurrentDays": 7,
+          "StorageClass": "STANDARD_IA"
+        }
+      ],
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 90
+      }
+    },
+    {
+      "ID": "DeleteExpiredArchives",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "database-archive/audit_events/"
+      },
+      "Expiration": {
+        "Days": 2555
+      }
+    }
+  ]
+}
+EOF
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket $BUCKET \
+  --lifecycle-configuration file:///tmp/lifecycle-policy.json
+
+echo "Lifecycle policy applied to s3://$BUCKET"
+
+# Verify the policy was applied
+aws s3api get-bucket-lifecycle-configuration \
+  --bucket $BUCKET \
+  --output json | jq '.Rules[] | {ID: .ID, Status: .Status, Transitions: .Transitions}'</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python automation script for scheduled tiering — runs nightly via Lambda or cron:</strong></p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>

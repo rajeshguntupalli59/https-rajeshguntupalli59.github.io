@@ -1,0 +1,513 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 8: Creating and Storing Embeddings in PostgreSQL — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 8: Creating and Storing Embeddings in PostgreSQL. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 8 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 8: Creating and Storing Embeddings in PostgreSQL</h2>
+
+<p class="text-gray-300 leading-relaxed">Embeddings are the bridge between unstructured text and the mathematical operations that make semantic search possible. If you've spent years designing schemas for structured data, the shift to storing 1,536-dimensional floating-point vectors alongside your rows can feel disorienting—but the underlying database engineering is familiar territory. This chapter walks through the complete workflow: generating embeddings from text using the OpenAI API and open-source alternatives, storing them efficiently in PostgreSQL using the pgvector extension, and structuring your schema for the query patterns you'll actually run in production. By the end, you'll have a working embedding pipeline that integrates with existing PostgreSQL infrastructure and handles the edge cases that break naive implementations.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.1 How Embeddings Fit Into a PostgreSQL Schema</h3>
+
+<p class="text-gray-300 leading-relaxed">Before writing any code, it helps to understand what you're actually storing. An embedding is a fixed-length array of 32-bit floats. The OpenAI <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> model produces 1,536 floats per input string. A single embedding consumes 1,536 × 4 bytes = 6,144 bytes, or roughly 6 KB. At 1 million rows, that's approximately 6 GB of raw vector data before indexes.</p>
+
+<p class="text-gray-300 leading-relaxed">From a PostgreSQL internals perspective, pgvector introduces a new column type called <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(n)</code> where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n</code> is the number of dimensions. This type stores the float array in a binary format with a header, and it participates in standard PostgreSQL mechanics: TOAST for oversized tuples, MVCC, WAL, logical replication, and point-in-time recovery all work as expected. The extension adds three distance operators that map directly to similarity functions:</p>
+
+<p class="text-gray-300 leading-relaxed">| Operator | Function | Use Case |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><-></code> | L2 (Euclidean) distance | When absolute magnitude matters |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> | Negative inner product | Max inner product search, dot product similarity |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> | Cosine distance | Normalized text embeddings (most common) |</p>
+
+<p class="text-gray-300 leading-relaxed">For text embeddings from OpenAI, Cohere, or sentence-transformers, cosine distance (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code>) is almost always correct. These models output normalized or near-normalized vectors, and cosine distance measures the angle between them regardless of magnitude. L2 distance works better for embeddings where magnitude carries meaning, such as certain vision or audio models.</p>
+
+<p class="text-gray-300 leading-relaxed">A minimal schema that stores document embeddings alongside their source text looks like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Enable the extension (requires superuser or pg_extension_owner membership)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+-- Core documents table
+CREATE TABLE documents (
+    id          BIGSERIAL PRIMARY KEY,
+    source_url  TEXT,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Chunks table — documents are split before embedding
+-- Typical chunk size: 256–512 tokens for retrieval tasks
+CREATE TABLE document_chunks (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    chunk_index     INT NOT NULL,           -- position within parent document
+    chunk_text      TEXT NOT NULL,          -- the actual text that was embedded
+    token_count     INT,                    -- tokens used for this chunk
+    embedding       vector(1536),           -- OpenAI text-embedding-3-small dimensions
+    model_name      TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    embedded_at     TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (document_id, chunk_index)
+);
+
+-- Standard B-tree indexes for filtered queries
+CREATE INDEX ON document_chunks (document_id);
+CREATE INDEX ON document_chunks (model_name);
+CREATE INDEX ON document_chunks (embedded_at);
+
+-- Partial index: only index rows where embedding is populated
+-- This avoids wasting index space on unprocessed chunks
+CREATE INDEX ON document_chunks (id) WHERE embedding IS NULL;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The separation between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">documents</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> is not optional for production systems. Embedding models have token limits—OpenAI's embedding models cap at 8,191 tokens. More importantly, shorter chunks produce more precise retrieval results. A chunk of 256–512 tokens typically outperforms a full 2,000-token document on recall benchmarks because the embedding captures a specific concept rather than a diffuse mixture of topics. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chunk_index</code> column preserves ordering so you can reconstruct context windows around matching chunks during retrieval.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.2 Generating Embeddings with the OpenAI API</h3>
+
+<p class="text-gray-300 leading-relaxed">The OpenAI embeddings endpoint is the most common starting point. The API is stateless and synchronous: you send text, you receive a vector. The key operational concerns are batching, error handling, token limits, and cost.</p>
+
+<p class="text-gray-300 leading-relaxed">OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> costs $0.02 per million tokens as of mid-2024, compared to $0.13 per million tokens for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>. For most retrieval applications, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> at 1,536 dimensions outperforms the older <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> at the same cost point, making it the default choice for new projects.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Python script handles the full embedding generation workflow: chunking a document, calling the API in batches, and inserting results into PostgreSQL via psycopg2. Batching up to 2,048 inputs per API call is supported by OpenAI; staying at 100–500 per batch is a practical compromise between throughput and memory pressure.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import time
+import psycopg2
+import psycopg2.extras
+from openai import OpenAI
+from typing import Generator
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:password@localhost:5432/vectordb"
+)
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIMENSIONS = 1536
+BATCH_SIZE = 100          # inputs per API call
+MAX_TOKENS_PER_CHUNK = 500  # approximate; 1 token ≈ 4 characters
+
+
+def chunk_text(text: str, max_chars: int = 2000) -&gt; Generator[str, None, None]:
+    """
+    Simple paragraph-aware chunker.
+    Production systems should use tiktoken for precise token counting.
+    """
+    paragraphs = text.split("\n\n")
+    current_chunk = []
+    current_len = 0
+
+    for para in paragraphs:
+        para = para.strip()
+        if not para:
+            continue
+        if current_len + len(para) &gt; max_chars and current_chunk:
+            yield "\n\n".join(current_chunk)
+            current_chunk = [para]
+            current_len = len(para)
+        else:
+            current_chunk.append(para)
+            current_len += len(para)
+
+    if current_chunk:
+        yield "\n\n".join(current_chunk)
+
+
+def get_embeddings(texts: list[str], retries: int = 3) -&gt; list[list[float]]:
+    """
+    Call OpenAI embeddings API with retry logic for rate limits.
+    Returns a list of embedding vectors in the same order as input texts.
+    """
+    for attempt in range(retries):
+        try:
+            response = client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=texts,
+            )
+            # The API guarantees same-order response as input
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            if "rate_limit" in str(e).lower() and attempt &lt; retries - 1:
+                wait = 2 ** attempt  # exponential backoff: 1s, 2s, 4s
+                print(f"Rate limited. Waiting {wait}s before retry {attempt + 1}")
+                time.sleep(wait)
+            else:
+                raise
+
+
+def embed_document(document_id: int, title: str, body: str) -&gt; int:
+    """
+    Chunk and embed a document, storing results in document_chunks.
+    Returns the number of chunks created.
+    """
+    chunks = list(chunk_text(body))
+    if not chunks:
+        return 0
+
+    conn = psycopg2.connect(DB_DSN)
+    inserted = 0
+
+    try:
+        # Process in batches to respect API limits
+        for batch_start in range(0, len(chunks), BATCH_SIZE):
+            batch_texts = chunks[batch_start : batch_start + BATCH_SIZE]
+            embeddings = get_embeddings(batch_texts)
+
+            rows = []
+            for i, (text, embedding) in enumerate(zip(batch_texts, embeddings)):
+                chunk_index = batch_start + i
+                token_estimate = len(text) // 4  # rough estimate
+                rows.append({
+                    "document_id": document_id,
+                    "chunk_index": chunk_index,
+                    "chunk_text": text,
+                    "token_count": token_estimate,
+                    "embedding": embedding,
+                    "model_name": EMBEDDING_MODEL,
+                })
+
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO document_chunks
+                        (document_id, chunk_index, chunk_text, token_count, embedding, model_name)
+                    VALUES %s
+                    ON CONFLICT (document_id, chunk_index) DO UPDATE
+                        SET chunk_text  = EXCLUDED.chunk_text,
+                            token_count = EXCLUDED.token_count,
+                            embedding   = EXCLUDED.embedding,
+                            model_name  = EXCLUDED.model_name,
+                            embedded_at = NOW()
+                    """,
+                    [
+                        (
+                            r["document_id"],
+                            r["chunk_index"],
+                            r["chunk_text"],
+                            r["token_count"],
+                            r["embedding"],
+                            r["model_name"],
+                        )
+                        for r in rows
+                    ],
+                    template="(%s, %s, %s, %s, %s::vector, %s)",
+                    page_size=BATCH_SIZE,
+                )
+            conn.commit()
+            inserted += len(rows)
+
+    finally:
+        conn.close()
+
+    return inserted
+
+
+if __name__ == "__main__":
+    # Example: insert a document and embed it
+    conn = psycopg2.connect(DB_DSN)
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO documents (title, body) VALUES (%s, %s) RETURNING id",
+            ("PostgreSQL Architecture", "PostgreSQL uses a process-per-connection model...\n\n"
+             "The shared buffer pool is the primary caching mechanism...\n\n"
+             "Write-ahead logging ensures durability across crashes..."),
+        )
+        doc_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    count = embed_document(doc_id, "PostgreSQL Architecture", "sample body text")
+    print(f"Created {count} embedded chunks for document {doc_id}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three implementation details here are worth explaining. First, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT ... DO UPDATE</code> clause handles re-embedding gracefully. When you upgrade models or fix chunking logic, you re-run the pipeline without managing deletes. Second, the explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">::vector</code> cast in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute_values</code> template is required—psycopg2 doesn't know how to serialize Python lists as the pgvector type natively. Third, token estimation using character count divided by 4 is intentionally rough; production systems should use the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tiktoken</code> library for precise counts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.3 Using Open-Source Embedding Models</h3>
+
+<p class="text-gray-300 leading-relaxed">The OpenAI API introduces a network call, a cost, and a dependency on an external service. For on-premises deployments, regulated industries, or high-throughput scenarios where per-token costs accumulate quickly, running an embedding model locally is the correct tradeoff.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sentence-transformers</code> library provides access to hundreds of pretrained models that run on CPU or GPU. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> model produces 384-dimensional embeddings and runs at roughly 14,000 sentences per second on an 8-core CPU. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BAAI/bge-large-en-v1.5</code> model at 1,024 dimensions scores near OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ada-002</code> on the MTEB benchmark while running entirely locally. For most RAG applications, one of these two models is the right starting point.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import numpy as np
+import psycopg2
+import psycopg2.extras
+from sentence_transformers import SentenceTransformer
+
+# Model selection:
+# all-MiniLM-L6-v2 → 384 dims, fast, good for general retrieval
+# BAAI/bge-large-en-v1.5 → 1024 dims, higher quality, 2x slower
+# intfloat/e5-large-v2 → 1024 dims, strong on asymmetric retrieval tasks
+MODEL_NAME = "BAAI/bge-large-en-v1.5"
+EMBEDDING_DIMENSIONS = 1024
+
+# Load once at module level — model loading takes 2–5 seconds
+model = SentenceTransformer(MODEL_NAME)
+
+DB_DSN = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://postgres:password@localhost:5432/vectordb"
+)
+
+
+def embed_texts_local(texts: list[str], batch_size: int = 64) -&gt; np.ndarray:
+    """
+    Generate embeddings using a local sentence-transformers model.
+    Returns a numpy array of shape (len(texts), EMBEDDING_DIMENSIONS).
+
+    BGE models expect a query prefix for retrieval tasks:
+    - Documents: embed as-is
+    - Queries: prefix with "Represent this sentence: "
+    """
+    embeddings = model.encode(
+        texts,
+        batch_size=batch_size,
+        normalize_embeddings=True,   # ensures cosine similarity = dot product
+        show_progress_bar=len(texts) &gt; 100,
+        convert_to_numpy=True,
+    )
+    return embeddings
+
+
+def embed_query(query_text: str) -&gt; list[float]:
+    """
+    Embed a user query. BGE models use a different prefix for queries vs. documents.
+    This asymmetric encoding improves retrieval quality on BGE models.
+    """
+    prefixed = f"Represent this sentence for searching relevant passages: {query_text}"
+    embedding = model.encode([prefixed], normalize_embeddings=True)
+    return embedding[0].tolist()
+
+
+def bulk_embed_pending_chunks(batch_size: int = 500) -&gt; int:
+    """
+    Find chunks without embeddings and fill them using the local model.
+    Designed to run as a background job or one-time migration.
+    """
+    conn = psycopg2.connect(DB_DSN)
+    total_processed = 0
+
+    try:
+        while True:
+            with conn.cursor() as cur:
+                # Use the partial index we created on (id) WHERE embedding IS NULL
+                cur.execute(
+                    """
+                    SELECT id, chunk_text
+                    FROM document_chunks
+                    WHERE embedding IS NULL
+                    ORDER BY id
+                    LIMIT %s
+                    """,
+                    (batch_size,),
+                )
+                rows = cur.fetchall()
+
+            if not rows:
+                break
+
+            ids = [r[0] for r in rows]
+            texts = [r[1] for r in rows]
+
+            embeddings = embed_texts_local(texts)
+
+            update_data = [
+                (embedding.tolist(), model_id)
+                for embedding, model_id in zip(embeddings, ids)
+            ]
+
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    UPDATE document_chunks AS dc
+                    SET embedding  = data.embedding::vector,
+                        model_name = %s,
+                        embedded_at = NOW()
+                    FROM (VALUES %s) AS data(embedding, id)
+                    WHERE dc.id = data.id::bigint
+                    """,
+                    update_data,
+                    template="(%s, %s)",
+                )
+
+            conn.commit()
+            total_processed += len(rows)
+            print(f"Embedded {total_processed} chunks so far...")
+
+    finally:
+        conn.close()
+
+    return total_processed
+
+
+if __name__ == "__main__":
+    # Smoke test: embed a single query and print its first 5 dimensions
+    vec = embed_query("How does PostgreSQL handle concurrent writes?")
+    print(f"Query embedding: {len(vec)} dimensions, first 5: {vec[:5]}")
+
+    # Run the backfill job
+    count = bulk_embed_pending_chunks()
+    print(f"Total chunks embedded: {count}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One tradeoff to understand: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sentence-transformers</code> models are session-local. On a multi-process application server, each worker loads the model separately, consuming 500 MB–2 GB of RAM per worker depending on the model. The standard mitigation is to move embedding generation out of the web application entirely—into a dedicated embedding service or a background queue that workers dispatch to asynchronously.</p>
+
+<p class="text-gray-300 leading-relaxed">The dimension mismatch between models is a schema problem that must be handled explicitly. If you embed documents with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> (384 dimensions) and later migrate to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BAAI/bge-large-en-v1.5</code> (1,024 dimensions), the column type <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(384)</code> will reject new inserts. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model_name</code> column in the schema above makes this tractable: you can run both models simultaneously during a migration window by using separate columns or a second table, verify retrieval quality, then cut over.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.4 Building the Vector Index</h3>
+
+<p class="text-gray-300 leading-relaxed">Storing vectors without an index is viable only up to approximately 100,000 rows. Beyond that threshold, every similarity query becomes a full sequential scan—PostgreSQL reads every row, computes the distance, and sorts. At 1 million rows and 1,536 dimensions, a sequential scan typically takes 3–8 seconds depending on hardware. With an HNSW index, the same query returns in 5–50 milliseconds.</p>
+
+<p class="text-gray-300 leading-relaxed">pgvector supports two index types: IVFFlat (inverted file with flat quantization) and HNSW (Hierarchical Navigable Small World graphs). The performance characteristics follow directly from their algorithms:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **IVFFlat** partitions the vector space into `lists` (Voronoi cells) during index build. At query time, it searches only the nearest `probes` cells. Build is fast, memory footprint is low, but recall is lower than HNSW at equivalent speed. Requires data to be pre-loaded before building (`CREATE INDEX AFTER` populating, not before).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW** builds a multi-layer proximity graph. Query traversal is faster and recall is higher, but the index takes longer to build and consumes more memory (approximately 6–10 bytes per vector per edge, plus the vectors themselves). New rows are inserted directly into the graph, making it better for append-heavy workloads.</li>
+
+<p class="text-gray-300 leading-relaxed">For most production deployments, HNSW is the right default. The following SQL creates and tunes it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- HNSW index using cosine distance
+-- m: number of connections per layer (default 16, range 4–64)
+--    Higher m → better recall, larger index, slower build
+-- ef_construction: size of the dynamic candidate list during build (default 64)
+--    Higher ef_construction → better recall, much slower build
+--    Recommended range: 64–200 for production
+
+CREATE INDEX CONCURRENTLY idx_chunks_embedding_hnsw
+ON document_chunks
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- For filtered queries (e.g., "find similar chunks within document X"),
+-- you CANNOT rely on the HNSW index alone — PostgreSQL may choose a seq scan
+-- when the WHERE clause is selective. Partial indexes help:
+
+-- Index only chunks from a specific model version
+CREATE INDEX CONCURRENTLY idx_chunks_embedding_v2
+ON document_chunks
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64)
+WHERE model_name = 'text-embedding-3-small';
+
+-- Control query-time recall vs. speed tradeoff
+-- ef_search=40 is the default; higher values improve recall at cost of latency
+-- Set this per-session for queries that require higher accuracy
+SET hnsw.ef_search = 100;
+
+-- Verify the index is being used
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT
+    dc.id,
+    dc.chunk_text,
+    dc.embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector AS distance
+FROM document_chunks dc
+WHERE dc.model_name = 'text-embedding-3-small'
+ORDER BY distance
+LIMIT 10;
+
+-- Check index size and usage statistics
+SELECT
+    indexname,
+    pg_size_pretty(pg_relation_size(indexname::regclass)) AS index_size,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE tablename = 'document_chunks';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One operational gotcha: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> on an HNSW index with 1 million rows and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction = 64</code> takes 20–90 minutes depending on hardware and dimensionality. Plan for this in maintenance windows. The index build is CPU-bound; parallelism is controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_maintenance_workers</code>. Setting this to 4–8 for the index build session reduces wall-clock time significantly:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Increase parallel workers for this session before running the index build
+SET max_parallel_maintenance_workers = 4;
+
+-- For IVFFlat, the rule of thumb for lists is sqrt(row_count)
+-- At 1M rows: lists = 1000
+-- probes at query time: typically lists / 10 = 100 (higher → better recall, slower)
+CREATE INDEX CONCURRENTLY idx_chunks_embedding_ivfflat
+ON document_chunks
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 1000);
+
+-- Set probes at query time
+SET ivfflat.probes = 100;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The recall-latency tradeoff is a parameter you tune against your data, not a fixed property of the extension. For RAG applications where top-10 recall at 95% is the target, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HNSW</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction=64</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search=80</code> is a reasonable starting configuration. Run the MTEB retrieval benchmarks against a sample of your own data to validate.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.5 Querying Embeddings in Production</h3>
+
+<p class="text-gray-300 leading-relaxed">The query pattern for semantic search in a RAG pipeline has three stages: embed the user query, find nearest neighbors, join to retrieve context. Each stage has production considerations that aren't visible in tutorial examples.</p>
+
+<p class="text-gray-300 leading-relaxed">The query below represents a full production pattern: embedding generation, nearest neighbor retrieval with metadata filters, and result hydration in a single round-trip using a parameterized query:</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

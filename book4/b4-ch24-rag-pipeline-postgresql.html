@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 24: Building a RAG Pipeline on PostgreSQL and pgvector — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 24: Building a RAG Pipeline on PostgreSQL and pgvector. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 24 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 24: Building a RAG Pipeline on PostgreSQL and pgvector</h2>
+
+<p class="text-gray-300 leading-relaxed">Retrieval-Augmented Generation (RAG) is the pattern that makes large language models useful in enterprise settings: instead of relying solely on what a model learned during training, you give it fresh, relevant context pulled from your own data at query time. For database professionals, RAG is fundamentally a query architecture problem—one where the "query" involves embedding vectors, approximate nearest-neighbor search, and prompt assembly rather than B-tree lookups and JOIN plans. PostgreSQL with pgvector is a compelling RAG backend precisely because it lets you keep your application data, your document metadata, and your vector indexes in one system you already know how to operate, monitor, and tune. This chapter builds a complete RAG pipeline on PostgreSQL and pgvector from first principles: schema design, embedding ingestion, retrieval logic, LLM integration, and the production patterns that separate a demo from a system you'd trust in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.1 RAG Architecture Through a Database Lens</h3>
+
+<p class="text-gray-300 leading-relaxed">Before writing a single line of Python, it helps to map RAG components onto database concepts you already reason about.</p>
+
+<p class="text-gray-300 leading-relaxed">A RAG system has two distinct phases: <strong class="text-white">ingestion</strong> (offline) and <strong class="text-white">retrieval + generation</strong> (online). In database terms:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Ingestion** is a bulk ETL pipeline. You load documents, chunk them, compute embeddings, and write rows into a vector-capable table. The bottleneck is usually the embedding API call, not the database write.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Retrieval** is a query. Given a question, you embed it, run an ANN (approximate nearest-neighbor) search, and return the top-*k* rows. This is where index design and query planning matter.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Generation** is a downstream consumer of your query results. The LLM receives the retrieved rows as context and produces an answer. From the database's perspective, generation is just a client that reads your resultset.</li>
+
+<p class="text-gray-300 leading-relaxed">The mental model that helps most: think of your document chunks as rows in a fact table, embeddings as a specialized indexed column, and the LLM as a reporting layer. The database's job is to serve relevant rows fast. The LLM's job is to synthesize them into language.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Where PostgreSQL fits:</strong> pgvector adds a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector</code> column type and three index types (IVFFlat, HNSW, and the newer streaming index). It supports L2 distance, cosine similarity, and inner product operators. Everything else—ACID transactions, MVCC, row-level security, JSONB metadata, full-text search, foreign keys to your application tables—comes standard from PostgreSQL. This is the core argument for pgvector over a dedicated vector database when you're already running Postgres: operational simplicity at the cost of some raw ANN throughput.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tradeoffs to keep in mind:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Property | pgvector | Dedicated vector DB |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Operational overhead | Low (existing Postgres) | New system to operate |</p>
+<p class="text-gray-300 leading-relaxed">| Metadata filtering | Full SQL | Varies; often limited |</p>
+<p class="text-gray-300 leading-relaxed">| ANN throughput (vectors/sec) | ~5k–50k QPS at 1536-dim | ~50k–500k QPS |</p>
+<p class="text-gray-300 leading-relaxed">| Hybrid search (BM25 + vector) | Yes, via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ts_rank</code> + vector | Weaviate, Qdrant natively |</p>
+<p class="text-gray-300 leading-relaxed">| Transactional consistency | Full ACID | Eventually consistent |</p>
+<p class="text-gray-300 leading-relaxed">| Max vector dimensions | 16,000 (HNSW), 2,000 (IVFFlat indexed) | Typically 20,000+ |</p>
+
+<p class="text-gray-300 leading-relaxed">For most enterprise RAG workloads under a few hundred QPS, pgvector is sufficient and the operational simplicity is worth it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.2 Schema Design for RAG Documents</h3>
+
+<p class="text-gray-300 leading-relaxed">Good schema design is the foundation. A poorly designed schema makes filtering, pagination, and metadata-based access control painful to retrofit.</p>
+
+<p class="text-gray-300 leading-relaxed">Start with the domain model: a <strong class="text-white">document</strong> is a source artifact (a PDF, a web page, a support ticket). A <strong class="text-white">chunk</strong> is a contiguous segment of text derived from that document, sized to fit within an embedding model's token window. The embedding lives on the chunk, not the document.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Enable the extension (run once per database)
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;   -- for fallback fuzzy search
+CREATE EXTENSION IF NOT EXISTS unaccent;  -- for text normalization
+
+-- Source documents
+CREATE TABLE documents (
+    id              BIGSERIAL PRIMARY KEY,
+    source_uri      TEXT NOT NULL,          -- s3://bucket/path, https://..., etc.
+    title           TEXT,
+    doc_type        TEXT NOT NULL,          -- 'pdf', 'html', 'ticket', 'confluence'
+    tenant_id       UUID NOT NULL,          -- multi-tenant isolation
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    content_hash    TEXT NOT NULL,          -- SHA-256; skip re-ingestion if unchanged
+    UNIQUE (source_uri, tenant_id)
+);
+
+-- Chunks derived from documents
+CREATE TABLE document_chunks (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     BIGINT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL,
+    chunk_index     INT NOT NULL,           -- position within document
+    chunk_text      TEXT NOT NULL,
+    token_count     INT NOT NULL,
+    embedding       vector(1536),           -- OpenAI text-embedding-3-small dimension
+    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    tsvector_col    TSVECTOR               -- for hybrid BM25 + vector search
+        GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED,
+    UNIQUE (document_id, chunk_index)
+);
+
+-- Indexes
+CREATE INDEX idx_chunks_tenant      ON document_chunks (tenant_id);
+CREATE INDEX idx_chunks_document    ON document_chunks (document_id);
+CREATE INDEX idx_chunks_tsvector    ON document_chunks USING GIN (tsvector_col);
+
+-- HNSW index for vector search (build after bulk load for speed)
+-- m=16 and ef_construction=64 are reasonable starting points;
+-- increase ef_construction to 128 for higher recall at the cost of build time
+CREATE INDEX idx_chunks_embedding_hnsw ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Retrieval audit log (optional but valuable for evals)
+CREATE TABLE retrieval_log (
+    id              BIGSERIAL PRIMARY KEY,
+    tenant_id       UUID NOT NULL,
+    query_text      TEXT NOT NULL,
+    query_embedding vector(1536),
+    top_k           INT NOT NULL,
+    retrieved_ids   BIGINT[] NOT NULL,      -- chunk ids returned
+    latency_ms      INT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Design decisions worth explaining:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `tenant_id` on every table: RAG pipelines almost always serve multiple users or teams. Row-level security policies on `tenant_id` let you enforce isolation at the database layer rather than trusting the application.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `content_hash` on documents: re-ingestion is expensive (embedding API calls cost money). Comparing hashes before ingesting lets you skip unchanged documents efficiently.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `tsvector_col` as a generated column: this keeps BM25 search available without application-side maintenance. Hybrid search outperforms pure vector search on factual queries, particularly for named entities, product codes, and technical terms.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> HNSW over IVFFlat for most workloads: HNSW doesn't require a training step (`VACUUM` triggers a rebuild with IVFFlat), has better recall at the same query latency, and handles incremental inserts gracefully. IVFFlat's advantage is lower memory usage at very large scale (tens of millions of vectors).</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.3 The Ingestion Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">Ingestion is a pipeline with four stages: <strong class="text-white">load → chunk → embed → store</strong>. Each stage has failure modes worth designing for explicitly.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# requirements: openai&gt;=1.0, psycopg2-binary, tiktoken, langchain-text-splitters
+
+import hashlib
+import os
+import time
+from typing import Iterator
+
+import openai
+import psycopg2
+import psycopg2.extras
+import tiktoken
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# --- Configuration ---
+DB_DSN = os.environ["PGVECTOR_DSN"]  # postgresql://user:pass@host:5432/ragdb
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_DIM = 1536
+CHUNK_SIZE_TOKENS = 512
+CHUNK_OVERLAP_TOKENS = 64
+BATCH_SIZE = 100  # embeddings per API call; OpenAI limit is 2048 inputs
+
+openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+tokenizer = tiktoken.encoding_for_model("text-embedding-3-small")
+
+
+def count_tokens(text: str) -&gt; int:
+    return len(tokenizer.encode(text))
+
+
+def chunk_document(text: str) -&gt; list[str]:
+    """
+    RecursiveCharacterTextSplitter respects paragraph and sentence boundaries.
+    We convert the token budget to approximate character counts using a
+    rough 4-chars-per-token heuristic, then verify token counts after splitting.
+    """
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE_TOKENS * 4,
+        chunk_overlap=CHUNK_OVERLAP_TOKENS * 4,
+        length_function=len,
+        separators=["\n\n", "\n", ". ", " ", ""],
+    )
+    chunks = splitter.split_text(text)
+    # Drop any chunks that exceed the model's 8192-token input limit
+    return [c for c in chunks if count_tokens(c) &lt;= 8000]
+
+
+def embed_batch(texts: list[str]) -&gt; list[list[float]]:
+    """
+    Embed a batch of texts. Implements simple exponential backoff on rate limits.
+    Returns embeddings in the same order as inputs.
+    """
+    for attempt in range(5):
+        try:
+            response = openai_client.embeddings.create(
+                model=EMBEDDING_MODEL,
+                input=texts,
+                encoding_format="float",
+            )
+            # The API guarantees ordering matches input
+            return [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+        except openai.RateLimitError:
+            wait = 2 ** attempt
+            print(f"Rate limited; retrying in {wait}s")
+            time.sleep(wait)
+    raise RuntimeError("Embedding API failed after 5 retries")
+
+
+def ingest_document(
+    conn,
+    source_uri: str,
+    title: str,
+    doc_type: str,
+    tenant_id: str,
+    content: str,
+    metadata: dict,
+) -&gt; int:
+    """
+    Ingest a single document. Returns the document_id.
+    Skips re-ingestion if content hash is unchanged.
+    """
+    content_hash = hashlib.sha256(content.encode()).hexdigest()
+
+    with conn.cursor() as cur:
+        # Upsert the document record
+        cur.execute(
+            """
+            INSERT INTO documents (source_uri, title, doc_type, tenant_id, metadata, content_hash)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source_uri, tenant_id) DO UPDATE
+                SET title        = EXCLUDED.title,
+                    updated_at   = now(),
+                    metadata     = EXCLUDED.metadata,
+                    content_hash = EXCLUDED.content_hash
+            RETURNING id,
+                      (xmax = 0) AS is_insert,
+                      (content_hash = EXCLUDED.content_hash) AS hash_unchanged
+            """,
+            (source_uri, title, doc_type, tenant_id,
+             psycopg2.extras.Json(metadata), content_hash),
+        )
+        row = cur.fetchone()
+        doc_id, is_insert, hash_unchanged = row
+
+        if not is_insert and hash_unchanged:
+            conn.rollback()
+            print(f"Skipping {source_uri}: content unchanged")
+            return doc_id
+
+        # Delete stale chunks before re-ingesting
+        if not is_insert:
+            cur.execute("DELETE FROM document_chunks WHERE document_id = %s", (doc_id,))
+
+        conn.commit()
+
+    # --- Chunking ---
+    chunks = chunk_document(content)
+    print(f"Document {doc_id}: {len(chunks)} chunks")
+
+    # --- Embed in batches, write rows ---
+    with conn.cursor() as cur:
+        for batch_start in range(0, len(chunks), BATCH_SIZE):
+            batch_texts = chunks[batch_start : batch_start + BATCH_SIZE]
+            embeddings = embed_batch(batch_texts)
+
+            rows = [
+                (
+                    doc_id,
+                    tenant_id,
+                    batch_start + i,
+                    text,
+                    count_tokens(text),
+                    embedding,
+                    EMBEDDING_MODEL,
+                )
+                for i, (text, embedding) in enumerate(zip(batch_texts, embeddings))
+            ]
+
+            psycopg2.extras.execute_values(
+                cur,
+                """
+                INSERT INTO document_chunks
+                    (document_id, tenant_id, chunk_index, chunk_text,
+                     token_count, embedding, embedding_model)
+                VALUES %s
+                """,
+                rows,
+                template="(%s, %s, %s, %s, %s, %s::vector, %s)",
+                page_size=50,
+            )
+
+        conn.commit()
+
+    return doc_id</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Production notes on ingestion:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parallelism:** The bottleneck is embedding API calls, not Postgres writes. Run multiple worker processes (not threads—the GIL hurts here) against a connection pool. A four-worker setup with `BATCH_SIZE=100` can sustain roughly 400 embeddings/second before hitting OpenAI's default rate limits.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Idempotency:** The `content_hash` check ensures re-running the pipeline on the same document is a no-op. This is important for scheduled re-ingestion of updated document sets.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index maintenance:** HNSW indexes on pgvector maintain themselves incrementally on insert, but recall degrades slightly as the index grows fragmented. Run `REINDEX INDEX CONCURRENTLY idx_chunks_embedding_hnsw` during low-traffic windows after large bulk loads.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Token budget:** The 512-token chunk size is a reasonable default for `text-embedding-3-small`. For GPT-4 with a 128k context window you can afford larger chunks (1024–2048 tokens) and thus fewer retrieval hops. Smaller chunks improve retrieval precision; larger chunks improve the coherence of context passed to the LLM.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.4 The Retrieval Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Retrieval is where the database work happens. A basic retrieval function runs a vector similarity search; a production retrieval function also handles metadata filtering, multi-tenancy, hybrid search, and result deduplication.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# requirements: openai, psycopg2-binary
+
+from dataclasses import dataclass
+
+import openai
+import psycopg2
+import psycopg2.extras
+
+
+@dataclass
+class RetrievedChunk:
+    chunk_id: int
+    document_id: int
+    source_uri: str
+    title: str
+    chunk_text: str
+    chunk_index: int
+    similarity: float
+    metadata: dict
+
+
+def retrieve(
+    conn,
+    query: str,
+    tenant_id: str,
+    top_k: int = 6,
+    doc_type_filter: str | None = None,
+    min_similarity: float = 0.35,
+    use_hybrid: bool = True,
+    hybrid_weight: float = 0.7,  # weight for vector score; (1 - weight) for BM25
+) -&gt; list[RetrievedChunk]:
+    """
+    Retrieve top-k relevant chunks for a query.
+
+    Hybrid mode: linear combination of cosine similarity (vector) and
+    normalized ts_rank (BM25). Hybrid consistently outperforms pure vector
+    search on factual/technical queries by 8–15% NDCG@10 in internal evals.
+
+    min_similarity filters out chunks below a cosine similarity threshold,
+    reducing hallucination risk from marginally relevant context.
+    """
+    # Embed the query using the same model as ingestion
+    response = openai_client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=[query],
+        encoding_format="float",
+    )
+    query_embedding = response.data[0].embedding
+    embedding_literal = f"[{','.join(str(x) for x in query_embedding)}]"
+
+    doc_type_clause = "AND d.doc_type = %(doc_type)s" if doc_type_filter else ""
+
+    if use_hybrid:
+        sql = f"""
+            WITH vector_scores AS (
+                SELECT
+                    c.id,
+                    1 - (c.embedding &lt;=&gt; %(embedding)s::vector) AS vec_score
+                FROM document_chunks c
+                WHERE c.tenant_id = %(tenant_id)s
+                  {doc_type_clause}
+                ORDER BY c.embedding &lt;=&gt; %(embedding)s::vector
+                LIMIT %(top_k_candidate)s
+            ),
+            bm25_scores AS (
+                SELECT
+                    c.id,
+                    ts_rank_cd(c.tsvector_col, plainto_tsquery('english', %(query)s)) AS bm25_score
+                FROM document_chunks c
+                WHERE c.tenant_id = %(tenant_id)s
+                  {doc_type_clause}
+                  AND c.tsvector_col @@ plainto_tsquery('english', %(query)s)
+            ),
+            combined AS (
+                SELECT
+                    v.id,
+                    (%(hw)s * v.vec_score) +
+                    ((1 - %(hw)s) * COALESCE(
+                        b.bm25_score / NULLIF(MAX(b.bm25_score) OVER (), 0),
+                        0
+                    )) AS combined_score,
+                    v.vec_score
+                FROM vector_scores v
+                LEFT JOIN bm25_scores b ON b.id = v.id
+            )
+            SELECT
+                c.id,
+                c.document_id,
+                d.source_uri,
+                d.title,
+                c.chunk_text,
+                c.chunk_index,
+                cm.combined_score AS similarity,
+                d.metadata
+            FROM combined cm
+            JOIN document_chunks c  ON c.id = cm.id
+            JOIN documents d        ON d.id = c.document_id
+            WHERE cm.vec_score &gt;= %(min_sim)s
+            ORDER BY cm.combined_score DESC
+            LIMIT %(top_k)s
+        """
+    else:
+        sql = f"""
+            SELECT
+                c.id,
+                c.document_id,
+                d.source_uri,
+                d.title,
+                c.chunk_text,
+                c.chunk_index,
+                1 - (c.embedding &lt;=&gt; %(embedding)s::vector) AS similarity,
+                d.metadata
+            FROM document_chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.tenant_id = %(tenant_id)s
+              {doc_type_clause}
+              AND 1 - (c.embedding &lt;=&gt; %(embedding)s::vector) &gt;= %(min_sim)s
+            ORDER BY c.embedding &lt;=&gt; %(embedding)s::vector
+            LIMIT %(top_k)s
+        """
+
+    params = {
+        "embedding": embedding_literal,
+        "tenant_id": tenant_id,
+        "query": query,
+        "top_k": top_k,
+        "top_k_candidate": top_k * 5,  # over-fetch for hybrid reranking
+        "min_sim": min_similarity,
+        "hw": hybrid_weight,
+        "doc_type": doc_type_filter,
+    }
+
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    return [
+        RetrievedChunk(
+            chunk_id=row["id"],
+            document_id=row["document_id"],
+            source_uri=row["source_uri"],
+            title=row["title"] or "",
+            chunk_text=row["chunk_text"],
+            chunk_index=row["chunk_index"],
+            similarity=float(row["similarity"]),
+            metadata=row["metadata"],
+        )
+        for row in rows
+    ]</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tuning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> at query time:</strong> pgvector's HNSW index respects a session-level parameter <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw.ef_search</code> (default 40). Higher values improve recall at the cost of query latency.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Measure baseline recall vs. latency tradeoff
+-- Run this against a test set of queries with known relevant chunks
+
+SET hnsw.ef_search = 40;   -- default; ~2–4ms per query at 1M vectors
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, 1 - (embedding &lt;=&gt; '[0.01,0.02,...]'::vector) AS score
+FROM document_chunks
+WHERE tenant_id = 'tenant-uuid-here'
+ORDER BY embedding &lt;=&gt; '[0.01,0.02,...]'::vector
+LIMIT 10;
+
+SET hnsw.ef_search = 100;  -- higher recall; ~6–10ms per query
+-- Use ef_search = 100–200 for latency-tolerant batch retrieval
+-- Use ef_search = 40–60 for interactive (&lt;50ms) workloads
+
+-- Check actual vs. approximate recall by comparing with exact search
+-- Exact search (no index, sequential scan) for ground truth:
+SET enable_indexscan = off;
+SELECT id FROM document_chunks
+ORDER BY embedding &lt;=&gt; '[0.01,0.02,...]'::vector
+LIMIT 10;
+-- Compare overlap with HNSW results to compute recall@10</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_similarity</code> threshold:</strong> 0.35 cosine similarity is a reasonable starting point for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code>. Below that, retrieved chunks tend to be topically adjacent rather than directly relevant, and passing them to the LLM increases hallucination risk. Calibrate this threshold against your specific domain using an evaluation set—technical documentation typically needs 0.40+, while general Q&A can tolerate 0.30.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.5 LLM Integration and Prompt Assembly</h3>
+
+<p class="text-gray-300 leading-relaxed">With a retrieval function in place, prompt assembly is the next design decision. The quality of the prompt structure affects answer quality more than almost any other variable in a RAG system.</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

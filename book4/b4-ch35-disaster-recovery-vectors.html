@@ -1,0 +1,561 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 35: Disaster Recovery for Vector Stores — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 35: Disaster Recovery for Vector Stores. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 35 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 35: Disaster Recovery for Vector Stores</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector databases are no longer experimental infrastructure. They sit directly in the critical path of production AI applications — powering search, recommendation engines, RAG pipelines, and real-time similarity lookups. When a vector store fails, the LLM application behind it often fails silently or degrades in ways that are harder to detect than a 500 error: results become stale, semantically incorrect, or simply absent. This chapter covers disaster recovery for vector stores from first principles through production-grade implementation, treating vector data with the same operational rigor that experienced DBAs apply to transactional systems. You will work through backup strategies, recovery time objectives, replication topologies, and the specific failure modes that make vector DR harder than traditional RDBMS recovery — including the cost and latency of re-embedding large corpora when source documents are your only remaining asset.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Unique DR Challenges of Vector Stores</h3>
+
+<p class="text-gray-300 leading-relaxed">Before designing recovery procedures, you need to understand what makes vector stores different from the relational databases you already know how to protect.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embeddings are derived data — but regenerating them is expensive</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In a relational database, if you lose a computed column, you run a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> statement and move on. Embeddings occupy a similar logical position — they are derived from source text or images — but regeneration is orders of magnitude more expensive. Re-embedding a 10-million-document corpus using OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code> at roughly $0.13 per million tokens (as of 2024 pricing), with an average document size of 512 tokens, costs approximately $650 and takes several hours even with full parallelism. For billion-vector deployments, the cost and time become recovery-blocking. This means vector data must be treated as primary data, not recomputable cache, in your backup strategy.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Indexes are the data</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In PostgreSQL, you can drop and rebuild an index without losing data — the heap is your source of truth. In most vector databases, the index *is* the primary data structure. An HNSW index in Weaviate or Qdrant contains the vectors themselves along with their navigational graph. Losing the index means losing everything. This shifts backup philosophy: you cannot separate data backup from index backup.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Consistency between vector stores and source systems</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Vector stores rarely stand alone. They contain embeddings derived from records in PostgreSQL, MongoDB, or S3 object stores. A complete DR plan must account for the synchronization point between source data and the vector index. If your PostgreSQL database is restored to a point-in-time 6 hours before your vector store backup, you now have semantic drift between your relational records and their embeddings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metadata amplifies the problem</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Modern vector stores store payload metadata alongside vectors — document IDs, timestamps, category tags, user IDs. This metadata often has relational consistency requirements with upstream systems. Recovery must restore vectors and metadata to a mutually consistent state.</p>
+
+<p class="text-gray-300 leading-relaxed">Table 35.1 maps traditional DR concepts to vector store equivalents:</p>
+
+<p class="text-gray-300 leading-relaxed">| Traditional DB Concept | Vector Store Equivalent | Key Difference |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Transaction log backup | Incremental vector export | Vectors have no native WAL |</p>
+<p class="text-gray-300 leading-relaxed">| Point-in-time recovery | Snapshot + re-sync from source | Requires source system alignment |</p>
+<p class="text-gray-300 leading-relaxed">| Logical backup (pg_dump) | JSON/binary vector export | May be 100x larger per record |</p>
+<p class="text-gray-300 leading-relaxed">| Physical backup | Volume snapshot | Index state may be partially flushed |</p>
+<p class="text-gray-300 leading-relaxed">| Read replica | Query replica / shard mirror | Consistency lag measured differently |</p>
+<p class="text-gray-300 leading-relaxed">| Restore test | Similarity query validation | Correctness, not just availability |</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Backup Strategies by Vector Store Platform</h3>
+
+<p class="text-gray-300 leading-relaxed">Each major vector database has different native backup capabilities. The right strategy depends on your RTO/RPO requirements, deployment model, and whether you control the underlying infrastructure.</p>
+
+<p class="text-gray-300 leading-relaxed">#### pgvector (PostgreSQL)</p>
+
+<p class="text-gray-300 leading-relaxed">pgvector stores vectors in standard PostgreSQL heap tuples. This means all of PostgreSQL's backup mechanisms work without modification: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code>, WAL archiving, and point-in-time recovery through your preferred tool (Barman, pgBackRest, WAL-G). The HNSW and IVFFlat indexes are rebuilt on restore from the base table data — but at significant cost for large tables.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Step 1: Check the size of your vector table and index before planning backup frequency
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename)) AS table_size,
+    pg_size_pretty(
+        pg_total_relation_size(schemaname||'.'||tablename) -
+        pg_relation_size(schemaname||'.'||tablename)
+    ) AS index_size
+FROM pg_tables
+WHERE tablename = 'document_embeddings';
+
+-- Step 2: Export vectors to a portable format for cross-platform recovery
+-- Useful when restoring to a different vector store after catastrophic failure
+COPY (
+    SELECT
+        id,
+        document_id,
+        chunk_index,
+        content_text,
+        embedding::text AS embedding_vector,
+        metadata,
+        created_at,
+        embedding_model
+    FROM document_embeddings
+    WHERE created_at &gt;= NOW() - INTERVAL '24 hours'
+    ORDER BY created_at
+) TO '/var/backups/pgvector/embeddings_incremental.csv'
+WITH (FORMAT CSV, HEADER TRUE);
+
+-- Step 3: Validate backup integrity — count and spot-check vector dimensionality
+SELECT
+    COUNT(*) AS total_vectors,
+    AVG(vector_dims(embedding)) AS avg_dims,
+    MIN(vector_dims(embedding)) AS min_dims,
+    MAX(vector_dims(embedding)) AS max_dims,
+    COUNT(*) FILTER (WHERE vector_dims(embedding) != 1536) AS malformed_vectors
+FROM document_embeddings;
+
+-- Step 4: Track the last-synced position between source table and embeddings table
+-- This watermark table drives incremental backup and re-sync recovery
+CREATE TABLE IF NOT EXISTS embedding_sync_state (
+    sync_id         SERIAL PRIMARY KEY,
+    source_table    TEXT NOT NULL,
+    last_source_id  BIGINT NOT NULL,
+    last_sync_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    vector_count    BIGINT NOT NULL,
+    model_version   TEXT NOT NULL,
+    notes           TEXT
+);
+
+INSERT INTO embedding_sync_state
+    (source_table, last_source_id, vector_count, model_version)
+SELECT
+    'documents',
+    MAX(id),
+    COUNT(*),
+    'text-embedding-3-large-1536'
+FROM document_embeddings
+ON CONFLICT DO NOTHING;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The critical insight for pgvector DR: after a restore, PostgreSQL recreates the heap first, then the indexes. On a 50M-row vector table with 1536-dimensional HNSW indexes, index rebuild can take 4–8 hours depending on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code> and parallelism. Your RTO must account for this separately from the restore time.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Pinecone</p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone is a fully managed service without direct infrastructure access, so DR strategy operates at the API level. Pinecone does not provide native cross-region replication for Standard tier indexes. Their Enterprise tier offers collections (snapshots) and the ability to create indexes from collections in different regions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Pinecone DR: backup via collection creation + cross-region restore
+
+from pinecone import Pinecone
+import time
+import json
+from datetime import datetime
+
+pc = Pinecone(api_key="YOUR_API_KEY")
+
+def create_pinecone_backup(index_name: str, collection_name: str = None) -&gt; dict:
+    """
+    Create a Pinecone collection (snapshot) from a live index.
+    Collections are immutable backups stored by Pinecone indefinitely.
+    """
+    if collection_name is None:
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        collection_name = f"{index_name}-backup-{timestamp}"
+
+    # Verify source index exists and is ready
+    index_info = pc.describe_index(index_name)
+    if index_info.status.ready is False:
+        raise RuntimeError(f"Index {index_name} is not in ready state: {index_info.status}")
+
+    vector_count = index_info.status.vector_count
+    print(f"Creating collection from {index_name} ({vector_count:,} vectors)")
+
+    # Create collection — this is a point-in-time snapshot
+    pc.create_collection(
+        name=collection_name,
+        source=index_name
+    )
+
+    # Poll until collection is ready
+    max_wait_seconds = 600
+    poll_interval = 15
+    elapsed = 0
+
+    while elapsed &lt; max_wait_seconds:
+        collection = pc.describe_collection(collection_name)
+        if collection.status == "Ready":
+            print(f"Collection {collection_name} ready after {elapsed}s")
+            break
+        elif collection.status == "Initializing":
+            print(f"  Collection initializing... ({elapsed}s elapsed)")
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+        else:
+            raise RuntimeError(f"Collection entered unexpected state: {collection.status}")
+    else:
+        raise TimeoutError(f"Collection not ready after {max_wait_seconds}s")
+
+    return {
+        "collection_name": collection_name,
+        "source_index": index_name,
+        "vector_count": collection.vector_count,
+        "dimension": collection.dimension,
+        "metric": collection.metric,
+        "created_at": datetime.utcnow().isoformat(),
+        "status": collection.status
+    }
+
+
+def restore_pinecone_from_collection(
+    collection_name: str,
+    target_index_name: str,
+    target_region: str = "us-east-1",
+    cloud: str = "aws"
+) -&gt; None:
+    """
+    Restore a Pinecone index from a collection backup, optionally in a different region.
+    This is the cross-region failover path.
+    """
+    collection = pc.describe_collection(collection_name)
+
+    if collection.status != "Ready":
+        raise RuntimeError(f"Collection {collection_name} is not in Ready state")
+
+    print(f"Restoring from collection: {collection_name}")
+    print(f"  Vectors: {collection.vector_count:,}")
+    print(f"  Dimensions: {collection.dimension}")
+    print(f"  Target region: {cloud}/{target_region}")
+
+    # Create new index from collection in target region
+    pc.create_index(
+        name=target_index_name,
+        dimension=collection.dimension,
+        metric=collection.metric,
+        source_collection=collection_name,
+        spec={
+            "serverless": {
+                "cloud": cloud,
+                "region": target_region
+            }
+        }
+    )
+
+    # Wait for index to be ready
+    max_wait = 900  # 15 minutes for large indexes
+    elapsed = 0
+    while elapsed &lt; max_wait:
+        index_desc = pc.describe_index(target_index_name)
+        if index_desc.status.ready:
+            print(f"Index {target_index_name} ready after {elapsed}s")
+            return
+        time.sleep(20)
+        elapsed += 20
+
+    raise TimeoutError("Restored index did not become ready within 15 minutes")
+
+
+def export_pinecone_vectors_to_json(
+    index_name: str,
+    output_path: str,
+    namespace: str = "",
+    batch_size: int = 1000
+) -&gt; int:
+    """
+    Export all vectors from a Pinecone index to JSON for cold storage backup.
+    Use this when you need a portable backup independent of Pinecone's collection system.
+    WARNING: Pinecone does not natively support list-all-vectors for large indexes.
+    This approach requires you to maintain a separate list of vector IDs.
+    """
+    index = pc.Index(index_name)
+    stats = index.describe_index_stats()
+
+    # Load IDs from your ID registry (you must maintain this separately)
+    with open(f"{output_path}.ids.txt", "r") as f:
+        all_ids = [line.strip() for line in f if line.strip()]
+
+    exported_count = 0
+    with open(output_path, "w") as out_file:
+        for i in range(0, len(all_ids), batch_size):
+            batch_ids = all_ids[i:i + batch_size]
+            response = index.fetch(ids=batch_ids, namespace=namespace)
+
+            for vec_id, vector_data in response.vectors.items():
+                record = {
+                    "id": vec_id,
+                    "values": vector_data.values,
+                    "metadata": vector_data.metadata or {},
+                    "namespace": namespace
+                }
+                out_file.write(json.dumps(record) + "\n")
+                exported_count += 1
+
+            if exported_count % 10000 == 0:
+                print(f"  Exported {exported_count:,} vectors...")
+
+    print(f"Export complete: {exported_count:,} vectors to {output_path}")
+    return exported_count
+
+
+# Example usage
+if __name__ == "__main__":
+    # Daily backup job
+    backup_info = create_pinecone_backup("production-embeddings")
+    
+    # Save backup manifest
+    with open(f"/var/backups/pinecone/manifest-{datetime.utcnow().date()}.json", "w") as f:
+        json.dump(backup_info, f, indent=2)
+    
+    print(f"Backup manifest: {backup_info}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone DR limitations to know</strong>: Collections capture vectors and metadata but not index configuration metadata like pod type (for pod-based indexes) or access control settings. Document these separately. Also, Pinecone collections are stored in the same cloud account — they protect against data corruption or accidental deletion but not against account-level or regional cloud outages unless you explicitly restore to a different region.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Weaviate</p>
+
+<p class="text-gray-300 leading-relaxed">Weaviate provides native backup support via its Backup API, supporting S3, GCS, Azure Blob Storage, and local filesystem as backup destinations. This is the most operationally complete backup system of the major vector databases.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Weaviate backup and restore using the official Python client v4
+
+import weaviate
+import weaviate.classes as wvc
+import time
+import boto3
+from datetime import datetime
+
+client = weaviate.connect_to_custom(
+    http_host="weaviate.production.internal",
+    http_port=8080,
+    http_secure=False,
+    grpc_host="weaviate.production.internal",
+    grpc_port=50051,
+    grpc_secure=False
+)
+
+
+def create_weaviate_backup(
+    backup_id: str,
+    backend: str = "s3",
+    include_classes: list = None,
+    wait_for_completion: bool = True
+) -&gt; dict:
+    """
+    Create a Weaviate backup to S3 (or GCS/Azure/filesystem).
+    
+    The backup captures:
+    - All vector data (HNSW graph + raw vectors)
+    - Object properties and metadata
+    - Schema definitions
+    - Class configurations
+    
+    Weaviate performs a consistent snapshot — no writes are blocked during backup.
+    """
+    backup_config = {
+        "id": backup_id,
+        "backend": backend,
+    }
+    
+    if include_classes:
+        backup_config["include"] = include_classes
+
+    print(f"Initiating Weaviate backup: {backup_id} -&gt; {backend}")
+    
+    response = client.backup.create(
+        backup_id=backup_id,
+        backend=backend,
+        include_collections=include_classes,
+        wait_for_completion=wait_for_completion
+    )
+    
+    return {
+        "backup_id": backup_id,
+        "backend": backend,
+        "status": response.status,
+        "path": response.path,
+        "classes": response.collections,
+        "started_at": datetime.utcnow().isoformat()
+    }
+
+
+def get_backup_status(backup_id: str, backend: str = "s3") -&gt; dict:
+    """Poll backup status for async backup jobs."""
+    response = client.backup.get_create_status(
+        backup_id=backup_id,
+        backend=backend
+    )
+    return {
+        "backup_id": backup_id,
+        "status": response.status,
+        "error": getattr(response, "error", None)
+    }
+
+
+def restore_weaviate_backup(
+    backup_id: str,
+    backend: str = "s3",
+    include_classes: list = None,
+    exclude_classes: list = None,
+    wait_for_completion: bool = True
+) -&gt; dict:
+    """
+    Restore a Weaviate backup. Can restore specific classes or entire cluster.
+    
+    Weaviate restore behavior:
+    - Classes that don't exist are created fresh
+    - Classes that already exist cause restore to fail (must delete first)
+    - Schema is restored along with data
+    """
+    print(f"Starting Weaviate restore from backup: {backup_id}")
+    
+    response = client.backup.restore(
+        backup_id=backup_id,
+        backend=backend,
+        include_collections=include_classes,
+        exclude_collections=exclude_classes,
+        wait_for_completion=wait_for_completion
+    )
+    
+    return {
+        "backup_id": backup_id,
+        "status": response.status,
+        "restored_classes": response.collections,
+        "error": getattr(response, "error", None)
+    }
+
+
+def validate_weaviate_restore(
+    class_name: str,
+    expected_min_count: int,
+    sample_query_vector: list = None
+) -&gt; dict:
+    """
+    Post-restore validation:
+    1. Check object count is within expected range
+    2. Run a sample similarity query to confirm index is queryable
+    """
+    collection = client.collections.get(class_name)
+    
+    # Count validation
+    count_result = collection.aggregate.over_all(total_count=True)
+    actual_count = count_result.total_count
+    
+    count_ok = actual_count &gt;= expected_min_count
+    
+    validation = {
+        "class": class_name,
+        "expected_min": expected_min_count,
+        "actual_count": actual_count,
+        "count_ok": count_ok,
+        "query_ok": None,
+        "query_latency_ms": None
+    }
+    
+    # Query validation — if a sample vector is provided
+    if sample_query_vector and count_ok:
+        start = time.time()
+        results = collection.query.near_vector(
+            near_vector=sample_query_vector,
+            limit=5,
+            return_metadata=wvc.query.MetadataQuery(distance=True)
+        )
+        latency_ms = (time.time() - start) * 1000
+        
+        validation["query_ok"] = len(results.objects) &gt; 0
+        validation["query_latency_ms"] = round(latency_ms, 2)
+        validation["top_result_distance"] = (
+            results.objects[0].metadata.distance
+            if results.objects else None
+        )
+    
+    return validation
+
+
+def schedule_weaviate_backup_rotation(
+    backend: str = "s3",
+    retention_days: int = 7,
+    backup_prefix: str = "weaviate-backup"
+) -&gt; None:
+    """
+    Create daily backup and clean up backups older than retention_days.
+    Designed to be called from a cron job or Airflow DAG.
+    
+    Note: Weaviate doesn't manage backup retention itself.
+    Cleanup is handled through the storage backend (S3 lifecycle rules recommended).
+    """
+    today = datetime.utcnow().strftime("%Y%m%d")
+    backup_id = f"{backup_prefix}-{today}"
+    
+    result = create_weaviate_backup(
+        backup_id=backup_id,
+        backend=backend,
+        wait_for_completion=True
+    )
+    
+    print(f"Backup result: {result}")
+    
+    # For S3-backed backups, enforce retention via S3 lifecycle
+    # (Better approach than manual deletion through Weaviate API)
+    print(f"Reminder: Ensure S3 lifecycle rule expires backups after {retention_days} days")
+    print(f"Backup path prefix: weaviate-backups/{backup_id}/")
+
+
+# Example DR runbook execution
+if __name__ == "__main__":
+    # Create backup
+    backup_id = f"prod-backup-{datetime.utcnow().strftime('%Y%m%d-%H%M')}"
+    backup_info = create_weaviate_backup(backup_id, backend="s3")
+    print(f"Backup complete: {backup_info}")
+    
+    # Restore to DR site (run on DR cluster)
+    # restore_result = restore_weaviate_backup(backup_id, backend="s3")
+    
+    # Validate
+    # validation = validate_weaviate_restore(
+    #     "DocumentEmbeddings",
+    #     expected_min_count=9_000_000
+    # )
+    # print(f"Validation: {validation}")
+
+client.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Weaviate's backup system has one notable constraint: during a backup, write operations continue but the backup is a consistent snapshot of the moment it was initiated. You will not get a backup that includes writes that arrived after the backup started. For high-write workloads, the RPO is effectively the time since the last backup started, not the time since it completed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Replication and High Availability Topologies</h3>
+
+<p class="text-gray-300 leading-relaxed">Backup and restore addresses your RPO and RTO for catastrophic failures. High availability — keeping the system running through partial failures without a full restore — requires replication.</p>
+
+<p class="text-gray-300 leading-relaxed">#### pgvector Replication</p>
+
+<p class="text-gray-300 leading-relaxed">pgvector inherits PostgreSQL's streaming replication without modification. Vectors stored in heap tuples replicate through WAL exactly like any other data. However, HNSW indexes on replicas are kept in sync through WAL as well — you are not rebuilding them, you are streaming the physical changes. This is one of pgvector's strongest operational advantages.</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

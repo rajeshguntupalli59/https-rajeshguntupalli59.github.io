@@ -1,0 +1,588 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 8: Short-Term vs Long-Term Memory Architecture — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 8: Short-Term vs Long-Term Memory Architecture. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 8 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 8: Short-Term vs Long-Term Memory Architecture</h2>
+
+<p class="text-gray-300 leading-relaxed">Memory is the difference between a chatbot and an intelligent assistant. Without it, every conversation starts from zero — the AI has no context about who you are, what you've discussed, or what you prefer. With well-designed memory architecture, an AI application can maintain coherent multi-turn conversations, recall decisions made weeks ago, learn user preferences over time, and surface relevant past context at exactly the right moment. PostgreSQL, with its combination of relational integrity, JSONB flexibility, pgvector similarity search, and real-time notification systems, is uniquely positioned to be the memory backbone for production AI applications. This chapter walks through building a complete two-tier memory system: short-term conversation buffers that keep current sessions coherent, and long-term episodic and semantic memory that persists knowledge across sessions and scales to millions of users.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Two-Tier Memory Model</h3>
+
+<p class="text-gray-300 leading-relaxed">Human cognition operates across multiple time scales. Working memory holds what you're thinking about right now. Long-term memory stores experiences, facts, and learned patterns. AI applications need the same architecture — and conflating the two tiers is one of the most common mistakes in early AI application design.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Short-term memory</strong> serves the active conversation. It answers the question: *what has been said in this session?* It needs to be fast, ordered, and bounded. You don't need to store every conversation forever — you need the last N turns accessible in milliseconds. This is your conversation history buffer.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Long-term memory</strong> serves the persistent self. It answers the question: *what do we know about this user, this domain, and past decisions?* It can be slower to retrieve but needs to be semantically searchable. You can't retrieve it by position — you retrieve it by relevance. This is your episodic memory, your user profile, and your knowledge base.</p>
+
+<p class="text-gray-300 leading-relaxed">The failure mode of conflating these is obvious in production: either you pass 100,000 tokens of conversation history into every LLM call (expensive, slow, and often irrelevant), or you throw away context between sessions and users feel unrecognized.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is the foundational schema that separates these two concerns cleanly:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core memory architecture schema
+-- Assumes pgvector is installed: CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+
+-- ============================================================
+-- SHORT-TERM MEMORY: Conversation sessions and message buffers
+-- ============================================================
+
+CREATE TABLE users (
+    user_id         UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    external_id     TEXT UNIQUE NOT NULL,       -- your app's user identifier
+    display_name    TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_active_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX idx_users_external_id ON users(external_id);
+CREATE INDEX idx_users_last_active ON users(last_active_at DESC);
+
+CREATE TABLE conversation_sessions (
+    session_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    title           TEXT,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    ended_at        TIMESTAMPTZ,
+    session_type    TEXT NOT NULL DEFAULT 'chat',   -- 'chat', 'agent', 'rag_query'
+    context_window  JSONB NOT NULL DEFAULT '{}',    -- session-level overrides
+    total_tokens    INTEGER NOT NULL DEFAULT 0,
+    message_count   INTEGER NOT NULL DEFAULT 0,
+    is_archived     BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX idx_sessions_user_id ON conversation_sessions(user_id, last_message_at DESC);
+CREATE INDEX idx_sessions_active ON conversation_sessions(user_id)
+    WHERE ended_at IS NULL AND is_archived = FALSE;
+
+CREATE TABLE conversation_messages (
+    message_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      UUID NOT NULL REFERENCES conversation_sessions(session_id) ON DELETE CASCADE,
+    user_id         UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    sequence_number INTEGER NOT NULL,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system', 'tool')),
+    content         TEXT NOT NULL,
+    content_tokens  INTEGER,
+    tool_calls      JSONB,                          -- for agent tool invocations
+    tool_results    JSONB,                          -- for tool return values
+    model_used      TEXT,                           -- 'gpt-4o', 'claude-3-5-sonnet', etc.
+    latency_ms      INTEGER,
+    finish_reason   TEXT,                           -- 'stop', 'length', 'tool_calls'
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE UNIQUE INDEX idx_messages_session_sequence
+    ON conversation_messages(session_id, sequence_number);
+CREATE INDEX idx_messages_session_created
+    ON conversation_messages(session_id, created_at ASC);
+CREATE INDEX idx_messages_user_recent
+    ON conversation_messages(user_id, created_at DESC);
+
+-- ============================================================
+-- LONG-TERM MEMORY: Episodic memories, user profiles, facts
+-- ============================================================
+
+CREATE TABLE memory_entries (
+    memory_id       UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    memory_type     TEXT NOT NULL CHECK (memory_type IN (
+                        'episodic',    -- "User mentioned they use Python"
+                        'semantic',    -- "User prefers concise answers"
+                        'procedural',  -- "When user asks X, always do Y"
+                        'working'      -- temporary cross-session state
+                    )),
+    content         TEXT NOT NULL,
+    source_session_id UUID REFERENCES conversation_sessions(session_id),
+    source_message_id UUID REFERENCES conversation_messages(message_id),
+    embedding       vector(1536),                   -- OpenAI ada-002 / text-embedding-3-small
+    importance_score FLOAT NOT NULL DEFAULT 0.5,    -- 0.0 to 1.0
+    access_count    INTEGER NOT NULL DEFAULT 0,
+    last_accessed_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ,                    -- for working memory with TTL
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE,
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX idx_memory_user_type
+    ON memory_entries(user_id, memory_type)
+    WHERE is_active = TRUE;
+CREATE INDEX idx_memory_embedding
+    ON memory_entries USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100)
+    WHERE is_active = TRUE;
+CREATE INDEX idx_memory_importance
+    ON memory_entries(user_id, importance_score DESC)
+    WHERE is_active = TRUE;
+CREATE INDEX idx_memory_tags
+    ON memory_entries USING GIN(tags);
+CREATE INDEX idx_memory_expires
+    ON memory_entries(expires_at)
+    WHERE expires_at IS NOT NULL AND is_active = TRUE;
+
+-- User preference and profile store (structured long-term memory)
+CREATE TABLE user_profiles (
+    profile_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id         UUID UNIQUE NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    preferences     JSONB NOT NULL DEFAULT '{}',    -- structured preferences
+    facts           JSONB NOT NULL DEFAULT '{}',    -- known facts about the user
+    interaction_stats JSONB NOT NULL DEFAULT '{}',  -- aggregate interaction data
+    persona_notes   TEXT,                           -- free-form notes for system prompt
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    version         INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX idx_profiles_user_id ON user_profiles(user_id);
+
+-- Function to auto-update updated_at
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_user_profiles_updated_at
+    BEFORE UPDATE ON user_profiles
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This schema draws a hard line between the two memory tiers. Conversation messages are relational — ordered by sequence, linked to sessions and users, queryable by position. Memory entries are semantic — embedded, importance-ranked, tagged, and searchable by similarity.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Short-Term Memory Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Short-term memory has two jobs: feed the LLM the right context for the current conversation, and do it fast enough that users don't notice the overhead. The implementation involves a conversation buffer that selects recent messages, respects token limits, and serializes cleanly into the format each LLM API expects.</p>
+
+<p class="text-gray-300 leading-relaxed">The token budget is the core constraint. GPT-4o has a 128K context window; Claude 3.5 Sonnet has 200K. But sending 100K tokens of history on every turn is expensive and slow. A practical short-term buffer targets 4,000–8,000 tokens for conversation history, leaving room for the system prompt, retrieved long-term memories, and the actual response.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Short-term memory retrieval functions
+
+-- Get recent messages for a session, with token budget control
+CREATE OR REPLACE FUNCTION get_session_context(
+    p_session_id    UUID,
+    p_max_messages  INTEGER DEFAULT 20,
+    p_max_tokens    INTEGER DEFAULT 6000
+)
+RETURNS TABLE (
+    message_id      UUID,
+    sequence_number INTEGER,
+    role            TEXT,
+    content         TEXT,
+    tool_calls      JSONB,
+    tool_results    JSONB,
+    created_at      TIMESTAMPTZ,
+    cumulative_tokens INTEGER
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH ranked_messages AS (
+        SELECT
+            cm.message_id,
+            cm.sequence_number,
+            cm.role,
+            cm.content,
+            cm.tool_calls,
+            cm.tool_results,
+            cm.created_at,
+            cm.content_tokens,
+            ROW_NUMBER() OVER (ORDER BY cm.sequence_number DESC) AS rn
+        FROM conversation_messages cm
+        WHERE cm.session_id = p_session_id
+        ORDER BY cm.sequence_number DESC
+        LIMIT p_max_messages
+    ),
+    with_cumulative AS (
+        SELECT
+            rm.*,
+            SUM(COALESCE(rm.content_tokens, LENGTH(rm.content) / 4))
+                OVER (ORDER BY rm.rn ASC) AS cum_tokens
+        FROM ranked_messages rm
+    )
+    SELECT
+        wc.message_id,
+        wc.sequence_number,
+        wc.role,
+        wc.content,
+        wc.tool_calls,
+        wc.tool_results,
+        wc.created_at,
+        wc.cum_tokens::INTEGER AS cumulative_tokens
+    FROM with_cumulative wc
+    WHERE wc.cum_tokens &lt;= p_max_tokens
+    ORDER BY wc.sequence_number ASC;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Append a message and update session counters atomically
+CREATE OR REPLACE FUNCTION append_message(
+    p_session_id    UUID,
+    p_user_id       UUID,
+    p_role          TEXT,
+    p_content       TEXT,
+    p_model_used    TEXT DEFAULT NULL,
+    p_latency_ms    INTEGER DEFAULT NULL,
+    p_tool_calls    JSONB DEFAULT NULL,
+    p_tool_results  JSONB DEFAULT NULL,
+    p_metadata      JSONB DEFAULT '{}'
+)
+RETURNS UUID AS $$
+DECLARE
+    v_sequence      INTEGER;
+    v_message_id    UUID;
+    v_token_estimate INTEGER;
+BEGIN
+    -- Get next sequence number with row lock to prevent race conditions
+    SELECT COALESCE(MAX(sequence_number), 0) + 1
+    INTO v_sequence
+    FROM conversation_messages
+    WHERE session_id = p_session_id
+    FOR UPDATE;
+
+    -- Rough token estimate: 4 chars ≈ 1 token
+    v_token_estimate := CEIL(LENGTH(p_content)::FLOAT / 4);
+
+    INSERT INTO conversation_messages (
+        session_id, user_id, sequence_number, role, content,
+        content_tokens, model_used, latency_ms,
+        tool_calls, tool_results, metadata
+    )
+    VALUES (
+        p_session_id, p_user_id, v_sequence, p_role, p_content,
+        v_token_estimate, p_model_used, p_latency_ms,
+        p_tool_calls, p_tool_results, p_metadata
+    )
+    RETURNING message_id INTO v_message_id;
+
+    -- Update session counters
+    UPDATE conversation_sessions
+    SET
+        last_message_at = NOW(),
+        message_count   = message_count + 1,
+        total_tokens    = total_tokens + v_token_estimate
+    WHERE session_id = p_session_id;
+
+    RETURN v_message_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Summarize a session when it grows too long (called before archiving)
+CREATE TABLE session_summaries (
+    summary_id      UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    session_id      UUID NOT NULL REFERENCES conversation_sessions(session_id),
+    summary_text    TEXT NOT NULL,
+    covered_through INTEGER NOT NULL,   -- last sequence_number included in summary
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    model_used      TEXT,
+    token_count     INTEGER
+);
+
+CREATE INDEX idx_summaries_session ON session_summaries(session_id, created_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now the Python layer that sits on top of this schema. This is where short-term memory gets wired into actual LLM calls:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># short_term_memory.py
+# Full short-term memory implementation with OpenAI and Claude support
+
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional
+from uuid import UUID
+
+import asyncpg
+import tiktoken
+from openai import AsyncOpenAI
+import anthropic
+
+# Initialize clients
+openai_client = AsyncOpenAI()
+anthropic_client = anthropic.Anthropic()
+
+
+class ConversationMemory:
+    """
+    Manages short-term conversation memory backed by PostgreSQL.
+    Handles session creation, message persistence, and context assembly.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, max_context_tokens: int = 6000):
+        self.pool = pool
+        self.max_context_tokens = max_context_tokens
+        self.encoder = tiktoken.encoding_for_model("gpt-4o")
+
+    def count_tokens(self, text: str) -&gt; int:
+        return len(self.encoder.encode(text))
+
+    async def get_or_create_session(
+        self, user_external_id: str, session_id: Optional[str] = None
+    ) -&gt; tuple[str, str]:
+        """
+        Returns (user_id, session_id). Creates user and session if needed.
+        """
+        async with self.pool.acquire() as conn:
+            # Upsert user
+            user_row = await conn.fetchrow(
+                """
+                INSERT INTO users (external_id)
+                VALUES ($1)
+                ON CONFLICT (external_id) DO UPDATE
+                    SET last_active_at = NOW()
+                RETURNING user_id
+                """,
+                user_external_id,
+            )
+            user_id = str(user_row["user_id"])
+
+            # Use existing session or create new one
+            if session_id:
+                session_row = await conn.fetchrow(
+                    "SELECT session_id FROM conversation_sessions WHERE session_id = $1",
+                    UUID(session_id),
+                )
+                if session_row:
+                    return user_id, session_id
+
+            # Create new session
+            session_row = await conn.fetchrow(
+                """
+                INSERT INTO conversation_sessions (user_id)
+                VALUES ($1::uuid)
+                RETURNING session_id
+                """,
+                user_id,
+            )
+            return user_id, str(session_row["session_id"])
+
+    async def load_context(self, session_id: str) -&gt; list[dict]:
+        """
+        Load recent messages formatted for LLM APIs (OpenAI/Anthropic format).
+        Respects token budget via the database function.
+        """
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT role, content, tool_calls, tool_results, sequence_number
+                FROM get_session_context($1::uuid, $2, $3)
+                ORDER BY sequence_number ASC
+                """,
+                UUID(session_id),
+                20,
+                self.max_context_tokens,
+            )
+
+        messages = []
+        for row in rows:
+            msg = {"role": row["role"], "content": row["content"]}
+
+            # Reconstruct tool call messages for agent conversations
+            if row["tool_calls"]:
+                msg["tool_calls"] = row["tool_calls"]
+            if row["tool_results"] and row["role"] == "tool":
+                msg["content"] = row["tool_results"]
+
+            messages.append(msg)
+
+        return messages
+
+    async def save_message(
+        self,
+        session_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        model_used: Optional[str] = None,
+        latency_ms: Optional[int] = None,
+        metadata: Optional[dict] = None,
+    ) -&gt; str:
+        """Save a message and return its message_id."""
+        async with self.pool.acquire() as conn:
+            message_id = await conn.fetchval(
+                """
+                SELECT append_message(
+                    $1::uuid, $2::uuid, $3, $4, $5, $6, NULL, NULL, $7
+                )
+                """,
+                UUID(session_id),
+                UUID(user_id),
+                role,
+                content,
+                model_used,
+                latency_ms,
+                metadata or {},
+            )
+        return str(message_id)
+
+    async def chat_with_memory(
+        self,
+        user_external_id: str,
+        user_message: str,
+        session_id: Optional[str] = None,
+        system_prompt: str = "You are a helpful assistant.",
+        model: str = "gpt-4o",
+    ) -&gt; tuple[str, str, str]:
+        """
+        Full chat turn with memory. Returns (response_text, session_id, message_id).
+        Loads context from DB → calls LLM → saves both messages to DB.
+        """
+        user_id, session_id = await self.get_or_create_session(
+            user_external_id, session_id
+        )
+
+        # Save user message first
+        await self.save_message(session_id, user_id, "user", user_message)
+
+        # Load conversation context
+        history = await self.load_context(session_id)
+
+        # Build messages for API call
+        messages = history  # already includes the user message we just saved
+
+        start_time = datetime.now(timezone.utc)
+
+        if model.startswith("gpt") or model.startswith("o"):
+            # OpenAI path
+            response = await openai_client.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": system_prompt}] + messages,
+                temperature=0.7,
+            )
+            reply = response.choices[0].message.content
+            finish_reason = response.choices[0].finish_reason
+
+        elif model.startswith("claude"):
+            # Anthropic path — system prompt is separate
+            response = anthropic_client.messages.create(
+                model=model,
+                max_tokens=2048,
+                system=system_prompt,
+                messages=messages,
+            )
+            reply = response.content[0].text
+            finish_reason = response.stop_reason
+
+        else:
+            raise ValueError(f"Unsupported model: {model}")
+
+        latency_ms = int(
+            (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+        )
+
+        # Save assistant response
+        message_id = await self.save_message(
+            session_id,
+            user_id,
+            "assistant",
+            reply,
+            model_used=model,
+            latency_ms=latency_ms,
+            metadata={"finish_reason": finish_reason},
+        )
+
+        return reply, session_id, message_id
+
+
+# FastAPI endpoint wiring
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI()
+
+
+class ChatRequest(BaseModel):
+    user_id: str
+    message: str
+    session_id: Optional[str] = None
+    model: str = "gpt-4o"
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    session_id: str
+    message_id: str
+
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
+    """Chat endpoint with automatic short-term memory management."""
+    # pool is set up at app startup via lifespan
+    memory = ConversationMemory(app.state.pool)
+
+    try:
+        reply, session_id, message_id = await memory.chat_with_memory(
+            user_external_id=request.user_id,
+            user_message=request.message,
+            session_id=request.session_id,
+            model=request.model,
+        )
+        return ChatResponse(reply=reply, session_id=session_id, message_id=message_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">get_session_context</code> function in PostgreSQL does the heavy lifting: it walks backward through messages, accumulates token counts, and stops when the budget is exhausted. This means the Python layer never pulls more data than it needs, and the token budget is enforced at the database level — not in application code where it's easy to forget.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Long-Term Memory Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Long-term memory is where PostgreSQL truly distinguishes itself from pure vector stores. You need semantic search *and* relational filtering. When retrieving memories for a user, you want to find embeddings that are close to the current conversation topic *and* that belong to this specific user *and* that haven't expired *and* that have high importance scores. A standalone vector database can do the first filter; PostgreSQL with pgvector does all four simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">The long-term memory layer has three components:</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Extraction</strong> — identifying what's worth remembering from a conversation</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Storage</strong> — embedding and storing extracted memories</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Retrieval</strong> — finding relevant past memories to inject into new conversations</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

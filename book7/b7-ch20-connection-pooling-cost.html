@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 20: Connection Pooling to Reduce Compute Overhead — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 20: Connection Pooling to Reduce Compute Overhead. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 20 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 20: Connection Pooling to Reduce Compute Overhead</h2>
+
+<p class="text-gray-300 leading-relaxed">Organizations running PostgreSQL on AWS RDS, Azure Database for PostgreSQL, or Cloud SQL routinely overpay for compute by 30–50% simply because each application thread holds a dedicated database connection whether it is actively executing a query or sitting idle. A db.r6g.2xlarge RDS instance running at $0.48/hour — $346/month — often spends the majority of its CPU cycles managing connection overhead rather than executing SQL. By deploying PgBouncer in transaction pooling mode in front of that instance, teams consistently reduce their active connection count from several hundred to fewer than fifty, which in turn allows them to right-size to a db.r6g.xlarge at $173/month — saving $173/month on a single instance without changing a line of application code. Across a fleet of ten such instances the annual saving reaches $20,760. This chapter covers how to diagnose connection waste, size a connection pool correctly, deploy and automate PgBouncer on each major cloud platform, and wire the entire operation into a scheduled cost-audit pipeline so savings are permanent rather than one-time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Diagnosing Connection Overhead Before You Optimize</h3>
+
+<p class="text-gray-300 leading-relaxed">No optimization survives a budget review without a before-state baseline. Connection overhead manifests in three measurable ways: high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> utilization, elevated CPU on the database instance while query throughput is low, and spikes in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> showing processes in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle in transaction</code> state.</p>
+
+<p class="text-gray-300 leading-relaxed">The following query exposes the exact distribution of connection states on a live PostgreSQL instance. Run it against every RDS or Cloud SQL instance in your fleet and export the results to a spreadsheet:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Connection state audit: run on each PostgreSQL instance
+-- Identifies idle connections that are burning compute capacity
+SELECT
+    datname                          AS database_name,
+    usename                          AS username,
+    state,
+    wait_event_type,
+    wait_event,
+    COUNT(*)                         AS connection_count,
+    ROUND(COUNT(*) * 100.0
+          / SUM(COUNT(*)) OVER (), 2) AS pct_of_total,
+    MAX(EXTRACT(EPOCH FROM (NOW() - state_change))::INT)
+                                     AS max_idle_seconds,
+    AVG(EXTRACT(EPOCH FROM (NOW() - state_change))::INT)
+                                     AS avg_idle_seconds
+FROM pg_stat_activity
+WHERE pid &lt;&gt; pg_backend_pid()        -- exclude this monitoring session
+GROUP BY datname, usename, state, wait_event_type, wait_event
+ORDER BY connection_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Interpret the output with these thresholds:</p>
+
+<p class="text-gray-300 leading-relaxed">| Condition | Meaning | Action |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle</code> > 40% of total | Application not releasing connections | Pool immediately |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle in transaction</code> > 5% | Long transactions or ORM misuse | Fix ORM + Pool |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_idle_seconds</code> > 300 | Connections parked for 5+ minutes | Reduce pool timeout |</p>
+<p class="text-gray-300 leading-relaxed">| Total connections > 80% of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> | Near exhaustion | Pool + raise limit |</p>
+
+<p class="text-gray-300 leading-relaxed">Pull the current <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> ceiling and see how close you are to it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Current connection ceiling vs. actual usage
+SELECT
+    name,
+    setting::INT                               AS configured_value,
+    (SELECT COUNT(*) FROM pg_stat_activity)    AS current_connections,
+    ROUND(
+        (SELECT COUNT(*) FROM pg_stat_activity)::NUMERIC
+        / setting::INT * 100, 1
+    )                                          AS utilization_pct
+FROM pg_parameter_status('max_connections')  -- not valid; use pg_settings
+-- Correction: use pg_settings for accurate value
+UNION ALL
+SELECT
+    'max_connections'                          AS name,
+    setting::INT                               AS configured_value,
+    (SELECT COUNT(*) FROM pg_stat_activity)    AS current_connections,
+    ROUND(
+        (SELECT COUNT(*) FROM pg_stat_activity)::NUMERIC
+        / setting::INT * 100, 1
+    )                                          AS utilization_pct
+FROM pg_settings
+WHERE name = 'max_connections';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On AWS RDS, cross-reference this data with CloudWatch. The metric <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> sampled over 24 hours tells you peak and average. Pull it with the CLI so you can baseline before and after pooling:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# baseline_connections.sh
+# Pulls 7-day connection metrics from CloudWatch for a named RDS instance
+# Usage: ./baseline_connections.sh mydb-instance-1 us-east-1
+
+INSTANCE_ID="${1:?Usage: $0 &lt;db-instance-id&gt; &lt;region&gt;}"
+REGION="${2:-us-east-1}"
+START_TIME=$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ' 2&gt;/dev/null \
+             || date -u -v-7d '+%Y-%m-%dT%H:%M:%SZ')  # macOS fallback
+END_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+echo "=== Connection baseline for: $INSTANCE_ID ==="
+
+aws cloudwatch get-metric-statistics \
+    --region        "$REGION" \
+    --namespace     AWS/RDS \
+    --metric-name   DatabaseConnections \
+    --dimensions    Name=DBInstanceIdentifier,Value="$INSTANCE_ID" \
+    --start-time    "$START_TIME" \
+    --end-time      "$END_TIME" \
+    --period        3600 \
+    --statistics    Maximum Average \
+    --output        json \
+| python3 - &lt;&lt; 'PYEOF'
+import sys, json
+data = json.load(sys.stdin)
+points = sorted(data["Datapoints"], key=lambda p: p["Timestamp"])
+print(f"{'Timestamp':&lt;30} {'Max':&gt;8} {'Avg':&gt;8}")
+print("-" * 50)
+for p in points:
+    print(f"{p['Timestamp']:&lt;30} {p['Maximum']:&gt;8.0f} {p['Average']:&gt;8.1f}")
+
+if points:
+    maxes = [p["Maximum"] for p in points]
+    avgs  = [p["Average"]  for p in points]
+    print(f"\nPeak 7-day maximum : {max(maxes):.0f}")
+    print(f"Mean of hourly avg : {sum(avgs)/len(avgs):.1f}")
+PYEOF
+
+echo ""
+echo "=== CPUUtilization during same window ==="
+aws cloudwatch get-metric-statistics \
+    --region      "$REGION" \
+    --namespace   AWS/RDS \
+    --metric-name CPUUtilization \
+    --dimensions  Name=DBInstanceIdentifier,Value="$INSTANCE_ID" \
+    --start-time  "$START_TIME" \
+    --end-time    "$END_TIME" \
+    --period      3600 \
+    --statistics  Maximum Average \
+    --output      json \
+| python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+points = sorted(data['Datapoints'], key=lambda p: p['Timestamp'])
+if points:
+    maxes = [p['Maximum'] for p in points]
+    avgs  = [p['Average']  for p in points]
+    print(f'Peak CPU  : {max(maxes):.1f}%')
+    print(f'Mean CPU  : {sum(avgs)/len(avgs):.1f}%')
+    print()
+    print('Rule of thumb: if mean CPU &lt; 20% and connections are high,')
+    print('you are paying for connection overhead, not real workload.')
+"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When peak connections are high and mean CPU is below 20%, the instance is sized for connection overhead rather than query work. That gap is your cost recovery opportunity.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Sizing the Pool: The Math Behind Right-Sizing</h3>
+
+<p class="text-gray-300 leading-relaxed">The common mistake is deploying PgBouncer with default settings and calling it done. The pool size determines whether you can actually downsize the instance, and the instance determines the monthly bill. Get the math right first.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL performs best when the number of *active* (non-idle) connections does not exceed <strong class="text-white">2 × vCPU count</strong>. For a db.r6g.2xlarge (8 vCPUs), the optimal active connection count is 16. Every connection above that figure competes for the same CPU cores and increases context-switching overhead — you pay for a larger instance to manage connections, not to execute queries.</p>
+
+<p class="text-gray-300 leading-relaxed">The PgBouncer pool target formula:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>server_pool_size = 2 × vCPU_count_of_target_instance
+max_client_conn  = peak_application_threads × safety_factor (1.25)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Example calculation for a migration from db.r6g.2xlarge to db.r6g.xlarge:</p>
+
+<p class="text-gray-300 leading-relaxed">| Parameter | Before | After |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Instance | db.r6g.2xlarge (8 vCPU) | db.r6g.xlarge (4 vCPU) |</p>
+<p class="text-gray-300 leading-relaxed">| On-Demand price | $0.480/hr | $0.240/hr |</p>
+<p class="text-gray-300 leading-relaxed">| Monthly cost | $346.56 | $172.80 |</p>
+<p class="text-gray-300 leading-relaxed">| Monthly saving | — | $173.76 |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> on RDS | 5,000* | 2,500* |</p>
+<p class="text-gray-300 leading-relaxed">| Application threads | 400 | 400 |</p>
+<p class="text-gray-300 leading-relaxed">| PgBouncer <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">default_pool_size</code> | — | 8 |</p>
+<p class="text-gray-300 leading-relaxed">| PgBouncer <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_client_conn</code> | — | 500 |</p>
+
+<p class="text-gray-300 leading-relaxed">*RDS sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> automatically based on instance RAM; values shown are illustrative.</p>
+
+<p class="text-gray-300 leading-relaxed">The key insight: 400 application threads share 8 server-side connections. Each thread waits at most a few milliseconds for a connection in transaction pooling mode because transactions complete in tens of milliseconds on OLTP workloads. Average wait is negligible compared to the compute saving.</p>
+
+<p class="text-gray-300 leading-relaxed">For Azure Database for PostgreSQL Flexible Server, the equivalent instance comparison is:</p>
+
+<p class="text-gray-300 leading-relaxed">| Tier | vCPU | RAM | Price (East US) | Monthly |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Standard_D4ds_v4 | 4 | 16 GB | $0.334/hr | $241 |</p>
+<p class="text-gray-300 leading-relaxed">| Standard_D2ds_v4 | 2 | 8 GB | $0.167/hr | $120 |</p>
+<p class="text-gray-300 leading-relaxed">| Saving per instance | | | | $121/mo |</p>
+
+<p class="text-gray-300 leading-relaxed">On Google Cloud SQL for PostgreSQL, the equivalent:</p>
+
+<p class="text-gray-300 leading-relaxed">| Machine type | vCPU | RAM | Price (us-central1) | Monthly |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| db-custom-4-15360 | 4 | 15 GB | $0.3567/hr | $257 |</p>
+<p class="text-gray-300 leading-relaxed">| db-custom-2-7680 | 2 | 7.5 GB | $0.1784/hr | $129 |</p>
+<p class="text-gray-300 leading-relaxed">| Saving per instance | | | | $128/mo |</p>
+
+<p class="text-gray-300 leading-relaxed">Before committing to a smaller instance, validate the pool size calculation against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>. The following query identifies the 95th-percentile query duration, which determines how long a server connection is held per transaction:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Estimate transaction duration from pg_stat_statements
+-- This determines whether transaction pooling is safe and effective
+SELECT
+    LEFT(query, 80)                                           AS query_sample,
+    calls,
+    ROUND((total_exec_time / calls)::NUMERIC, 2)             AS avg_exec_ms,
+    ROUND(
+        PERCENTILE_CONT(0.95) WITHIN GROUP
+        (ORDER BY total_exec_time / calls)
+        OVER ()::NUMERIC, 2)                                  AS p95_exec_ms,
+    ROUND((mean_exec_time)::NUMERIC, 2)                       AS mean_exec_ms,
+    rows / calls                                              AS avg_rows_returned
+FROM pg_stat_statements
+WHERE calls &gt; 100
+  AND query NOT LIKE '%pg_stat%'   -- exclude monitoring queries
+ORDER BY total_exec_time DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If p95 query duration is under 100ms (typical for OLTP), transaction pooling is safe. If you see queries above 5,000ms regularly, those long-running queries will hold server connections and reduce the effectiveness of the pool — address query performance before right-sizing compute.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Deploying PgBouncer on Each Cloud Platform</h3>
+
+<p class="text-gray-300 leading-relaxed">PgBouncer sits between the application and the RDS/Cloud SQL instance. It multiplexes hundreds of client connections onto a small number of server connections. The deployment pattern differs slightly by cloud platform.</p>
+
+<p class="text-gray-300 leading-relaxed">#### AWS: PgBouncer on EC2 or ECS</p>
+
+<p class="text-gray-300 leading-relaxed">The lowest-latency placement for PgBouncer on AWS is an EC2 instance in the same Availability Zone as the primary RDS instance, or a Fargate task in ECS if you want managed infrastructure. A t3.small ($0.0208/hr, $15/month) handles tens of thousands of application connections with negligible CPU usage — it is purely I/O and memory bounded.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Bash script provisions PgBouncer on an Amazon Linux 2023 EC2 instance, configures it for transaction pooling, and registers it as a systemd service:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# deploy_pgbouncer_aws.sh
+# Installs and configures PgBouncer on Amazon Linux 2023
+# Run as ec2-user with sudo privileges
+# Requires: RDS endpoint, DB name, credentials in AWS Secrets Manager
+
+set -euo pipefail
+
+RDS_ENDPOINT="${RDS_ENDPOINT:?Set RDS_ENDPOINT environment variable}"
+RDS_PORT="${RDS_PORT:-5432}"
+DB_NAME="${DB_NAME:?Set DB_NAME environment variable}"
+SECRET_ARN="${SECRET_ARN:?Set SECRET_ARN for Secrets Manager}"
+PGBOUNCER_PORT=6432
+POOL_SIZE="${POOL_SIZE:-16}"         # 2 × vCPU of target instance
+MAX_CLIENT_CONN="${MAX_CLIENT_CONN:-500}"
+
+echo "[1/6] Installing PgBouncer..."
+sudo dnf install -y pgbouncer
+
+echo "[2/6] Fetching credentials from Secrets Manager..."
+SECRET=$(aws secretsmanager get-secret-value \
+    --secret-id "$SECRET_ARN" \
+    --query SecretString \
+    --output text)
+DB_USER=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+DB_PASS=$(echo "$SECRET" | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+
+echo "[3/6] Writing pgbouncer.ini..."
+sudo tee /etc/pgbouncer/pgbouncer.ini &gt; /dev/null &lt;&lt; INIEOF
+[databases]
+${DB_NAME} = host=${RDS_ENDPOINT} port=${RDS_PORT} dbname=${DB_NAME}
+
+[pgbouncer]
+listen_addr          = 0.0.0.0
+listen_port          = ${PGBOUNCER_PORT}
+auth_type            = scram-sha-256
+auth_file            = /etc/pgbouncer/userlist.txt
+
+; TRANSACTION mode: connection returned to pool after each transaction
+; This is the mode that enables compute right-sizing
+pool_mode            = transaction
+
+default_pool_size    = ${POOL_SIZE}
+min_pool_size        = 2
+reserve_pool_size    = 5
+reserve_pool_timeout = 3
+max_client_conn      = ${MAX_CLIENT_CONN}
+
+; Connection hygiene — recycle idle server connections
+server_idle_timeout  = 60
+client_idle_timeout  = 300
+server_lifetime      = 3600
+
+; Logging for cost audit trail
+log_connections      = 1
+log_disconnections   = 1
+stats_period         = 60
+
+; TLS toward RDS
+server_tls_sslmode   = require
+
+; Admin interface — restrict to localhost
+admin_users          = pgbouncer_admin
+stats_users          = pgbouncer_stats
+INIEOF
+
+echo "[4/6] Writing userlist.txt..."
+# PgBouncer needs MD5 or SCRAM hashes; use pg_shadow query for production
+# For initial setup, write plaintext and migrate to scram-sha-256 hashes
+sudo tee /etc/pgbouncer/userlist.txt &gt; /dev/null &lt;&lt; USEREOF
+"${DB_USER}" "${DB_PASS}"
+"pgbouncer_admin" "changeme_admin_pw"
+"pgbouncer_stats" "changeme_stats_pw"
+USEREOF
+sudo chmod 600 /etc/pgbouncer/userlist.txt
+sudo chown pgbouncer:pgbouncer /etc/pgbouncer/userlist.txt
+
+echo "[5/6] Enabling and starting systemd service..."
+sudo systemctl enable pgbouncer
+sudo systemctl restart pgbouncer
+sudo systemctl status pgbouncer --no-pager
+
+echo "[6/6] Verification..."
+echo "Connecting to PgBouncer admin interface..."
+PGPASSWORD="changeme_admin_pw" psql \
+    -h 127.0.0.1 -p $PGBOUNCER_PORT \
+    -U pgbouncer_admin pgbouncer \
+    -c "SHOW POOLS;" \
+    -c "SHOW STATS;" \
+    -c "SHOW CONFIG;" 2&gt;&1 | head -60
+
+echo ""
+echo "=== Deployment complete ==="
+echo "Application connection string:"
+echo "  host=&lt;this-ec2-ip&gt; port=${PGBOUNCER_PORT} dbname=${DB_NAME} user=${DB_USER}"
+echo ""
+echo "Next step: update application connection strings, then right-size RDS instance."</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Azure: PgBouncer Built-In vs. Sidecar</p>
+
+<p class="text-gray-300 leading-relaxed">Azure Database for PostgreSQL Flexible Server includes PgBouncer as a built-in feature — enable it with a single CLI command at no additional cost:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# enable_pgbouncer_azure.sh
+# Enables built-in PgBouncer on Azure Database for PostgreSQL Flexible Server
+# Requires: az CLI logged in, Contributor role on the server resource
+
+RESOURCE_GROUP="${RESOURCE_GROUP:?Set RESOURCE_GROUP}"
+SERVER_NAME="${SERVER_NAME:?Set SERVER_NAME}"
+SUBSCRIPTION="${SUBSCRIPTION:-$(az account show --query id -o tsv)}"
+
+echo "=== Enabling PgBouncer on Azure PostgreSQL Flexible Server ==="
+echo "Server      : $SERVER_NAME"
+echo "Resource Grp: $RESOURCE_GROUP"
+
+# Enable the pgbouncer extension and set pool parameters
+az postgres flexible-server parameter set \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name    "$SERVER_NAME" \
+    --name           "pgbouncer.enabled" \
+    --value          "true"
+
+az postgres flexible-server parameter set \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name    "$SERVER_NAME" \
+    --name           "pgbouncer.default_pool_size" \
+    --value          "16"
+
+az postgres flexible-server parameter set \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name    "$SERVER_NAME" \
+    --name           "pgbouncer.max_client_conn" \
+    --value          "500"
+
+az postgres flexible-server parameter set \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name    "$SERVER_NAME" \
+    --name           "pgbouncer.pool_mode" \
+    --value          "transaction"
+
+az postgres flexible-server parameter set \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name    "$SERVER_NAME" \
+    --name           "pgbouncer.server_idle_timeout" \
+    --value          "60"
+
+echo ""
+echo "=== Verifying PgBouncer status ==="
+az postgres flexible-server parameter list \
+    --resource-group "$RESOURCE_GROUP" \
+    --server-name    "$SERVER_NAME" \
+    --query          "[?starts_with(name, 'pgbouncer')]" \
+    --output         table
+
+echo ""
+echo "=== PgBouncer connection endpoint ==="
+SERVER_FQDN=$(az postgres flexible-server show \
+    --resource-group "$RESOURCE_GROUP" \
+    --name           "$SERVER_NAME" \
+    --query          "fullyQualifiedDomainName" \
+    --output         tsv)
+
+echo "Standard port (direct) : ${SERVER_FQDN}:5432"
+echo "PgBouncer port         : ${SERVER_FQDN}:6432"
+echo ""
+echo "Update application connection strings to port 6432."
+echo "Monitor via Azure Monitor metric: active_connections"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Google Cloud SQL, the native proxy (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloud-sql-proxy</code>) handles authentication but does not pool connections. Deploy PgBouncer as a Cloud Run sidecar or on a single e2-micro ($0.0084/hr, $6/month) in the same region.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Measuring the Cost Impact and Automating Continuous Monitoring</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying PgBouncer is a one-time action. The ongoing value comes from continuously verifying that pooling efficiency is maintained as the application evolves — new features often add new connection patterns that erode pool efficiency over time. The following Python script runs on a cron schedule, compares current connection behavior against a stored baseline, and posts an alert to Slack when efficiency drops below threshold. It also queries the AWS Cost Explorer API to correlate connection count changes with actual spend.</p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>

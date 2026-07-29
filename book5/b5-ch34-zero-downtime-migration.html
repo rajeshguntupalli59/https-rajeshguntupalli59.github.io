@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 34: Zero-Downtime Cloud Migrations — The Cloud Database Engineer</title>
+  <meta name="description" content="The Cloud Database Engineer Chapter 34: Zero-Downtime Cloud Migrations. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-orange-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-orange-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 5 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-orange-400 hover:text-orange-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-orange-900/40 border border-orange-800/40 text-orange-300 text-xs rounded-full font-medium">Chapter 34 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The Cloud Database Engineer</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 34: Zero-Downtime Cloud Migrations</h2>
+
+<p class="text-gray-300 leading-relaxed">Moving a production database to the cloud without downtime is one of the most operationally demanding challenges a DBA will face. The raw mechanics—logical replication, change data capture, cutover scripting—are not new. What changes in the cloud is the tooling surface, the failure modes, and the organizational expectations. Cloud migrations often carry a political weight that on-prem upgrades did not: leadership expects zero impact, and the migration team is responsible for delivering it against managed services that hide their internals behind API abstractions. This chapter covers the full arc of a zero-downtime migration: pre-migration assessment, continuous replication setup using AWS DMS, Azure Database Migration Service, and GCP Database Migration Service, schema conversion for heterogeneous workloads, cutover orchestration, and post-migration validation. Every pattern here is drawn from production environments where downtime was measured in seconds, not minutes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.1 Pre-Migration Assessment: What You Must Know Before You Touch Anything</h3>
+
+<p class="text-gray-300 leading-relaxed">Zero-downtime migrations fail during planning, not during execution. The actual data movement phase is deterministic. The failures come from unexamined assumptions made weeks earlier.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema Complexity Inventory</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Start by cataloging every object type in your source database. For PostgreSQL sources, run:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inventory of all non-trivial schema objects in PostgreSQL source
+SELECT
+    n.nspname                        AS schema_name,
+    c.relname                        AS object_name,
+    CASE c.relkind
+        WHEN 'r' THEN 'TABLE'
+        WHEN 'v' THEN 'VIEW'
+        WHEN 'm' THEN 'MATERIALIZED_VIEW'
+        WHEN 'f' THEN 'FOREIGN_TABLE'
+        WHEN 'p' THEN 'PARTITIONED_TABLE'
+    END                              AS object_type,
+    pg_size_pretty(pg_total_relation_size(c.oid)) AS total_size,
+    s.n_live_tup                     AS live_rows,
+    s.n_dead_tup                     AS dead_rows,
+    CASE WHEN s.n_live_tup &gt; 0
+         THEN ROUND(100.0 * s.n_dead_tup / s.n_live_tup, 2)
+         ELSE 0
+    END                              AS bloat_pct
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_stat_user_tables s
+    ON s.schemaname = n.nspname AND s.relname = c.relname
+WHERE n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+  AND c.relkind IN ('r', 'v', 'm', 'f', 'p')
+ORDER BY pg_total_relation_size(c.oid) DESC NULLS LAST;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server sources heading to Azure SQL or RDS for SQL Server, run the Database Migration Assistant (DMA) locally before involving any cloud tooling. DMA will surface blockers—cross-database queries, linked server dependencies, CLR assemblies, Service Broker endpoints—that no cloud migration service will handle automatically. A 50-table OLTP database with two linked servers and a CLR aggregate function is not a zero-downtime migration candidate until those dependencies are resolved. Treat DMA output as a go/no-go gate, not a to-do list.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication Eligibility</strong></p>
+
+<p class="text-gray-300 leading-relaxed">AWS DMS requires that source tables have a primary key or a unique non-nullable index for CDC (Change Data Capture) mode. Tables without either will be replicated using full-load only, meaning they receive no ongoing changes during the migration window. Query this on your source before you start:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find tables with no primary key or unique constraint (PostgreSQL)
+SELECT
+    t.table_schema,
+    t.table_name,
+    pg_size_pretty(pg_total_relation_size(
+        (t.table_schema || '.' || t.table_name)::regclass
+    )) AS table_size
+FROM information_schema.tables t
+WHERE t.table_type = 'BASE TABLE'
+  AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
+  AND NOT EXISTS (
+      SELECT 1
+      FROM information_schema.table_constraints tc
+      WHERE tc.table_schema = t.table_schema
+        AND tc.table_name   = t.table_name
+        AND tc.constraint_type IN ('PRIMARY KEY', 'UNIQUE')
+  )
+ORDER BY pg_total_relation_size(
+    (t.table_schema || '.' || t.table_name)::regclass
+) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Any table returned here needs a decision: add a surrogate primary key before migration, accept full-load-only semantics for it, or exclude it from replication and handle it with a separate bulk transfer at cutover.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Network Bandwidth Estimation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The migration network path matters more than the instance size. A db.r6g.8xlarge target instance is irrelevant if your source datacenter has 1 Gbps uplink shared with production traffic. Measure actual source database write throughput during peak hours using pg_stat_bgwriter and your existing monitoring:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> At 100 MB/s sustained write rate, you generate 360 GB/hour of WAL. DMS CDC must consume this continuously.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> AWS DMS replication instances top out at approximately 200–400 MB/s throughput depending on instance class (dms.r5.4xlarge gives roughly 300 MB/s in practice).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A 10 TB database at 50 MB/s average write rate will produce roughly 1.5 TB of change data over an 8-hour migration window. Your DMS replication instance log storage must accommodate this.</li>
+
+<p class="text-gray-300 leading-relaxed">Budget at least 30% of your uplink capacity exclusively for migration traffic, or schedule the full-load phase during off-peak hours when application writes drop below 20% of peak.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.2 Continuous Replication with AWS DMS</h3>
+
+<p class="text-gray-300 leading-relaxed">AWS Database Migration Service is the most commonly used tool for migrations into RDS and Aurora. It operates in two phases: full load (bulk copy) and CDC (ongoing change capture). Understanding both phases at the configuration level is what separates a successful migration from one that requires an emergency rollback.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Infrastructure Setup</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Provision the DMS replication instance, endpoints, and task via Terraform to keep the configuration reproducible:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Terraform: DMS replication instance and task configuration
+resource "aws_dms_replication_instance" "migration" {
+  replication_instance_id     = "prod-migration-ri"
+  replication_instance_class  = "dms.r5.4xlarge"
+  allocated_storage           = 500          # GB — covers CDC buffer
+  multi_az                    = false        # Single-AZ is fine; this is transient
+  publicly_accessible         = false
+  vpc_security_group_ids      = [var.migration_sg_id]
+  replication_subnet_group_id = aws_dms_replication_subnet_group.migration.id
+  engine_version              = "3.5.2"
+  auto_minor_version_upgrade  = false
+
+  tags = {
+    Environment = "migration"
+    Owner       = "dba-team"
+  }
+}
+
+resource "aws_dms_endpoint" "source_pg" {
+  endpoint_id   = "source-postgres-prod"
+  endpoint_type = "source"
+  engine_name   = "postgres"
+
+  username      = var.source_pg_user
+  password      = var.source_pg_password
+  server_name   = var.source_pg_host
+  port          = 5432
+  database_name = var.source_db_name
+  ssl_mode      = "require"
+
+  postgres_settings {
+    capture_ddls                 = false   # DDL capture is experimental; manage DDL separately
+    max_file_size                = 32768
+    heartbeat_enable             = true
+    heartbeat_frequency          = 5
+    heartbeat_schema             = "dms_heartbeat"
+    slot_name                    = "dms_migration_slot"
+    plugin_name                  = "pglogical"
+    execute_timeout              = 60000
+    after_connect_script         = "SET search_path TO '$user', public"
+  }
+}
+
+resource "aws_dms_endpoint" "target_aurora" {
+  endpoint_id   = "target-aurora-postgres"
+  endpoint_type = "target"
+  engine_name   = "aurora-postgresql"
+
+  username      = var.aurora_admin_user
+  password      = var.aurora_admin_password
+  server_name   = var.aurora_cluster_endpoint
+  port          = 5432
+  database_name = var.target_db_name
+  ssl_mode      = "require"
+}
+
+resource "aws_dms_replication_task" "full_load_cdc" {
+  replication_task_id       = "prod-migration-full-cdc"
+  migration_type            = "full-load-and-cdc"
+  replication_instance_arn  = aws_dms_replication_instance.migration.replication_instance_arn
+  source_endpoint_arn       = aws_dms_endpoint.source_pg.endpoint_arn
+  target_endpoint_arn       = aws_dms_endpoint.target_aurora.endpoint_arn
+
+  table_mappings = jsonencode({
+    rules = [
+      {
+        rule-type = "selection"
+        rule-id   = "1"
+        rule-name = "include-all"
+        object-locator = {
+          schema-name = "%"
+          table-name  = "%"
+        }
+        rule-action = "include"
+      },
+      {
+        rule-type = "selection"
+        rule-id   = "2"
+        rule-name = "exclude-audit-log"
+        object-locator = {
+          schema-name = "public"
+          table-name  = "audit_log_archive"
+        }
+        rule-action    = "exclude"
+      }
+    ]
+  })
+
+  replication_task_settings = jsonencode({
+    TargetMetadata = {
+      TargetSchema              = ""
+      SupportLobs              = true
+      FullLobMode              = false
+      LobChunkSize             = 64
+      LimitedSizeLobMode       = true
+      LobMaxSize               = 32768
+    }
+    FullLoadSettings = {
+      TargetTablePrepMode       = "DO_NOTHING"   # Schema pre-created via SCT
+      CreatePkAfterFullLoad     = false
+      StopTaskCachedChangesApplied  = false
+      StopTaskCachedChangesNotApplied = false
+      MaxFullLoadSubTasks       = 8
+      TransactionConsistencyTimeout = 600
+      CommitRate                = 50000
+    }
+    Logging = {
+      EnableLogging            = true
+      LogComponents = [
+        { Id = "SOURCE_UNLOAD", Severity = "LOGGER_SEVERITY_DEFAULT" },
+        { Id = "TARGET_LOAD",   Severity = "LOGGER_SEVERITY_DEFAULT" },
+        { Id = "TASK_MANAGER",  Severity = "LOGGER_SEVERITY_DEFAULT" }
+      ]
+    }
+    ControlTablesSettings = {
+      historyTimeslotInMinutes = 5
+      StatusTableEnabled       = true
+      SuspendedTablesTableEnabled = true
+      replicationStatusTableEnabled = true
+    }
+  })
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Critical DMS Configuration Details</strong></p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TargetTablePrepMode = "DO_NOTHING"</code> means DMS assumes you have pre-created the schema using the AWS Schema Conversion Tool or a manual DDL script. Never use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP_AND_CREATE</code> in a zero-downtime scenario—it will truncate target tables if the task is restarted.</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CreatePkAfterFullLoad = false</code> means primary keys must exist before full load begins. This is the correct setting when you pre-create schema. If you set it to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">true</code>, DMS drops constraints during load and recreates them afterward, which significantly speeds up large table loads but creates a window where the target has no constraints.</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MaxFullLoadSubTasks = 8</code> controls parallel table loading. On a dms.r5.4xlarge replication instance, 8 parallel subtasks is a reasonable default. Increasing this beyond 16 rarely improves throughput and increases memory pressure on the replication instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring DMS Lag</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Once full load completes and CDC begins, lag monitoring is your primary operational responsibility. DMS exposes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CDCLatencySource</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CDCLatencyTarget</code> via CloudWatch. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CDCLatencySource</code> is the lag between a change occurring in the source WAL and DMS reading it. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CDCLatencyTarget</code> is the lag between DMS reading the change and applying it to the target. A healthy migration keeps both metrics below 5 seconds during peak and below 30 seconds during business hours for non-time-sensitive migrations.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Monitor DMS CDC latency via AWS CLI
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/DMS \
+  --metric-name CDCLatencySource \
+  --dimensions Name=ReplicationInstanceIdentifier,Value=prod-migration-ri \
+  --start-time "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" \
+  --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --period 60 \
+  --statistics Average,Maximum \
+  --output table
+
+# Check replication task status
+aws dms describe-replication-tasks \
+  --filters Name=replication-task-arn,Values=&lt;task-arn&gt; \
+  --query 'ReplicationTasks[0].{Status:Status,FullLoadProgress:ReplicationTaskStats.FullLoadProgressPercent,TablesLoaded:ReplicationTaskStats.TablesLoaded,TablesLoading:ReplicationTaskStats.TablesLoading,TablesErrored:ReplicationTaskStats.TablesErrored,LatencySource:ReplicationTaskStats.CDCLatencySource}' \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL Source: WAL and Replication Slot Management</strong></p>
+
+<p class="text-gray-300 leading-relaxed">DMS creates a PostgreSQL logical replication slot on the source when using pglogical or pgoutput plugins. This slot is one of the most operationally dangerous objects in your source database during migration. If DMS falls behind or stops, PostgreSQL will retain WAL segments to satisfy the slot, and your source disk will fill.</p>
+
+<p class="text-gray-300 leading-relaxed">Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_slot_wal_keep_size</code> in PostgreSQL 13+ to cap this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL 13+: Limit WAL retained for replication slots
+ALTER SYSTEM SET max_slot_wal_keep_size = '50GB';
+SELECT pg_reload_conf();
+
+-- Monitor slot lag continuously during migration
+SELECT
+    slot_name,
+    plugin,
+    slot_type,
+    active,
+    active_pid,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn)) AS pending_wal,
+    EXTRACT(EPOCH FROM (now() - pg_stat_replication.write_lag))::int AS write_lag_seconds
+FROM pg_replication_slots
+LEFT JOIN pg_stat_replication USING (pid)
+WHERE slot_name LIKE 'dms%';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">retained_wal</code> exceeds 20 GB on a source with limited disk, investigate immediately. If DMS has stopped and you cannot restart it within minutes, you will need to either increase disk on the source or drop the slot and restart the task from the beginning.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.3 Schema Conversion and Heterogeneous Migrations</h3>
+
+<p class="text-gray-300 leading-relaxed">When the source and target engines differ—Oracle or SQL Server migrating to PostgreSQL or Aurora—schema conversion is a migration project in itself. AWS Schema Conversion Tool (SCT) handles this partially. The "partially" is what you need to manage.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SCT Assessment Report</strong></p>
+
+<p class="text-gray-300 leading-relaxed">SCT classifies every schema object into three tiers: automatically convertible, with issues (requiring manual intervention), and unsupported. In production Oracle-to-Aurora-PostgreSQL migrations, expect:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 70–85% of simple tables and views to convert automatically</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Stored procedures and functions: 30–60% automatic conversion, depending on PL/SQL complexity</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Oracle-specific types (XMLTYPE, spatial types, nested tables): manual conversion required</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Database links and synonyms: not converted, must be refactored at the application layer</li>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server to Azure SQL migrations, the conversion rate is higher because Microsoft designed Azure SQL to be a near-superset of SQL Server on-prem. The blockers are typically CLR user-defined types, cross-database transactions, and FILESTREAM columns.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Running SCT from CLI for Automation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">SCT has a GUI that most DBAs use interactively, but it also has a command-line interface for automation in migration pipelines:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Run AWS SCT assessment in headless mode
+# Prerequisites: SCT installed, Java 11+
+
+SCT_HOME="/opt/aws-schema-conversion-tool"
+PROJECT_FILE="migration_project.sct"
+REPORT_DIR="/var/migration/reports/$(date +%Y%m%d)"
+
+mkdir -p "$REPORT_DIR"
+
+# Generate assessment report without applying conversion
+java -jar "${SCT_HOME}/AWSSchemaConversionTool.jar" \
+  --project-file "${PROJECT_FILE}" \
+  --assess \
+  --output-folder "${REPORT_DIR}" \
+  --report-name "migration_assessment" \
+  --log-file "${REPORT_DIR}/sct.log" \
+  --override-settings \
+    sourceType=ORACLE \
+    targetType=AURORA_POSTGRESQL \
+    assessmentReportFormats=PDF,CSV
+
+# Parse blockers from CSV report
+echo "=== HIGH-ACTION ITEMS ==="
+awk -F',' '$5 == "Action Required"' \
+  "${REPORT_DIR}/migration_assessment.csv" | \
+  cut -d',' -f1,2,3,6 | head -50
+
+echo "=== CONVERSION SUMMARY ==="
+grep -E "^(Total|Automatically|Manually|Could not)" \
+  "${REPORT_DIR}/migration_assessment.csv"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Handling Oracle Sequences in Aurora PostgreSQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Oracle sequences and Aurora PostgreSQL sequences behave differently under concurrent load. Oracle NEXTVAL is session-cached; PostgreSQL NEXTVAL is always transactional. When converting Oracle applications that rely on high-frequency sequence calls, replace them with PostgreSQL sequences that use a large cache value:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Aurora PostgreSQL: Replace Oracle-style sequence with cached equivalent
+-- Oracle default: INCREMENT BY 1, CACHE 20
+-- Under high concurrency, this causes sequence contention on Aurora
+
+-- Correct approach for high-throughput OLTP on Aurora
+CREATE SEQUENCE order_id_seq
+    START WITH 1
+    INCREMENT BY 1
+    CACHE 1000          -- Oracle's 20 is too low for Aurora's parallel connections
+    NO CYCLE;
+
+-- Verify sequence cache in pg_sequences
+SELECT
+    schemaname,
+    sequencename,
+    start_value,
+    increment_by,
+    cache_size,
+    last_value
+FROM pg_sequences
+WHERE sequencename = 'order_id_seq';
+
+-- For UUID-based primary keys (preferred on Aurora for distributed workloads)
+-- Replace integer sequences entirely
+ALTER TABLE orders
+    ALTER COLUMN order_id SET DEFAULT gen_random_uuid();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The cache value of 1,000 is not arbitrary. On Aurora with 200+ concurrent connections each calling NEXTVAL on every INSERT, a cache of 20 causes the sequence to flush to storage every 20 calls. At 500 INSERTs/second across 200 connections, that is 25 storage flushes per second for sequences alone. A cache of 1,000 reduces this to one flush per connection per 1,000 inserts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">34.4 Azure and GCP Migration Paths</h3>
+
+<p class="text-gray-300 leading-relaxed">AWS DMS gets the most industry attention, but Azure Database Migration Service and GCP Database Migration Service each have distinct characteristics that affect cutover strategy.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Database Migration Service</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure DMS supports online (continuous sync) migration for PostgreSQL to Azure Database for PostgreSQL - Flexible Server and SQL Server to Azure SQL Managed Instance. For PostgreSQL sources, it uses the logical replication protocol—the same mechanism as DMS—but its configuration surface is smaller and its limitations are more restrictive.</p>
+
+<p class="text-gray-300 leading-relaxed">Azure DMS online migration requires that the source PostgreSQL instance have <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level = logical</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_replication_slots >= 5</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_senders >= 10</code>, and that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hba.conf</code> allows the Azure DMS IP range with replication privilege. In a managed source environment where you cannot freely edit postgresql.conf, this becomes an operational constraint.</p>
+
+<p class="text-gray-300 leading-relaxed">Set up an Azure DMS migration project via CLI:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Azure CLI: Create and start an online PostgreSQL migration to Flexible Server
+
+RESOURCE_GROUP="rg-migration-prod"
+LOCATION="eastus2"
+DMS_SERVICE="dms-prod-migration"
+PROJECT_NAME="pg-to-flexible-migration"
+TASK_NAME="pg-migration-task-01"
+
+# Create DMS service instance (Premium tier required for online migration)
+az dms create \
+  --resource-group "$RESOURCE_GROUP" \
+  --name "$DMS_SERVICE" \
+  --location "$LOCATION" \
+  --sku-name "Premium_4vCores" \
+  --subnet "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Network/virtualNetworks/vnet-migration/subnets/snet-dms"
+
+# Create migration project
+az dms project create \
+  --resource-group "$RESOURCE_GROUP" \
+  --service-name "$DMS_SERVICE" \
+  --name "$PROJECT_NAME" \
+  --source-platform "PostgreSQL" \
+  --target-platform "AzureDbForPostgreSql" \
+  --location "$LOCATION"
+
+# Create task with source and target connection info
+az dms project task create \
+  --resource-group "$RESOURCE_GROUP" \
+  --service-name "$DMS_SERVICE" \
+  --project-name "$PROJECT_NAME" \
+  --name "$TASK_NAME" \
+  --task-type "OnlineMigration" \
+  --source-connection-json '{
+    "serverName": "'"$SOURCE_PG_HOST"'",
+    "serverPort": 5432,
+    "databaseName": "'"$SOURCE_DB"'",
+    "userName": "migration_user",
+    "password": "'"$SOURCE_PG_PASS"'",
+    "encryptConnection": true,
+    "trustServerCertificate": false
+  }' \
+  --target-connection-json '{
+    "serverName": "'"$AZURE_FLEX_HOST"'",
+    "serverPort": 5432,
+    "databaseName": "'"$TARGET_DB"'",
+    "userName": "adminuser",
+    "password": "'"$AZURE_FLEX_PASS"'",
+    "encryptConnection": true
+  }' \
+  --selected-databases '[{
+    "name": "'"$SOURCE_DB"'",
+    "targetDatabaseName": "'"$TARGET_DB"'",
+    "migrationSetting": {
+      "desiredRpOs": 0
+    },
+    "sourceSetting": {},
+    "targetSetting": {}
+  }]'
+
+# Monitor migration status
+az dms project task show \
+  --resource-group "$RESOURCE_GROUP" \
+  --service-name "$DMS_SERVICE" \
+  --project-name "$PROJECT_NAME" \
+  --name "$TASK_NAME" \
+  --expand output \
+  --query 'output[0].migrationState'</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP Database Migration Service</strong></p>
+
+<p class="text-gray-300 leading-relaxed">GCP DMS uses connection profiles and migration jobs as its primary abstractions. For Cloud SQL for PostgreSQL targets, GCP DMS is competitive with AWS DMS in capability. For AlloyDB targets, GCP DMS is the only supported path from external PostgreSQL sources.</p>
+
+    </div>
+    <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The Cloud Database Engineer</div>
+  </footer>
+</body>
+</html>

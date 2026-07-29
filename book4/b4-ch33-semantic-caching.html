@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 33: Semantic Caching for LLM Applications — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 33: Semantic Caching for LLM Applications. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 33 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 33: Semantic Caching for LLM Applications</h2>
+
+<p class="text-gray-300 leading-relaxed">LLM API calls are expensive, slow, and deterministic enough that many questions asked of a system are semantically equivalent even when worded differently. A user asking "What's the refund policy?" and another asking "How do I get my money back?" want the same answer. Conventional caching based on exact string matching would treat these as cache misses. Semantic caching uses vector similarity to recognize that two queries mean roughly the same thing and return a cached response—cutting latency from seconds to milliseconds and reducing token costs by 40–80% in production workloads with high query repetition. This chapter covers how semantic caches work, how to build one with pgvector and Redis, how to integrate caching into LangChain and LlamaIndex pipelines, and how to operate a semantic cache in production without sacrificing answer quality.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.1 How Semantic Caching Differs from Conventional Caching</h3>
+
+<p class="text-gray-300 leading-relaxed">Traditional application caches operate on exact key matching. You hash the input, look up the hash, return the value if it exists. This works well when inputs are programmatically generated and predictable—SQL query strings, API endpoint parameters, serialized data structures. It fails completely for natural language, where the same information need generates an infinite variety of phrasings.</p>
+
+<p class="text-gray-300 leading-relaxed">Semantic caching replaces the hash lookup with a vector similarity search. The cache stores (embedding, response) pairs. When a new query arrives, you embed it, search the cache for the nearest stored embedding, and if the similarity exceeds a threshold, return the cached response rather than hitting the LLM. The similarity threshold is the most operationally significant parameter in the entire system.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The threshold problem in database terms</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Think of the similarity threshold like a fuzzy match tolerance in a string similarity join. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">similarity_threshold = 1.0</code> and you effectively get exact matching—nothing hits the cache. Set it to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.7</code> and you start returning cached responses to queries that are topically related but semantically distinct. A question about "returning a defective product" and "canceling a subscription" might both score 0.75 cosine similarity against a cached refund policy answer, but they need different responses.</p>
+
+<p class="text-gray-300 leading-relaxed">In production systems, threshold tuning requires:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A labeled evaluation set of query pairs tagged as "same intent" or "different intent"</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Precision/recall measurement against that set at multiple thresholds</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Separate thresholds per query domain (customer support vs. code generation vs. data lookup)</li>
+
+<p class="text-gray-300 leading-relaxed">Typical production thresholds by domain:</p>
+
+<p class="text-gray-300 leading-relaxed">| Domain | Threshold (cosine) | Rationale |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| FAQ / support | 0.92–0.95 | High repetition, controlled vocabulary |</p>
+<p class="text-gray-300 leading-relaxed">| Code generation | 0.97–0.99 | Small semantic changes produce different code |</p>
+<p class="text-gray-300 leading-relaxed">| Document Q&A | 0.93–0.96 | User intent more variable |</p>
+<p class="text-gray-300 leading-relaxed">| Data lookup / SQL gen | 0.96–0.99 | Precision required |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cache invalidation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Semantic caches share the same invalidation challenges as conventional caches, plus a new one: a cached response may become stale not because the query changed but because the underlying data or policy changed. A refund policy answer cached in January may be wrong after a February policy update. You need TTL-based expiration and event-driven invalidation tied to source document updates, just as you would in any read-through cache architecture.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.2 Building a Semantic Cache with pgvector</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL with pgvector is a natural fit for a semantic cache if your application is already running on Postgres. You avoid introducing a new infrastructure component, benefit from transactional consistency, and can use standard SQL for cache management queries.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE semantic_cache (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    query_text      TEXT NOT NULL,
+    query_embedding VECTOR(1536) NOT NULL,
+    response_text   TEXT NOT NULL,
+    model           TEXT NOT NULL DEFAULT 'gpt-4o',
+    namespace       TEXT NOT NULL DEFAULT 'default',
+    hit_count       INTEGER NOT NULL DEFAULT 0,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_accessed   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ,
+    metadata        JSONB
+);
+
+-- HNSW index for fast ANN lookup
+-- ef_construction=128, m=16 are reasonable defaults for a cache
+-- that may grow to millions of entries
+CREATE INDEX idx_semantic_cache_embedding
+    ON semantic_cache
+    USING hnsw (query_embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 128);
+
+-- Namespace + expiry index for cache management
+CREATE INDEX idx_semantic_cache_namespace_expires
+    ON semantic_cache (namespace, expires_at)
+    WHERE expires_at IS NOT NULL;
+
+-- Function to look up cache and update hit count atomically
+CREATE OR REPLACE FUNCTION semantic_cache_lookup(
+    p_embedding     VECTOR(1536),
+    p_namespace     TEXT,
+    p_threshold     FLOAT DEFAULT 0.93,
+    p_limit         INT DEFAULT 1
+)
+RETURNS TABLE (
+    id              UUID,
+    query_text      TEXT,
+    response_text   TEXT,
+    similarity      FLOAT
+)
+LANGUAGE SQL
+AS $$
+    UPDATE semantic_cache sc
+    SET
+        hit_count    = hit_count + 1,
+        last_accessed = NOW()
+    FROM (
+        SELECT
+            c.id,
+            c.query_text,
+            c.response_text,
+            1 - (c.query_embedding &lt;=&gt; p_embedding) AS similarity
+        FROM semantic_cache c
+        WHERE
+            c.namespace = p_namespace
+            AND (c.expires_at IS NULL OR c.expires_at &gt; NOW())
+            AND 1 - (c.query_embedding &lt;=&gt; p_embedding) &gt;= p_threshold
+        ORDER BY c.query_embedding &lt;=&gt; p_embedding
+        LIMIT p_limit
+    ) ranked
+    WHERE sc.id = ranked.id
+    RETURNING sc.id, sc.query_text, sc.response_text, ranked.similarity;
+$$;
+
+-- Purge expired entries (run on a schedule)
+CREATE OR REPLACE FUNCTION purge_expired_cache(p_namespace TEXT DEFAULT NULL)
+RETURNS INTEGER
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_deleted INTEGER;
+BEGIN
+    DELETE FROM semantic_cache
+    WHERE expires_at &lt; NOW()
+      AND (p_namespace IS NULL OR namespace = p_namespace);
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python client wrapping the pgvector cache</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import hashlib
+import asyncio
+import psycopg
+import numpy as np
+from openai import AsyncOpenAI
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+# pip install openai psycopg[binary] numpy
+
+class PgvectorSemanticCache:
+    """
+    Semantic cache backed by pgvector.
+    Drop-in wrapper around any LLM call function.
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        openai_client: AsyncOpenAI,
+        namespace: str = "default",
+        threshold: float = 0.93,
+        ttl_seconds: int = 86400,  # 24 hours
+        embedding_model: str = "text-embedding-3-small",
+    ):
+        self.dsn = dsn
+        self.oai = openai_client
+        self.namespace = namespace
+        self.threshold = threshold
+        self.ttl_seconds = ttl_seconds
+        self.embedding_model = embedding_model
+        self._pool: Optional[psycopg.AsyncConnection] = None
+
+    async def _get_conn(self) -&gt; psycopg.AsyncConnection:
+        if self._pool is None:
+            self._pool = await psycopg.AsyncConnection.connect(self.dsn)
+        return self._pool
+
+    async def embed(self, text: str) -&gt; list[float]:
+        response = await self.oai.embeddings.create(
+            model=self.embedding_model,
+            input=text,
+        )
+        return response.data[0].embedding
+
+    async def get(self, query: str) -&gt; Optional[dict]:
+        embedding = await self.embed(query)
+        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+        conn = await self._get_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT id, query_text, response_text, similarity
+                FROM semantic_cache_lookup(
+                    %s::vector,
+                    %s,
+                    %s,
+                    1
+                )
+                """,
+                (embedding_str, self.namespace, self.threshold),
+            )
+            row = await cur.fetchone()
+            if row:
+                return {
+                    "id": str(row[0]),
+                    "cached_query": row[1],
+                    "response": row[2],
+                    "similarity": float(row[3]),
+                    "cache_hit": True,
+                }
+        return None
+
+    async def set(
+        self,
+        query: str,
+        response: str,
+        model: str = "gpt-4o",
+        metadata: Optional[dict] = None,
+    ) -&gt; str:
+        embedding = await self.embed(query)
+        embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+        expires_at = datetime.now(timezone.utc) + timedelta(seconds=self.ttl_seconds)
+
+        conn = await self._get_conn()
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO semantic_cache
+                    (query_text, query_embedding, response_text,
+                     model, namespace, expires_at, metadata)
+                VALUES (%s, %s::vector, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    query,
+                    embedding_str,
+                    response,
+                    model,
+                    self.namespace,
+                    expires_at,
+                    metadata,
+                ),
+            )
+            result = await cur.fetchone()
+            await conn.commit()
+            return str(result[0])
+
+    async def get_or_generate(
+        self,
+        query: str,
+        llm_call_fn,
+        model: str = "gpt-4o",
+    ) -&gt; dict:
+        """
+        Cache-aside pattern: check cache first, generate and store on miss.
+        llm_call_fn: async callable(query) -&gt; str
+        """
+        cached = await self.get(query)
+        if cached:
+            return cached
+
+        # Cache miss — call the LLM
+        response_text = await llm_call_fn(query)
+        entry_id = await self.set(query, response_text, model=model)
+
+        return {
+            "id": entry_id,
+            "response": response_text,
+            "similarity": 1.0,
+            "cache_hit": False,
+        }
+
+
+# Usage example
+async def main():
+    oai = AsyncOpenAI()
+    cache = PgvectorSemanticCache(
+        dsn="postgresql://app:secret@localhost:5432/llmcache",
+        openai_client=oai,
+        namespace="customer_support",
+        threshold=0.93,
+        ttl_seconds=3600 * 24 * 7,  # 7 days
+    )
+
+    async def call_llm(query: str) -&gt; str:
+        response = await oai.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": query}],
+        )
+        return response.choices[0].message.content
+
+    # First call — cache miss, LLM invoked
+    result1 = await cache.get_or_generate(
+        "What is your return policy for electronics?",
+        call_llm,
+    )
+    print(f"Cache hit: {result1['cache_hit']}, similarity: {result1['similarity']:.4f}")
+
+    # Semantically similar — should hit the cache
+    result2 = await cache.get_or_generate(
+        "Can I return a laptop I bought last week?",
+        call_llm,
+    )
+    print(f"Cache hit: {result2['cache_hit']}, similarity: {result2['similarity']:.4f}")
+
+
+asyncio.run(main())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.3 Semantic Caching with Redis and a Dedicated Vector Store</h3>
+
+<p class="text-gray-300 leading-relaxed">For applications that need sub-5ms cache lookups and cannot afford a full Postgres query round-trip, Redis with the RediSearch module (or Redis Stack) provides an in-memory vector cache. The tradeoff is that Redis is bounded by available memory; entries must be kept small or the cache must be tiered.</p>
+
+<p class="text-gray-300 leading-relaxed">An alternative pattern uses a dedicated fast vector store—Qdrant or Chroma—as the semantic index while storing full response text in Redis by ID. The vector store answers "does a similar query exist?" (returning an ID), and Redis retrieves the response body by that ID in a second sub-millisecond lookup.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Tiered semantic cache: Qdrant for similarity search, Redis for response storage
+# pip install qdrant-client redis openai sentence-transformers
+
+import json
+import uuid
+import hashlib
+import redis.asyncio as aioredis
+from qdrant_client import AsyncQdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+    SearchRequest,
+)
+from sentence_transformers import SentenceTransformer
+from typing import Optional
+import asyncio
+
+COLLECTION_NAME = "semantic_cache_index"
+EMBEDDING_DIM = 384  # all-MiniLM-L6-v2
+CACHE_TTL_SECONDS = 86400
+
+
+class TieredSemanticCache:
+    """
+    Qdrant holds the embedding index.
+    Redis holds response payloads keyed by cache entry ID.
+    Embedding is done locally with sentence-transformers to avoid
+    external API latency on cache reads.
+    """
+
+    def __init__(
+        self,
+        qdrant_url: str = "http://localhost:6333",
+        redis_url: str = "redis://localhost:6379",
+        threshold: float = 0.92,
+        namespace: str = "default",
+    ):
+        self.qdrant = AsyncQdrantClient(url=qdrant_url)
+        self.redis_url = redis_url
+        self.threshold = threshold
+        self.namespace = namespace
+        self.encoder = SentenceTransformer("all-MiniLM-L6-v2")
+        self._redis: Optional[aioredis.Redis] = None
+
+    async def _get_redis(self) -&gt; aioredis.Redis:
+        if self._redis is None:
+            self._redis = await aioredis.from_url(self.redis_url, decode_responses=True)
+        return self._redis
+
+    async def initialize(self):
+        """Create Qdrant collection if it doesn't exist."""
+        collections = await self.qdrant.get_collections()
+        existing = [c.name for c in collections.collections]
+        if COLLECTION_NAME not in existing:
+            await self.qdrant.create_collection(
+                collection_name=COLLECTION_NAME,
+                vectors_config=VectorParams(
+                    size=EMBEDDING_DIM,
+                    distance=Distance.COSINE,
+                ),
+            )
+            print(f"Created collection: {COLLECTION_NAME}")
+
+    def embed(self, text: str) -&gt; list[float]:
+        # SentenceTransformer is synchronous; wrap in thread pool for async use
+        vec = self.encoder.encode(text, normalize_embeddings=True)
+        return vec.tolist()
+
+    async def get(self, query: str) -&gt; Optional[dict]:
+        embedding = self.embed(query)
+
+        results = await self.qdrant.search(
+            collection_name=COLLECTION_NAME,
+            query_vector=embedding,
+            query_filter=Filter(
+                must=[
+                    FieldCondition(
+                        key="namespace",
+                        match=MatchValue(value=self.namespace),
+                    )
+                ]
+            ),
+            limit=1,
+            score_threshold=self.threshold,
+        )
+
+        if not results:
+            return None
+
+        hit = results[0]
+        entry_id = hit.payload["entry_id"]
+        similarity = hit.score
+
+        # Fetch response from Redis
+        redis = await self._get_redis()
+        payload_json = await redis.get(f"scache:{entry_id}")
+        if payload_json is None:
+            # Redis entry expired but Qdrant entry still exists — treat as miss
+            return None
+
+        payload = json.loads(payload_json)
+        return {
+            "entry_id": entry_id,
+            "cached_query": payload["query"],
+            "response": payload["response"],
+            "model": payload.get("model"),
+            "similarity": similarity,
+            "cache_hit": True,
+        }
+
+    async def set(
+        self,
+        query: str,
+        response: str,
+        model: str = "gpt-4o",
+        metadata: Optional[dict] = None,
+    ) -&gt; str:
+        entry_id = str(uuid.uuid4())
+        embedding = self.embed(query)
+
+        # Write to Qdrant
+        await self.qdrant.upsert(
+            collection_name=COLLECTION_NAME,
+            points=[
+                PointStruct(
+                    id=entry_id,
+                    vector=embedding,
+                    payload={
+                        "namespace": self.namespace,
+                        "entry_id": entry_id,
+                        "query_preview": query[:100],
+                    },
+                )
+            ],
+        )
+
+        # Write response to Redis with TTL
+        payload = {
+            "query": query,
+            "response": response,
+            "model": model,
+            "metadata": metadata or {},
+        }
+        redis = await self._get_redis()
+        await redis.setex(
+            f"scache:{entry_id}",
+            CACHE_TTL_SECONDS,
+            json.dumps(payload),
+        )
+
+        return entry_id
+
+    async def invalidate_namespace(self, namespace: str):
+        """Delete all cache entries for a namespace from Qdrant."""
+        await self.qdrant.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=Filter(
+                must=[
+                    FieldCondition(
+                        key="namespace",
+                        match=MatchValue(value=namespace),
+                    )
+                ]
+            ),
+        )
+
+
+# Benchmark: measure cache hit latency vs LLM latency
+async def benchmark():
+    import time
+
+    cache = TieredSemanticCache(threshold=0.90, namespace="demo")
+    await cache.initialize()
+
+    test_query = "Explain the difference between OLTP and OLAP databases."
+
+    # Warm the cache with a synthetic response
+    await cache.set(
+        query=test_query,
+        response="OLTP systems handle high-volume transactional workloads...",
+        model="gpt-4o",
+    )
+
+    # Measure lookup latency
+    queries = [
+        "What is the difference between OLTP and OLAP?",
+        "OLAP vs OLTP — what should I know?",
+        "How are transactional and analytical databases different?",
+    ]
+
+    for q in queries:
+        t0 = time.perf_counter()
+        result = await cache.get(q)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        hit = result is not None
+        sim = result["similarity"] if result else 0.0
+        print(f"[{elapsed_ms:5.1f}ms] hit={hit} sim={sim:.4f} | {q[:60]}")
+
+
+asyncio.run(benchmark())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Typical latency profile for this tiered design on local hardware:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Embedding (MiniLM, CPU): 3–8ms</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Qdrant ANN search (in-memory, 100K entries): 0.5–2ms</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Redis GET: 0.2–0.5ms</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Total cache hit latency: 4–12ms**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> GPT-4o API call: 800ms–4000ms</li>
+
+<p class="text-gray-300 leading-relaxed">The 100x latency reduction justifies the operational complexity for high-traffic applications.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.4 LangChain and LlamaIndex Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">Both LangChain and LlamaIndex ship first-class semantic cache integrations. Using them avoids reimplementing cache logic and ensures the cache participates correctly in chains and agent loops.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LangChain with GPTCache and pgvector</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# LangChain semantic cache using the built-in SQLAlchemy + pgvector backend
+# pip install langchain langchain-openai langchain-community pgvector psycopg2-binary
+
+import os
+from langchain.globals import set_llm_cache
+from langchain_community.cache import InMemoryCache
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain.schema import HumanMessage
+
+# LangChain ships a semantic cache that uses any vector store
+# via the SemanticSimilarityExactMatchCache interface
+from langchain_community.cache import RedisSemanticCache
+from langchain_openai import OpenAIEmbeddings
+
+# Option A: Redis semantic cache (simplest for prototyping)
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+set_llm_cache(
+    RedisSemanticCache(
+        redis_url=os.environ.get("REDIS_URL", "redis://localhost:6379"),
+        embedding=embeddings,
+        score_threshold=0.2,  # LangChain uses L2 distance; 0.2 ≈ 0.93 cosine
+    )
+)
+
+llm = ChatOpenAI(model="gpt-4o", temperature=0)
+
+# All calls through this LLM instance now go through the semantic cache
+import time
+
+queries = [
+    "What are the ACID properties of a database?",
+    "Can you explain ACID compliance in databases?",
+    "What does ACID stand for in database systems?",
+]
+
+for query in queries:
+    t0 = time.perf_counter()
+    response = llm.invoke([HumanMessage(content=query)])
+    elapsed = (time.perf_counter() - t0) * 1000
+    print(f"[{elapsed:6.0f}ms] {query[:50]}")
+    print(f"         {response.content[:80]}...")
+    print()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LlamaIndex with a custom semantic cache node postprocessor</strong></p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

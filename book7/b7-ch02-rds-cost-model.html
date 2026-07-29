@@ -1,0 +1,475 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 2: AWS RDS Cost Model: Compute, Storage, I/O, and Transfer — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 2: AWS RDS Cost Model: Compute, Storage, I/O, and Transfer. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 2 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 2: AWS RDS Cost Model: Compute, Storage, I/O, and Transfer</h2>
+
+<p class="text-gray-300 leading-relaxed">Organizations running AWS RDS at scale routinely overpay by 40–60% — not because the pricing is opaque, but because most teams accept the default configuration and never revisit it. A single db.r6g.2xlarge running PostgreSQL with gp2 storage, Multi-AZ enabled, and no Reserved Instance commitment can cost over $1,800/month. That same workload, rightsized to a db.r6g.xlarge on gp3 storage with a one-year Reserved Instance, costs closer to $680/month. That is $1,120/month saved on a single instance — before touching I/O fees, snapshot retention, or data transfer charges. This chapter dismantles the AWS RDS cost model component by component, shows you exactly where the money goes, and gives you the queries, scripts, and automation to recover it systematically.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.1 Understanding the RDS Billing Anatomy</h3>
+
+<p class="text-gray-300 leading-relaxed">AWS bills RDS across five distinct cost dimensions. Most teams only see the monthly total and treat it as a single line item. That is a mistake. To optimize, you need to decompose the bill into its components and assign each one a remediation strategy.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The five RDS cost dimensions:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Dimension | Typical Share of Bill | Primary Lever |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Compute (instance hours) | 50–65% | Reserved Instances, rightsizing, stop/start |</p>
+<p class="text-gray-300 leading-relaxed">| Storage (EBS volumes) | 15–25% | gp2 → gp3 migration, size right-sizing |</p>
+<p class="text-gray-300 leading-relaxed">| I/O requests | 5–20% | gp3 eliminates per-I/O charges entirely |</p>
+<p class="text-gray-300 leading-relaxed">| Data transfer | 3–10% | Same-AZ reads, VPC endpoints, caching |</p>
+<p class="text-gray-300 leading-relaxed">| Snapshots and backups | 2–8% | Retention period tuning, export cleanup |</p>
+
+<p class="text-gray-300 leading-relaxed">The critical insight here is that gp2 storage charges per I/O request beyond the baseline throughput, which scales at 3 IOPS per GB. A 500 GB gp2 volume provides 1,500 baseline IOPS. Any database workload that regularly exceeds this baseline incurs per-request charges that accumulate invisibly. A busy OLTP workload on a 500 GB gp2 volume can easily pay $200–$400/month in I/O alone. gp3 provides 3,000 IOPS and 125 MB/s throughput at no per-I/O charge, and costs $0.08/GB/month compared to gp2's $0.115/GB/month. The math on a 1 TB volume is straightforward:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **gp2, 1 TB**: $0.115 × 1,024 GB = **$117.76/month** (plus I/O charges)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **gp3, 1 TB**: $0.08 × 1,024 GB = **$81.92/month** (no I/O charges)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage savings**: $35.84/month, approximately 30%</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **I/O savings**: varies, but commonly $50–$200/month on active workloads</li>
+
+<p class="text-gray-300 leading-relaxed">That is the storage dimension alone. Compute is where the larger numbers live.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Retrieving your current RDS cost breakdown using AWS Cost Explorer:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Pull RDS cost breakdown by usage type for the last 30 days
+# Requires: AWS CLI configured with Cost Explorer permissions
+
+START_DATE=$(date -d "30 days ago" +%Y-%m-%d 2&gt;/dev/null || \
+             date -v-30d +%Y-%m-%d)
+END_DATE=$(date +%Y-%m-%d)
+
+echo "=== RDS Cost Breakdown by Usage Type (Last 30 Days) ==="
+
+aws ce get-cost-and-usage \
+  --time-period Start=${START_DATE},End=${END_DATE} \
+  --granularity MONTHLY \
+  --filter '{
+    "Dimensions": {
+      "Key": "SERVICE",
+      "Values": ["Amazon Relational Database Service"]
+    }
+  }' \
+  --group-by Type=DIMENSION,Key=USAGE_TYPE \
+  --metrics "UnblendedCost" "UsageQuantity" \
+  --output json | \
+  python3 -c "
+import json, sys
+
+data = json.load(sys.stdin)
+results = data['ResultsByTime'][0]['Groups']
+
+# Parse and sort by cost descending
+costs = []
+for group in results:
+    usage_type = group['Keys'][0]
+    cost = float(group['Metrics']['UnblendedCost']['Amount'])
+    quantity = float(group['Metrics']['UsageQuantity']['Amount'])
+    if cost &gt; 0.01:
+        costs.append((cost, usage_type, quantity))
+
+costs.sort(reverse=True)
+
+print(f'{'Usage Type':&lt;55} {'Cost (USD)':&gt;12} {'Quantity':&gt;12}')
+print('-' * 80)
+for cost, usage_type, quantity in costs:
+    short_type = usage_type[-50:] if len(usage_type) &gt; 50 else usage_type
+    print(f'{short_type:&lt;55} \${cost:&gt;10.2f}  {quantity:&gt;10.1f}')
+
+total = sum(c[0] for c in costs)
+print('-' * 80)
+print(f'{'TOTAL RDS SPEND':&lt;55} \${total:&gt;10.2f}')
+"
+
+echo ""
+echo "=== RDS Instances with No Cost Allocation Tags ==="
+aws rds describe-db-instances \
+  --query 'DBInstances[*].{ID:DBInstanceIdentifier,Class:DBInstanceClass,Engine:Engine,Status:DBInstanceStatus}' \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this script every Monday morning as part of a cost review cadence. The output tells you immediately whether I/O charges are appearing as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RDS:StorageIOUsage</code> line items — a clear signal that affected instances should move to gp3.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.2 Compute Cost Analysis: Finding the Right Instance</h3>
+
+<p class="text-gray-300 leading-relaxed">Compute is the largest single cost driver in RDS. The instance family, size, and purchase option together determine whether you are paying market rate or overpaying substantially. AWS offers three purchase options for RDS compute:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **On-Demand**: Full price, no commitment, billed per second (minimum 10 minutes)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Reserved Instances (RI)**: 1-year or 3-year commitment, 30–60% discount</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Savings Plans**: More flexible than RIs, applies across instance families</li>
+
+<p class="text-gray-300 leading-relaxed">A db.r6g.2xlarge running PostgreSQL on-demand costs approximately $0.48/hour in us-east-1, or $345.60/month. The same instance on a one-year Reserved Instance (no upfront) costs $0.296/hour, or $213.12/month — a <strong class="text-white">38% reduction</strong> with zero architectural changes.</p>
+
+<p class="text-gray-300 leading-relaxed">The instance family choice matters as much as the size. The r6g (Graviton2) family provides 10–20% better price-performance than the equivalent r5 instances, and up to 35% cost reduction for equivalent workloads. Teams still running r5 or r4 instances have low-hanging savings available with a simple instance class modification.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query to identify compute sizing opportunities using CloudWatch metrics:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+rds_compute_rightsizing.py
+
+Analyzes CPU and memory utilization across all RDS instances over
+the last 14 days. Flags instances with consistently low CPU for
+downsizing and instances at saturation for upsizing.
+
+Schedule: Weekly via EventBridge + Lambda or cron
+"""
+
+import boto3
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+def get_cloudwatch_metric_stats(cw_client, instance_id, metric_name, days=14):
+    """Retrieve average, max, and p95 for a given CloudWatch RDS metric."""
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(days=days)
+
+    response = cw_client.get_metric_statistics(
+        Namespace='AWS/RDS',
+        MetricName=metric_name,
+        Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=3600,  # 1-hour granularity
+        Statistics=['Average', 'Maximum'],
+        ExtendedStatistics=['p95']
+    )
+
+    datapoints = response.get('Datapoints', [])
+    if not datapoints:
+        return None
+
+    averages = [dp['Average'] for dp in datapoints]
+    maximums = [dp['Maximum'] for dp in datapoints]
+    p95_values = [dp['ExtendedStatistics'].get('p95', 0) for dp in datapoints]
+
+    return {
+        'avg': sum(averages) / len(averages),
+        'max': max(maximums),
+        'p95': sum(p95_values) / len(p95_values) if p95_values else 0,
+        'datapoint_count': len(datapoints)
+    }
+
+def estimate_monthly_cost(instance_class, engine, region='us-east-1'):
+    """
+    Approximate on-demand hourly rates for common instance types.
+    In production, replace with AWS Price List API calls.
+    """
+    # Approximate on-demand rates (us-east-1, PostgreSQL/MySQL, Feb 2025)
+    rates = {
+        'db.t3.micro':    0.017,
+        'db.t3.small':    0.034,
+        'db.t3.medium':   0.068,
+        'db.t3.large':    0.136,
+        'db.t3.xlarge':   0.272,
+        'db.t3.2xlarge':  0.544,
+        'db.r5.large':    0.240,
+        'db.r5.xlarge':   0.480,
+        'db.r5.2xlarge':  0.960,
+        'db.r5.4xlarge':  1.920,
+        'db.r6g.large':   0.208,
+        'db.r6g.xlarge':  0.416,
+        'db.r6g.2xlarge': 0.480,
+        'db.r6g.4xlarge': 0.960,
+        'db.r6g.8xlarge': 1.920,
+        'db.m5.large':    0.190,
+        'db.m5.xlarge':   0.380,
+        'db.m5.2xlarge':  0.760,
+        'db.m6g.large':   0.171,
+        'db.m6g.xlarge':  0.342,
+        'db.m6g.2xlarge': 0.684,
+    }
+    hourly = rates.get(instance_class, 0)
+    return hourly * 730  # approximate monthly hours
+
+def analyze_rds_rightsizing():
+    rds_client = boto3.client('rds')
+    cw_client = boto3.client('cloudwatch')
+
+    instances = rds_client.describe_db_instances()['DBInstances']
+
+    print(f"{'Instance ID':&lt;35} {'Class':&lt;20} {'CPU Avg':&gt;8} {'CPU P95':&gt;8} "
+          f"{'CPU Max':&gt;8} {'Est. Monthly':&gt;13} {'Recommendation'}")
+    print("-" * 120)
+
+    total_potential_savings = 0.0
+
+    for inst in instances:
+        if inst['DBInstanceStatus'] != 'available':
+            continue
+
+        instance_id = inst['DBInstanceIdentifier']
+        instance_class = inst['DBInstanceClass']
+        engine = inst['Engine']
+
+        cpu_stats = get_cloudwatch_metric_stats(cw_client, instance_id, 'CPUUtilization')
+
+        if not cpu_stats or cpu_stats['datapoint_count'] &lt; 50:
+            recommendation = "INSUFFICIENT DATA"
+            monthly_cost = estimate_monthly_cost(instance_class, engine)
+            savings = 0.0
+        else:
+            monthly_cost = estimate_monthly_cost(instance_class, engine)
+            cpu_avg = cpu_stats['avg']
+            cpu_p95 = cpu_stats['p95']
+            cpu_max = cpu_stats['max']
+
+            if cpu_p95 &lt; 20 and cpu_max &lt; 50:
+                recommendation = "DOWNSIZE CANDIDATE"
+                savings = monthly_cost * 0.40  # approximate 40% savings one size down
+                total_potential_savings += savings
+            elif cpu_p95 &lt; 40 and cpu_max &lt; 70:
+                recommendation = "RESERVE (RI opportunity)"
+                savings = monthly_cost * 0.38
+                total_potential_savings += savings
+            elif cpu_avg &gt; 75:
+                recommendation = "UPSIZE or OPTIMIZE QUERIES"
+                savings = 0.0
+            else:
+                recommendation = "OK"
+                savings = 0.0
+
+            print(f"{instance_id:&lt;35} {instance_class:&lt;20} "
+                  f"{cpu_avg:&gt;7.1f}% {cpu_p95:&gt;7.1f}% {cpu_max:&gt;7.1f}% "
+                  f"${monthly_cost:&gt;11.2f}  {recommendation}"
+                  + (f" (save ~${savings:.0f}/mo)" if savings &gt; 0 else ""))
+            continue
+
+        print(f"{instance_id:&lt;35} {instance_class:&lt;20} "
+              f"{'N/A':&gt;8} {'N/A':&gt;8} {'N/A':&gt;8} "
+              f"${monthly_cost:&gt;11.2f}  {recommendation}")
+
+    print("-" * 120)
+    print(f"Total estimated monthly savings opportunity: ${total_potential_savings:,.2f}")
+    print(f"Annual savings opportunity: ${total_potential_savings * 12:,.2f}")
+
+if __name__ == '__main__':
+    analyze_rds_rightsizing()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this weekly. Any instance showing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DOWNSIZE CANDIDATE</code> where P95 CPU stays below 20% for two consecutive weeks is a legitimate rightsizing target. For production databases, validate against peak traffic periods — holiday seasons, month-end close, batch jobs — before committing to a smaller instance class.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Reserved Instance calculation for a CTO-level decision:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For a db.r6g.2xlarge running continuously in production:</p>
+
+<p class="text-gray-300 leading-relaxed">| Purchase Option | Hourly Rate | Monthly Cost | Annual Cost | Savings vs On-Demand |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| On-Demand | $0.480 | $350.40 | $4,204.80 | — |</p>
+<p class="text-gray-300 leading-relaxed">| 1-Year RI, No Upfront | $0.296 | $216.08 | $2,592.96 | <strong class="text-white">38%</strong> |</p>
+<p class="text-gray-300 leading-relaxed">| 1-Year RI, All Upfront | $0.273 | $199.29 | $2,391.48 | <strong class="text-white">43%</strong> |</p>
+<p class="text-gray-300 leading-relaxed">| 3-Year RI, All Upfront | $0.194 | $141.62 | $1,699.44 | <strong class="text-white">60%</strong> |</p>
+
+<p class="text-gray-300 leading-relaxed">For a fleet of 10 such instances, the difference between on-demand and one-year reserved is <strong class="text-white">$16,118/year</strong>. That is a conversation every CTO should be having with their cloud team quarterly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">2.3 Storage Cost Deep Dive: gp2 to gp3 Migration</h3>
+
+<p class="text-gray-300 leading-relaxed">The storage billing story in RDS changed significantly when AWS introduced gp3 in 2022. Despite gp3 being strictly superior for most workloads — cheaper per GB, higher baseline IOPS, no per-I/O charges, and independently scalable IOPS and throughput — a large fraction of RDS instances in production today still run on gp2. This is a pure cost problem with a well-defined solution.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">gp2 vs gp3 economics (us-east-1, February 2025):</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Storage Type | Price/GB/Month | Baseline IOPS | Max IOPS | Throughput | I/O Charges |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| gp2 | $0.115 | 3 × GB (min 100) | 16,000 | 250 MB/s | Yes, above baseline |</p>
+<p class="text-gray-300 leading-relaxed">| gp3 | $0.080 | 3,000 (fixed) | 16,000 (+$0.02/IOPS) | 125 MB/s (+$0.04/MB/s) | Never |</p>
+<p class="text-gray-300 leading-relaxed">| io1 | $0.125 | Provisioned | 64,000 | 4,000 MB/s | Never |</p>
+<p class="text-gray-300 leading-relaxed">| io2 | $0.125 | Provisioned | 256,000 | 4,000 MB/s | Never |</p>
+
+<p class="text-gray-300 leading-relaxed">For the vast majority of RDS workloads, gp3 at base configuration (3,000 IOPS, 125 MB/s) is sufficient. For high-IOPS workloads that were previously on gp2 with large volumes to get more IOPS, the math is even more compelling: you can right-size the storage volume down and provision exactly the IOPS needed on gp3.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Example: A team running a 2 TB gp2 volume to get 6,000 IOPS:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> gp2 cost: 2,048 GB × $0.115 = **$235.52/month** (plus I/O charges)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> gp3 equivalent: 500 GB × $0.080 + (6,000 - 3,000) IOPS × $0.02 = $40 + $60 = **$100/month**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Monthly savings: $135.52 + eliminated I/O charges**</li>
+
+<p class="text-gray-300 leading-relaxed">The following query identifies all RDS instances still on gp2 and calculates the projected savings:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run this against an Amazon Athena table built from AWS Cost and Usage Reports,
+-- or adapt for your cost data warehouse.
+-- This example uses the standard CUR schema.
+
+SELECT
+    line_item_resource_id                           AS instance_arn,
+    resource_tags_user_environment                  AS environment,
+    resource_tags_user_team                         AS team,
+    product_volume_type                             AS storage_type,
+    SUM(line_item_usage_amount)                     AS total_gb_hours,
+    SUM(line_item_unblended_cost)                   AS total_storage_cost,
+    -- Estimate gp3 equivalent cost
+    ROUND(
+        (SUM(line_item_usage_amount) / 730.0)       -- convert GB-hours to GB
+        * 0.080, 2
+    )                                               AS gp3_estimated_cost,
+    -- Savings potential
+    ROUND(
+        SUM(line_item_unblended_cost)
+        - (SUM(line_item_usage_amount) / 730.0 * 0.080),
+        2
+    )                                               AS estimated_monthly_savings
+FROM
+    cost_and_usage_report
+WHERE
+    line_item_service_code    = 'AmazonRDS'
+    AND product_volume_type   = 'General Purpose'   -- this is gp2 in CUR
+    AND line_item_usage_type  LIKE '%StorageUsage%'
+    AND year = '2025'
+    AND month = '2'
+GROUP BY
+    line_item_resource_id,
+    resource_tags_user_environment,
+    resource_tags_user_team,
+    product_volume_type
+HAVING
+    SUM(line_item_unblended_cost) &gt; 10.00           -- ignore trivially small volumes
+ORDER BY
+    estimated_monthly_savings DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">To execute the gp2 → gp3 migration itself, AWS allows you to modify storage type without downtime for most instance classes. The modification applies immediately and the volume conversion happens in the background:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# migrate_gp2_to_gp3.sh
+# Migrates a single RDS instance from gp2 to gp3 storage.
+# Run during low-traffic periods. No downtime required for most engines.
+# Validate: check Performance Insights for I/O latency before and after.
+
+INSTANCE_ID="${1:-}"
+DRY_RUN="${2:-true}"   # Set to "false" to execute
+
+if [[ -z "$INSTANCE_ID" ]]; then
+    echo "Usage: $0 &lt;instance-id&gt; [true|false]"
+    echo "  Second argument: dry-run mode (default: true)"
+    exit 1
+fi
+
+echo "=== Checking current storage configuration ==="
+CURRENT_CONFIG=$(aws rds describe-db-instances \
+    --db-instance-identifier "$INSTANCE_ID" \
+    --query 'DBInstances[0].{
+        StorageType:StorageType,
+        AllocatedStorage:AllocatedStorage,
+        Iops:Iops,
+        StorageThroughput:StorageThroughput,
+        MultiAZ:MultiAZ,
+        InstanceClass:DBInstanceClass
+    }' \
+    --output json)
+
+echo "$CURRENT_CONFIG" | python3 -c "
+import json, sys
+config = json.load(sys.stdin)
+storage_type = config.get('StorageType', 'unknown')
+allocated_gb = config.get('AllocatedStorage', 0)
+iops = config.get('Iops', 'N/A')
+multi_az = config.get('MultiAZ', False)
+instance_class = config.get('InstanceClass', 'unknown')
+
+print(f'Instance class:    {instance_class}')
+print(f'Storage type:      {storage_type}')
+print(f'Allocated storage: {allocated_gb} GB')
+print(f'Current IOPS:      {iops}')
+print(f'Multi-AZ:          {multi_az}')
+
+if storage_type == 'gp3':
+    print('Already on gp3. No migration needed.')
+    sys.exit(0)
+
+# Cost calculations
+gp2_monthly = allocated_gb * 0.115
+gp3_monthly = allocated_gb * 0.080
+savings = gp2_monthly - gp3_monthly
+multiplier = 2 if multi_az else 1  # Multi-AZ doubles storage cost
+
+print()
+print('=== Cost Impact (excluding I/O charges) ===')
+print(f'gp2 monthly cost:  \${gp2_monthly * multiplier:.2f}')
+print(f'gp3 monthly cost:  \${gp3_monthly * multiplier:.2f}')
+print(f'Monthly savings:   \${savings * multiplier:.2f}')
+print(f'Annual savings:    \${savings * multiplier * 12:.2f}')
+print(f'(Multi-AZ multiplier of {multiplier} applied)')
+"
+
+STORAGE_TYPE=$(aws rds describe-db-instances \
+    --db-instance-identifier "$INSTANCE_ID" \
+    --query 'DBInstances[0].StorageType' \
+    --output text)
+
+if [[ "$STORAGE_TYPE" == "gp3" ]]; then
+    echo "Instance is already on gp3. Exiting."
+    exit 0
+fi
+
+if [[ "$DRY_RUN" == "true" ]]; then
+    echo ""
+    echo "DRY RUN: Would execute the following modification:"
+    echo "aws rds modify-db-instance \\"
+    echo "    --db-instance-identifier $INSTANCE_ID \\"
+    echo "    --storage-type gp3 \\"
+    echo "    --apply-immediately"
+    echo ""
+    echo "Set second argument to 'false' to execute."
+else
+    echo ""
+    echo "=== Executing gp2 to gp3 migration ==="
+    aws rds modify-db-instance \
+        --db-instance-identifier "$INSTANCE_ID" \
+        --storage-type gp3 \
+        --apply-immediately
+
+    echo "Migration initiated. Monitor status with:"
+    echo "  aws rds describe-db-instances \\"
+    echo "      --db-instance-identifier $INSTANCE_ID \\"
+    echo "      --query 'DBInstances[0].PendingModifiedValues'"
+fi</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For a fleet migration, run this script in a</p></div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>

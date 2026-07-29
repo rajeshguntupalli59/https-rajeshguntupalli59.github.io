@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 33: Cost Attribution: Tracking AI Feature Usage Per User — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 33: Cost Attribution: Tracking AI Feature Usage Per User. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 33 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 33: Cost Attribution: Tracking AI Feature Usage Per User</h2>
+
+<p class="text-gray-300 leading-relaxed">AI features are not free. Every embedding generation, every LLM call, every reranking pass consumes tokens that cost real money, and in multi-tenant applications those costs need to land somewhere specific. Without cost attribution, you're flying blind: you don't know which users are burning your GPU budget, which features have unexpectedly high per-request costs, or whether your premium tier pricing even covers what you're spending on inference. This chapter builds a complete cost tracking system on PostgreSQL — from schema design through real-time attribution, budget enforcement, and billing integration — so that AI feature costs become first-class citizens in your application, not a line item you discover when the monthly cloud bill arrives.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Shape of AI Cost Data</h3>
+
+<p class="text-gray-300 leading-relaxed">AI costs in a PostgreSQL-backed application come from a handful of distinct operation types, each with different metering units. Embedding calls charge per token. Chat completions charge per input token and per output token at different rates. Reranking models often charge per document-pair scored. Image generation charges per image at per-resolution rates. Any serious cost attribution system needs to capture this heterogeneity at the source — not aggregate it away.</p>
+
+<p class="text-gray-300 leading-relaxed">The second complication is attribution scope. A single user-facing request might trigger multiple AI operations: a query is embedded, the embedding goes to pgvector for retrieval, retrieved chunks get reranked, and then a completion model synthesizes the answer. Each operation has its own cost, but the user sees one response. You need to link all those child operations to the originating user action, which means tracking a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">request_id</code> through the entire call chain.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL handles this naturally. A relational schema with foreign keys from usage events back to requests, and from requests back to users, gives you the aggregation paths you need. A vector-only store gives you nowhere to put this relational graph. The combination of JSONB for provider-specific metadata, row-level security for tenant isolation, and window functions for quota enforcement makes PostgreSQL the right place to own this data entirely.</p>
+
+<p class="text-gray-300 leading-relaxed">The pricing data itself also belongs in the database. Model prices change. If you hardcode <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gpt-4o</code> input token cost as a constant in your Python application, you'll silently mis-price every request after the next OpenAI rate change. Store pricing in a table with effective date ranges, and join usage records against the active pricing at call time.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Schema: pricing catalog with temporal validity
+CREATE TABLE ai_model_pricing (
+    pricing_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    provider        TEXT NOT NULL,                    -- 'openai', 'anthropic', 'cohere'
+    model_name      TEXT NOT NULL,
+    operation_type  TEXT NOT NULL,                    -- 'embedding', 'chat', 'rerank', 'image'
+    cost_per_input_token   NUMERIC(12, 8),            -- NULL for non-token operations
+    cost_per_output_token  NUMERIC(12, 8),
+    cost_per_request       NUMERIC(12, 8),            -- flat rate, e.g. image generation
+    cost_unit       TEXT NOT NULL DEFAULT 'USD',
+    effective_from  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    effective_until TIMESTAMPTZ,                      -- NULL = currently active
+    CONSTRAINT no_overlap EXCLUDE USING GIST (
+        provider WITH =,
+        model_name WITH =,
+        operation_type WITH =,
+        TSTZRANGE(effective_from, effective_until) WITH &&
+    )
+);
+
+-- Current pricing for major models
+INSERT INTO ai_model_pricing
+    (provider, model_name, operation_type, cost_per_input_token, cost_per_output_token, cost_per_request)
+VALUES
+    ('openai',    'gpt-4o',                  'chat',      0.000005,   0.000015,  NULL),
+    ('openai',    'gpt-4o-mini',             'chat',      0.00000015, 0.0000006, NULL),
+    ('openai',    'text-embedding-3-small',  'embedding', 0.00000002, NULL,      NULL),
+    ('openai',    'text-embedding-3-large',  'embedding', 0.00000013, NULL,      NULL),
+    ('anthropic', 'claude-3-5-sonnet-20241022', 'chat',  0.000003,   0.000015,  NULL),
+    ('anthropic', 'claude-3-5-haiku-20241022',  'chat',  0.0000008,  0.000004,  NULL),
+    ('cohere',    'rerank-english-v3.0',     'rerank',    NULL,       NULL,      0.000001)
+ON CONFLICT DO NOTHING;
+
+-- Helper: get active pricing for a model right now
+CREATE OR REPLACE FUNCTION get_active_pricing(
+    p_provider TEXT,
+    p_model    TEXT,
+    p_op_type  TEXT
+)
+RETURNS TABLE (
+    cost_per_input_token  NUMERIC,
+    cost_per_output_token NUMERIC,
+    cost_per_request      NUMERIC
+)
+LANGUAGE SQL STABLE AS $$
+    SELECT
+        cost_per_input_token,
+        cost_per_output_token,
+        cost_per_request
+    FROM ai_model_pricing
+    WHERE provider       = p_provider
+      AND model_name     = p_model
+      AND operation_type = p_op_type
+      AND effective_from &lt;= NOW()
+      AND (effective_until IS NULL OR effective_until &gt; NOW())
+    LIMIT 1;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Design: Requests, Events, and Attribution</h3>
+
+<p class="text-gray-300 leading-relaxed">The attribution schema has three layers. The outermost layer is the user request — a single unit of user intent. Inside that sits one or more AI operations. Each operation records raw token counts from the provider response, and a computed cost is materialized by joining against the pricing table at insert time. Materializing the cost at write time rather than computing it dynamically on every read keeps dashboards fast and preserves historical accuracy even when prices change later.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- The user request context: every AI-assisted user action
+CREATE TABLE ai_requests (
+    request_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id         UUID NOT NULL REFERENCES users(user_id),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    session_id      UUID,
+    feature_name    TEXT NOT NULL,   -- 'rag_search', 'code_explain', 'chat_assistant'
+    endpoint        TEXT,            -- '/api/v1/search'
+    request_ts      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    response_ts     TIMESTAMPTZ,
+    total_latency_ms INT,
+    http_status     INT,
+    metadata        JSONB DEFAULT '{}'
+);
+
+CREATE INDEX idx_ai_requests_user    ON ai_requests(user_id, request_ts DESC);
+CREATE INDEX idx_ai_requests_tenant  ON ai_requests(tenant_id, request_ts DESC);
+CREATE INDEX idx_ai_requests_feature ON ai_requests(feature_name, request_ts DESC);
+
+-- Individual AI operation calls within a request
+CREATE TABLE ai_usage_events (
+    event_id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id          UUID NOT NULL REFERENCES ai_requests(request_id) ON DELETE CASCADE,
+    user_id             UUID NOT NULL,   -- denormalized for query performance
+    tenant_id           UUID NOT NULL,   -- denormalized for RLS
+    provider            TEXT NOT NULL,
+    model_name          TEXT NOT NULL,
+    operation_type      TEXT NOT NULL,   -- 'embedding', 'chat', 'rerank', 'image'
+    -- Raw usage from provider response
+    input_tokens        INT,
+    output_tokens       INT,
+    total_tokens        INT GENERATED ALWAYS AS (COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0)) STORED,
+    request_count       INT DEFAULT 1,  -- for batch ops or reranking N docs
+    -- Cost computed at insert time
+    input_cost_usd      NUMERIC(12, 8),
+    output_cost_usd     NUMERIC(12, 8),
+    request_cost_usd    NUMERIC(12, 8),
+    total_cost_usd      NUMERIC(12, 8) GENERATED ALWAYS AS (
+                            COALESCE(input_cost_usd, 0) +
+                            COALESCE(output_cost_usd, 0) +
+                            COALESCE(request_cost_usd, 0)
+                        ) STORED,
+    -- Provider response metadata (finish_reason, model version, etc.)
+    provider_response   JSONB DEFAULT '{}',
+    event_ts            TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_usage_events_request  ON ai_usage_events(request_id);
+CREATE INDEX idx_usage_events_user_ts  ON ai_usage_events(user_id, event_ts DESC);
+CREATE INDEX idx_usage_events_tenant   ON ai_usage_events(tenant_id, event_ts DESC);
+CREATE INDEX idx_usage_events_model    ON ai_usage_events(model_name, event_ts DESC);
+CREATE INDEX idx_usage_events_cost     ON ai_usage_events(total_cost_usd, event_ts DESC);
+
+-- Trigger to auto-compute costs at insert time
+CREATE OR REPLACE FUNCTION compute_usage_cost()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+DECLARE
+    pricing RECORD;
+BEGIN
+    SELECT * INTO pricing
+    FROM get_active_pricing(NEW.provider, NEW.model_name, NEW.operation_type);
+
+    IF pricing IS NOT NULL THEN
+        NEW.input_cost_usd  := COALESCE(NEW.input_tokens, 0)  * COALESCE(pricing.cost_per_input_token, 0);
+        NEW.output_cost_usd := COALESCE(NEW.output_tokens, 0) * COALESCE(pricing.cost_per_output_token, 0);
+        NEW.request_cost_usd := COALESCE(NEW.request_count, 1) * COALESCE(pricing.cost_per_request, 0);
+    END IF;
+
+    RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER trg_compute_cost
+    BEFORE INSERT ON ai_usage_events
+    FOR EACH ROW EXECUTE FUNCTION compute_usage_cost();
+
+-- Row-level security: tenants only see their own usage
+ALTER TABLE ai_usage_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE ai_requests ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_usage ON ai_usage_events
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_requests ON ai_requests
+    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The generated column <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_cost_usd</code> is immediately available for range queries and index use without any application-side aggregation. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">provider_response</code> JSONB column stores the raw API response envelope — useful for debugging unexpected token counts or catching cases where the model returned a truncated response and you were still charged.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Instrumentation: Recording Costs from Python</h3>
+
+<p class="text-gray-300 leading-relaxed">Every AI call in your application needs a wrapper that records usage before returning the result to the caller. The cleanest approach is a context manager that accepts a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">request_id</code>, makes the AI call, extracts token usage from the provider response, and writes the event in a background task so it never adds latency to the user response.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># cost_tracker.py — wraps OpenAI and Anthropic calls with automatic cost recording
+import asyncio
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Optional, Any
+
+import asyncpg
+from openai import AsyncOpenAI
+from anthropic import AsyncAnthropic
+
+# Connection pool — shared across the application
+_pool: asyncpg.Pool | None = None
+
+async def get_pool() -&gt; asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(
+            dsn="postgresql://app_user:secret@localhost:5432/ai_app_db",
+            min_size=2,
+            max_size=10,
+            server_settings={"application_name": "ai_cost_tracker"},
+        )
+    return _pool
+
+
+async def record_usage_event(
+    request_id: str,
+    user_id: str,
+    tenant_id: str,
+    provider: str,
+    model_name: str,
+    operation_type: str,
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    request_count: int = 1,
+    provider_response: Optional[dict] = None,
+) -&gt; None:
+    """Fire-and-forget cost recording. Runs as a background task."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO ai_usage_events (
+                request_id, user_id, tenant_id,
+                provider, model_name, operation_type,
+                input_tokens, output_tokens, request_count,
+                provider_response
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            """,
+            uuid.UUID(request_id),
+            uuid.UUID(user_id),
+            uuid.UUID(tenant_id),
+            provider,
+            model_name,
+            operation_type,
+            input_tokens,
+            output_tokens,
+            request_count,
+            provider_response or {},
+        )
+
+
+class CostTracker:
+    """
+    Wraps AI provider clients with automatic cost attribution.
+    Usage:
+        tracker = CostTracker(user_id=..., tenant_id=..., request_id=...)
+        response = await tracker.chat(model="gpt-4o", messages=[...])
+    """
+
+    def __init__(
+        self,
+        user_id: str,
+        tenant_id: str,
+        request_id: Optional[str] = None,
+        feature_name: str = "unknown",
+    ):
+        self.user_id = user_id
+        self.tenant_id = tenant_id
+        self.request_id = request_id or str(uuid.uuid4())
+        self.feature_name = feature_name
+        self._openai = AsyncOpenAI()
+        self._anthropic = AsyncAnthropic()
+
+    async def _ensure_request_row(self, endpoint: Optional[str] = None) -&gt; None:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO ai_requests (request_id, user_id, tenant_id, feature_name, endpoint)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (request_id) DO NOTHING
+                """,
+                uuid.UUID(self.request_id),
+                uuid.UUID(self.user_id),
+                uuid.UUID(self.tenant_id),
+                self.feature_name,
+                endpoint,
+            )
+
+    async def openai_chat(
+        self, model: str, messages: list[dict], **kwargs
+    ) -&gt; Any:
+        await self._ensure_request_row()
+        response = await self._openai.chat.completions.create(
+            model=model, messages=messages, **kwargs
+        )
+        usage = response.usage
+        # Schedule cost recording without blocking the caller
+        asyncio.create_task(
+            record_usage_event(
+                request_id=self.request_id,
+                user_id=self.user_id,
+                tenant_id=self.tenant_id,
+                provider="openai",
+                model_name=model,
+                operation_type="chat",
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+                provider_response={
+                    "finish_reason": response.choices[0].finish_reason,
+                    "model": response.model,
+                    "system_fingerprint": response.system_fingerprint,
+                },
+            )
+        )
+        return response
+
+    async def anthropic_chat(
+        self, model: str, messages: list[dict], max_tokens: int = 1024, **kwargs
+    ) -&gt; Any:
+        await self._ensure_request_row()
+        response = await self._anthropic.messages.create(
+            model=model, messages=messages, max_tokens=max_tokens, **kwargs
+        )
+        asyncio.create_task(
+            record_usage_event(
+                request_id=self.request_id,
+                user_id=self.user_id,
+                tenant_id=self.tenant_id,
+                provider="anthropic",
+                model_name=model,
+                operation_type="chat",
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                provider_response={
+                    "stop_reason": response.stop_reason,
+                    "model": response.model,
+                },
+            )
+        )
+        return response
+
+    async def openai_embed(self, model: str, texts: list[str]) -&gt; Any:
+        await self._ensure_request_row()
+        response = await self._openai.embeddings.create(
+            model=model, input=texts
+        )
+        asyncio.create_task(
+            record_usage_event(
+                request_id=self.request_id,
+                user_id=self.user_id,
+                tenant_id=self.tenant_id,
+                provider="openai",
+                model_name=model,
+                operation_type="embedding",
+                input_tokens=response.usage.prompt_tokens,
+                output_tokens=None,
+                request_count=len(texts),
+                provider_response={"model": response.model},
+            )
+        )
+        return response
+
+    async def mark_complete(self, http_status: int = 200) -&gt; None:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE ai_requests
+                SET response_ts = NOW(),
+                    total_latency_ms = EXTRACT(EPOCH FROM (NOW() - request_ts)) * 1000,
+                    http_status = $2
+                WHERE request_id = $1
+                """,
+                uuid.UUID(self.request_id),
+                http_status,
+            )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">asyncio.create_task</code> pattern is deliberate: the cost write happens concurrently with returning the AI response to the user. For high-throughput applications, you may want to batch these writes through a Celery worker instead, which the next section covers.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># fastapi_endpoint.py — wiring CostTracker into a RAG endpoint
+from fastapi import FastAPI, Depends, Request, HTTPException
+from pydantic import BaseModel
+import uuid
+
+app = FastAPI()
+
+
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
+
+
+class SearchResponse(BaseModel):
+    answer: str
+    sources: list[str]
+    request_id: str
+
+
+def get_current_user(request: Request) -&gt; dict:
+    # Replace with your actual auth middleware
+    return {
+        "user_id": request.headers.get("X-User-ID", str(uuid.uuid4())),
+        "tenant_id": request.headers.get("X-Tenant-ID", str(uuid.uuid4())),
+    }
+
+
+@app.post("/api/v1/search", response_model=SearchResponse)
+async def rag_search(
+    body: SearchRequest,
+    user: dict = Depends(get_current_user),
+):
+    tracker = CostTracker(
+        user_id=user["user_id"],
+        tenant_id=user["tenant_id"],
+        feature_name="rag_search",
+    )
+
+    try:
+        # Step 1: Embed the query — cost attributed automatically
+        embed_response = await tracker.openai_embed(
+            model="text-embedding-3-small",
+            texts=[body.query],
+        )
+        query_vector = embed_response.data[0].embedding
+
+        # Step 2: Retrieve from pgvector (no LLM cost here)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT chunk_text, source_url,
+                       1 - (embedding &lt;=&gt; $1::vector) AS similarity
+                FROM document_chunks
+                ORDER BY embedding &lt;=&gt; $1::vector
+                LIMIT $2
+                """,
+                str(query_vector),
+                body.top_k,
+            )
+
+        context = "\n\n".join(r["chunk_text"] for r in rows)
+        sources = [r["source_url"] for r in rows]
+
+        # Step 3: Generate answer — cost attributed automatically
+        messages = [
+            {"role": "system", "content": "Answer using only the provided context."},
+            {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {body.query}"},
+        ]
+        chat_response = await tracker.anthropic_chat(
+            model="claude-3-5-haiku-20241022",
+            messages=messages,
+            max_tokens=512,
+        )
+
+        await tracker.mark_complete(http_status=200)
+
+        return SearchResponse(
+            answer=chat_response.content[0].text,
+            sources=sources,
+            request_id=tracker.request_id,
+        )
+
+    except Exception as exc:
+        await tracker.mark_complete(http_status=500)
+        raise HTTPException(status_code=500, detail=str(exc))</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Budget Enforcement and Quota Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Recording costs is only half the job. The other half is enforcing spending limits before users exceed them, not after. PostgreSQL is the right place to implement this enforcement because the usage data already lives there — you don't need a separate service to answer "how much has this user spent today?"</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

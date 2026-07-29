@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 19: Milvus: Open-Source Vector Search at Enterprise Scale — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 19: Milvus: Open-Source Vector Search at Enterprise Scale. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 19 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 19: Milvus: Open-Source Vector Search at Enterprise Scale</h2>
+
+<p class="text-gray-300 leading-relaxed">Milvus occupies a distinctive position in the vector database landscape: it is the most fully-featured open-source vector search engine designed from the ground up for production workloads at scale. While pgvector is the natural extension for teams already on PostgreSQL, and Pinecone offers managed simplicity, Milvus targets organizations that need full control over their infrastructure, support for billions of vectors, and enterprise-grade operational features — without paying managed-service premiums or accepting vendor lock-in. This chapter covers Milvus architecture, deployment patterns, collection and index design, filtering and hybrid search, and the operational patterns that separate a proof-of-concept cluster from a system you can put on-call. Whether you are migrating from a simpler vector store that has started showing its limits, or designing a greenfield AI platform, understanding Milvus at the engineering level gives you the vocabulary and judgment to decide when it is the right tool and how to run it correctly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.1 Milvus Architecture: Disaggregated Storage and Compute</h3>
+
+<p class="text-gray-300 leading-relaxed">Milvus 2.x was rebuilt around a cloud-native, disaggregated architecture. Understanding this design is essential before you write a single line of code, because it directly determines how you size clusters, recover from failures, and tune for throughput versus latency.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Four Layers</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus separates concerns into four functional layers that can scale independently:</p>
+
+<p class="text-gray-300 leading-relaxed">| Layer | Components | Responsibility |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Access | Proxy | Request routing, load balancing, query planning |</p>
+<p class="text-gray-300 leading-relaxed">| Coordinator | Root, Query, Data, Index coordinators | Metadata management, segment assignment, topology |</p>
+<p class="text-gray-300 leading-relaxed">| Worker | Query Nodes, Data Nodes, Index Nodes | Actual compute: search, ingest, index build |</p>
+<p class="text-gray-300 leading-relaxed">| Storage | Object storage (S3/MinIO) + etcd + message bus (Pulsar/Kafka) | Durability, WAL, metadata |</p>
+
+<p class="text-gray-300 leading-relaxed">This is architecturally analogous to separating the PostgreSQL planner, executor, storage manager, and WAL writer into independently scalable services — something relational databases have only recently begun doing in products like Aurora and Spanner. For vector workloads, this disaggregation matters because index building is CPU-and-memory-intensive work that would otherwise contend with query serving. A Milvus Index Node can build an IVF_FLAT or HNSW index on a 100M-vector segment while Query Nodes continue serving search requests without interference.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Segment Model</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Data in Milvus is organized into segments, the fundamental unit of indexing and distribution. Segments start as *growing* (in-memory, accepting inserts), then seal to *sealed* (immutable), and eventually get compacted and persisted to object storage. This is structurally similar to LSM-tree compaction in RocksDB or PostgreSQL's autovacuum cycle — data flows through a pipeline of mutability states, with index building happening asynchronously on sealed segments.</p>
+
+<p class="text-gray-300 leading-relaxed">A sealed segment with an HNSW index on S3 is loaded into Query Node memory on demand. This lazy-load model enables a cluster to host more data than fits in aggregate RAM, at the cost of cold-query latency when a segment must be fetched from object storage. Tune the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dataCoord.segment.maxSize</code> parameter (default 512 MB) to control segment granularity — smaller segments reduce memory pressure per load but increase metadata overhead.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Message Bus and WAL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus uses Apache Pulsar (or Kafka in enterprise configurations) as its internal message bus. Every insert, delete, and schema change is published as a message and consumed by Data Nodes for persistence and by Query Nodes for real-time visibility. This gives Milvus a *streaming-first* ingestion model: you do not insert into a table and wait for a commit; you publish a record and it becomes queryable within milliseconds once the Query Node consumes the message off the channel. The practical consequence is that Milvus offers *eventual consistency* by default, not the snapshot isolation you get from PostgreSQL. For RAG pipelines where documents are indexed asynchronously after upload, this is usually acceptable. For applications that insert a record and immediately query for it, you must call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">collection.flush()</code> to force segment sealing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.2 Deployment: From Docker Compose to Kubernetes</h3>
+
+<p class="text-gray-300 leading-relaxed">Milvus ships in two operational modes: <strong class="text-white">Milvus Lite</strong> (in-process, for development only), <strong class="text-white">Milvus Standalone</strong> (single-node, suitable for up to ~50M vectors), and <strong class="text-white">Milvus Distributed</strong> (the full multi-node cluster). Zilliz Cloud is the managed SaaS version if you want to outsource operations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Local Development with Docker Compose</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Download the official Milvus standalone compose file
+wget https://github.com/milvus-io/milvus/releases/download/v2.4.0/milvus-standalone-docker-compose.yml \
+     -O docker-compose.yml
+
+# Start Milvus standalone with embedded MinIO and etcd
+docker-compose up -d
+
+# Verify all services are healthy
+docker-compose ps
+# Expected: milvus-standalone, milvus-minio, milvus-etcd all running
+
+# Check Milvus version and connectivity
+docker exec milvus-standalone milvus --version</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python Environment Setup</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Install the Milvus client and supporting libraries
+# pip install pymilvus==2.4.0 sentence-transformers openai numpy
+
+from pymilvus import connections, utility
+
+# Connect to local standalone instance
+connections.connect(
+    alias="default",
+    host="localhost",
+    port="19530"
+)
+
+# Verify connection and list existing collections
+print("Milvus version:", utility.get_server_version())
+print("Existing collections:", utility.list_collections())</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Kubernetes Deployment with Helm</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For production, use the official Helm chart. The following configuration is a starting point for a medium-scale deployment handling ~200M vectors with mixed read/write workloads:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Add Milvus Helm repository
+helm repo add milvus https://zilliztech.github.io/milvus-helm/
+helm repo update
+
+# Create a values override file for production sizing
+cat &gt; milvus-values.yaml &lt;&lt; 'EOF'
+cluster:
+  enabled: true
+
+# Proxy handles client connections and query routing
+proxy:
+  replicas: 2
+  resources:
+    requests:
+      cpu: "2"
+      memory: "4Gi"
+    limits:
+      cpu: "4"
+      memory: "8Gi"
+
+# Query nodes serve search requests — size for your working set
+queryNode:
+  replicas: 4
+  resources:
+    requests:
+      cpu: "8"
+      memory: "32Gi"
+    limits:
+      cpu: "16"
+      memory: "64Gi"
+
+# Data nodes handle ingestion and segment persistence
+dataNode:
+  replicas: 2
+  resources:
+    requests:
+      cpu: "4"
+      memory: "8Gi"
+
+# Index nodes build vector indexes asynchronously
+indexNode:
+  replicas: 2
+  resources:
+    requests:
+      cpu: "16"
+      memory: "32Gi"
+
+# External object storage — replace with your S3 bucket
+minio:
+  enabled: false  # Use external S3
+
+externalS3:
+  enabled: true
+  host: "s3.amazonaws.com"
+  port: 443
+  useSSL: true
+  bucketName: "milvus-production"
+  accessKey: ""   # Use IAM roles or secrets manager
+  secretKey: ""
+
+# External etcd for metadata durability
+etcd:
+  enabled: false
+
+externalEtcd:
+  enabled: true
+  endpoints:
+    - "etcd-0.etcd-headless:2379"
+    - "etcd-1.etcd-headless:2379"
+    - "etcd-2.etcd-headless:2379"
+
+# Pulsar for message bus
+pulsar:
+  enabled: true
+  broker:
+    replicaCount: 2
+
+EOF
+
+# Deploy to the milvus namespace
+kubectl create namespace milvus
+helm install milvus milvus/milvus \
+  --namespace milvus \
+  --values milvus-values.yaml \
+  --version 4.1.0</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key sizing principle for Query Nodes: your working dataset (the collection of segments actively loaded) must fit in aggregate Query Node memory. If your total index size is 160 GB and each Query Node has 32 GB available for data, you need at least 5 Query Nodes. Monitor the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus_querynode_cache_hit_rate</code> Prometheus metric — anything below 85% indicates memory pressure and cold-load latency will dominate your p99.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.3 Collection Design, Indexing, and Schema Modeling</h3>
+
+<p class="text-gray-300 leading-relaxed">A Milvus *collection* is the conceptual equivalent of a table. It has a schema with a primary key, scalar fields for metadata, and one or more vector fields. Getting schema design right before you load 500M records saves you from a costly dump-and-reload cycle.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema Design and Collection Creation</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import (
+    connections, Collection, CollectionSchema,
+    FieldSchema, DataType, utility
+)
+import numpy as np
+
+connections.connect(alias="default", host="localhost", port="19530")
+
+# Define schema for a document chunk collection
+# Analogous to CREATE TABLE with column definitions
+fields = [
+    FieldSchema(
+        name="chunk_id",
+        dtype=DataType.INT64,
+        is_primary=True,
+        auto_id=True          # Milvus generates IDs, like SERIAL in PostgreSQL
+    ),
+    FieldSchema(
+        name="document_id",
+        dtype=DataType.VARCHAR,
+        max_length=128         # Scalar field for filtering
+    ),
+    FieldSchema(
+        name="chunk_index",
+        dtype=DataType.INT32    # Position within document
+    ),
+    FieldSchema(
+        name="content_type",
+        dtype=DataType.VARCHAR,
+        max_length=32          # "paragraph", "table", "code", etc.
+    ),
+    FieldSchema(
+        name="created_at",
+        dtype=DataType.INT64   # Unix timestamp — Milvus has no native TIMESTAMP
+    ),
+    FieldSchema(
+        name="embedding",
+        dtype=DataType.FLOAT_VECTOR,
+        dim=1536               # OpenAI text-embedding-3-small dimensions
+    ),
+    FieldSchema(
+        name="sparse_embedding",   # For hybrid dense+sparse search
+        dtype=DataType.SPARSE_FLOAT_VECTOR
+    )
+]
+
+schema = CollectionSchema(
+    fields=fields,
+    description="Document chunks with dense and sparse embeddings",
+    enable_dynamic_field=True   # Allows schemaless extra fields, like JSONB
+)
+
+# Create the collection with 2 shards
+# More shards = better write parallelism, but higher metadata overhead
+collection = Collection(
+    name="document_chunks",
+    schema=schema,
+    shards_num=2
+)
+
+print(f"Collection created: {collection.name}")
+print(f"Schema fields: {[f.name for f in collection.schema.fields]}")
+
+# Build index on the dense vector field
+# HNSW is the right default for most workloads under 500M vectors
+index_params = {
+    "metric_type": "COSINE",
+    "index_type": "HNSW",
+    "params": {
+        "M": 16,              # Neighbors per node. Range: 4-64. Higher = better recall, more memory
+        "efConstruction": 200  # Build-time search depth. Higher = better index quality, slower build
+    }
+}
+
+collection.create_index(
+    field_name="embedding",
+    index_params=index_params,
+    index_name="dense_hnsw"
+)
+
+# Build index on sparse vector field for BM25-style keyword matching
+sparse_index_params = {
+    "metric_type": "IP",
+    "index_type": "SPARSE_INVERTED_INDEX",
+    "params": {"drop_ratio_build": 0.2}  # Drop bottom 20% of weights to save space
+}
+
+collection.create_index(
+    field_name="sparse_embedding",
+    index_params=sparse_index_params,
+    index_name="sparse_inverted"
+)
+
+# Build scalar index on document_id for filtered searches
+# Equivalent to CREATE INDEX on a relational column
+collection.create_index(
+    field_name="document_id",
+    index_name="doc_id_index"
+)
+
+print("Indexes created successfully")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index Type Selection</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus supports a broader range of index types than most vector databases. The selection criteria map cleanly to database index selection reasoning:</p>
+
+<p class="text-gray-300 leading-relaxed">| Index Type | Best For | Memory | Build Time | Recall | Notes |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| FLAT | <1M vectors, exact recall required | High | Fast | 100% | Brute force, no approximation |</p>
+<p class="text-gray-300 leading-relaxed">| IVF_FLAT | 1M–100M, balanced | Medium | Medium | ~98% | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nlist</code> controls cluster count |</p>
+<p class="text-gray-300 leading-relaxed">| IVF_SQ8 | Memory-constrained, 8-bit quantization | Low | Medium | ~95% | Good throughput/memory tradeoff |</p>
+<p class="text-gray-300 leading-relaxed">| HNSW | <500M, low-latency queries | High | Slow | ~99% | Best recall/latency tradeoff |</p>
+<p class="text-gray-300 leading-relaxed">| DISKANN | >500M, cannot fit in RAM | Disk | Slow | ~97% | Serves from SSD, lower cost |</p>
+<p class="text-gray-300 leading-relaxed">| GPU_IVF_FLAT | Batch throughput workloads | GPU VRAM | Fast (GPU) | ~98% | Requires CUDA-capable hardware |</p>
+<p class="text-gray-300 leading-relaxed">| SCANN | High-recall, Google-developed | Medium | Medium | ~99% | Competitive with HNSW at scale |</p>
+
+<p class="text-gray-300 leading-relaxed">For HNSW, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">M</code> parameter is the most impactful tunable. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">M=16</code> is a good default — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">M=32</code> increases memory usage by roughly 2x but improves recall for high-dimensional spaces (>768 dimensions). The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> parameter at query time (not index build time) is the runtime recall/latency lever: start at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef=64</code> and increase until recall meets your SLA, then cap it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.4 Querying: ANN Search, Filtered Search, and Hybrid Search</h3>
+
+<p class="text-gray-300 leading-relaxed">Milvus search is richer than the typical "find K nearest neighbors" interface. Understanding its query primitives lets you build sophisticated retrieval patterns that would require multiple round trips in simpler systems.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Basic ANN Search and Filtered Search</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection
+from sentence_transformers import SentenceTransformer
+import time
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("document_chunks")
+
+# Load collection into Query Node memory before searching
+# This is the equivalent of a warm cache — cold collections have high first-query latency
+collection.load()
+
+# Initialize embedding model
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
+
+def search_documents(
+    query: str,
+    document_ids: list[str] | None = None,
+    content_type: str | None = None,
+    top_k: int = 10,
+    ef: int = 64
+) -&gt; list[dict]:
+    """
+    Search with optional pre-filtering on scalar fields.
+    Pre-filtering in Milvus happens before ANN search (unlike post-filtering),
+    which maintains recall guarantees but requires scalar indexes.
+    """
+    query_embedding = encoder.encode([query])[0].tolist()
+
+    # Build filter expression — syntax is similar to SQL WHERE clause
+    filter_parts = []
+    if document_ids:
+        # IN operator for set membership
+        ids_str = '", "'.join(document_ids)
+        filter_parts.append(f'document_id in ["{ids_str}"]')
+    if content_type:
+        filter_parts.append(f'content_type == "{content_type}"')
+
+    filter_expr = " and ".join(filter_parts) if filter_parts else ""
+
+    search_params = {
+        "metric_type": "COSINE",
+        "params": {"ef": ef}   # Runtime recall parameter for HNSW
+    }
+
+    start = time.perf_counter()
+    results = collection.search(
+        data=[query_embedding],
+        anns_field="embedding",
+        param=search_params,
+        limit=top_k,
+        expr=filter_expr if filter_expr else None,
+        output_fields=["document_id", "chunk_index", "content_type", "created_at"]
+    )
+    latency_ms = (time.perf_counter() - start) * 1000
+
+    hits = []
+    for hit in results[0]:
+        hits.append({
+            "chunk_id": hit.id,
+            "score": hit.score,
+            "document_id": hit.entity.get("document_id"),
+            "chunk_index": hit.entity.get("chunk_index"),
+            "content_type": hit.entity.get("content_type"),
+            "latency_ms": latency_ms
+        })
+
+    return hits
+
+# Example: Search within specific documents with content type filter
+results = search_documents(
+    query="how to configure connection pooling",
+    document_ids=["postgresql-docs-v16", "pgbouncer-readme"],
+    content_type="paragraph",
+    top_k=5
+)
+
+for r in results:
+    print(f"Score: {r['score']:.4f} | Doc: {r['document_id']} | Chunk: {r['chunk_index']}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Hybrid Search: Dense + Sparse Fusion</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Hybrid search — combining dense semantic embeddings with sparse keyword-matching vectors — is one of Milvus's strongest differentiators. The rationale is well-established: dense retrieval handles paraphrase and semantic similarity, sparse retrieval handles exact keyword matching. Combining them with Reciprocal Rank Fusion (RRF) or weighted scoring consistently outperforms either alone, particularly for technical documentation where exact terms matter.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import (
+    connections, Collection, AnnSearchRequest,
+    RRFRanker, WeightedRanker
+)
+from pymilvus.model.hybrid import BGEM3EmbeddingFunction
+import numpy as np
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("document_chunks")
+collection.load()
+
+# BGE-M3 generates both dense and sparse embeddings in one pass
+# This is more efficient than separate dense and sparse encoder calls
+embedding_fn = BGEM3EmbeddingFunction(
+    model_name="BAAI/bge-m3",
+    device="cpu",       # Use "cuda" if GPU available
+    use_fp16=False
+)
+
+def hybrid_search(
+    query: str,
+    top_k: int = 10,
+    dense_weight: float = 0.7,
+    sparse_weight: float = 0.3,
+    use_rrf: bool = True
+) -&gt; list[dict]:
+    """
+    Hybrid dense+sparse search with configurable fusion strategy.
+    RRF is rank-based and robust to score scale differences.
+    WeightedRanker requires scores to be on the same scale.
+    """
+    # Generate both dense and sparse embeddings
+    embeddings = embedding_fn([query])
+    dense_vec = embeddings["dense"][0]
+    sparse_vec = embeddings["sparse"][[0]]  # scipy sparse matrix row
+
+    # Dense search request — HNSW index
+    dense_request = AnnSearchRequest(
+        data=[dense_vec.tolist()],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"ef": 100}},
+        limit=top_k * 2   # Over-fetch to allow fusion reranking
+    )
+
+    # Sparse search request — inverted index
+    sparse_request = AnnSearchRequest(
+        data=[sparse_vec],
+        anns_field="sparse_embedding",
+        param={"metric_type": "IP", "params": {"drop_ratio_search": 0.2}},
+        limit=top_k * 2
+    )
+
+    # Fusion strategy: RRF (rank-based) vs Weighted (score-based)
+    if use_rrf:
+        ranker = RRFRanker(k=60)   # k=60 is the standard RRF constant
+    else:
+        ranker = WeightedRanker(dense_weight, sparse_weight)
+
+    results = collection.hybrid_search(
+        reqs=[dense_request, sparse_request],
+        ranker=ranker,
+        limit=top_k,
+        output_fields=["document_id", "chunk_index", "content_type"]
+    )
+
+    hits = []
+    for hit in results[0]:
+        hits.append({
+            "chunk_id": hit.id,
+            "fused_score": hit.score,
+            "document_id": hit.entity.get("document_id"),
+            "chunk_index": hit.entity.get("chunk_index"),
+        })
+
+    return hits
+
+# Compare dense-only vs hybrid for a keyword-sensitive query
+query = "pgvector ivfflat index creation syntax"
+
+hybrid_results = hybrid_search(query, use_rrf=True)
+print("Hybrid search results (RRF fusion):")
+for r in hybrid_results[:5]:
+    print(f"  Score: {r['fused_score']:.4f} | {r['document_id']}:{r['chunk_index']}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Range Search and Grouping</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Two additional search primitives worth knowing: *range search* returns all vectors within a distance threshold (rather than top-K), which is useful for deduplication and similarity clustering. *Grouping search* returns the best match per group — equivalent to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DISTINCT ON (document_id)</code> in PostgreSQL — preventing a single long document from dominating results with many similar chunks.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("document_chunks")
+collection.load()
+
+# Range search: find all chunks within a cosine similarity threshold
+# Useful for deduplication — flag chunks with similarity &gt; 0.98 as near-duplicates
+def range_search_for_deduplication(embedding: list[float], threshold: float = 0.98):
+    results = collection.search(
+        data=[embedding],
+        anns_field="embedding",
+        param={
+            "metric_type": "COSINE",
+            "params": {
+                "ef": 200,
+                "radius": 1.0 - threshold,      # Convert similarity threshold to distance
+                "range_filter": 0.0              # Include everything from 0 to radius
+            }
+        },
+        limit=100,
+        output_fields=["document_id", "chunk_index"]
+    )
+    return results[0]
+
+# Grouping search: best match per document, prevent any single doc from dominating
+def search_with_document_diversity(query_embedding: list[float], top_k: int = 10):
+    results = collection.search(
+        data=[query_embedding],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"ef": 200}},
+        limit=top_k,
+        group_by_field="document_id",   # One result per unique document_id
+        group_size=1,                    # How many results per group
+        output_fields=["document_id", "chunk_index", "content_type"]
+    )
+    return results[0]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.5 Ingestion Pipelines and Data Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Ingesting data into Milvus at scale requires attention to batching, consistency semantics, and the operational lifecycle of collections. Unlike a relational database where you <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> rows and they are immediately visible to subsequent queries, Milvus's streaming architecture means you need to manage the pipeline explicitly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Batch Ingestion with OpenAI Embeddings</strong></p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

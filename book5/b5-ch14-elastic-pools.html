@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 14: Elastic Pools: Multi-Tenant Cost Optimization — The Cloud Database Engineer</title>
+  <meta name="description" content="The Cloud Database Engineer Chapter 14: Elastic Pools: Multi-Tenant Cost Optimization. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-orange-500 to-orange-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-orange-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 5 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-orange-400 hover:text-orange-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-orange-900/40 border border-orange-800/40 text-orange-300 text-xs rounded-full font-medium">Chapter 14 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">The Cloud Database Engineer</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 14: Elastic Pools: Multi-Tenant Cost Optimization</h2>
+
+<p class="text-gray-300 leading-relaxed">Running dozens of databases for separate tenants on dedicated instances is the fastest way to inflate a cloud bill. A SaaS platform with 200 customers, each assigned their own <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t3.medium</code> RDS instance, burns through hundreds of instance-hours per hour—most of them idle at 3 AM. The economics that made dedicated instances sensible on-premises (you already paid for the hardware) break down completely when you're billed by the second in the cloud. This chapter covers the architectural patterns and platform-specific tools that let you consolidate multi-tenant workloads without sacrificing isolation: Azure SQL Elastic Pools, Aurora Serverless v2 shared clusters, RDS Proxy connection pooling, and equivalent consolidation strategies on Google Cloud SQL and AlloyDB. You'll learn how to right-size shared resource pools, enforce per-tenant resource governance, and build the monitoring scaffolding that tells you when a tenant is crowding out its neighbors.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.1 The Multi-Tenant Database Problem: Why Dedicated Instances Fail at Scale</h3>
+
+<p class="text-gray-300 leading-relaxed">On-premises, the conversation around multi-tenancy usually came down to shared schemas, separate schemas within one instance, or fully separate databases on the same host. You had a server with 256 GB of RAM and 32 cores. You ran 40 databases on it. The marginal cost of database 41 was almost nothing—some buffer pool pressure, a few more background threads.</p>
+
+<p class="text-gray-300 leading-relaxed">Cloud changes the unit economics entirely. Every instance is a billable entity, independently metered. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t3.medium</code> on RDS runs roughly $0.068/hour on-demand in us-east-1. Multiply that by 200 tenants and you're at $13.60/hour just for compute—$9,792/month before storage, I/O, or data transfer. If average CPU utilization across those instances is 5%, you're paying for 95% of compute you don't use.</p>
+
+<p class="text-gray-300 leading-relaxed">The fundamental problem is variance in tenant load. Figure 14.1 (conceptually) shows a classic multi-tenant utilization curve: a few power users driving high load during business hours, a long tail of small customers almost always idle. The peak of one tenant rarely aligns with the peak of another. If you could stack those utilization profiles, the aggregate load fits comfortably in far fewer resources.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Three consolidation models exist in practice:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Shared instance, separate databases</strong> — All tenants share one RDS or Cloud SQL instance. Cheapest, but noisy-neighbor risk is highest and blast radius of an instance failure covers all tenants simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Elastic pool / shared cluster</strong> — Tenants have isolated database objects but draw from a shared resource pool with per-tenant caps. This is the Azure SQL Elastic Pool model and approximately what Aurora Serverless v2 achieves for a cluster.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Connection multiplexing over dedicated instances</strong> — Tenants keep dedicated instances but a proxy layer (RDS Proxy, PgBouncer) eliminates per-connection overhead so you can pack more application threads against fewer, larger instances.</p>
+
+<p class="text-gray-300 leading-relaxed">The right model depends on tenant count, isolation requirements, and SLA commitments. Enterprise SaaS with contractual data isolation guarantees often must use model 3. High-volume SMB SaaS with hundreds or thousands of small tenants typically needs model 2. The rest of this chapter walks through concrete implementations of each.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.2 Azure SQL Elastic Pools: The Reference Implementation</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Elastic Pools are the most mature and complete implementation of the shared resource pool pattern in managed cloud databases. If you've worked with SQL Server, the mental model is a single SQL Server instance running multiple databases—except Azure enforces resource limits at the pool and per-database level using DTUs or vCores, and bills you for the pool rather than per database.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pool configuration with Azure CLI:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create a resource group and logical server first
+az group create \
+  --name rg-saas-prod \
+  --location eastus2
+
+az sql server create \
+  --name sql-saas-prod-eastus2 \
+  --resource-group rg-saas-prod \
+  --location eastus2 \
+  --admin-user sqladmin \
+  --admin-password "$(openssl rand -base64 24)"
+
+# Create a General Purpose elastic pool — 8 vCores total shared across tenants
+# min-capacity per database: 0 vCores (can scale to zero when idle)
+# max-capacity per database: 4 vCores (no single tenant can consume more than 50%)
+az sql elastic-pool create \
+  --name ep-saas-tenants \
+  --resource-group rg-saas-prod \
+  --server sql-saas-prod-eastus2 \
+  --edition GeneralPurpose \
+  --family Gen5 \
+  --capacity 8 \
+  --db-min-capacity 0 \
+  --db-max-capacity 4 \
+  --storage 512000 \
+  --zone-redundant true
+
+# Add an existing tenant database to the pool
+az sql db create \
+  --name tenant-acme-corp \
+  --resource-group rg-saas-prod \
+  --server sql-saas-prod-eastus2 \
+  --elastic-pool ep-saas-tenants \
+  --max-size 50GB</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--db-min-capacity 0</code> setting is important: databases configured this way pause their vCore reservation when connection count drops to zero, letting the pool's capacity shift entirely to active tenants. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--db-max-capacity 4</code> cap is your noisy-neighbor protection. Without it, a runaway tenant query can consume all 8 vCores and starve everyone else.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Terraform equivalent for reproducible infrastructure:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>resource "azurerm_mssql_elasticpool" "saas_pool" {
+  name                = "ep-saas-tenants"
+  resource_group_name = azurerm_resource_group.saas.name
+  location            = azurerm_resource_group.saas.location
+  server_name         = azurerm_mssql_server.saas_prod.name
+  max_size_gb         = 500
+
+  sku {
+    name     = "GP_Gen5"
+    tier     = "GeneralPurpose"
+    family   = "Gen5"
+    capacity = 8
+  }
+
+  per_database_settings {
+    min_capacity = 0
+    max_capacity = 4
+  }
+
+  zone_redundant = true
+
+  tags = {
+    Environment = "production"
+    CostCenter  = "platform-engineering"
+  }
+}
+
+resource "azurerm_mssql_database" "tenant_db" {
+  for_each        = toset(var.tenant_names)
+  name            = "tenant-${each.key}"
+  server_id       = azurerm_mssql_server.saas_prod.id
+  elastic_pool_id = azurerm_mssql_elasticpool.saas_pool.id
+  max_size_gb     = 50
+  
+  # Collation must match your application requirements
+  # Changing this after creation requires a rebuild
+  collation = "SQL_Latin1_General_CP1_CI_AS"
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Right-sizing the pool:</strong> The most common mistake is sizing the pool based on the sum of per-database maximums rather than realistic concurrent peak load. If you have 50 tenant databases each with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_capacity</code> of 4 vCores, you might think you need 200 vCores. In practice, if peak concurrent load is never more than 10 databases simultaneously, an 8–16 vCore pool handles it. Azure publishes a workload simulator in their documentation, but the more reliable method is to run your tenants on dedicated instances for 2–4 weeks, capture the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_resource_stats</code> DMV data, and use that to model peak concurrency.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run this against each tenant database to capture utilization baseline
+-- before migrating to a pool
+SELECT 
+    start_time,
+    end_time,
+    avg_cpu_percent,
+    avg_data_io_percent,
+    avg_log_write_percent,
+    avg_memory_usage_percent,
+    max_worker_percent,
+    max_session_percent
+FROM sys.dm_db_resource_stats
+ORDER BY start_time DESC;
+
+-- Aggregate to find realistic peak across your tenant population
+-- Run across all databases using a linked server or centralized monitoring schema
+SELECT 
+    DB_NAME() AS tenant_name,
+    MAX(avg_cpu_percent) AS peak_cpu_pct,
+    AVG(avg_cpu_percent) AS avg_cpu_pct,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY avg_cpu_percent) 
+        OVER () AS p95_cpu_pct,
+    MAX(avg_data_io_percent) AS peak_io_pct
+FROM sys.dm_db_resource_stats
+WHERE start_time &gt;= DATEADD(DAY, -14, GETUTCDATE());</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pool monitoring with Azure Monitor:</strong> Once in production, you need alerts on pool-level saturation—not just per-database. If 8 vCores are pegged at 100% for sustained periods, the pool is undersized regardless of how good individual tenant metrics look.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Alert when pool CPU exceeds 85% for 5 consecutive minutes
+az monitor metrics alert create \
+  --name "ElasticPool-CPU-Saturation" \
+  --resource-group rg-saas-prod \
+  --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-saas-prod/providers/Microsoft.Sql/servers/sql-saas-prod-eastus2/elasticPools/ep-saas-tenants" \
+  --condition "avg Percentage CPU &gt; 85" \
+  --window-size 5m \
+  --evaluation-frequency 1m \
+  --action-group ag-oncall-dba \
+  --description "Elastic pool approaching CPU saturation — evaluate adding vCores or shedding tenants"
+
+# Alert on storage utilization
+az monitor metrics alert create \
+  --name "ElasticPool-Storage-High" \
+  --resource-group rg-saas-prod \
+  --scopes "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-saas-prod/providers/Microsoft.Sql/servers/sql-saas-prod-eastus2/elasticPools/ep-saas-tenants" \
+  --condition "avg allocated_data_storage &gt; 460000" \
+  --window-size 15m \
+  --evaluation-frequency 5m \
+  --action-group ag-oncall-dba \
+  --description "Pool storage above 90% of 500 GB allocation"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">What Elastic Pools cannot do:</strong> Despite being the reference implementation, Elastic Pools have hard limits worth knowing before you commit. As of 2024, a single General Purpose pool supports a maximum of 500 databases. Business Critical tier caps at 100 databases. Hyperscale databases cannot participate in Elastic Pools at all—each Hyperscale database must have dedicated compute. Cross-region pools don't exist; all databases in a pool must reside on the same logical server in the same region. If your architecture requires geo-distributed tenant databases, you're back to per-database geo-replication, which is manageable but expensive.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.3 Aurora Serverless v2: Fractional Scaling for AWS Multi-Tenancy</h3>
+
+<p class="text-gray-300 leading-relaxed">AWS doesn't have a direct equivalent to Elastic Pools. What it has is Aurora Serverless v2, which achieves similar economics through a different mechanism: ACUs (Aurora Capacity Units) that scale in 0.5 ACU increments per database instance, down to a configured minimum. An Aurora cluster can mix Serverless v2 and provisioned instances, and multiple Serverless v2 instances in a cluster share the same underlying storage layer.</p>
+
+<p class="text-gray-300 leading-relaxed">The key insight for multi-tenant architectures: you don't get a shared resource pool across multiple Aurora clusters the way Azure lets multiple databases share one pool. Instead, the consolidation happens by running all tenants within a single Aurora cluster—either as separate databases within one instance or as separate schemas—and letting Serverless v2 scale the compute capacity down to near-zero when tenants are idle.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating a multi-tenant Aurora Serverless v2 cluster:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create parameter group customized for multi-tenant workloads
+aws rds create-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name aurora-pg-multitenant \
+  --db-parameter-group-family aurora-postgresql15 \
+  --description "Multi-tenant Aurora cluster parameters"
+
+# Set connection and resource parameters
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name aurora-pg-multitenant \
+  --parameters \
+    "ParameterName=max_connections,ParameterValue=5000,ApplyMethod=pending-reboot" \
+    "ParameterName=shared_buffers,ParameterValue={DBInstanceClassMemory/4},ApplyMethod=pending-reboot" \
+    "ParameterName=work_mem,ParameterValue=4096,ApplyMethod=immediate" \
+    "ParameterName=idle_in_transaction_session_timeout,ParameterValue=30000,ApplyMethod=immediate" \
+    "ParameterName=statement_timeout,ParameterValue=300000,ApplyMethod=immediate"
+
+# Create the Aurora Serverless v2 cluster
+aws rds create-db-cluster \
+  --db-cluster-identifier aurora-saas-prod \
+  --engine aurora-postgresql \
+  --engine-version 15.4 \
+  --db-cluster-parameter-group-name aurora-pg-multitenant \
+  --master-username clusteradmin \
+  --master-user-password "$(aws secretsmanager get-random-password \
+    --password-length 32 \
+    --require-each-included-type \
+    --query RandomPassword \
+    --output text)" \
+  --vpc-security-group-ids sg-0abc123def456789 \
+  --db-subnet-group-name aurora-private-subnet-group \
+  --backup-retention-period 14 \
+  --preferred-backup-window "03:00-04:00" \
+  --preferred-maintenance-window "sun:05:00-sun:06:00" \
+  --storage-encrypted \
+  --kms-key-id arn:aws:kms:us-east-1:123456789012:key/mrk-abc123 \
+  --enable-cloudwatch-logs-exports postgresql \
+  --serverless-v2-scaling-configuration MinCapacity=0.5,MaxCapacity=16
+
+# Create the writer instance as Serverless v2
+aws rds create-db-instance \
+  --db-instance-identifier aurora-saas-prod-writer \
+  --db-cluster-identifier aurora-saas-prod \
+  --db-instance-class db.serverless \
+  --engine aurora-postgresql
+
+# Create a reader instance — also Serverless v2, for read scaling
+aws rds create-db-instance \
+  --db-instance-identifier aurora-saas-prod-reader-1 \
+  --db-cluster-identifier aurora-saas-prod \
+  --db-instance-class db.serverless \
+  --engine aurora-postgresql \
+  --promotion-tier 15</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MinCapacity=0.5</code> is the economic lever. At 0.5 ACUs, each instance consumes approximately 1 GB of RAM and minimal CPU. If your tenants have well-separated business hours (e.g., a US-only SaaS product with all customers on Eastern time), overnight minimum capacity can be 0.5 ACUs for the writer while your total bill approaches zero. At 16 ACUs maximum, you have approximately 32 GB RAM and the equivalent of a db.r5.2xlarge available for peak load.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gotcha:</strong> Serverless v2 does not scale to zero. The minimum is 0.5 ACUs. True scale-to-zero (Aurora Serverless v1 behavior) is deprecated for new workloads and came with cold start latencies of up to 30 seconds—unacceptable for production SaaS. Accept the 0.5 ACU floor as the cost of always-warm capacity.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Per-tenant resource governance in PostgreSQL:</strong> Unlike Azure SQL Elastic Pools, Aurora with PostgreSQL has no built-in per-database CPU or I/O caps. You enforce this at the application layer using connection pooling and at the database layer using PostgreSQL resource groups (pg_query_settings in Aurora) and per-role connection limits.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create an isolated schema and role for each tenant
+-- This runs once per tenant onboarding
+
+-- Create tenant role with connection limit
+CREATE ROLE tenant_acme_corp 
+  WITH LOGIN 
+  CONNECTION LIMIT 50
+  PASSWORD 'generated-at-runtime';
+
+-- Create schema owned by tenant role
+CREATE SCHEMA tenant_acme_corp AUTHORIZATION tenant_acme_corp;
+
+-- Set default search path so tenant queries stay in their schema
+ALTER ROLE tenant_acme_corp SET search_path = tenant_acme_corp, public;
+
+-- Set per-role resource controls
+ALTER ROLE tenant_acme_corp SET statement_timeout = '120s';
+ALTER ROLE tenant_acme_corp SET idle_in_transaction_session_timeout = '30s';
+ALTER ROLE tenant_acme_corp SET work_mem = '8MB';
+
+-- Grant access to shared lookup tables in public schema
+GRANT USAGE ON SCHEMA public TO tenant_acme_corp;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO tenant_acme_corp;
+
+-- Verify connection limits across tenants
+SELECT 
+    rolname,
+    rolconnlimit,
+    (SELECT count(*) FROM pg_stat_activity WHERE usename = r.rolname) AS active_connections
+FROM pg_roles r
+WHERE rolname LIKE 'tenant_%'
+ORDER BY active_connections DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.4 RDS Proxy: Connection Pooling as Cost Optimization Infrastructure</h3>
+
+<p class="text-gray-300 leading-relaxed">If you're running provisioned RDS or Aurora instances—not Serverless v2—and your multi-tenant application creates many short-lived database connections (typical for Lambda-based or containerized SaaS backends), you're burning compute on connection overhead. Each PostgreSQL backend process consumes roughly 5–10 MB of memory. With 500 tenants each maintaining 10 application connections through NAT, your instance needs 25–50 GB just to hold idle connection state. That drives you to larger, more expensive instance classes.</p>
+
+<p class="text-gray-300 leading-relaxed">RDS Proxy sits between your application tier and RDS/Aurora. It multiplexes thousands of application connections onto a much smaller set of database backend connections using transaction-level pinning. The application thinks it has 10,000 open connections. The database sees 200. This lets you run smaller instance classes while supporting larger application-layer concurrency—a direct cost reduction.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create RDS Proxy for a multi-tenant Aurora PostgreSQL cluster
+# Proxy IAM role must have secretsmanager:GetSecretValue permission
+aws iam create-role \
+  --role-name rds-proxy-saas-role \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "rds.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam put-role-policy \
+  --role-name rds-proxy-saas-role \
+  --policy-name rds-proxy-secrets-access \
+  --policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Action": ["secretsmanager:GetSecretValue"],
+      "Resource": "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds/aurora-saas-prod/*"
+    },{
+      "Effect": "Allow",
+      "Action": ["kms:Decrypt"],
+      "Resource": "arn:aws:kms:us-east-1:123456789012:key/mrk-abc123",
+      "Condition": {
+        "StringEquals": {"kms:ViaService": "secretsmanager.us-east-1.amazonaws.com"}
+      }
+    }]
+  }'
+
+# Create the proxy
+aws rds create-db-proxy \
+  --db-proxy-name rds-proxy-saas-prod \
+  --engine-family POSTGRESQL \
+  --auth '[
+    {
+      "Description": "Aurora cluster admin",
+      "AuthScheme": "SECRETS",
+      "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:rds/aurora-saas-prod/admin",
+      "IAMAuth": "REQUIRED"
+    }
+  ]' \
+  --role-arn arn:aws:iam::123456789012:role/rds-proxy-saas-role \
+  --vpc-subnet-ids subnet-0aaa111 subnet-0bbb222 subnet-0ccc333 \
+  --vpc-security-group-ids sg-0proxy123 \
+  --require-tls \
+  --idle-client-timeout 1800 \
+  --connection-borrow-timeout 120 \
+  --max-connections-percent 90 \
+  --debug-logging false
+
+# Register the Aurora cluster as a proxy target
+aws rds register-db-proxy-targets \
+  --db-proxy-name rds-proxy-saas-prod \
+  --db-cluster-identifiers aurora-saas-prod</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS Proxy limitations that catch people off guard:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Proxy endpoints are regional. You cannot route through a proxy to a cross-region reader.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Each proxy supports one target group (one cluster or one RDS instance). For multiple Aurora clusters, you need multiple proxies—and you pay per proxy plus per connection-hour.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> RDS Proxy does not support all PostgreSQL features. Specifically: SET LOCAL statements cause session pinning (the proxy pins the full application connection to one backend for the duration of the transaction, defeating multiplexing). If your application sets custom session variables per request—common in row-level security multi-tenant patterns—profile pinning rates carefully before declaring cost savings achieved.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Pinning check: monitor the `DatabaseConnectionsCurrentlySessionPinned` CloudWatch metric. If pinning rate is above 40–50% of your connections, the proxy overhead may exceed its benefit for your workload.</li>
+
+    </div>
+    <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-orange-600 hover:bg-orange-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · The Cloud Database Engineer</div>
+  </footer>
+</body>
+</html>

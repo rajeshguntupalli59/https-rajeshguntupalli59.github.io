@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 30: Change Data Capture for AI Feature Pipelines — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 30: Change Data Capture for AI Feature Pipelines. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 30 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 30: Change Data Capture for AI Feature Pipelines</h2>
+
+<p class="text-gray-300 leading-relaxed">When your PostgreSQL database changes, your AI features should respond. A customer updates their profile — their personalization embeddings should refresh. A product description changes — the semantic search index needs updating. A support ticket gets resolved — the RAG knowledge base should reflect the new resolution. Without a systematic way to detect and act on these changes, your AI application operates on stale data, and stale data means wrong answers.</p>
+
+<p class="text-gray-300 leading-relaxed">Change Data Capture (CDC) is the mechanism that connects your operational database to your AI feature pipeline. This chapter covers how to use PostgreSQL's logical replication system, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code>, and trigger-based patterns to build reactive AI pipelines that keep embeddings fresh, feature stores synchronized, and LLM context up to date — without polling, without full table scans, and without the latency that kills real-time AI applications.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.1 The CDC Foundation: Logical Replication and pg_notify</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL ships with two CDC primitives worth building on. The first is logical replication, which reads the write-ahead log (WAL) and emits row-level changes as structured events. The second is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code>, a lightweight pub/sub system built directly into the database. For AI feature pipelines, these serve different purposes: logical replication gives you durability and ordering guarantees for high-volume change streams, while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> gives you sub-millisecond latency for real-time embedding updates on targeted tables.</p>
+
+<p class="text-gray-300 leading-relaxed">Understanding when to use each is the first design decision. If you need every change captured reliably and processed exactly once — think embedding refreshes for a product catalog — logical replication is correct. If you need low-latency notification for conversational features — think invalidating a cached user context when preferences change — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> wins on simplicity.</p>
+
+<p class="text-gray-300 leading-relaxed">Start by enabling logical replication if it isn't already active:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Check current WAL level
+psql -U postgres -c "SHOW wal_level;"
+
+# If not logical, update postgresql.conf
+echo "wal_level = logical" &gt;&gt; /etc/postgresql/16/main/postgresql.conf
+echo "max_replication_slots = 10" &gt;&gt; /etc/postgresql/16/main/postgresql.conf
+echo "max_wal_senders = 10" &gt;&gt; /etc/postgresql/16/main/postgresql.conf
+
+# Restart PostgreSQL (plan for a brief outage)
+systemctl restart postgresql@16-main
+
+# Verify
+psql -U postgres -c "SHOW wal_level;"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now build the schema that supports CDC-driven AI pipelines. The design centers on a change event table that acts as a durable queue, decoupling the moment of change from the moment of AI processing:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core tables for a product catalog with AI features
+CREATE TABLE products (
+    product_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sku             TEXT UNIQUE NOT NULL,
+    name            TEXT NOT NULL,
+    description     TEXT,
+    category        TEXT NOT NULL,
+    price           NUMERIC(12, 2),
+    attributes      JSONB DEFAULT '{}',
+    is_active       BOOLEAN DEFAULT TRUE,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Tracks which fields affect embeddings, to avoid unnecessary recomputation
+CREATE TABLE embedding_sensitive_columns (
+    table_name      TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    weight          NUMERIC(3, 2) DEFAULT 1.0,  -- relative importance for reranking
+    PRIMARY KEY (table_name, column_name)
+);
+
+INSERT INTO embedding_sensitive_columns VALUES
+    ('products', 'name', 1.0),
+    ('products', 'description', 1.0),
+    ('products', 'category', 0.7),
+    ('products', 'attributes', 0.5);
+
+-- Durable change event queue for AI pipeline processing
+CREATE TABLE ai_change_events (
+    event_id        BIGSERIAL PRIMARY KEY,
+    event_type      TEXT NOT NULL CHECK (event_type IN ('INSERT', 'UPDATE', 'DELETE')),
+    table_name      TEXT NOT NULL,
+    record_id       TEXT NOT NULL,
+    old_data        JSONB,
+    new_data        JSONB,
+    changed_columns TEXT[],
+    requires_embedding_refresh BOOLEAN GENERATED ALWAYS AS (
+        -- Only flag if embedding-sensitive columns changed
+        (new_data IS NOT NULL)
+    ) STORED,
+    pipeline_status TEXT DEFAULT 'pending' CHECK (
+        pipeline_status IN ('pending', 'processing', 'completed', 'failed', 'skipped')
+    ),
+    retry_count     INT DEFAULT 0,
+    error_message   TEXT,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    processed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX idx_change_events_status ON ai_change_events (pipeline_status, created_at)
+    WHERE pipeline_status IN ('pending', 'failed');
+CREATE INDEX idx_change_events_table ON ai_change_events (table_name, record_id);
+
+-- Product embeddings table (pgvector)
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE product_embeddings (
+    product_id      UUID PRIMARY KEY REFERENCES products(product_id) ON DELETE CASCADE,
+    embedding       VECTOR(1536),
+    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    source_text     TEXT NOT NULL,  -- the text that was embedded, for drift detection
+    source_hash     TEXT NOT NULL,  -- SHA-256 of source_text, for quick staleness check
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_product_embeddings_vector
+    ON product_embeddings USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Trigger to capture changes and emit notifications
+CREATE OR REPLACE FUNCTION capture_ai_change_event()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_record_id     TEXT;
+    v_changed_cols  TEXT[];
+    v_event_id      BIGINT;
+    v_old_data      JSONB;
+    v_new_data      JSONB;
+BEGIN
+    -- Determine record ID (assume first PK-like column or use a naming convention)
+    v_record_id := COALESCE(
+        (row_to_json(NEW) -&gt;&gt; TG_TABLE_NAME || '_id'),
+        (row_to_json(NEW) -&gt;&gt; 'id'),
+        'unknown'
+    );
+
+    IF TG_OP = 'INSERT' THEN
+        v_new_data := row_to_json(NEW)::JSONB;
+        v_old_data := NULL;
+        v_changed_cols := ARRAY(SELECT jsonb_object_keys(v_new_data));
+    ELSIF TG_OP = 'UPDATE' THEN
+        v_new_data := row_to_json(NEW)::JSONB;
+        v_old_data := row_to_json(OLD)::JSONB;
+        -- Identify only changed columns
+        SELECT ARRAY_AGG(key) INTO v_changed_cols
+        FROM (
+            SELECT jsonb_object_keys(v_new_data) AS key
+            EXCEPT
+            SELECT jsonb_object_keys(
+                jsonb_strip_nulls(v_old_data) - ARRAY(
+                    SELECT k FROM jsonb_each_text(v_new_data) n
+                    JOIN jsonb_each_text(v_old_data) o USING (key)
+                    WHERE n.value = o.value
+                )
+            )
+        ) changed;
+    ELSIF TG_OP = 'DELETE' THEN
+        v_old_data := row_to_json(OLD)::JSONB;
+        v_new_data := NULL;
+        v_changed_cols := NULL;
+    END IF;
+
+    INSERT INTO ai_change_events (
+        event_type, table_name, record_id,
+        old_data, new_data, changed_columns
+    ) VALUES (
+        TG_OP, TG_TABLE_NAME, v_record_id,
+        v_old_data, v_new_data, v_changed_cols
+    )
+    RETURNING event_id INTO v_event_id;
+
+    -- Emit real-time notification with minimal payload
+    PERFORM pg_notify(
+        'ai_pipeline_events',
+        json_build_object(
+            'event_id', v_event_id,
+            'table', TG_TABLE_NAME,
+            'op', TG_OP,
+            'id', v_record_id
+        )::TEXT
+    );
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger to products table
+CREATE TRIGGER trg_products_ai_cdc
+    AFTER INSERT OR UPDATE OR DELETE ON products
+    FOR EACH ROW EXECUTE FUNCTION capture_ai_change_event();
+
+-- Auto-update timestamp
+CREATE OR REPLACE FUNCTION update_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_products_updated_at
+    BEFORE UPDATE ON products
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.2 The Logical Replication Consumer</h3>
+
+<p class="text-gray-300 leading-relaxed">For high-volume tables where triggers add write overhead, or where you need to capture changes from tables you can't modify (third-party schemas, audit tables), logical replication via a replication slot is the right tool. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgoutput</code> plugin ships with PostgreSQL and requires no extensions. Build a consumer that translates WAL events into AI pipeline tasks.</p>
+
+<p class="text-gray-300 leading-relaxed">First, create the publication and replication slot:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a publication covering AI-relevant tables
+CREATE PUBLICATION ai_feature_pipeline
+    FOR TABLE products, orders, customer_profiles, support_tickets
+    WITH (publish = 'insert, update, delete');
+
+-- Create a replication slot using the pgoutput plugin
+-- This must be done as a superuser or replication role
+SELECT pg_create_logical_replication_slot(
+    'ai_pipeline_slot',
+    'pgoutput'
+);
+
+-- Verify
+SELECT slot_name, plugin, slot_type, active, restart_lsn
+FROM pg_replication_slots
+WHERE slot_name = 'ai_pipeline_slot';
+
+-- Check current WAL consumption (monitor this — unconsumed WAL grows disk usage)
+SELECT
+    slot_name,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag_size,
+    active
+FROM pg_replication_slots;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now build the Python consumer. This runs as a long-lived service, streaming WAL changes and dispatching them to Celery for async processing:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># cdc_consumer.py — Logical replication consumer for AI feature pipeline
+import asyncio
+import json
+import logging
+import os
+import signal
+from datetime import datetime
+from typing import Any
+
+import psycopg
+from psycopg.rows import dict_row
+from celery import Celery
+
+# Configure structured logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": "%(message)s"}'
+)
+logger = logging.getLogger(__name__)
+
+# Celery app pointing at Redis
+celery_app = Celery(
+    'ai_pipeline',
+    broker=os.getenv('REDIS_URL', 'redis://localhost:6379/0'),
+    backend=os.getenv('REDIS_URL', 'redis://localhost:6379/0')
+)
+
+# Tables that require embedding refresh and which columns trigger it
+EMBEDDING_SENSITIVE_TABLES = {
+    'products': {'name', 'description', 'category', 'attributes'},
+    'support_tickets': {'title', 'body', 'resolution'},
+    'customer_profiles': {'bio', 'preferences', 'tags'},
+}
+
+class WALConsumer:
+    """
+    Consumes PostgreSQL logical replication stream and dispatches
+    AI pipeline tasks based on the nature of each change.
+    """
+
+    def __init__(self, dsn: str, slot_name: str, publication: str):
+        self.dsn = dsn
+        self.slot_name = slot_name
+        self.publication = publication
+        self.running = True
+        self._processed_count = 0
+        self._skipped_count = 0
+
+    def _should_refresh_embedding(
+        self,
+        table_name: str,
+        changed_columns: list[str] | None
+    ) -&gt; bool:
+        if table_name not in EMBEDDING_SENSITIVE_TABLES:
+            return False
+        if changed_columns is None:
+            return True  # INSERT — always embed
+        sensitive = EMBEDDING_SENSITIVE_TABLES[table_name]
+        return bool(sensitive.intersection(set(changed_columns)))
+
+    def _extract_record_id(self, table_name: str, data: dict) -&gt; str | None:
+        # Convention: &lt;table_singular&gt;_id or just 'id'
+        id_col = f"{table_name.rstrip('s')}_id"
+        return str(data.get(id_col) or data.get('id') or data.get('uuid'))
+
+    def _dispatch_pipeline_tasks(
+        self,
+        operation: str,
+        table_name: str,
+        record_id: str,
+        old_data: dict | None,
+        new_data: dict | None,
+        changed_columns: list[str] | None
+    ):
+        """Route change events to appropriate Celery tasks."""
+
+        if operation == 'DELETE':
+            # Remove stale embeddings and cached features
+            celery_app.send_task(
+                'tasks.delete_embedding',
+                args=[table_name, record_id],
+                queue='embedding_ops'
+            )
+            celery_app.send_task(
+                'tasks.invalidate_feature_cache',
+                args=[table_name, record_id],
+                queue='cache_ops'
+            )
+            return
+
+        needs_embed = self._should_refresh_embedding(table_name, changed_columns)
+
+        if needs_embed:
+            celery_app.send_task(
+                'tasks.refresh_embedding',
+                args=[table_name, record_id, new_data],
+                queue='embedding_ops',
+                # Exponential backoff retry policy
+                retry=True,
+                retry_policy={
+                    'max_retries': 3,
+                    'interval_start': 2,
+                    'interval_step': 4,
+                    'interval_max': 30,
+                }
+            )
+            self._processed_count += 1
+        else:
+            self._skipped_count += 1
+            logger.debug(
+                f"Skipping embedding refresh for {table_name}/{record_id} "
+                f"— changed columns {changed_columns} not embedding-sensitive"
+            )
+
+        # Always update the feature store for downstream ML models
+        celery_app.send_task(
+            'tasks.update_feature_store',
+            args=[table_name, record_id, new_data, changed_columns],
+            queue='feature_ops'
+        )
+
+    async def run(self):
+        """Main consumer loop using psycopg3 async logical replication."""
+
+        conn_info = self.dsn + " replication=database"
+
+        async with await psycopg.AsyncConnection.connect(
+            conn_info,
+            autocommit=True
+        ) as conn:
+            logger.info(
+                f"Connected to logical replication slot: {self.slot_name}"
+            )
+
+            # Start the replication stream
+            await conn.execute(
+                f"START_REPLICATION SLOT {self.slot_name} LOGICAL 0/0 "
+                f"(proto_version '1', publication_names '{self.publication}')"
+            )
+
+            async for msg in conn.cursor():
+                if not self.running:
+                    break
+
+                # pgoutput protocol parsing
+                # In production, use python-replication or pg_logical_emit
+                payload = msg.payload
+                if payload[0:1] == b'w':  # WAL data
+                    data = json.loads(payload[1:])
+                    operation = data.get('action')
+                    table_name = data.get('table')
+
+                    if operation in ('I', 'U', 'D'):
+                        op_map = {'I': 'INSERT', 'U': 'UPDATE', 'D': 'DELETE'}
+                        old_data = data.get('old')
+                        new_data = data.get('new') or data.get('columns')
+                        changed_columns = None
+
+                        if operation == 'U' and old_data and new_data:
+                            changed_columns = [
+                                k for k in new_data
+                                if new_data.get(k) != old_data.get(k)
+                            ]
+
+                        record_id = self._extract_record_id(
+                            table_name,
+                            new_data or old_data or {}
+                        )
+
+                        self._dispatch_pipeline_tasks(
+                            op_map[operation],
+                            table_name,
+                            record_id,
+                            old_data,
+                            new_data,
+                            changed_columns
+                        )
+
+                        # Acknowledge WAL position
+                        await conn.execute(
+                            f"SELECT pg_replication_slot_advance("
+                            f"'{self.slot_name}', '{msg.data_start}')"
+                        )
+
+                        if self._processed_count % 100 == 0:
+                            logger.info(
+                                f"Pipeline stats — processed: {self._processed_count}, "
+                                f"skipped: {self._skipped_count}"
+                            )
+
+    def shutdown(self):
+        logger.info("Shutting down WAL consumer gracefully...")
+        self.running = False
+
+
+async def main():
+    consumer = WALConsumer(
+        dsn=os.getenv('DATABASE_URL', 'postgresql://postgres@localhost/myapp'),
+        slot_name='ai_pipeline_slot',
+        publication='ai_feature_pipeline'
+    )
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, consumer.shutdown)
+
+    await consumer.run()
+
+
+if __name__ == '__main__':
+    asyncio.run(main())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.3 Celery Workers for Async Embedding Refresh</h3>
+
+<p class="text-gray-300 leading-relaxed">The Celery task layer is where the actual AI work happens. Each task receives a record ID and its data, generates embeddings via the OpenAI API, and writes them back to PostgreSQL. The design matters here: tasks must be idempotent (safe to retry), they must detect whether embeddings are actually stale before calling the API (costs money), and they should use connection pooling through PgBouncer rather than opening direct connections.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

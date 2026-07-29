@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 5: Connection Pooling for AI Apps: PgBouncer at Scale — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 5: Connection Pooling for AI Apps: PgBouncer at Scale. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 5 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 5: Connection Pooling for AI Apps: PgBouncer at Scale</h2>
+
+<p class="text-gray-300 leading-relaxed">AI applications punish databases in ways that traditional web apps never did. A single RAG pipeline might open a connection to retrieve embeddings, hold it open while waiting 3–8 seconds for an LLM to respond, then use it again to write conversation history — all while hundreds of concurrent users trigger the same pattern simultaneously. Multiply that by the async, bursty, long-tail latency profile of LLM calls, and you have a recipe for connection exhaustion that will take down your PostgreSQL instance faster than any traffic spike you've seen before. This chapter covers how to configure PgBouncer specifically for AI workloads: the pooling modes that match LLM call patterns, the schema and monitoring infrastructure that lets you see what's happening in real time, and the FastAPI integration patterns that keep your application from holding connections hostage during inference.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Why AI Apps Break Standard Connection Pooling Assumptions</h3>
+
+<p class="text-gray-300 leading-relaxed">Traditional web applications follow a predictable pattern: a request comes in, a database query runs in milliseconds, the connection returns to the pool. Connection poolers were designed around this model. The math works: if each query takes 5ms and you have 100ms of request budget, one connection can serve 20 requests per second.</p>
+
+<p class="text-gray-300 leading-relaxed">LLM applications break this model at every assumption. Consider what happens during a RAG request:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Retrieve the user's conversation history: ~2ms database query</p>
+<p class="text-gray-300 leading-relaxed">2. Embed the user's query via OpenAI or a local model: ~50–200ms</p>
+<p class="text-gray-300 leading-relaxed">3. Vector similarity search against pgvector: ~10–50ms</p>
+<p class="text-gray-300 leading-relaxed">4. Call Claude or GPT-4 for completion: <strong class="text-white">2,000–15,000ms</strong></p>
+<p class="text-gray-300 leading-relaxed">5. Write the assistant response and updated history: ~3ms</p>
+
+<p class="text-gray-300 leading-relaxed">If your application holds a database connection through step 4 — which many naive implementations do — a connection that could have served thousands of requests is idle for up to 15 seconds waiting on an external API. With 100 PostgreSQL connections and 100 concurrent users each waiting on an LLM, you have zero headroom.</p>
+
+<p class="text-gray-300 leading-relaxed">The fix is architectural, not just configurational. You need to release database connections before calling the LLM, re-acquire them after. PgBouncer's transaction-mode pooling enforces this pattern at the infrastructure level.</p>
+
+<p class="text-gray-300 leading-relaxed">#### The Three Pooling Modes and Why Transaction Mode Wins for AI</p>
+
+<p class="text-gray-300 leading-relaxed">PgBouncer offers three pooling modes:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Session mode**: One server connection per client session. Behaves like no pooler. Safe but wasteful. Appropriate only when you need session-level features like `SET LOCAL` parameters or advisory locks that must persist across statements.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Statement mode**: Connection returned to pool after every single SQL statement. Maximally efficient but breaks multi-statement transactions. Cannot use `BEGIN`/`COMMIT` blocks. Inappropriate for most application code.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Transaction mode**: Connection returned to pool after each transaction completes. This is what AI applications need.</li>
+
+<p class="text-gray-300 leading-relaxed">Transaction mode lets you do this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Connection acquired
+async with pool.acquire() as conn:
+    history = await conn.fetch("SELECT * FROM conversation_history WHERE session_id = $1", session_id)
+    embedding = await conn.fetchval("SELECT embedding FROM query_cache WHERE query_hash = $1", query_hash)
+# Connection RELEASED back to pool HERE
+
+# LLM call happens with no DB connection held
+response = await call_llm(history, embedding)  # Could take 10 seconds
+
+# Connection re-acquired for write
+async with pool.acquire() as conn:
+    await conn.execute("INSERT INTO conversation_history ...", ...)
+# Connection RELEASED again</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With this pattern, 20 PgBouncer client slots can support thousands of concurrent AI requests because the connection is only held during the actual microseconds of database I/O.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Setting Up PgBouncer for an AI Workload</p>
+
+<p class="text-gray-300 leading-relaxed">Install and configure PgBouncer with settings tuned for AI application characteristics: high concurrency, bursty patterns, and long idle periods between transactions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Install PgBouncer (Ubuntu/Debian)
+apt-get install pgbouncer
+
+# Or via Docker — common for containerized AI deployments
+docker run -d \
+  --name pgbouncer \
+  -e DATABASES_HOST=postgres \
+  -e DATABASES_PORT=5432 \
+  -e DATABASES_USER=aiapp \
+  -e DATABASES_PASSWORD=secretpassword \
+  -e DATABASES_DBNAME=ai_production \
+  -e PGBOUNCER_POOL_MODE=transaction \
+  -e PGBOUNCER_MAX_CLIENT_CONN=5000 \
+  -e PGBOUNCER_DEFAULT_POOL_SIZE=100 \
+  -e PGBOUNCER_MIN_POOL_SIZE=20 \
+  -e PGBOUNCER_RESERVE_POOL_SIZE=25 \
+  -e PGBOUNCER_RESERVE_POOL_TIMEOUT=3 \
+  -e PGBOUNCER_MAX_DB_CONNECTIONS=150 \
+  -e PGBOUNCER_IDLE_TRANSACTION_TIMEOUT=30 \
+  -e PGBOUNCER_SERVER_IDLE_TIMEOUT=600 \
+  -e PGBOUNCER_CLIENT_IDLE_TIMEOUT=0 \
+  -p 5432:5432 \
+  bitnami/pgbouncer:latest</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For production, manage PgBouncer configuration through files rather than environment variables, which gives you more control and allows hot reloads:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># /etc/pgbouncer/pgbouncer.ini — Production AI workload configuration
+[databases]
+# Main application database
+ai_production = host=postgres-primary port=5432 dbname=ai_production \
+    pool_size=80 max_db_connections=100
+
+# Read replicas for embedding search — AI reads are heavy
+ai_production_ro = host=postgres-replica port=5432 dbname=ai_production \
+    pool_size=120 max_db_connections=150 pool_mode=transaction
+
+# Separate pool for embedding ingestion jobs (Celery workers)
+ai_ingestion = host=postgres-primary port=5432 dbname=ai_production \
+    pool_size=20 max_db_connections=25
+
+[pgbouncer]
+# Pooling mode — transaction is mandatory for AI apps
+pool_mode = transaction
+
+# Client connection limits
+# AI apps have many concurrent async connections
+max_client_conn = 5000
+default_pool_size = 80
+
+# Reserve pool handles traffic spikes when LLM responses
+# arrive simultaneously (thundering herd after batch inference)
+reserve_pool_size = 20
+reserve_pool_timeout = 2
+
+# Timeouts tuned for AI workload characteristics
+# Idle transaction timeout: kills connections held open during LLM calls
+# This is your safety net for buggy application code
+idle_transaction_timeout = 30
+
+# Server-side idle timeout
+server_idle_timeout = 600
+
+# How long to wait for a server connection before erroring
+# Keep short — fail fast, let application retry
+server_connect_timeout = 15
+server_login_retry = 2
+
+# Client keepalive — important for long-running AI agent sessions
+client_keepalive_interval = 60
+client_keepalive_count = 5
+
+# TLS for production
+server_tls_sslmode = require
+client_tls_sslmode = require
+client_tls_cert_file = /etc/pgbouncer/client.crt
+client_tls_key_file = /etc/pgbouncer/client.key
+
+# Logging — capture connection churn for capacity planning
+log_connections = 1
+log_disconnections = 1
+log_pooler_errors = 1
+stats_period = 60
+
+# Admin interface for monitoring
+admin_users = pgbouncer_admin
+stats_users = pgbouncer_monitor
+
+listen_addr = 0.0.0.0
+listen_port = 5432
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+
+# PID file
+pidfile = /var/run/pgbouncer/pgbouncer.pid</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># /etc/pgbouncer/userlist.txt
+# Generated with: SELECT '"' || rolname || '" "' || rolpassword || '"' FROM pg_authid WHERE rolcanlogin;
+"aiapp" "SCRAM-SHA-256$4096:..."
+"pgbouncer_admin" "SCRAM-SHA-256$4096:..."
+"pgbouncer_monitor" "SCRAM-SHA-256$4096:..."
+
+# Reload configuration without dropping connections
+kill -HUP $(cat /var/run/pgbouncer/pgbouncer.pid)
+# Or via admin console:
+psql -h 127.0.0.1 -p 5432 -U pgbouncer_admin pgbouncer -c "RELOAD;"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Design: Monitoring Connection Pool Health</h3>
+
+<p class="text-gray-300 leading-relaxed">Before you can tune PgBouncer for your AI workload, you need to see what's happening. Build a monitoring schema that captures pool metrics alongside AI request metrics so you can correlate connection exhaustion with LLM latency spikes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a dedicated schema for operational metrics
+CREATE SCHEMA IF NOT EXISTS ops;
+
+-- Connection pool health snapshots — pulled from PgBouncer stats
+CREATE TABLE ops.pgbouncer_snapshots (
+    snapshot_id     BIGSERIAL PRIMARY KEY,
+    captured_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    database_name   TEXT NOT NULL,
+    -- Client connection counts
+    cl_active       INTEGER NOT NULL,  -- Clients connected and active
+    cl_waiting      INTEGER NOT NULL,  -- Clients waiting for a server connection
+    cl_cancel_req   INTEGER NOT NULL,  -- Clients that sent cancel requests
+    -- Server connection counts  
+    sv_active       INTEGER NOT NULL,  -- Server connections in use
+    sv_idle         INTEGER NOT NULL,  -- Server connections available
+    sv_used         INTEGER NOT NULL,  -- Server connections idle &gt; server_check_delay
+    sv_tested       INTEGER NOT NULL,  -- Server connections being tested
+    sv_login        INTEGER NOT NULL,  -- Server connections being established
+    -- Pool configuration (captured for change tracking)
+    pool_size       INTEGER NOT NULL,
+    -- Derived health metrics
+    wait_ratio      NUMERIC(5,2) GENERATED ALWAYS AS (
+        CASE WHEN (cl_active + cl_waiting) &gt; 0 
+             THEN ROUND(cl_waiting::NUMERIC / (cl_active + cl_waiting) * 100, 2)
+             ELSE 0 
+        END
+    ) STORED,
+    pool_utilization NUMERIC(5,2) GENERATED ALWAYS AS (
+        CASE WHEN pool_size &gt; 0
+             THEN ROUND(sv_active::NUMERIC / pool_size * 100, 2)
+             ELSE 0
+        END
+    ) STORED
+);
+
+-- Index for time-series queries and alerting
+CREATE INDEX idx_pgbouncer_snapshots_time 
+    ON ops.pgbouncer_snapshots (captured_at DESC, database_name);
+CREATE INDEX idx_pgbouncer_snapshots_waiting 
+    ON ops.pgbouncer_snapshots (captured_at DESC) 
+    WHERE cl_waiting &gt; 0;
+
+-- AI request performance tracking — correlate with pool health
+CREATE TABLE ops.ai_request_metrics (
+    request_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id          UUID NOT NULL,
+    user_id             BIGINT,
+    pipeline_type       TEXT NOT NULL,  -- 'rag', 'chat', 'embedding', 'agent'
+    started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at        TIMESTAMPTZ,
+    -- Phase timing breakdown
+    db_fetch_ms         INTEGER,   -- Time spent on initial DB reads
+    embedding_ms        INTEGER,   -- Time to embed the query
+    vector_search_ms    INTEGER,   -- pgvector similarity search time
+    llm_call_ms         INTEGER,   -- Time waiting for LLM response
+    db_write_ms         INTEGER,   -- Time spent writing results back
+    total_ms            INTEGER GENERATED ALWAYS AS (
+        EXTRACT(MILLISECONDS FROM (completed_at - started_at))::INTEGER
+    ) STORED,
+    -- Connection pool interaction
+    pool_wait_ms        INTEGER,   -- Time spent waiting for a pool connection
+    connections_used    SMALLINT DEFAULT 0,  -- How many pool acquisitions
+    -- Result metadata
+    tokens_used         INTEGER,
+    error_code          TEXT,
+    -- Context for debugging
+    model_name          TEXT,
+    retrieval_chunks    SMALLINT
+);
+
+CREATE INDEX idx_ai_metrics_session ON ops.ai_request_metrics (session_id, started_at DESC);
+CREATE INDEX idx_ai_metrics_pipeline ON ops.ai_request_metrics (pipeline_type, started_at DESC);
+CREATE INDEX idx_ai_metrics_slow ON ops.ai_request_metrics (started_at DESC) 
+    WHERE total_ms &gt; 10000 OR pool_wait_ms &gt; 500;
+
+-- Connection pool events — for post-incident analysis
+CREATE TABLE ops.pool_events (
+    event_id        BIGSERIAL PRIMARY KEY,
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    event_type      TEXT NOT NULL,  -- 'exhaustion', 'timeout', 'spike', 'recovery'
+    database_name   TEXT NOT NULL,
+    cl_waiting      INTEGER,
+    sv_active       INTEGER,
+    pool_size       INTEGER,
+    details         JSONB
+);
+
+CREATE INDEX idx_pool_events_time ON ops.pool_events (occurred_at DESC, event_type);
+
+-- View: Real-time pool health dashboard
+CREATE OR REPLACE VIEW ops.pool_health_current AS
+SELECT 
+    s.database_name,
+    s.captured_at,
+    s.cl_active,
+    s.cl_waiting,
+    s.sv_active,
+    s.sv_idle,
+    s.pool_utilization,
+    s.wait_ratio,
+    -- How long has the wait condition been occurring?
+    CASE WHEN s.cl_waiting &gt; 0 THEN
+        NOW() - (
+            SELECT MIN(s2.captured_at) 
+            FROM ops.pgbouncer_snapshots s2
+            WHERE s2.database_name = s.database_name
+              AND s2.cl_waiting &gt; 0
+              AND s2.captured_at &gt; NOW() - INTERVAL '1 hour'
+        )
+    END AS waiting_duration,
+    -- Average LLM latency in last 5 minutes (for correlation)
+    (
+        SELECT ROUND(AVG(m.llm_call_ms))
+        FROM ops.ai_request_metrics m
+        WHERE m.started_at &gt; NOW() - INTERVAL '5 minutes'
+          AND m.llm_call_ms IS NOT NULL
+    ) AS avg_llm_ms_5min
+FROM ops.pgbouncer_snapshots s
+WHERE s.snapshot_id = (
+    SELECT MAX(s2.snapshot_id) 
+    FROM ops.pgbouncer_snapshots s2
+    WHERE s2.database_name = s.database_name
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">FastAPI Integration: Connection Management for RAG Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">The application layer is where connection pooling strategy becomes concrete. This example shows a production FastAPI RAG endpoint that properly manages connection acquisition and release around LLM calls.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># app/database.py — Connection pool setup with PgBouncer awareness
+
+import asyncpg
+import time
+import logging
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+from fastapi import FastAPI
+
+logger = logging.getLogger(__name__)
+
+# Global connection pool — asyncpg works excellently with PgBouncer transaction mode
+pool: asyncpg.Pool | None = None
+
+# PgBouncer-specific connection parameters
+PGBOUNCER_DSN = "postgresql://aiapp:password@pgbouncer:5432/ai_production"
+
+async def create_pool() -&gt; asyncpg.Pool:
+    """
+    Create asyncpg pool configured for PgBouncer transaction mode.
+    Key: disable prepared statements — PgBouncer can't route them correctly
+    in transaction mode because the connection that prepared the statement
+    may not be the connection that executes it.
+    """
+    return await asyncpg.create_pool(
+        dsn=PGBOUNCER_DSN,
+        min_size=5,
+        max_size=50,  # asyncpg pool size (client-side)
+        max_queries=50000,
+        max_inactive_connection_lifetime=300,
+        # CRITICAL for PgBouncer transaction mode:
+        # Disable prepared statement caching — PgBouncer in transaction mode
+        # cannot guarantee the same server connection handles PREPARE and EXECUTE
+        statement_cache_size=0,
+        # Connection initialization: set search path and statement timeout
+        init=init_connection,
+        # Server settings passed on connection
+        server_settings={
+            "application_name": "ai_rag_service",
+            "statement_timeout": "30000",  # 30s max query time
+            "lock_timeout": "5000",         # 5s lock timeout
+        }
+    )
+
+async def init_connection(conn: asyncpg.Connection) -&gt; None:
+    """Initialize each new connection with AI-specific settings."""
+    await conn.execute("SET search_path TO public, vectors, ops")
+    # Register pgvector codec so asyncpg handles the vector type
+    await conn.execute("SELECT 1")  # Warm the connection
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool
+    pool = await create_pool()
+    logger.info(f"Connection pool created: min=5, max=50 via PgBouncer")
+    yield
+    await pool.close()
+    logger.info("Connection pool closed")
+
+app = FastAPI(lifespan=lifespan)</code></pre>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

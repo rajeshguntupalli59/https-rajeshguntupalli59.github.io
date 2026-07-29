@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 18: Query Cost Attribution: Which Queries Are Burning Money — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 18: Query Cost Attribution: Which Queries Are Burning Money. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 18 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 18: Query Cost Attribution: Which Queries Are Burning Money</h2>
+
+<p class="text-gray-300 leading-relaxed">Organizations running cloud databases routinely overpay by 30–60% not because their infrastructure is wrong, but because a handful of queries are consuming disproportionate compute, I/O, and memory resources that translate directly into larger instance sizes, higher storage throughput costs, and ballooning read replica bills. This chapter shows you how to identify exactly which queries are responsible for those costs, assign dollar values to each one, and build an automated attribution pipeline that surfaces the worst offenders before they hit your monthly bill. Teams that implement structured query cost attribution typically find that the top 5% of queries account for 70–80% of database compute spend—and that fixing three to five of them can cut monthly RDS or Cloud SQL bills by $2,000–$15,000 without touching a single infrastructure knob.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.1 The Attribution Problem: Connecting Query Execution to Dollar Costs</h3>
+
+<p class="text-gray-300 leading-relaxed">Most DBAs know which queries are slow. Far fewer know which queries are *expensive*. The distinction matters enormously for FinOps work. A query that runs in 50 milliseconds but executes 2 million times per day is doing more damage to your bill than a query that takes 10 seconds and runs once an hour. Cloud costs accumulate through three primary mechanisms at the database layer:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compute costs</strong> arise when queries hold CPU longer than necessary, forcing you onto a larger instance class. Moving from an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> ($0.528/hour on-demand, us-east-1) to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> ($1.056/hour) costs an additional $382/month—a cost that is entirely invisible unless you connect it to the queries driving CPU saturation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">I/O costs</strong> hit you in two ways. For RDS with gp2 storage, provisioned IOPS above the baseline incur per-IOPS charges of $0.10/IOPS-month. For gp3, you pay $0.02/GB-month for storage plus $0.08 per provisioned IOPS beyond 3,000. Queries doing full table scans on large tables are the most common driver of unexpected IOPS bills.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Network and replication costs</strong> surface when poorly written queries return massive result sets or trigger excessive binary log events that replicate to read replicas or cross-region standby instances. Data transfer between Availability Zones costs $0.01/GB on AWS, which becomes significant when a single analytics query pulls 500GB across the wire nightly.</p>
+
+<p class="text-gray-300 leading-relaxed">The framework this chapter builds assigns three cost components to every query: compute cost, I/O cost, and network cost. These roll up into a single monthly dollar figure per query, giving you a ranked list to work from.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.2 Extracting Query Cost Data: pg_stat_statements, Performance Insights, and sys.dm_exec_query_stats</h3>
+
+<p class="text-gray-300 leading-relaxed">#### PostgreSQL: pg_stat_statements</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> is the foundational tool for PostgreSQL cost attribution on RDS, Aurora PostgreSQL, and Cloud SQL. Enable it in the parameter group:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements (requires rds.force_ssl=1 on RDS)
+-- Add to parameter group: shared_preload_libraries = pg_stat_statements
+-- Then run:
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Reset statistics at the start of a billing cycle measurement window
+SELECT pg_stat_statements_reset();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once you have a week or more of data, the following query converts raw execution statistics into a cost estimate. The per-vCPU-hour figure is derived from your actual instance cost divided by vCPU count and a utilization assumption.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query cost attribution for PostgreSQL
+-- Assumes db.r6g.4xlarge: $1.056/hr, 16 vCPUs, 75% avg utilization
+-- Effective cost per vCPU-hour = $1.056 / 16 = $0.066
+-- Adjust cost_per_vcpu_hour and iops_cost_per_million to match your setup
+
+WITH constants AS (
+    SELECT
+        0.066  AS cost_per_vcpu_hour,    -- $/vCPU-hr for your instance class
+        0.08   AS iops_cost_per_million, -- RDS gp3 I/O cost approximation
+        720    AS hours_per_month
+),
+query_stats AS (
+    SELECT
+        queryid,
+        LEFT(query, 120)                                    AS query_preview,
+        calls,
+        total_exec_time / 1000.0                            AS total_exec_seconds,
+        mean_exec_time / 1000.0                             AS mean_exec_seconds,
+        stddev_exec_time / 1000.0                           AS stddev_exec_seconds,
+        rows,
+        shared_blks_hit + shared_blks_read                  AS total_blocks_accessed,
+        shared_blks_read                                    AS disk_blocks_read,
+        shared_blks_written + local_blks_written            AS blocks_written,
+        blk_read_time / 1000.0                              AS blk_read_seconds,
+        blk_write_time / 1000.0                             AS blk_write_seconds,
+        -- CPU time approximation: total time minus I/O wait time
+        GREATEST(0, (total_exec_time - blk_read_time - blk_write_time) / 1000.0)
+                                                            AS cpu_seconds
+    FROM pg_stat_statements
+    WHERE calls &gt; 100  -- filter noise
+),
+cost_calc AS (
+    SELECT
+        qs.queryid,
+        qs.query_preview,
+        qs.calls,
+        qs.total_exec_seconds,
+        qs.mean_exec_seconds,
+        qs.disk_blocks_read,
+        qs.rows,
+        -- Compute cost: CPU seconds consumed * per-second vCPU cost
+        ROUND((qs.cpu_seconds * c.cost_per_vcpu_hour / 3600.0)::numeric, 4)
+                                                            AS compute_cost_usd,
+        -- I/O cost: blocks read from disk (8KB blocks = IOPS approximation)
+        ROUND((qs.disk_blocks_read / 1000000.0 * c.iops_cost_per_million)::numeric, 4)
+                                                            AS io_cost_usd,
+        -- Total estimated monthly cost (scaled from observation window)
+        -- Assumes stats cover exactly 7 days; scale to 30 days
+        ROUND(((qs.cpu_seconds * c.cost_per_vcpu_hour / 3600.0)
+             + (qs.disk_blocks_read / 1000000.0 * c.iops_cost_per_million))
+             * (30.0 / 7.0)::numeric, 2)                   AS estimated_monthly_cost_usd
+    FROM query_stats qs
+    CROSS JOIN constants c
+)
+SELECT
+    queryid,
+    query_preview,
+    calls,
+    ROUND(total_exec_seconds::numeric, 2)                   AS total_exec_sec,
+    ROUND(mean_exec_seconds * 1000::numeric, 2)             AS avg_ms,
+    disk_blocks_read,
+    rows                                                    AS total_rows_returned,
+    compute_cost_usd,
+    io_cost_usd,
+    estimated_monthly_cost_usd,
+    ROUND(100.0 * estimated_monthly_cost_usd
+          / SUM(estimated_monthly_cost_usd) OVER (), 2)     AS pct_of_total_cost
+FROM cost_calc
+ORDER BY estimated_monthly_cost_usd DESC
+LIMIT 25;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This query returns a ranked list showing each query's estimated monthly dollar contribution. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pct_of_total_cost</code> column is the number that matters to a CTO: it answers "what fraction of our database bill does this query own?"</p>
+
+<p class="text-gray-300 leading-relaxed">#### SQL Server: sys.dm_exec_query_stats</p>
+
+<p class="text-gray-300 leading-relaxed">For Azure SQL Database and SQL Server on RDS, the equivalent attribution lives in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query cost attribution for SQL Server / Azure SQL Database
+-- Adjust @instance_cost_per_hour to match your DTU/vCore pricing
+-- Azure SQL Business Critical 8 vCores = ~$1.13/hr
+DECLARE @instance_cost_per_hour  FLOAT = 1.13;
+DECLARE @vcpu_count              INT   = 8;
+DECLARE @observation_hours       FLOAT = 168.0; -- 7 days
+DECLARE @cost_per_cpu_second     FLOAT = @instance_cost_per_hour / @vcpu_count / 3600.0;
+
+SELECT TOP 25
+    qs.total_worker_time / 1000000.0                        AS total_cpu_seconds,
+    qs.total_elapsed_time / 1000000.0                       AS total_elapsed_seconds,
+    qs.total_logical_reads                                  AS logical_reads,
+    qs.total_physical_reads                                 AS physical_reads,
+    qs.total_logical_writes                                 AS logical_writes,
+    qs.execution_count,
+    qs.total_rows,
+    SUBSTRING(qt.text, (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset
+          END - qs.statement_start_offset) / 2) + 1)       AS query_text,
+    qp.query_plan,
+    -- Compute cost estimate
+    ROUND(qs.total_worker_time / 1000000.0
+          * @cost_per_cpu_second, 4)                        AS compute_cost_usd,
+    -- I/O cost: physical reads * 8KB pages, approximate $0.115/GB for Azure Premium SSD
+    ROUND(qs.total_physical_reads * 8.0 / 1048576.0
+          * 0.115, 4)                                       AS io_cost_usd,
+    -- Projected monthly (scale from observation window to 30 days)
+    ROUND((qs.total_worker_time / 1000000.0 * @cost_per_cpu_second
+          + qs.total_physical_reads * 8.0 / 1048576.0 * 0.115)
+          * (720.0 / @observation_hours), 2)                AS est_monthly_cost_usd
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+OUTER APPLY sys.dm_exec_query_plan(qs.plan_handle) qp
+WHERE qs.execution_count &gt; 50
+ORDER BY est_monthly_cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### MySQL and Aurora MySQL</p>
+
+<p class="text-gray-300 leading-relaxed">Aurora MySQL and RDS MySQL expose per-query metrics through the Performance Schema. Enable the statement digest:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Aurora MySQL / RDS MySQL query cost attribution
+-- Requires performance_schema = ON and events_statements_summary_by_digest enabled
+-- performance-schema-instrument = 'statement/sql/%=ON' in parameter group
+
+SELECT
+    SCHEMA_NAME,
+    LEFT(DIGEST_TEXT, 120)                                  AS query_preview,
+    COUNT_STAR                                              AS executions,
+    ROUND(SUM_TIMER_WAIT / 1e12, 2)                         AS total_exec_seconds,
+    ROUND(AVG_TIMER_WAIT / 1e9, 2)                          AS avg_exec_ms,
+    SUM_ROWS_EXAMINED                                       AS rows_examined,
+    SUM_ROWS_SENT                                           AS rows_sent,
+    SUM_NO_INDEX_USED                                       AS full_scans,
+    SUM_NO_GOOD_INDEX_USED                                  AS bad_index_uses,
+    -- Efficiency ratio: lower is worse (ideal = 1.0)
+    ROUND(SUM_ROWS_SENT * 1.0 / NULLIF(SUM_ROWS_EXAMINED, 0), 4)
+                                                            AS row_efficiency,
+    -- Compute cost approximation (db.r6g.2xlarge Aurora: $0.48/hr, 8 vCPUs)
+    ROUND(SUM_TIMER_WAIT / 1e12 * (0.48 / 8.0 / 3600.0), 4)
+                                                            AS compute_cost_usd,
+    -- I/O approximation via rows examined (Aurora charges per I/O request)
+    -- Aurora I/O = $0.20 per 1M requests
+    ROUND(SUM_ROWS_EXAMINED / 1000000.0 * 0.20, 4)          AS aurora_io_cost_usd,
+    ROUND((SUM_TIMER_WAIT / 1e12 * (0.48 / 8.0 / 3600.0)
+          + SUM_ROWS_EXAMINED / 1000000.0 * 0.20)
+          * (30.0 / 7.0), 2)                                AS est_monthly_cost_usd
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SCHEMA_NAME IS NOT NULL
+  AND COUNT_STAR &gt; 50
+  AND LAST_SEEN &gt; DATE_SUB(NOW(), INTERVAL 7 DAY)
+ORDER BY est_monthly_cost_usd DESC
+LIMIT 25;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aurora_io_cost_usd</code> column is particularly important for Aurora Serverless v1 and Aurora standard configurations on the I/O-optimized pricing plan decision. If your I/O cost exceeds 25% of total Aurora storage + I/O costs, switching to Aurora I/O-Optimized pricing ($0.225/GB-month, no separate I/O charge) typically saves money—and reducing row examination in these queries accelerates that crossover point.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.3 AWS Performance Insights and Cost Explorer Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">Performance Insights provides the bridge between database-level metrics and the infrastructure cost data in Cost Explorer. The combination is powerful: Performance Insights shows you which SQL is consuming DB time, while Cost Explorer shows you what that DB time is costing in dollars.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Pulling Performance Insights Data via AWS CLI</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Retrieve top SQL queries by DB load from Performance Insights
+# Requires: aws cli v2, jq, Performance Insights enabled on the RDS instance
+# Run this daily via cron or EventBridge to populate a cost attribution table
+
+DB_INSTANCE_ID="prod-postgres-01"
+REGION="us-east-1"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+# Performance Insights uses a resource ARN
+PI_RESOURCE_ID=$(aws rds describe-db-instances \
+    --db-instance-identifier "$DB_INSTANCE_ID" \
+    --region "$REGION" \
+    --query 'DBInstances[0].DbiResourceId' \
+    --output text)
+
+# Fetch top 25 SQL digests for the past 7 days
+# Metric: db.load.avg (average active sessions)
+START_TIME=$(date -u -d '7 days ago' '+%Y-%m-%dT%H:%M:%SZ')
+END_TIME=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+
+aws pi get-resource-metrics \
+    --service-type RDS \
+    --identifier "$PI_RESOURCE_ID" \
+    --metric-queries '[
+        {
+            "Metric": "db.load.avg",
+            "GroupBy": {
+                "Group": "db.sql",
+                "Dimensions": ["db.sql.tokenized_id"],
+                "Limit": 25
+            }
+        }
+    ]' \
+    --start-time "$START_TIME" \
+    --end-time "$END_TIME" \
+    --period-in-seconds 3600 \
+    --region "$REGION" \
+    --output json \
+    | jq '.MetricList[] | {
+        metric: .Key.Metric,
+        sql_id: .Key.Dimensions["db.sql.tokenized_id"],
+        avg_load: (.DataPoints | map(.Value) | add / length)
+      }' \
+    | jq -s 'sort_by(-.avg_load)' \
+    &gt; /tmp/pi_top_queries_$(date +%Y%m%d).json
+
+echo "Performance Insights data saved to /tmp/pi_top_queries_$(date +%Y%m%d).json"
+
+# Fetch instance cost from Cost Explorer for the same period
+aws ce get-cost-and-usage \
+    --time-period "Start=$(date -u -d '7 days ago' '+%Y-%m-%d'),End=$(date -u '+%Y-%m-%d')" \
+    --granularity DAILY \
+    --filter '{
+        "And": [
+            {
+                "Dimensions": {
+                    "Key": "SERVICE",
+                    "Values": ["Amazon Relational Database Service"]
+                }
+            },
+            {
+                "Tags": {
+                    "Key": "db-instance",
+                    "Values": ["prod-postgres-01"]
+                }
+            }
+        ]
+    }' \
+    --metrics "BlendedCost" "UsageQuantity" \
+    --group-by Type=DIMENSION,Key=USAGE_TYPE \
+    --output json \
+    &gt; /tmp/rds_cost_$(date +%Y%m%d).json
+
+echo "Cost Explorer data saved to /tmp/rds_cost_$(date +%Y%m%d).json"
+
+# Combine: total DB cost / total DB load = cost per AAS unit
+TOTAL_COST=$(cat /tmp/rds_cost_$(date +%Y%m%d).json \
+    | jq '[.ResultsByTime[].Groups[].Metrics.BlendedCost.Amount | tonumber] | add')
+
+echo "Total RDS cost (7 days): \$$TOTAL_COST"
+echo "Cost attribution file ready for Python enrichment step"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### GCP: Pulling BigQuery Cost Data for Cloud SQL</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# GCP cost attribution for Cloud SQL queries
+# Requires: gcloud CLI, BigQuery billing export enabled
+# Billing export dataset: billing_export.gcp_billing_export_v1_XXXXXX
+
+PROJECT_ID="your-project-id"
+BILLING_DATASET="billing_export"
+BILLING_TABLE="gcp_billing_export_v1_XXXXXXXX"  # replace with your export table
+
+# Query BigQuery for Cloud SQL costs broken down by resource labels
+bq query \
+    --use_legacy_sql=false \
+    --project_id="$PROJECT_ID" \
+    --format=json \
+    "
+    SELECT
+        DATE(usage_start_time)                              AS usage_date,
+        labels.value                                        AS instance_label,
+        service.description                                 AS service,
+        sku.description                                     AS sku,
+        SUM(cost)                                           AS total_cost_usd,
+        SUM(usage.amount)                                   AS usage_amount,
+        usage.unit                                          AS unit
+    FROM \`${PROJECT_ID}.${BILLING_DATASET}.${BILLING_TABLE}\`
+    CROSS JOIN UNNEST(labels) AS labels
+    WHERE
+        service.description = 'Cloud SQL'
+        AND labels.key = 'db-instance'
+        AND DATE(usage_start_time) &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+    GROUP BY 1, 2, 3, 4, 7
+    ORDER BY total_cost_usd DESC
+    LIMIT 100
+    " &gt; /tmp/cloudsql_cost_$(date +%Y%m%d).json
+
+echo "Cloud SQL cost data exported to /tmp/cloudsql_cost_$(date +%Y%m%d).json"
+
+# Retrieve slow query log from Cloud SQL via Cloud Logging
+gcloud logging read \
+    'resource.type="cloudsql_database" 
+     jsonPayload.message=~"Query_time"
+     severity&gt;=DEFAULT' \
+    --project="$PROJECT_ID" \
+    --limit=1000 \
+    --format=json \
+    --freshness=7d \
+    &gt; /tmp/cloudsql_slow_queries_$(date +%Y%m%d).json
+
+echo "Slow query log exported. Lines: $(wc -l &lt; /tmp/cloudsql_slow_queries_$(date +%Y%m%d).json)"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.4 Building an Automated Query Cost Attribution Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">Manual query analysis is a one-time exercise. The organizations that consistently control costs automate the attribution process and integrate it into their observability stack. The following Python pipeline runs on a daily schedule (via AWS Lambda, Cloud Functions, or a cron job on an EC2 instance) and writes results to a PostgreSQL tracking table and optionally to Slack or PagerDuty.</p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>

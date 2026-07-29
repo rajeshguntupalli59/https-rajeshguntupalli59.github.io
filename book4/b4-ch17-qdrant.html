@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 17: Qdrant: Payload Filtering and Precision Tuning — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 17: Qdrant: Payload Filtering and Precision Tuning. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 17 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 17: Qdrant: Payload Filtering and Precision Tuning</h2>
+
+<p class="text-gray-300 leading-relaxed">Qdrant occupies a distinctive position in the vector database landscape: it was built from the ground up in Rust with a clear architectural opinion that vector search and structured metadata filtering should be first-class equals, not an afterthought. Where other systems treat payload filters as a post-processing step applied after ANN retrieval, Qdrant's filtered HNSW implementation weaves payload conditions directly into the graph traversal itself. The result is a system where adding filters often costs less than you expect, and where the gap between "give me the nearest vectors" and "give me the nearest vectors matching these exact business conditions" nearly disappears. This chapter walks through Qdrant's data model, its payload indexing system, the mechanics of filtered HNSW, and the production configuration knobs that separate a tuned deployment from one that simply runs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.1 Qdrant's Data Model: Collections, Points, and Payloads</h3>
+
+<p class="text-gray-300 leading-relaxed">Before touching query syntax, you need to understand how Qdrant organizes data. The mental model maps cleanly to relational concepts, which makes it approachable for DBAs.</p>
+
+<p class="text-gray-300 leading-relaxed">A <strong class="text-white">collection</strong> is Qdrant's equivalent of a table. It holds a set of <strong class="text-white">points</strong>, where each point contains:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A **unique ID** — either a 64-bit unsigned integer or a UUID string</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> One or more **vectors** — dense, sparse, or multivector depending on configuration</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A **payload** — an arbitrary JSON document, roughly analogous to a JSONB column in PostgreSQL</li>
+
+<p class="text-gray-300 leading-relaxed">Unlike traditional databases where schema is enforced at write time, Qdrant's payload schema is flexible by default. You can insert points with completely different payload shapes into the same collection. However, the analogy to PostgreSQL's JSONB goes further than you might expect: just as PostgreSQL requires explicit index creation on JSONB paths before those paths become filter-efficient, Qdrant requires you to create <strong class="text-white">payload indexes</strong> before payload fields become efficient filter predicates.</p>
+
+<p class="text-gray-300 leading-relaxed">This distinction matters. Without a payload index, Qdrant performs a full scan of all payload documents to evaluate a filter condition — effectively a sequential scan. With a payload index, filter evaluation happens in a purpose-built data structure before or during vector traversal.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Supported payload types and their indexed forms:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Payload Type | Qdrant Index Type | Analogy |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| String/keyword | Keyword index | B-tree on VARCHAR |</p>
+<p class="text-gray-300 leading-relaxed">| Integer | Integer index | B-tree on BIGINT |</p>
+<p class="text-gray-300 leading-relaxed">| Float | Float index | B-tree on DOUBLE |</p>
+<p class="text-gray-300 leading-relaxed">| Boolean | — (inline, fast) | BIT column |</p>
+<p class="text-gray-300 leading-relaxed">| Geo coordinates | Geo index | PostGIS spatial index |</p>
+<p class="text-gray-300 leading-relaxed">| Full text | Text index (tokenized) | GIN index on tsvector |</p>
+<p class="text-gray-300 leading-relaxed">| UUID | UUID index | B-tree on UUID |</p>
+
+<p class="text-gray-300 leading-relaxed">The collection-level configuration also controls vector parameters, distance metrics, and the HNSW graph parameters that affect both search quality and resource consumption. Let's stand up a collection and populate it with something realistic.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance,
+    VectorParams,
+    PointStruct,
+    CreateCollection,
+)
+from sentence_transformers import SentenceTransformer
+import uuid
+
+# Connect to a local Qdrant instance (default port 6333)
+client = QdrantClient(host="localhost", port=6333)
+
+COLLECTION_NAME = "product_catalog"
+VECTOR_DIM = 384  # all-MiniLM-L6-v2 output dimension
+
+# Create collection with explicit HNSW configuration
+client.create_collection(
+    collection_name=COLLECTION_NAME,
+    vectors_config=VectorParams(
+        size=VECTOR_DIM,
+        distance=Distance.COSINE,
+        # HNSW index params — tunable per collection
+        hnsw_config={
+            "m": 16,               # edges per node; higher = better recall, more RAM
+            "ef_construct": 100,   # build-time beam width
+            "full_scan_threshold": 10_000,  # switch to brute force below this count
+        },
+    ),
+)
+
+# Create payload indexes BEFORE bulk insert (more efficient)
+client.create_payload_index(
+    collection_name=COLLECTION_NAME,
+    field_name="category",
+    field_schema="keyword",
+)
+client.create_payload_index(
+    collection_name=COLLECTION_NAME,
+    field_name="price",
+    field_schema="float",
+)
+client.create_payload_index(
+    collection_name=COLLECTION_NAME,
+    field_name="in_stock",
+    field_schema="bool",
+)
+client.create_payload_index(
+    collection_name=COLLECTION_NAME,
+    field_name="description",
+    field_schema={
+        "type": "text",
+        "tokenizer": "word",
+        "min_token_len": 2,
+        "max_token_len": 20,
+        "lowercase": True,
+    },
+)
+
+# Encode some product descriptions
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
+
+products = [
+    {"id": str(uuid.uuid4()), "text": "Wireless noise-canceling over-ear headphones",
+     "category": "electronics", "price": 149.99, "in_stock": True, "brand": "SoundPro"},
+    {"id": str(uuid.uuid4()), "text": "Ergonomic mechanical keyboard with RGB backlight",
+     "category": "electronics", "price": 89.99, "in_stock": True, "brand": "TypeMaster"},
+    {"id": str(uuid.uuid4()), "text": "Standing desk converter, 36-inch wide surface",
+     "category": "furniture", "price": 229.00, "in_stock": False, "brand": "DeskRise"},
+    {"id": str(uuid.uuid4()), "text": "Portable USB-C hub with 4K HDMI output",
+     "category": "electronics", "price": 59.99, "in_stock": True, "brand": "HubTech"},
+    {"id": str(uuid.uuid4()), "text": "Adjustable lumbar support office chair",
+     "category": "furniture", "price": 399.00, "in_stock": True, "brand": "ErgoSeat"},
+]
+
+vectors = encoder.encode([p["text"] for p in products]).tolist()
+
+points = [
+    PointStruct(
+        id=p["id"],
+        vector=v,
+        payload={
+            "category": p["category"],
+            "price":    p["price"],
+            "in_stock": p["in_stock"],
+            "brand":    p["brand"],
+            "description": p["text"],
+        },
+    )
+    for p, v in zip(products, vectors)
+]
+
+# Upsert in a single batch
+operation_info = client.upsert(
+    collection_name=COLLECTION_NAME,
+    wait=True,   # synchronous — waits for indexing to complete
+    points=points,
+)
+print(f"Upsert status: {operation_info.status}")
+
+# Verify collection info
+info = client.get_collection(COLLECTION_NAME)
+print(f"Points count: {info.points_count}")
+print(f"Indexed vectors: {info.indexed_vectors_count}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wait=True</code> parameter deserves mention. Qdrant is eventually consistent by default — vectors are accepted into a write-ahead buffer before being incorporated into the HNSW graph. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wait=True</code> blocks until the operation is confirmed durable, which is the correct choice for transactional writes. For bulk loading, omitting it (or setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wait=False</code>) allows pipelining and can improve throughput by an order of magnitude, provided you validate completeness afterward.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.2 Payload Filtering: From Simple Conditions to Complex Predicates</h3>
+
+<p class="text-gray-300 leading-relaxed">Qdrant's filter language uses a nested boolean structure that maps directly to SQL WHERE clauses. Once you see the correspondence, the API becomes predictable.</p>
+
+<p class="text-gray-300 leading-relaxed">The top-level filter is always one of: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">must</code> (AND), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">should</code> (OR), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">must_not</code> (NOT), or their nested combinations. Each condition targets a specific payload field using a typed matcher.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import (
+    Filter,
+    FieldCondition,
+    MatchValue,
+    MatchAny,
+    Range,
+    SearchRequest,
+)
+
+encoder = SentenceTransformer("all-MiniLM-L6-v2")
+query_text = "comfortable headphones for long work sessions"
+query_vector = encoder.encode(query_text).tolist()
+
+# -------------------------------------------------------------------
+# Example 1: Simple AND filter
+# SQL equivalent: WHERE category = 'electronics' AND in_stock = true
+# -------------------------------------------------------------------
+simple_filter = Filter(
+    must=[
+        FieldCondition(key="category", match=MatchValue(value="electronics")),
+        FieldCondition(key="in_stock", match=MatchValue(value=True)),
+    ]
+)
+
+results = client.search(
+    collection_name=COLLECTION_NAME,
+    query_vector=query_vector,
+    query_filter=simple_filter,
+    limit=5,
+    with_payload=True,
+    with_vectors=False,
+)
+
+for r in results:
+    print(f"Score: {r.score:.4f} | {r.payload['description']} | ${r.payload['price']}")
+
+# -------------------------------------------------------------------
+# Example 2: Range filter on numeric field
+# SQL equivalent: WHERE price BETWEEN 50.00 AND 200.00
+# -------------------------------------------------------------------
+price_filter = Filter(
+    must=[
+        FieldCondition(key="price", range=Range(gte=50.0, lte=200.0)),
+        FieldCondition(key="in_stock", match=MatchValue(value=True)),
+    ]
+)
+
+results_price = client.search(
+    collection_name=COLLECTION_NAME,
+    query_vector=query_vector,
+    query_filter=price_filter,
+    limit=10,
+    with_payload=["description", "price", "brand"],
+)
+
+# -------------------------------------------------------------------
+# Example 3: OR condition with MatchAny
+# SQL equivalent: WHERE category IN ('electronics', 'accessories')
+# -------------------------------------------------------------------
+category_filter = Filter(
+    must=[
+        FieldCondition(
+            key="category",
+            match=MatchAny(any=["electronics", "accessories"]),
+        ),
+        FieldCondition(key="price", range=Range(lt=100.0)),
+    ]
+)
+
+# -------------------------------------------------------------------
+# Example 4: Nested boolean — (must AND) combined with (should OR)
+# SQL equivalent:
+#   WHERE in_stock = true
+#     AND (category = 'electronics' OR price &lt; 100.0)
+# -------------------------------------------------------------------
+nested_filter = Filter(
+    must=[
+        FieldCondition(key="in_stock", match=MatchValue(value=True)),
+        Filter(
+            should=[
+                FieldCondition(key="category", match=MatchValue(value="electronics")),
+                FieldCondition(key="price", range=Range(lt=100.0)),
+            ]
+        ),
+    ]
+)
+
+results_nested = client.search(
+    collection_name=COLLECTION_NAME,
+    query_vector=query_vector,
+    query_filter=nested_filter,
+    limit=5,
+    with_payload=True,
+)
+
+# -------------------------------------------------------------------
+# Example 5: must_not exclusion
+# SQL equivalent: WHERE brand != 'SoundPro' AND in_stock = true
+# -------------------------------------------------------------------
+exclusion_filter = Filter(
+    must=[
+        FieldCondition(key="in_stock", match=MatchValue(value=True)),
+    ],
+    must_not=[
+        FieldCondition(key="brand", match=MatchValue(value="SoundPro")),
+    ],
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One thing that trips up developers coming from SQL: Qdrant filters operate on the <strong class="text-white">payload document as a whole</strong>, not on join results. There is no equivalent of a multi-table join at query time. If your data model requires join semantics — say, filtering products by a property that lives in a separate entity — you must denormalize that property into the point's payload before inserting. This is standard practice in vector databases and mirrors the document database pattern: write-time denormalization in exchange for read-time simplicity and speed.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Nested payload fields</strong> are accessed with dot notation. If a payload contains <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{"metadata": {"region": "us-east-1"}}</code>, the filter key is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"metadata.region"</code>. Arrays are also supported: if a payload field contains <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">["tag1", "tag2", "tag3"]</code>, a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MatchValue</code> condition checks whether any element matches.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.3 Filtered HNSW: How Qdrant Avoids the Post-Filter Penalty</h3>
+
+<p class="text-gray-300 leading-relaxed">To understand why Qdrant's filtered search is competitive with unfiltered search, you need to understand what most other systems do and why it's costly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The naive approach — post-filtering:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. Retrieve the top-K neighbors from the HNSW graph</p>
+<p class="text-gray-300 leading-relaxed">2. Apply payload filters to those K results</p>
+<p class="text-gray-300 leading-relaxed">3. Return however many survive the filter</p>
+
+<p class="text-gray-300 leading-relaxed">This works when the filter selectivity is low (most documents pass). When selectivity is high — say, only 0.1% of documents match the filter — you need to retrieve K/0.001 = 1000K candidates to expect K results. At that point, you have effectively done a full graph scan, and the ANN index provides no benefit.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Qdrant's approach — filtered HNSW traversal:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant maintains an additional data structure: a <strong class="text-white">payload filter index</strong> for each indexed field, which maps field values to point IDs. During HNSW traversal, Qdrant uses this index to evaluate filter conditions per candidate node *before* computing distances or following graph edges. Nodes that fail the filter condition are skipped during graph traversal, not just discarded afterward.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical effect is that the search explores the graph only through nodes that satisfy the filter. This is closer to how a PostgreSQL partial index works: the index was built over a specific subset of data, and queries that match that predicate can use the index directly rather than filtering after retrieval.</p>
+
+<p class="text-gray-300 leading-relaxed">There is a tradeoff: HNSW graphs can become less connected when many nodes are excluded. Qdrant addresses this with an automatic fallback mechanism. When the expected number of matching points falls below <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">full_scan_threshold</code> (configured per collection), Qdrant switches to brute-force search over only the matching points. For small result sets, brute force over a tiny filtered subset is faster than graph traversal anyway.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Demonstrating the performance difference between filtered and unfiltered search,
+# and verifying that Qdrant is using its index vs. brute force path.
+
+import time
+from qdrant_client.models import SearchParams
+
+# For a larger dataset, create and populate a collection programmatically
+import random
+import numpy as np
+
+LARGE_COLLECTION = "benchmark_collection"
+N_POINTS = 100_000
+DIM = 128
+
+# Create collection
+try:
+    client.delete_collection(LARGE_COLLECTION)
+except Exception:
+    pass
+
+client.create_collection(
+    collection_name=LARGE_COLLECTION,
+    vectors_config=VectorParams(
+        size=DIM,
+        distance=Distance.COSINE,
+        hnsw_config={
+            "m": 16,
+            "ef_construct": 128,
+            "full_scan_threshold": 10_000,
+        },
+    ),
+)
+
+# Create payload index before bulk insert
+client.create_payload_index(
+    collection_name=LARGE_COLLECTION,
+    field_name="tenant_id",
+    field_schema="keyword",
+)
+client.create_payload_index(
+    collection_name=LARGE_COLLECTION,
+    field_name="score",
+    field_schema="float",
+)
+
+# Generate random points with tenant labels (100 tenants, ~1000 points each)
+BATCH_SIZE = 1000
+tenants = [f"tenant_{i:03d}" for i in range(100)]
+
+for batch_start in range(0, N_POINTS, BATCH_SIZE):
+    batch_ids = list(range(batch_start, min(batch_start + BATCH_SIZE, N_POINTS)))
+    batch_vectors = np.random.rand(len(batch_ids), DIM).tolist()
+    batch_points = [
+        PointStruct(
+            id=i,
+            vector=v,
+            payload={
+                "tenant_id": random.choice(tenants),
+                "score": random.uniform(0.0, 1.0),
+            },
+        )
+        for i, v in zip(batch_ids, batch_vectors)
+    ]
+    client.upsert(
+        collection_name=LARGE_COLLECTION,
+        wait=False,   # async for bulk load throughput
+        points=batch_points,
+    )
+
+# Wait for indexing to complete
+import time
+while True:
+    info = client.get_collection(LARGE_COLLECTION)
+    if info.status.value == "green":
+        break
+    time.sleep(1)
+
+query_vector = np.random.rand(DIM).tolist()
+
+# Benchmark 1: Unfiltered search
+start = time.perf_counter()
+for _ in range(50):
+    client.search(
+        collection_name=LARGE_COLLECTION,
+        query_vector=query_vector,
+        limit=10,
+    )
+unfiltered_ms = (time.perf_counter() - start) / 50 * 1000
+print(f"Unfiltered search avg latency: {unfiltered_ms:.2f}ms")
+
+# Benchmark 2: Filtered search — 1% selectivity (1 of 100 tenants)
+tenant_filter = Filter(
+    must=[FieldCondition(key="tenant_id", match=MatchValue(value="tenant_042"))]
+)
+start = time.perf_counter()
+for _ in range(50):
+    client.search(
+        collection_name=LARGE_COLLECTION,
+        query_vector=query_vector,
+        query_filter=tenant_filter,
+        limit=10,
+        search_params=SearchParams(hnsw_ef=128),  # explicit ef at query time
+    )
+filtered_ms = (time.perf_counter() - start) / 50 * 1000
+print(f"Filtered search (1% selectivity) avg latency: {filtered_ms:.2f}ms")
+
+# Benchmark 3: High-selectivity filter — 0.1% with range condition
+narrow_filter = Filter(
+    must=[
+        FieldCondition(key="tenant_id", match=MatchValue(value="tenant_042")),
+        FieldCondition(key="score", range=Range(gte=0.95)),
+    ]
+)
+start = time.perf_counter()
+for _ in range(50):
+    client.search(
+        collection_name=LARGE_COLLECTION,
+        query_vector=query_vector,
+        query_filter=narrow_filter,
+        limit=10,
+    )
+narrow_ms = (time.perf_counter() - start) / 50 * 1000
+print(f"High-selectivity filtered search avg latency: {narrow_ms:.2f}ms")
+# Note: at very high selectivity, Qdrant switches to brute-force over
+# the matching subset, which is often faster than graph traversal</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In practice on commodity hardware with this dataset size, you should see unfiltered search at 1–3ms, 1%-selectivity filtered search at 2–6ms, and high-selectivity search (where brute-force kicks in) at under 2ms because the matching set is small. The filtered HNSW penalty is far smaller than the equivalent post-filter architecture.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Precision Tuning: ef, Quantization, and Segment Configuration</h3>
+
+<p class="text-gray-300 leading-relaxed">Qdrant exposes more precision knobs than most vector databases. Understanding them requires understanding the search accuracy vs. speed tradeoff in concrete terms.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The ef parameter:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In HNSW, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> (exploration factor) controls how many candidates the graph explorer keeps in its priority queue during traversal. Higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> means more candidates explored, which increases recall at the cost of latency. Two separate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> values exist:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ef_construct`: Used during index build. Set this once at collection creation. Typical values: 100–400. Higher values produce better graph connectivity but slow down writes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `hnsw_ef` (or `ef` at search time): Used during query. Can be set per-query via `SearchParams`. Typical range: 64–512.</li>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> parameter controls the number of bidirectional edges each node maintains in the graph. Higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> increases RAM usage proportionally but improves recall, especially at lower <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> values. For 100k–1M vectors, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code> is a reasonable default. For datasets requiring very high recall (>99%) at large scale, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=32</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=64</code> is warranted.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quantization:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant supports three quantization strategies that trade accuracy for speed and memory reduction:</p>
+
+<p class="text-gray-300 leading-relaxed">| Strategy | Memory Reduction | Recall Impact | Typical Use |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Scalar (int8) | ~4x | <1% at ef rescore | General purpose |</p>
+<p class="text-gray-300 leading-relaxed">| Product Quantization (PQ) | 8–32x | 2–5% without rescore | Memory-constrained |</p>
+<p class="text-gray-300 leading-relaxed">| Binary | ~32x | Significant without rescore | Pre-filtering, speed priority |</p>
+
+<p class="text-gray-300 leading-relaxed">All three support <strong class="text-white">rescoring</strong>: after the initial quantized search narrows the candidate set, Qdrant fetches the original full-precision vectors for the top candidates and re-ranks them. This recovers most of the accuracy penalty. The tradeoff is I/O for the rescore step.</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

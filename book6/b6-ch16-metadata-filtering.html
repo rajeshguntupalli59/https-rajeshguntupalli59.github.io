@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 16: Metadata Filtering with SQL and Vector Search Together — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 16: Metadata Filtering with SQL and Vector Search Together. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 16 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 16: Metadata Filtering with SQL and Vector Search Together</h2>
+
+<p class="text-gray-300 leading-relaxed">Most vector search tutorials show you a single embedding column, a distance operator, and a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT 10</code>. That works for demos. In production AI applications, you almost never want the top-10 most semantically similar documents from your entire corpus — you want the top-10 most semantically similar documents *that belong to this tenant, in this language, published after this date, with this approval status, and not already shown to this user*. The moment you add those constraints, you are doing metadata filtering combined with vector search, and how you implement that combination determines whether your RAG system is fast, accurate, and correct — or slow, leaky, and wrong.</p>
+
+<p class="text-gray-300 leading-relaxed">This chapter covers the full stack: schema design that makes filtering efficient, the different architectural patterns for combining SQL predicates with ANN search, how pgvector's HNSW index interacts with WHERE clauses, query patterns for common RAG filtering scenarios, and the Python layer that ties it all together into a production-ready retrieval pipeline.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Metadata Filtering Is Not an Afterthought</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector similarity search answers a deceptively simple question: which embeddings in this set are closest to my query embedding? The problem is that "this set" — the entire embedding table — is almost never the right scope for a production query.</p>
+
+<p class="text-gray-300 leading-relaxed">Consider a multi-tenant knowledge base serving 500 companies. Each company has uploaded their own documents. Without metadata filtering, a similarity search for "how do I reset my password?" might return results from a competitor's documentation. This is not a minor inconvenience — it is a data isolation failure. Row-level security and tenant-scoped queries are standard database thinking, and they apply equally to vector search.</p>
+
+<p class="text-gray-300 leading-relaxed">Beyond multi-tenancy, filtering requirements in real RAG systems include:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Temporal filters** — only retrieve documents updated within the last 90 days, because older content may be stale</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Status filters** — only retrieve `published` or `approved` documents, not drafts</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Language filters** — retrieve documents matching the detected user language</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Category/taxonomy filters** — pre-narrow the corpus by topic before semantic ranking</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Permission filters** — only show content the authenticated user has access to</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Deduplication** — exclude document IDs already retrieved in previous turns</li>
+
+<p class="text-gray-300 leading-relaxed">Each of these is a standard SQL predicate. PostgreSQL is extraordinarily good at evaluating them. The engineering challenge is combining them efficiently with the approximate nearest neighbor (ANN) search that pgvector provides.</p>
+
+<p class="text-gray-300 leading-relaxed">The fundamental tension is this: HNSW and IVFFlat indexes are built to traverse the vector space efficiently, but they work best when they can consider a large candidate set. If your SQL WHERE clause eliminates 99% of rows before the index traversal, the ANN index may not help much — or may even be bypassed in favor of a sequential scan. Understanding this tradeoff lets you design schemas and queries that give you both correctness and speed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Design for Filterable Vector Search</h3>
+
+<p class="text-gray-300 leading-relaxed">The schema is where the filtering strategy lives. A common mistake is storing metadata as a single JSONB blob and expecting ad-hoc filtering to be fast. Some metadata should be JSONB; most filtering attributes should be typed columns with indexes.</p>
+
+<p class="text-gray-300 leading-relaxed">Here is a realistic schema for a multi-tenant document knowledge base:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extensions
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_trgm;  -- for text search on titles
+
+-- Tenants
+CREATE TABLE tenants (
+    tenant_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          TEXT NOT NULL,
+    plan          TEXT NOT NULL DEFAULT 'free',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Document sources (S3 buckets, web crawls, uploads, etc.)
+CREATE TABLE document_sources (
+    source_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id     UUID NOT NULL REFERENCES tenants(tenant_id),
+    name          TEXT NOT NULL,
+    source_type   TEXT NOT NULL,  -- 'upload', 'web_crawl', 'api_sync'
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Documents (parent records — a PDF, a web page, a Confluence article)
+CREATE TABLE documents (
+    document_id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id     UUID NOT NULL REFERENCES tenants(tenant_id),
+    source_id     UUID REFERENCES document_sources(source_id),
+    title         TEXT NOT NULL,
+    url           TEXT,
+    language      TEXT NOT NULL DEFAULT 'en',
+    status        TEXT NOT NULL DEFAULT 'draft',
+        -- CHECK constraint ensures valid statuses
+        CONSTRAINT documents_status_check
+            CHECK (status IN ('draft', 'processing', 'published', 'archived')),
+    category      TEXT,
+    tags          TEXT[] NOT NULL DEFAULT '{}',
+    author_id     UUID,
+    word_count    INTEGER,
+    -- Timestamps matter for recency filtering
+    content_updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Arbitrary metadata that doesn't need indexing
+    extra_metadata      JSONB NOT NULL DEFAULT '{}'
+);
+
+-- Indexes for common filter patterns
+CREATE INDEX idx_documents_tenant_status
+    ON documents (tenant_id, status);
+
+CREATE INDEX idx_documents_tenant_language
+    ON documents (tenant_id, language);
+
+CREATE INDEX idx_documents_tenant_category
+    ON documents (tenant_id, category)
+    WHERE category IS NOT NULL;
+
+CREATE INDEX idx_documents_content_updated_at
+    ON documents (tenant_id, content_updated_at DESC)
+    WHERE status = 'published';
+
+CREATE INDEX idx_documents_tags
+    ON documents USING GIN (tags);
+
+-- Chunks (the actual units of retrieval — documents split into overlapping chunks)
+CREATE TABLE document_chunks (
+    chunk_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL,  -- denormalized for faster filtering
+    chunk_index     INTEGER NOT NULL,
+    chunk_text      TEXT NOT NULL,
+    token_count     INTEGER,
+    -- Denormalized filter columns from parent document
+    -- This is intentional: avoids JOINs during hot-path retrieval
+    language        TEXT NOT NULL DEFAULT 'en',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    category        TEXT,
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    content_updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The embedding
+    embedding       vector(1536),  -- OpenAI text-embedding-3-small dimensions
+    -- Bookkeeping
+    embedding_model TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT fk_chunk_tenant
+        FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+);
+
+-- Partial index: only index published chunks
+-- This is the most important optimization for metadata-filtered vector search
+CREATE INDEX idx_chunks_embedding_published
+    ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WHERE status = 'published';
+
+-- Composite b-tree indexes for metadata filtering
+CREATE INDEX idx_chunks_tenant_status
+    ON document_chunks (tenant_id, status);
+
+CREATE INDEX idx_chunks_tenant_language_status
+    ON document_chunks (tenant_id, language, status);
+
+CREATE INDEX idx_chunks_tenant_category
+    ON document_chunks (tenant_id, category, status)
+    WHERE category IS NOT NULL;
+
+CREATE INDEX idx_chunks_tags
+    ON document_chunks USING GIN (tags)
+    WHERE status = 'published';
+
+-- User retrieval history (for deduplication across conversation turns)
+CREATE TABLE retrieval_history (
+    id              BIGSERIAL PRIMARY KEY,
+    session_id      UUID NOT NULL,
+    user_id         UUID NOT NULL,
+    tenant_id       UUID NOT NULL,
+    chunk_id        UUID NOT NULL REFERENCES document_chunks(chunk_id),
+    retrieved_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX idx_retrieval_history_session
+    ON retrieval_history (session_id, retrieved_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key design decisions here:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Denormalized filter columns on chunks</strong> — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">language</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">category</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tags</code> are duplicated from the parent document onto every chunk. This avoids a JOIN on every retrieval query. The JOIN cost matters when you are running hundreds of queries per second.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Partial HNSW index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'published'</code></strong> — The HNSW index only covers rows where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'published'</code>. This means the index is smaller (faster to build and traverse), and queries that filter on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'published'</code> can use the index efficiently. Draft documents never pollute semantic search results.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Typed columns for high-cardinality filters</strong> — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">language</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">category</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code> are typed columns, not JSONB keys. These can be covered by B-tree composite indexes that PostgreSQL's planner knows how to use.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Three Patterns for Combining Filters and Vector Search</h3>
+
+<p class="text-gray-300 leading-relaxed">There are three fundamental architectural patterns for combining SQL predicates with vector similarity search. PostgreSQL supports all three, and the right choice depends on your data distribution and query selectivity.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 1: Pre-filter then search (SQL first)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Apply the SQL WHERE clause to narrow the candidate set, then do vector search on the result.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Pre-filter pattern: PostgreSQL evaluates the WHERE clause,
+-- then applies vector distance ordering within the filtered set
+SELECT
+    dc.chunk_id,
+    dc.document_id,
+    dc.chunk_text,
+    dc.category,
+    dc.content_updated_at,
+    1 - (dc.embedding &lt;=&gt; $1::vector) AS cosine_similarity
+FROM document_chunks dc
+WHERE
+    dc.tenant_id    = $2
+    AND dc.status   = 'published'
+    AND dc.language = $3
+    AND dc.content_updated_at &gt;= NOW() - INTERVAL '90 days'
+ORDER BY dc.embedding &lt;=&gt; $1::vector
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern works well when filters are highly selective — if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id + status + language</code> reduces the candidate set to a few thousand rows, PostgreSQL will scan those rows and compute distances sequentially. With a small filtered set, sequential distance computation is fast enough that the HNSW index may not be needed.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 2: Search then post-filter (vector first)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Retrieve a large pool of nearest neighbors from the full vector space, then apply SQL filters to the pool.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Post-filter pattern: retrieve k*multiplier candidates, then filter
+-- Use a CTE to make the intent explicit
+WITH vector_candidates AS (
+    SELECT
+        chunk_id,
+        document_id,
+        chunk_text,
+        tenant_id,
+        status,
+        language,
+        category,
+        content_updated_at,
+        1 - (embedding &lt;=&gt; $1::vector) AS cosine_similarity
+    FROM document_chunks
+    ORDER BY embedding &lt;=&gt; $1::vector
+    LIMIT 200  -- retrieve 20x more than we need, then filter
+),
+filtered AS (
+    SELECT *
+    FROM vector_candidates
+    WHERE
+        tenant_id    = $2
+        AND status   = 'published'
+        AND language = $3
+        AND content_updated_at &gt;= NOW() - INTERVAL '90 days'
+)
+SELECT
+    chunk_id,
+    document_id,
+    chunk_text,
+    category,
+    content_updated_at,
+    cosine_similarity
+FROM filtered
+ORDER BY cosine_similarity DESC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern works well when filters have low selectivity (most documents match) or when you cannot afford a sequential scan of the filtered set (the filtered set is still very large). The risk is that your filters might eliminate most of the 200 candidates, leaving you with fewer than 10 results. You need to tune the over-fetch multiplier.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 3: Partitioned HNSW indexes (partition-per-tenant)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For large multi-tenant deployments, partition the table by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> and build separate HNSW indexes per partition. Each tenant's vector search is isolated to their partition.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a partitioned chunks table
+CREATE TABLE document_chunks_partitioned (
+    chunk_id        UUID NOT NULL DEFAULT gen_random_uuid(),
+    document_id     UUID NOT NULL,
+    tenant_id       UUID NOT NULL,
+    chunk_index     INTEGER NOT NULL,
+    chunk_text      TEXT NOT NULL,
+    language        TEXT NOT NULL DEFAULT 'en',
+    status          TEXT NOT NULL DEFAULT 'draft',
+    category        TEXT,
+    tags            TEXT[] NOT NULL DEFAULT '{}',
+    content_updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    embedding       vector(1536),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, chunk_id)
+) PARTITION BY HASH (tenant_id);
+
+-- Create 16 partitions
+DO $$
+BEGIN
+    FOR i IN 0..15 LOOP
+        EXECUTE format(
+            'CREATE TABLE document_chunks_p%s
+             PARTITION OF document_chunks_partitioned
+             FOR VALUES WITH (modulus 16, remainder %s)',
+            i, i
+        );
+    END LOOP;
+END;
+$$;
+
+-- Create HNSW indexes on each partition
+DO $$
+BEGIN
+    FOR i IN 0..15 LOOP
+        EXECUTE format(
+            'CREATE INDEX idx_chunks_p%s_embedding
+             ON document_chunks_p%s
+             USING hnsw (embedding vector_cosine_ops)
+             WITH (m = 16, ef_construction = 64)
+             WHERE status = ''published''',
+            i, i
+        );
+    END LOOP;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When you query with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = $1</code>, PostgreSQL's partition pruning eliminates all partitions not matching the hash of that tenant ID. The HNSW index on the remaining partition is smaller and faster to traverse.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Implementation: The Retrieval Pipeline in Python</h3>
+
+<p class="text-gray-300 leading-relaxed">Here is a production retrieval pipeline using FastAPI, asyncpg, and the OpenAI embedding API. It handles all three filter patterns, chooses the right strategy based on query parameters, and integrates with a Redis cache for repeated queries.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

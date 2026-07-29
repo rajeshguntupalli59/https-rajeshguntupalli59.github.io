@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 9: HNSW vs IVFFlat Indexing: Performance Tradeoffs — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 9: HNSW vs IVFFlat Indexing: Performance Tradeoffs. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 9 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 9: HNSW vs IVFFlat Indexing: Performance Tradeoffs</h2>
+
+<p class="text-gray-300 leading-relaxed">Vector search at scale lives or dies by its index structure. When you move beyond brute-force exact search — the vector equivalent of a full table scan — you enter the world of Approximate Nearest Neighbor (ANN) algorithms, and two of them dominate production deployments: HNSW (Hierarchical Navigable Small World) and IVFFlat (Inverted File Index with Flat quantization). Both solve the same fundamental problem — find the k most similar vectors to a query without scanning every row — but they make dramatically different engineering tradeoffs around memory, build time, query latency, and recall accuracy. This chapter unpacks how each algorithm works, where the numbers actually land in practice, and how to make the right choice for your workload. Database engineers will find familiar analogies throughout: if B-tree vs. hash index decisions feel natural to you, this chapter will feel like home.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">How Vector Indexes Work: The ANN Problem</h3>
+
+<p class="text-gray-300 leading-relaxed">Exact nearest neighbor search requires computing the distance from a query vector to every stored vector. At 1 million vectors with 1536 dimensions (OpenAI's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> output size), that's 1.5 billion floating-point operations per query. Even with SIMD parallelism, you're looking at hundreds of milliseconds — unacceptable for interactive applications.</p>
+
+<p class="text-gray-300 leading-relaxed">ANN algorithms trade a small amount of recall accuracy for dramatic speed improvements. The core insight is identical to why you don't read every page of a book to find a topic — you use an index that organizes content spatially, letting you skip most of the data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recall</strong> is the ANN equivalent of query correctness. A recall of 0.95 means that for any query, your ANN search returns 95% of the same results that a brute-force exact search would return. Production systems typically target 0.90–0.99 recall depending on application sensitivity. A recommendation engine might tolerate 0.90. A medical record retrieval system needs 0.99+.</p>
+
+<p class="text-gray-300 leading-relaxed">Think of it this way: recall in vector search maps roughly to what DBAs know as index selectivity, except you control the tradeoff dynamically through search parameters rather than waiting for a statistics update.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">IVFFlat: The Inverted Index Approach</h3>
+
+<p class="text-gray-300 leading-relaxed">IVFFlat follows a partitioning strategy that any DBA who has worked with table partitioning will recognize immediately.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">How it works:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">During index build, IVFFlat runs k-means clustering on your vector dataset, dividing all vectors into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> number of clusters. Each cluster has a centroid — a representative vector at its geometric center. At query time, the algorithm:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Computes distance from the query vector to all centroids</p>
+<p class="text-gray-300 leading-relaxed">2. Selects the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes</code> closest centroids (you control this number)</p>
+<p class="text-gray-300 leading-relaxed">3. Scans every vector in those selected clusters for exact distance comparisons</p>
+<p class="text-gray-300 leading-relaxed">4. Returns the top-k results</p>
+
+<p class="text-gray-300 leading-relaxed">This is structurally identical to a partitioned table with a partition pruning step. The centroids are your partition keys, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes</code> is how many partitions you're willing to scan.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Build-time parameters:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `lists`: Number of clusters. Rule of thumb: `sqrt(n)` for datasets up to 1 million rows; `n/1000` for larger datasets. More lists = faster queries but slower build and higher minimum `probes` needed for good recall.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Build time scales with dataset size roughly linearly after the k-means phase.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query-time parameters:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `probes`: Number of clusters to scan. Higher values increase recall but increase query latency proportionally. Default is 1 (fast, low recall). Setting `probes = lists` degrades to exact search.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Create a table and populate it
+CREATE TABLE documents (
+    id          BIGSERIAL PRIMARY KEY,
+    content     TEXT,
+    embedding   vector(1536)
+);
+
+-- Build an IVFFlat index
+-- lists = sqrt(1,000,000) ≈ 1000 for a 1M row dataset
+CREATE INDEX ON documents
+USING ivfflat (embedding vector_cosine_ops)
+WITH (lists = 1000);
+
+-- At query time, set probes in the session or transaction
+-- probes = 10 gives ~0.90 recall; probes = 50 gives ~0.98 recall
+SET ivfflat.probes = 10;
+
+SELECT id, content, 1 - (embedding &lt;=&gt; '[...]'::vector) AS similarity
+FROM documents
+ORDER BY embedding &lt;=&gt; '[...]'::vector
+LIMIT 10;
+
+-- For higher-stakes queries, bump probes in the same session
+SET ivfflat.probes = 50;
+
+SELECT id, content, 1 - (embedding &lt;=&gt; '[...]'::vector) AS similarity
+FROM documents
+ORDER BY embedding &lt;=&gt; '[...]'::vector
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">IVFFlat performance characteristics (empirical baselines):</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Dataset Size | lists | probes | Recall | QPS (single core) | Build Time |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| 100K vectors | 100 | 5 | ~0.88 | ~2,000 | ~10s |</p>
+<p class="text-gray-300 leading-relaxed">| 100K vectors | 100 | 20 | ~0.97 | ~600 | ~10s |</p>
+<p class="text-gray-300 leading-relaxed">| 1M vectors | 1000 | 10 | ~0.90 | ~400 | ~5 min |</p>
+<p class="text-gray-300 leading-relaxed">| 1M vectors | 1000 | 50 | ~0.98 | ~90 | ~5 min |</p>
+
+<p class="text-gray-300 leading-relaxed">These numbers assume 1536-dimensional float32 vectors on a single modern CPU core. GPU acceleration and parallelism multiply QPS significantly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Critical limitation:</strong> IVFFlat requires the index to be built on a fully populated (or near-final) dataset. The k-means centroids are computed once at build time. If your data distribution shifts significantly — because you've added a new category of documents that clusters differently — you'll need to rebuild the index to restore recall. This is not unlike rebuilding a hash-partitioned table after a distribution skew event.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">HNSW: The Graph Navigation Approach</h3>
+
+<p class="text-gray-300 leading-relaxed">HNSW works on a fundamentally different principle. Rather than partitioning the vector space, it builds a multi-layer graph where nodes are your vectors and edges connect nearby vectors. The "hierarchical" part means the graph has multiple layers: upper layers are sparse long-range connections, lower layers are dense short-range connections. This mirrors skip list data structures — upper lanes for coarse navigation, lower lanes for precise landing.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">How it works:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">During index build, each vector is inserted into the graph. HNSW assigns each vector a random maximum layer (following an exponential distribution so most vectors appear only in layer 0). Edges are drawn greedily to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">M</code> nearest neighbors at each layer.</p>
+
+<p class="text-gray-300 leading-relaxed">At query time:</p>
+<p class="text-gray-300 leading-relaxed">1. Start at the entry point in the top layer</p>
+<p class="text-gray-300 leading-relaxed">2. Greedily traverse edges toward the query vector, descending layers</p>
+<p class="text-gray-300 leading-relaxed">3. At layer 0 (the base layer with all vectors), run a beam search with width <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code></p>
+<p class="text-gray-300 leading-relaxed">4. Return the top-k candidates</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Build-time parameters:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `m`: Number of bidirectional edges per node (typically 8–64). Higher values increase recall and memory usage. Memory per vector scales as `O(m)`.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ef_construction`: Size of the dynamic candidate list during build. Higher values improve index quality but slow build time. Typically 64–512.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query-time parameters:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `ef_search` (called `hnsw.ef_search` in pgvector): Beam width during search. Higher values increase recall but increase latency. Never set lower than `k` (your LIMIT value).</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- HNSW index with tuned parameters
+-- m=16 is the default; ef_construction=64 is the default
+CREATE INDEX ON documents
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Set ef_search at query time
+-- ef_search = 40 gives ~0.95 recall
+-- ef_search = 100 gives ~0.99 recall
+SET hnsw.ef_search = 64;
+
+SELECT id, content, 1 - (embedding &lt;=&gt; '[...]'::vector) AS similarity
+FROM documents
+ORDER BY embedding &lt;=&gt; '[...]'::vector
+LIMIT 10;
+
+-- Check index size
+SELECT pg_size_pretty(pg_relation_size('documents_embedding_idx'));
+
+-- Inspect index build progress (pgvector 0.6+)
+SELECT phase, blocks_done, blocks_total,
+       tuples_done, tuples_total
+FROM pg_stat_progress_create_index
+WHERE relid = 'documents'::regclass;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">HNSW performance characteristics (empirical baselines):</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Dataset Size | m | ef_construction | ef_search | Recall | QPS (single core) | Build Time |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| 100K vectors | 16 | 64 | 40 | ~0.96 | ~3,000 | ~45s |</p>
+<p class="text-gray-300 leading-relaxed">| 100K vectors | 16 | 64 | 100 | ~0.99 | ~1,500 | ~45s |</p>
+<p class="text-gray-300 leading-relaxed">| 1M vectors | 16 | 64 | 64 | ~0.97 | ~800 | ~90 min |</p>
+<p class="text-gray-300 leading-relaxed">| 1M vectors | 32 | 128 | 100 | ~0.99 | ~400 | ~3.5 hrs |</p>
+
+<p class="text-gray-300 leading-relaxed">The build time gap is significant and gets worse at scale. HNSW build at 1M vectors takes 10–50x longer than IVFFlat at equivalent recall targets.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory footprint:</strong> HNSW stores the graph structure in memory. At <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code> with 1M float32 vectors at 1536 dimensions:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Raw vector data: ~6 GB</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> HNSW graph overhead: ~500 MB–1 GB</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Total working set: ~7 GB</li>
+
+<p class="text-gray-300 leading-relaxed">This is the primary reason HNSW can saturate RAM on large datasets before you hit query performance limits.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Head-to-Head Comparison: When to Choose Which</h3>
+
+<p class="text-gray-300 leading-relaxed">The choice between HNSW and IVFFlat comes down to five operational axes. Every production decision should be evaluated against all five simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Query Latency</strong></p>
+
+<p class="text-gray-300 leading-relaxed">HNSW wins at low concurrency. Its graph traversal is CPU cache-friendly and predictable. At <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search = 64</code>, HNSW typically delivers 2–4ms p99 latency on 1M vectors with a warm cache. IVFFlat at equivalent recall (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes = 50</code>) typically lands at 10–25ms p99 because it performs brute-force scans within clusters, which have worse cache behavior at high dimensionality.</p>
+
+<p class="text-gray-300 leading-relaxed">At high concurrency (50+ simultaneous queries), the memory bandwidth requirements of HNSW's graph traversal become a bottleneck, and the gap narrows.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Index Build Time</strong></p>
+
+<p class="text-gray-300 leading-relaxed">IVFFlat wins decisively. For a 1M vector dataset, IVFFlat builds in minutes; HNSW takes hours. For 10M+ vectors, HNSW build time can extend into days without parallelism. If your pipeline requires frequent full index rebuilds — for example, after bulk data loads or schema migrations — IVFFlat is the pragmatic choice.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Incremental Insert Behavior</strong></p>
+
+<p class="text-gray-300 leading-relaxed">HNSW wins. Inserting new vectors into an HNSW index is a graph operation: find neighbors, add edges, done. No rebalancing required. Query recall degrades gracefully as vectors are inserted.</p>
+
+<p class="text-gray-300 leading-relaxed">IVFFlat cannot efficiently accommodate new vectors that fall outside the distribution of the original k-means clusters. New vectors get assigned to their nearest centroid, but if the new data represents a genuinely new cluster (say, you started indexing documents in a new domain), recall drops because the probed clusters won't contain the relevant neighbors. You're rebuilding.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Demonstrating incremental insert behavior difference with pgvector via psycopg2
+import psycopg2
+import numpy as np
+from pgvector.psycopg2 import register_vector
+
+conn = psycopg2.connect("dbname=vectordb user=postgres")
+register_vector(conn)
+cur = conn.cursor()
+
+def insert_batch(embeddings: list[np.ndarray], contents: list[str]):
+    """
+    HNSW: insert works seamlessly; graph expands with each new node.
+    IVFFlat: insert works but may degrade recall if new vectors
+             fall outside existing cluster centroids.
+    """
+    for embedding, content in zip(embeddings, contents):
+        cur.execute(
+            "INSERT INTO documents (content, embedding) VALUES (%s, %s)",
+            (content, embedding)
+        )
+    conn.commit()
+    print(f"Inserted {len(embeddings)} vectors.")
+
+def measure_recall(query_vector: np.ndarray, k: int = 10) -&gt; float:
+    """
+    Compare ANN results against exact search to estimate recall.
+    """
+    # Exact search (sequential scan, bypasses index)
+    cur.execute("SET enable_indexscan = off")
+    cur.execute(
+        "SELECT id FROM documents ORDER BY embedding &lt;=&gt; %s LIMIT %s",
+        (query_vector, k)
+    )
+    exact_ids = set(row[0] for row in cur.fetchall())
+
+    # ANN search (uses index)
+    cur.execute("SET enable_indexscan = on")
+    cur.execute("SET hnsw.ef_search = 64")
+    cur.execute(
+        "SELECT id FROM documents ORDER BY embedding &lt;=&gt; %s LIMIT %s",
+        (query_vector, k)
+    )
+    ann_ids = set(row[0] for row in cur.fetchall())
+
+    recall = len(exact_ids & ann_ids) / k
+    return recall
+
+# Simulate incremental inserts and recall measurement
+rng = np.random.default_rng(42)
+batch_size = 10_000
+num_batches = 5
+
+for batch_num in range(num_batches):
+    # Simulate new embeddings arriving (e.g., from OpenAI API)
+    new_embeddings = [rng.standard_normal(1536).astype(np.float32)
+                      for _ in range(batch_size)]
+    new_contents = [f"doc_batch{batch_num}_{i}" for i in range(batch_size)]
+    
+    insert_batch(new_embeddings, new_contents)
+    
+    # Sample query to measure recall after each batch
+    query = rng.standard_normal(1536).astype(np.float32)
+    recall = measure_recall(query)
+    
+    cur.execute("SELECT COUNT(*) FROM documents")
+    total = cur.fetchone()[0]
+    print(f"After batch {batch_num + 1}: {total:,} total vectors, recall = {recall:.3f}")
+
+cur.close()
+conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Memory Usage</strong></p>
+
+<p class="text-gray-300 leading-relaxed">IVFFlat wins on memory efficiency. The inverted lists are compact structures; only the centroid vectors and the flat vector lists need to stay in memory for good performance. HNSW's graph layer — the bidirectional edge lists — consumes memory proportional to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m * n</code>, where n is the number of vectors. At m=16 and 10M vectors, the graph alone occupies ~2.5 GB before the vector data itself.</p>
+
+<p class="text-gray-300 leading-relaxed">For memory-constrained deployments (small cloud instances, embedded applications), IVFFlat often fits where HNSW does not.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">5. Recall Consistency</strong></p>
+
+<p class="text-gray-300 leading-relaxed">HNSW produces more consistent recall across diverse query distributions. IVFFlat recall is uneven: queries whose nearest neighbors span multiple clusters get worse recall than queries whose neighborhood is tightly contained within one cluster. This is the partitioning equivalent of a query that crosses partition boundaries — you'll miss results unless you increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">HNSW's graph traversal is more distribution-agnostic. It navigates toward the answer regardless of how the vector space is partitioned, which is why it tends to be the default recommendation for general-purpose vector search.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Managed Vector Databases: How They Expose These Tradeoffs</h3>
+
+<p class="text-gray-300 leading-relaxed">The same fundamental tradeoffs appear in every managed vector database, even when the interface abstracts away the implementation details.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Weaviate: HNSW configuration (Weaviate default index type)
+import weaviate
+from weaviate.classes.config import Configure, VectorDistances
+
+client = weaviate.connect_to_local()
+
+# Create a collection with explicit HNSW tuning
+client.collections.create(
+    name="Documents",
+    vectorizer_config=Configure.Vectorizer.none(),  # bring-your-own vectors
+    vector_index_config=Configure.VectorIndex.hnsw(
+        distance_metric=VectorDistances.COSINE,
+        ef_construction=128,   # higher = better index quality, slower build
+        max_connections=32,    # equivalent to m in HNSW
+        ef=64,                 # ef_search equivalent; can be overridden per query
+        dynamic_ef_min=100,    # auto-tune ef_search based on load
+        dynamic_ef_max=500,
+        dynamic_ef_factor=8,
+    )
+)
+
+# Create a collection with flat (exact) index for small datasets
+client.collections.create(
+    name="SmallDocuments",
+    vectorizer_config=Configure.Vectorizer.none(),
+    vector_index_config=Configure.VectorIndex.flat(
+        distance_metric=VectorDistances.COSINE,
+        # Flat index = exact search; appropriate for &lt; 10K vectors
+        # No recall tradeoff, but latency scales linearly with dataset size
+    )
+)
+
+# Query with per-request ef override
+collection = client.collections.get("Documents")
+results = collection.query.near_vector(
+    near_vector=[0.1, 0.2, ...],  # 1536-dim query vector
+    limit=10,
+    return_metadata=["distance"],
+)
+
+for obj in results.objects:
+    print(f"ID: {obj.uuid}, Distance: {obj.metadata.distance:.4f}")
+
+client.close()</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Qdrant: comparing HNSW configuration options
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, HnswConfigDiff,
+    OptimizersConfigDiff, SearchParams
+)
+
+client = QdrantClient(host="localhost", port=6333)
+
+# Create collection with tuned HNSW
+client.recreate_collection(
+    collection_name="production_docs",
+    vectors_config=VectorParams(
+        size=1536,
+        distance=Distance.COSINE,
+    ),
+    hnsw_config=HnswConfigDiff(
+        m=16,                    # edges per node; default 16
+        ef_construct=100,        # build-time beam width; default 100
+        full_scan_threshold=10_000,  # fall back to exact search below this count
+        # This is a key Qdrant feature: automatic exact search for small collections
+    ),
+    optimizers_config=OptimizersConfigDiff(
+        indexing_threshold=20_000,   # don't build HNSW until 20K vectors loaded
+        # Prevents expensive partial index builds during bulk ingestion
+    )
+)
+
+# Query with per-request ef override — critical for latency/recall tuning
+search_results = client.search(
+    collection_name="production_docs",
+    query_vector=[0.1, 0.2, ...],  # your query embedding
+    limit=10,
+    search_params=SearchParams(
+        hnsw_ef=128,        # override collection default for this query
+        exact=False         # True forces exact search regardless of index
+    )
+)
+
+for result in search_results:
+    print(f"ID: {result.id}, Score: {result.score:.4f}")
+
+# Qdrant's quantization support (not available in pgvector IVFFlat):
+# Scalar quantization reduces memory 4x at ~1% recall cost
+from qdrant_client.models import ScalarQuantization, ScalarQuantizationConfig, ScalarType
+
+client.recreate_collection(
+    collection_name="memory_optimized_docs",
+    vectors_config=VectorParams(size=1536, distance=Distance.COSINE),
+    quantization_config=ScalarQuantization(
+        scalar=ScalarQuantizationConfig(
+            type=ScalarType.INT8,
+            quantile=0.99,     # clip outliers beyond 99th percentile
+            always_ram=True,   # keep quantized vectors in RAM, original on disk
+        )
+    )
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone</strong> abstracts index type selection entirely — you choose a serverless or pod-based deployment, and the platform manages the underlying algorithm. Pod-based deployments expose <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">metric</code> (cosine, euclidean, dotproduct) and pod type/size but not raw HNSW parameters. The tradeoff is operational simplicity at the cost of fine-grained tuning. For teams without a dedicated ML infrastructure engineer, this is often the right call.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Milvus</strong> exposes both HNSW and IVFFlat as first-class options along with more exotic indexes like DISKANN (for data that exceeds RAM), IVF_SQ8 (scalar quantization of IVFFlat), and HNSW_SQ. For very large datasets (>100M vectors) that cannot fit in RAM, DISKANN becomes the relevant comparison point — but that's beyond the scope of this chapter.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Production Tuning Playbook</h3>
+
+<p class="text-gray-300 leading-relaxed">Understanding the algorithms is necessary but not sufficient. Here is how experienced practitioners actually set parameters in production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Establish your recall floor</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Before touching index parameters, decide what recall is acceptable for your application. Run exact search on a representative query sample and benchmark baseline latency. Then set a target: "We need 0.95 recall at under 20ms p99 at 100 QPS."</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Size your index</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For IVFFlat: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists = sqrt(row_count)</code> is a reliable starting point up to 1M rows. For HNSW: start with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction=64</code> — these are conservative defaults that work well across most workloads.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: Tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> against recall</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run the recall measurement loop from the earlier Python example against your actual query distribution. Plot recall vs. latency as you sweep the parameter. The curve will be steep initially (large recall gains per unit of latency) and then flatten (diminishing returns). Pick the knee of the curve.</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

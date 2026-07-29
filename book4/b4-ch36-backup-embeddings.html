@@ -1,0 +1,579 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 36: Backup Strategies for Embedding Data — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 36: Backup Strategies for Embedding Data. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 36 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 36: Backup Strategies for Embedding Data</h2>
+
+<p class="text-gray-300 leading-relaxed">Embedding data presents a deceptively familiar backup challenge. The vectors themselves are just floating-point arrays — and any experienced DBA knows how to back up a table of floats. What makes embedding backups genuinely different is the relationship between three distinct artifacts that must remain in sync: the raw source data, the embeddings derived from that data, and the model that produced those embeddings. Back up only two of the three and you have a restoration problem that won't reveal itself until you're already in a production incident. This chapter covers the full backup and recovery strategy for vector workloads — from pgvector snapshots to managed Pinecone exports, from model versioning to the operational patterns that keep RAG pipelines recoverable at scale.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Three-Artifact Problem</h3>
+
+<p class="text-gray-300 leading-relaxed">In traditional database backups, data is self-contained. A row in a customer table means the same thing whether you restore it today or in three years. Embeddings are not self-contained — they are a function of source text and model weights, and that function changes when either input changes.</p>
+
+<p class="text-gray-300 leading-relaxed">Consider a document chunk stored in pgvector:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+CREATE TABLE document_chunks (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_id   UUID NOT NULL REFERENCES documents(id),
+    chunk_text  TEXT NOT NULL,
+    embedding   VECTOR(1536),
+    model_id    VARCHAR(100) NOT NULL,  -- e.g. 'text-embedding-3-small-v1'
+    model_hash  VARCHAR(64),            -- SHA-256 of model release tag
+    embedded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT fk_source FOREIGN KEY (source_id)
+        REFERENCES documents(id) ON DELETE CASCADE
+);
+
+-- Index for backup validation queries
+CREATE INDEX idx_chunks_model ON document_chunks(model_id, embedded_at);
+
+-- View: chunks without matching source data (backup integrity check)
+CREATE VIEW orphaned_embeddings AS
+SELECT dc.id, dc.source_id, dc.model_id, dc.embedded_at
+FROM   document_chunks dc
+LEFT   JOIN documents d ON d.id = dc.source_id
+WHERE  d.id IS NULL;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model_id</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model_hash</code> columns are the starting point for a coherent backup strategy. If you restore embeddings generated by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> but your application is now calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>, every similarity search will return nonsense — not an error, not a crash, just silently wrong results. Backing up the vector data without capturing what produced it means the restore is incomplete by definition.</p>
+
+<p class="text-gray-300 leading-relaxed">The three artifacts to track together:</p>
+
+<p class="text-gray-300 leading-relaxed">| Artifact | What to Back Up | Where It Lives |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Source data | Raw text, documents, metadata | Your primary RDBMS or object store |</p>
+<p class="text-gray-300 leading-relaxed">| Embeddings | Vector arrays + model provenance | Vector database or pgvector table |</p>
+<p class="text-gray-300 leading-relaxed">| Model reference | Model version, provider, API endpoint config | Model registry, config management |</p>
+
+<p class="text-gray-300 leading-relaxed">The goal of an embedding backup strategy is to ensure that after any restore event, you can either (a) serve existing embeddings from a consistent snapshot where all three artifacts match, or (b) regenerate embeddings from source data using the same model version. Both paths need explicit support in your backup design.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Backup Strategies for pgvector</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL with pgvector behaves like any other PostgreSQL workload for the purposes of backup tooling. The difference is in how large the data gets. A table with 10 million document chunks at 1536 dimensions (float4, 4 bytes per dimension) holds approximately <strong class="text-white">58 GB</strong> of vector data before indices. HNSW indices on that table add another 15–30 GB depending on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code> parameters. Plan storage accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Logical Backups with pg_dump</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For moderate-scale deployments (under ~50 GB of vector data), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> is still workable:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Full logical backup — include custom format for parallel restore capability
+pg_dump \
+  --format=custom \
+  --compress=9 \
+  --jobs=4 \
+  --table=document_chunks \
+  --table=documents \
+  --file=/backup/rag_vectors_$(date +%Y%m%d_%H%M%S).dump \
+  rag_production_db
+
+# Verify backup integrity before storing offsite
+pg_restore --list /backup/rag_vectors_20240615_020000.dump | head -30
+
+# Restore to a staging environment for validation
+pg_restore \
+  --format=custom \
+  --jobs=4 \
+  --dbname=rag_staging \
+  /backup/rag_vectors_20240615_020000.dump</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> does not back up HNSW or IVFFlat indices — it captures the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> DDL, which means the index is rebuilt from scratch on restore. For a 10-million-row table, that rebuild takes 20–45 minutes depending on hardware. Budget this into your RTO. If rebuilding the index is unacceptable, use physical backup methods.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Physical Backups with pgBackRest</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For large vector tables where index rebuild time breaks your RTO, pgBackRest with incremental backups is the right tool:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# pgbackrest.conf excerpt for vector workload
+# /etc/pgbackrest/pgbackrest.conf
+
+[global]
+repo1-path=/mnt/backup/pgbackrest
+repo1-retention-full=4          # 4 full backups (weekly cycle = 1 month)
+repo1-retention-diff=14         # 14 differential backups
+repo1-cipher-type=aes-256-cbc
+repo1-cipher-pass=&lt;VAULT_SECRET&gt;
+compress-type=lz4               # lz4 is faster than gzip for large float arrays
+compress-level=3
+process-max=4
+
+[rag-production]
+pg1-path=/var/lib/postgresql/16/main
+pg1-host=db-primary.internal
+
+# Full backup — run weekly
+pgbackrest --stanza=rag-production backup --type=full
+
+# Differential backup — run daily
+pgbackrest --stanza=rag-production backup --type=diff
+
+# Restore to point-in-time (critical for embedding consistency)
+pgbackrest --stanza=rag-production restore \
+  --target="2024-06-15 03:00:00" \
+  --target-action=promote</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The PITR capability is particularly valuable for embedding data. If your embedding pipeline had a bug that corrupted embeddings between 14:00 and 16:00 yesterday, you can restore to 13:59 and have a clean state — HNSW index intact, no rebuild required.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Incremental Strategy for Append-Heavy Workloads</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Most RAG pipelines are append-heavy: new documents get embedded and inserted, old embeddings rarely change. This makes partial exports viable as a complement to full backups:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Export only embeddings created in the last 24 hours
+COPY (
+    SELECT
+        dc.id,
+        dc.source_id,
+        dc.chunk_text,
+        dc.embedding::TEXT,   -- cast vector to text for portable export
+        dc.model_id,
+        dc.model_hash,
+        dc.embedded_at,
+        d.title,
+        d.source_url
+    FROM   document_chunks dc
+    JOIN   documents d ON d.id = dc.source_id
+    WHERE  dc.embedded_at &gt;= NOW() - INTERVAL '24 hours'
+    ORDER BY dc.embedded_at
+)
+TO '/backup/incremental/chunks_20240615.csv'
+WITH (FORMAT CSV, HEADER, DELIMITER ',');
+
+-- Track export completion for audit trail
+INSERT INTO backup_audit (export_type, row_count, export_start, export_end, file_path)
+SELECT
+    'incremental_daily',
+    COUNT(*),
+    MIN(embedded_at),
+    MAX(embedded_at),
+    '/backup/incremental/chunks_20240615.csv'
+FROM document_chunks
+WHERE embedded_at &gt;= NOW() - INTERVAL '24 hours';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Exporting from Managed Vector Databases</h3>
+
+<p class="text-gray-300 leading-relaxed">Managed services like Pinecone, Weaviate Cloud, and Qdrant Cloud do not expose file-level backup interfaces. Backup means export — pulling vectors out via API and storing them yourself. This is the primary gap in managed vector database offerings as of 2024, and every production deployment needs an explicit strategy to address it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone: Batch Fetch Export</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone does not offer a native export API as of this writing. The operational pattern is to maintain a shadow copy in your source database and reconstruct from there, but if you need the actual vectors:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import json
+import time
+from pinecone import Pinecone
+from pathlib import Path
+
+pc = Pinecone(api_key=os.environ["PINECONE_API_KEY"])
+index = pc.Index("rag-production")
+
+def export_pinecone_namespace(
+    index,
+    namespace: str,
+    output_dir: str,
+    batch_size: int = 1000
+) -&gt; dict:
+    """
+    Export all vectors from a Pinecone namespace.
+    Uses list() to paginate IDs, then fetch() in batches.
+    Returns export statistics.
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    output_file = f"{output_dir}/pinecone_{namespace}_{int(time.time())}.jsonl"
+
+    stats = index.describe_index_stats()
+    namespace_stats = stats.namespaces.get(namespace, {})
+    total_vectors = namespace_stats.get("vector_count", 0)
+
+    print(f"Exporting {total_vectors} vectors from namespace '{namespace}'")
+
+    exported = 0
+    pages_written = 0
+
+    with open(output_file, "w") as f:
+        # list() paginates through all vector IDs
+        for ids_page in index.list(namespace=namespace, limit=batch_size):
+            if not ids_page:
+                break
+
+            # Fetch actual vectors + metadata
+            result = index.fetch(ids=ids_page, namespace=namespace)
+
+            for vector_id, vector_data in result.vectors.items():
+                record = {
+                    "id": vector_id,
+                    "values": vector_data.values,
+                    "metadata": vector_data.metadata or {},
+                    "namespace": namespace
+                }
+                f.write(json.dumps(record) + "\n")
+                exported += 1
+
+            pages_written += 1
+            if pages_written % 10 == 0:
+                print(f"  Progress: {exported}/{total_vectors} vectors exported")
+
+    return {
+        "namespace": namespace,
+        "total_exported": exported,
+        "output_file": output_file,
+        "timestamp": time.time()
+    }
+
+# Export all namespaces
+stats = index.describe_index_stats()
+for namespace in stats.namespaces.keys():
+    result = export_pinecone_namespace(
+        index=index,
+        namespace=namespace,
+        output_dir="/backup/pinecone",
+        batch_size=1000
+    )
+    print(f"Exported: {result}")
+
+# Save index configuration alongside data
+index_config = {
+    "name": "rag-production",
+    "dimension": stats.dimension,
+    "metric": "cosine",
+    "namespaces": {
+        ns: data.vector_count
+        for ns, data in stats.namespaces.items()
+    },
+    "export_timestamp": time.time()
+}
+
+with open("/backup/pinecone/index_config.json", "w") as f:
+    json.dump(index_config, f, indent=2)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This export produces JSONL files that can be reimported to a new Pinecone index or cross-loaded into Weaviate or Qdrant if you need to migrate. The key requirement: store this alongside your model configuration so you know exactly which embedding model produced these vectors.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate: Native Backup API</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Weaviate has a first-class backup API that supports S3, GCS, and Azure Blob Storage backends. This is significantly more operationally clean than the Pinecone fetch-loop approach:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import weaviate
+import time
+import os
+
+client = weaviate.connect_to_wcs(
+    cluster_url=os.environ["WEAVIATE_URL"],
+    auth_credentials=weaviate.auth.AuthApiKey(os.environ["WEAVIATE_API_KEY"])
+)
+
+def create_weaviate_backup(
+    client,
+    backup_id: str,
+    classes: list[str] | None = None,  # None = all classes
+    backend: str = "s3",
+    bucket: str = "my-weaviate-backups",
+    path: str = "backups"
+) -&gt; dict:
+    """
+    Trigger a Weaviate backup and wait for completion.
+    Returns backup status details.
+    """
+    backup_config = {
+        "id": backup_id,
+        "include": classes  # omit to back up all classes
+    }
+
+    print(f"Starting Weaviate backup: {backup_id}")
+
+    result = client.backup.create(
+        backup_id=backup_id,
+        backend=backend,
+        include_classes=classes,
+        wait_for_completion=False  # async — we'll poll
+    )
+
+    print(f"Backup initiated. Status: {result.status}")
+
+    # Poll until completion
+    while True:
+        status = client.backup.get_create_status(
+            backup_id=backup_id,
+            backend=backend
+        )
+
+        if status.status == "SUCCESS":
+            print(f"Backup completed: {backup_id}")
+            return {
+                "backup_id": backup_id,
+                "status": "SUCCESS",
+                "backend": backend,
+                "path": f"s3://{bucket}/{path}/{backup_id}"
+            }
+        elif status.status == "FAILED":
+            raise RuntimeError(f"Backup failed: {status.error}")
+        else:
+            print(f"  Status: {status.status} — waiting 10s...")
+            time.sleep(10)
+
+# Create a timestamped backup
+backup_id = f"rag-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+
+backup_result = create_weaviate_backup(
+    client=client,
+    backup_id=backup_id,
+    classes=["DocumentChunk", "Document"],  # specific classes only
+    backend="s3",
+    bucket="my-weaviate-backups"
+)
+
+print(f"Backup stored: {backup_result}")
+
+# Restore from backup (e.g., disaster recovery scenario)
+def restore_weaviate_backup(client, backup_id: str, backend: str = "s3"):
+    result = client.backup.restore(
+        backup_id=backup_id,
+        backend=backend,
+        wait_for_completion=True
+    )
+    print(f"Restore status: {result.status}")
+    return result
+
+client.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Weaviate backups are consistent snapshots — they do not require downtime and they include schema definitions, object properties, and vector indices together. This is the model all vector databases should eventually follow, and it simplifies the three-artifact problem considerably because schema (which includes the model configuration) is part of the backup payload.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Model Versioning as a Backup Dependency</h3>
+
+<p class="text-gray-300 leading-relaxed">Vectors are only interpretable in the context of the model that created them. This makes model version management a first-class backup concern, not an afterthought. DBAs entering the AI infrastructure space often underestimate this dependency because traditional database backups have no equivalent.</p>
+
+<p class="text-gray-300 leading-relaxed">The failure mode looks like this: you restore your vector database from a backup taken six months ago. The backup is clean. All vectors are present. You rebuild the HNSW index. Queries return results. But your application team upgraded from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> four months ago, and the two models produce vectors in incompatible embedding spaces. The cosine similarities you're computing between the restored old vectors and new query vectors are geometrically meaningless.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model Registry Pattern</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import json
+import hashlib
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+
+class EmbeddingModelRegistry:
+    """
+    Tracks model versions used to produce embeddings.
+    Persisted as JSON alongside vector backups.
+    In production, back this up to S3/GCS with versioning enabled.
+    """
+
+    def __init__(self, registry_path: str = "/etc/rag/model_registry.json"):
+        self.registry_path = Path(registry_path)
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load()
+
+    def _load(self):
+        if self.registry_path.exists():
+            with open(self.registry_path) as f:
+                self.data = json.load(f)
+        else:
+            self.data = {"models": {}, "current": None}
+
+    def _save(self):
+        with open(self.registry_path, "w") as f:
+            json.dump(self.data, f, indent=2)
+
+    def register_model(
+        self,
+        model_id: str,
+        provider: str,
+        dimensions: int,
+        endpoint: str,
+        api_version: str | None = None,
+        notes: str = ""
+    ) -&gt; str:
+        """
+        Register a model version. Returns a stable model_hash
+        that can be stored alongside each embedding row.
+        """
+        fingerprint = f"{provider}:{model_id}:{dimensions}:{api_version or ''}"
+        model_hash = hashlib.sha256(fingerprint.encode()).hexdigest()[:16]
+
+        self.data["models"][model_hash] = {
+            "model_id": model_id,
+            "provider": provider,
+            "dimensions": dimensions,
+            "endpoint": endpoint,
+            "api_version": api_version,
+            "registered_at": datetime.now(timezone.utc).isoformat(),
+            "notes": notes,
+            "hash": model_hash
+        }
+
+        self._save()
+        return model_hash
+
+    def set_current(self, model_hash: str):
+        assert model_hash in self.data["models"], f"Unknown model hash: {model_hash}"
+        self.data["current"] = model_hash
+        self._save()
+
+    def get_current(self) -&gt; dict:
+        assert self.data["current"], "No current model set"
+        return self.data["models"][self.data["current"]]
+
+    def get_model(self, model_hash: str) -&gt; dict:
+        return self.data["models"].get(model_hash)
+
+    def compatibility_check(
+        self,
+        backup_model_hash: str,
+        current_model_hash: str
+    ) -&gt; dict:
+        """
+        Check whether backup vectors are compatible with current model.
+        Returns a dict with compatibility status and recommended action.
+        """
+        backup_model = self.get_model(backup_model_hash)
+        current_model = self.get_model(current_model_hash)
+
+        if backup_model_hash == current_model_hash:
+            return {"compatible": True, "action": "restore_directly"}
+
+        if backup_model["dimensions"] != current_model["dimensions"]:
+            return {
+                "compatible": False,
+                "action": "re_embed_all",
+                "reason": f"Dimension mismatch: {backup_model['dimensions']} vs {current_model['dimensions']}"
+            }
+
+        if backup_model["model_id"] != current_model["model_id"]:
+            return {
+                "compatible": False,
+                "action": "re_embed_all",
+                "reason": f"Different model: {backup_model['model_id']} vs {current_model['model_id']}"
+            }
+
+        return {
+            "compatible": False,
+            "action": "evaluate",
+            "reason": "Same model ID but different versions — test similarity quality before deciding"
+        }
+
+
+# Usage
+registry = EmbeddingModelRegistry()
+
+# Register models in use
+hash_ada = registry.register_model(
+    model_id="text-embedding-ada-002",
+    provider="openai",
+    dimensions=1536,
+    endpoint="https://api.openai.com/v1/embeddings",
+    notes="Legacy model, used before 2024-03"
+)
+
+hash_v3 = registry.register_model(
+    model_id="text-embedding-3-small",
+    provider="openai",
+    dimensions=1536,
+    endpoint="https://api.openai.com/v1/embeddings",
+    api_version="2024-02-01",
+    notes="Current production model"
+)
+
+registry.set_current(hash_v3)
+
+# Before restore: check compatibility
+check = registry.compatibility_check(hash_ada, hash_v3)
+print(check)
+# {'compatible': False, 'action': 're_embed_all', 'reason': 'Different model: ...'}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Back up the model registry JSON to the same location as your vector exports and treat it as part of the backup artifact set. If the registry says a restore requires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">re_embed_all</code>, your recovery procedure needs to include re-embedding time in the RTO calculation — which at 10 million chunks and API rate limits can be measured in hours, not minutes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Recovery Procedures and RTO Planning</h3>
+
+<p class="text-gray-300 leading-relaxed">Recovery from a backup event in a vector workload has three distinct phases, each with its own time budget:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Data restore</strong> — Moving backup files to the target system and importing them</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Index rebuild</strong> — Reconstructing the vector index (HNSW, IVFFlat, etc.)</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Re-embedding</strong> — If model compatibility check fails, regenerating all vectors from source</p>
+
+<p class="text-gray-300 leading-relaxed">Understanding the time cost of each phase is the foundation of a realistic RTO commitment.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase Timing Reference</strong> (approximate, hardware-dependent)</p>
+
+<p class="text-gray-300 leading-relaxed">| Operation | Scale | Typical Duration |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| pgBackRest physical restore | 100 GB | 15–30 min |</p>
+<p class="text-gray-300 leading-relaxed">| pg_dump logical restore | 100 GB | 45–90 min |</p>
+<p class="text-gray-300 leading-relaxed">| HNSW index rebuild (10M vectors, 1536-dim) | — | 20–45 min |</p>
+<p class="text-gray-300 leading-relaxed">| Re-embedding via OpenAI API (10M chunks) | rate-limited | 4–12 hours |</p>
+<p class="text-gray-300 leading-relaxed">| Re-embedding via local sentence-transformers | GPU available | 2–4 hours |</p>
+<p class="text-gray-300 leading-relaxed">| Weaviate backup restore from S3 | 50 GB | 10–20 min |</p>
+<p class="text-gray-300 leading-relaxed">| Pinecone upsert re-import | 10M vectors | 3–6 hours |</p>
+
+<p class="text-gray-300 leading-relaxed">The re-embedding phase is the wildcard. If your recovery plan includes it, you need either pre-approved API rate limit increases with your embedding provider, or local model hosting capability. Planning for model-version-locked recovery avoids this phase entirely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Automated Recovery Validation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">After any restore, automated validation should confirm that the restored vectors actually work before the system accepts production traffic:</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

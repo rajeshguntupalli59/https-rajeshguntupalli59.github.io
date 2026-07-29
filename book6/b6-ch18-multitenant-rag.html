@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 18: Multi-Tenant RAG: One Database, Many Customers — AI-Native Apps on PostgreSQL</title>
+  <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 18: Multi-Tenant RAG: One Database, Many Customers. LLMs, RAG, agents — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-rose-500 to-rose-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-rose-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 6 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-rose-400 hover:text-rose-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-rose-900/40 border border-rose-800/40 text-rose-300 text-xs rounded-full font-medium">Chapter 18 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">AI-Native Apps on PostgreSQL</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 18: Multi-Tenant RAG: One Database, Many Customers</h2>
+
+<p class="text-gray-300 leading-relaxed">Building a RAG system for one tenant is a solved problem. Building one that serves hundreds of enterprise customers — each with their own documents, their own access controls, their own embedding models, and their own usage quotas — while sharing a single PostgreSQL cluster is a different animal entirely. This chapter walks through the complete architecture for multi-tenant RAG: how to partition knowledge, enforce isolation at the database level, handle per-tenant configuration, and scale embedding ingestion without turning your cluster into a bottleneck. PostgreSQL's combination of row-level security, pgvector, JSONB, and logical replication makes it uniquely suited to this problem in ways that purpose-built vector databases simply cannot match.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Case for Shared Infrastructure</h3>
+
+<p class="text-gray-300 leading-relaxed">Before jumping into schema design, it's worth being explicit about why you'd run all tenants on the same PostgreSQL cluster rather than giving each tenant their own database or their own instance.</p>
+
+<p class="text-gray-300 leading-relaxed">The naive approach — one database per customer — sounds appealing from an isolation perspective. It fails in practice for three reasons. First, PostgreSQL connection overhead multiplies badly: a hundred tenants each needing ten connections means a thousand connections before you've written a line of application code. Second, schema migrations become an operational nightmare — deploying a new embedding column means coordinating across a hundred databases simultaneously. Third, you lose cross-tenant analytics, aggregate billing queries, and system-wide monitoring that your operations team needs.</p>
+
+<p class="text-gray-300 leading-relaxed">The shared-schema approach solves all three. One schema, one migration path, one connection pool. PostgreSQL's row-level security (RLS) gives you tenant isolation at the database engine level — not in application code, where it can be accidentally bypassed.</p>
+
+<p class="text-gray-300 leading-relaxed">The key insight: <strong class="text-white">tenant isolation in a shared schema is a database responsibility, not an application responsibility.</strong> When you enforce isolation via RLS policies on every table, even a buggy query that forgets a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = $1</code> clause returns zero rows instead of leaking data across customers. That guarantee is worth the schema complexity.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Schema Design: Tenants, Documents, and Vectors</h3>
+
+<p class="text-gray-300 leading-relaxed">The foundation is a tenant registry table that drives everything downstream. Every table in the system has a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> foreign key that anchors rows to a specific customer.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core tenant registry
+CREATE TABLE tenants (
+    tenant_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            TEXT NOT NULL,
+    slug            TEXT NOT NULL UNIQUE,
+    plan            TEXT NOT NULL DEFAULT 'starter'
+                    CHECK (plan IN ('starter', 'professional', 'enterprise')),
+    embedding_model TEXT NOT NULL DEFAULT 'text-embedding-3-small',
+    llm_model       TEXT NOT NULL DEFAULT 'gpt-4o-mini',
+    max_documents   INTEGER NOT NULL DEFAULT 1000,
+    max_tokens_day  BIGINT NOT NULL DEFAULT 1000000,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active       BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+-- Per-tenant API credentials (encrypted at rest via pgcrypto)
+CREATE TABLE tenant_api_keys (
+    key_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id   UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    key_hash    TEXT NOT NULL UNIQUE,  -- SHA-256 of the actual key
+    key_prefix  TEXT NOT NULL,         -- first 8 chars for display
+    name        TEXT NOT NULL,
+    scopes      TEXT[] NOT NULL DEFAULT ARRAY['read', 'write'],
+    last_used   TIMESTAMPTZ,
+    expires_at  TIMESTAMPTZ,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    is_active   BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE INDEX idx_tenant_api_keys_hash ON tenant_api_keys(key_hash);
+CREATE INDEX idx_tenant_api_keys_tenant ON tenant_api_keys(tenant_id);
+
+-- Document metadata — no vectors here, those live in a separate table
+CREATE TABLE documents (
+    document_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    title           TEXT NOT NULL,
+    source_uri      TEXT,
+    content_type    TEXT NOT NULL DEFAULT 'text/plain',
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'processing', 'ready', 'failed', 'archived')),
+    chunk_count     INTEGER NOT NULL DEFAULT 0,
+    token_count     INTEGER NOT NULL DEFAULT 0,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    -- File-level hash to detect duplicate uploads
+    content_hash    TEXT,
+    ingested_at     TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_documents_tenant ON documents(tenant_id);
+CREATE INDEX idx_documents_status ON documents(tenant_id, status);
+CREATE INDEX idx_documents_content_hash ON documents(tenant_id, content_hash);
+
+-- Chunks with embeddings — this is where pgvector lives
+CREATE TABLE document_chunks (
+    chunk_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    document_id     UUID NOT NULL REFERENCES documents(document_id) ON DELETE CASCADE,
+    chunk_index     INTEGER NOT NULL,
+    content         TEXT NOT NULL,
+    token_count     INTEGER NOT NULL,
+    embedding       VECTOR(1536),      -- OpenAI small / ada-002 compatible
+    embedding_model TEXT NOT NULL,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (document_id, chunk_index)
+);
+
+-- HNSW index scoped by tenant — the magic that makes per-tenant search fast
+-- We'll discuss the partitioning strategy for this index below
+CREATE INDEX idx_chunks_embedding_hnsw ON document_chunks
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX idx_chunks_tenant ON document_chunks(tenant_id);
+CREATE INDEX idx_chunks_document ON document_chunks(document_id);
+
+-- Conversation history — full context per tenant, per session
+CREATE TABLE conversations (
+    conversation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    user_id         TEXT NOT NULL,     -- tenant's own user identifier
+    title           TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_message_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_conversations_tenant_user ON conversations(tenant_id, user_id);
+
+CREATE TABLE conversation_messages (
+    message_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES conversations(conversation_id) ON DELETE CASCADE,
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    role            TEXT NOT NULL CHECK (role IN ('user', 'assistant', 'system')),
+    content         TEXT NOT NULL,
+    -- Track which chunks were used to generate this response
+    source_chunk_ids UUID[],
+    -- Token accounting
+    prompt_tokens   INTEGER,
+    completion_tokens INTEGER,
+    model           TEXT,
+    latency_ms      INTEGER,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_messages_conversation ON conversation_messages(conversation_id, created_at);
+CREATE INDEX idx_messages_tenant ON conversation_messages(tenant_id);
+
+-- Usage tracking for billing and quota enforcement
+CREATE TABLE usage_events (
+    event_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id) ON DELETE CASCADE,
+    event_type      TEXT NOT NULL,  -- 'embedding', 'completion', 'retrieval'
+    tokens_used     INTEGER NOT NULL DEFAULT 0,
+    model           TEXT,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Partition usage_events by month for query performance
+CREATE INDEX idx_usage_tenant_date ON usage_events(tenant_id, created_at);
+
+-- Audit log — immutable record of all data access
+CREATE TABLE audit_log (
+    log_id          BIGSERIAL PRIMARY KEY,
+    tenant_id       UUID NOT NULL REFERENCES tenants(tenant_id),
+    actor_key_id    UUID REFERENCES tenant_api_keys(key_id),
+    action          TEXT NOT NULL,
+    resource_type   TEXT,
+    resource_id     UUID,
+    ip_address      INET,
+    metadata        JSONB NOT NULL DEFAULT '{}',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_audit_tenant_time ON audit_log(tenant_id, created_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Notice several design decisions embedded in this schema. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> column appears on every table — not just documents — so RLS policies can be applied uniformly without joining back to a parent table. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code> column lives on both <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenants</code> (the default) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> (the actual model used) because tenants may change models over time and you need to know which model generated each vector for correct similarity comparisons. Usage events are a separate table rather than counters on the tenant row, which avoids lock contention and gives you a full audit trail for billing disputes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Row-Level Security: Making Tenant Isolation Automatic</h3>
+
+<p class="text-gray-300 leading-relaxed">RLS is the load-bearing wall of the multi-tenant architecture. Once it's in place, every query — regardless of which application code path executes it — automatically scopes to the current tenant.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable RLS on all tenant-scoped tables
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE conversation_messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE usage_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_log ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_api_keys ENABLE ROW LEVEL SECURITY;
+
+-- Application role — this is what your FastAPI app connects as
+CREATE ROLE app_user;
+GRANT CONNECT ON DATABASE ragdb TO app_user;
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA public TO app_user;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
+
+-- Admin role — bypasses RLS for migrations and ops
+CREATE ROLE rag_admin BYPASSRLS;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO rag_admin;
+
+-- The session variable that controls which tenant is active
+-- Application sets this at the start of every connection/transaction
+-- current_setting('app.tenant_id') returns the active tenant UUID
+
+CREATE POLICY tenant_isolation_documents ON documents
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_chunks ON document_chunks
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_conversations ON conversations
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_messages ON conversation_messages
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_usage ON usage_events
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_audit ON audit_log
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+CREATE POLICY tenant_isolation_api_keys ON tenant_api_keys
+    FOR ALL TO app_user
+    USING (tenant_id = current_setting('app.tenant_id')::UUID)
+    WITH CHECK (tenant_id = current_setting('app.tenant_id')::UUID);
+
+-- Helper function to set tenant context and validate the API key in one shot
+CREATE OR REPLACE FUNCTION set_tenant_context(p_api_key TEXT)
+RETURNS UUID AS $$
+DECLARE
+    v_tenant_id UUID;
+    v_key_id    UUID;
+    v_key_hash  TEXT;
+BEGIN
+    v_key_hash := encode(sha256(p_api_key::bytea), 'hex');
+
+    SELECT t.tenant_id, k.key_id
+    INTO v_tenant_id, v_key_id
+    FROM tenant_api_keys k
+    JOIN tenants t ON t.tenant_id = k.tenant_id
+    WHERE k.key_hash = v_key_hash
+      AND k.is_active = TRUE
+      AND t.is_active = TRUE
+      AND (k.expires_at IS NULL OR k.expires_at &gt; NOW());
+
+    IF v_tenant_id IS NULL THEN
+        RAISE EXCEPTION 'Invalid or expired API key' USING ERRCODE = '28000';
+    END IF;
+
+    -- Set the session variable — all subsequent queries use this
+    PERFORM set_config('app.tenant_id', v_tenant_id::TEXT, true);  -- true = transaction-local
+
+    -- Update last_used asynchronously via trigger or background job
+    UPDATE tenant_api_keys
+    SET last_used = NOW()
+    WHERE key_id = v_key_id;
+
+    RETURN v_tenant_id;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Quota check function — call before expensive operations
+CREATE OR REPLACE FUNCTION check_tenant_quota(
+    p_tenant_id UUID,
+    p_tokens_needed INTEGER DEFAULT 0
+)
+RETURNS BOOLEAN AS $$
+DECLARE
+    v_tenant        tenants%ROWTYPE;
+    v_doc_count     INTEGER;
+    v_tokens_today  BIGINT;
+BEGIN
+    SELECT * INTO v_tenant FROM tenants WHERE tenant_id = p_tenant_id;
+
+    SELECT COUNT(*) INTO v_doc_count
+    FROM documents
+    WHERE tenant_id = p_tenant_id
+      AND status != 'archived';
+
+    IF v_doc_count &gt;= v_tenant.max_documents THEN
+        RAISE EXCEPTION 'Document quota exceeded: % of % used',
+            v_doc_count, v_tenant.max_documents
+            USING ERRCODE = '53400';
+    END IF;
+
+    SELECT COALESCE(SUM(tokens_used), 0) INTO v_tokens_today
+    FROM usage_events
+    WHERE tenant_id = p_tenant_id
+      AND created_at &gt;= DATE_TRUNC('day', NOW());
+
+    IF v_tokens_today + p_tokens_needed &gt; v_tenant.max_tokens_day THEN
+        RAISE EXCEPTION 'Daily token quota exceeded: % used, % limit',
+            v_tokens_today, v_tenant.max_tokens_day
+            USING ERRCODE = '53400';
+    END IF;
+
+    RETURN TRUE;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The session variable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">app.tenant_id</code> is the pivot point. Every connection — whether from PgBouncer, a direct FastAPI handler, or a background Celery worker — must call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">set_config('app.tenant_id', ...)</code> before executing any data query. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">transaction-local = true</code>, the setting expires at the end of the transaction, which means a connection returned to the pool can't accidentally carry a previous tenant's context into the next request.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Ingestion Pipeline: Per-Tenant Embeddings at Scale</h3>
+
+<p class="text-gray-300 leading-relaxed">Document ingestion is where multi-tenancy gets complicated. Different tenants use different embedding models. Some are on your free tier with a 1,000 document limit; others are enterprise customers ingesting 50,000 documents. You need a pipeline that's fair, observable, and resilient.</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture uses Celery for async task queuing with Redis as the broker, FastAPI for the upload endpoint, and PostgreSQL itself for task state tracking via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code>.</p>
+</div>
+    <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
+        <p class="text-xs text-gray-400">8 modules · Schema browser · AI assistant · Query optimizer · PostgreSQL, SQL Server, MySQL</p>
+      </div>
+      <a href="../products.html" class="shrink-0 px-6 py-3 bg-rose-600 hover:bg-rose-500 text-white font-semibold rounded-xl text-sm transition">Learn More →</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · AI-Native Apps on PostgreSQL</div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 30: Handling Embedding Model Version Changes — Vector Databases & AI</title>
+  <meta name="description" content="Vector Databases & AI Chapter 30: Handling Embedding Model Version Changes. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-cyan-500 to-cyan-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-cyan-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 4 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6">
+      <a href="index.html" class="text-xs text-cyan-400 hover:text-cyan-300 transition">← All Chapters</a>
+    </div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-cyan-900/40 border border-cyan-800/40 text-cyan-300 text-xs rounded-full font-medium">Chapter 30 of 40</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Vector Databases & AI</span>
+    </div>
+    <div class="space-y-4 text-sm">
+<h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 30: Handling Embedding Model Version Changes</h2>
+
+<p class="text-gray-300 leading-relaxed">Embedding models are not static infrastructure. OpenAI retires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> in favor of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>. Cohere ships <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-v3</code> with a different vector dimension than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embed-v2</code>. A sentence-transformers model you fine-tuned six months ago gets replaced by a better checkpoint. Every time the model changes, every vector in your database becomes potentially incompatible with every new query vector — and the search results degrade silently unless you have a plan. This chapter covers what actually breaks during an embedding model transition, how to detect degradation before your users do, and the concrete migration strategies that let you move from one model to another without taking your search system offline.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Why Model Changes Break Vector Search</h3>
+
+<p class="text-gray-300 leading-relaxed">The core problem is geometric. Every embedding model defines its own latent space — a coordinate system where semantically similar concepts cluster together. When you switch models, you are not changing the data; you are changing the entire coordinate system. A document vector produced by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> (1536 dimensions) and a query vector produced by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> (also 1536 dimensions, but a completely different latent space) are meaningless when compared with cosine similarity. The numbers look plausible. The system returns results. But those results are essentially random relative to what the user actually asked.</p>
+
+<p class="text-gray-300 leading-relaxed">This failure mode is the worst kind in database systems: silent and gradual. There is no error thrown. There is no query timeout. The cosine distance computation succeeds perfectly — it just computes the distance between two points in incompatible coordinate systems. If you have monitoring on query latency but not on result quality, this class of failure will go undetected until users start complaining or A/B test metrics collapse.</p>
+
+<p class="text-gray-300 leading-relaxed">From a database perspective, think of it like changing your collation rules on a text column after the data is already indexed. The index physically exists and returns results, but the sort order is now wrong relative to the application's expectations. The difference is that collation failures at least sometimes produce obviously garbled output. Embedding model mismatches produce results that look completely reasonable.</p>
+
+<p class="text-gray-300 leading-relaxed">The specific failure scenarios are:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dimension mismatch</strong>: The new model produces vectors of a different length than the old model. pgvector will throw a hard error if you attempt to insert a 1024-dimensional vector into a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector(1536)</code> column. Pinecone will reject the upsert with an HTTP 400. This is the *easy* failure to catch.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Latent space drift</strong>: Same vector dimension, completely different coordinate space. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> both produce 1536-dimensional vectors, but they are not comparable. This is the silent failure that requires active quality monitoring to detect.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Normalization differences</strong>: Some models produce unit-normalized vectors by default; others do not. If your index uses dot product similarity (which many ANN indexes optimize for), switching from a normalized to an unnormalized model changes the effective similarity function without changing your index configuration.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tokenization boundary shifts</strong>: A new model version might chunk text differently at the tokenizer level, meaning that the same 512-token input produces a vector that reflects subtly different semantic content. This is the hardest to detect because the degradation is partial rather than total.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Detecting Degradation Before and After Migration</h3>
+
+<p class="text-gray-300 leading-relaxed">Before you migrate a single vector, establish a baseline you can measure against. Detection requires two things: a ground-truth evaluation set and a continuous monitoring pipeline.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Building an evaluation set</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A ground truth evaluation set is a collection of queries where you already know which documents should rank in the top K results. For a customer support system, this might be 200 sample support tickets paired with the knowledge base articles that human agents actually used to resolve them. For a code search system, it might be 100 natural language queries paired with the functions they should retrieve.</p>
+
+<p class="text-gray-300 leading-relaxed">The metric to track is Recall@K — specifically, what percentage of the known-relevant documents appear in the top K results. For most production systems, Recall@10 between 0.75 and 0.90 indicates healthy retrieval. A drop below 0.60 is a signal that something has gone wrong with your retrieval layer.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Evaluation harness for embedding model comparison
+# Requires: openai, sentence-transformers, numpy, scikit-learn
+
+import numpy as np
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+
+client = OpenAI()
+
+# Ground truth evaluation set
+# Format: (query, [list of relevant doc ids])
+EVAL_SET = [
+    ("How do I reset my password?", ["doc_042", "doc_107"]),
+    ("billing cycle change request", ["doc_019", "doc_023", "doc_091"]),
+    ("API rate limit exceeded error", ["doc_055", "doc_056"]),
+    ("cancel subscription", ["doc_011", "doc_012"]),
+    ("two factor authentication setup", ["doc_088", "doc_089", "doc_090"]),
+]
+
+# Precomputed document corpus embeddings (already stored in your vector DB)
+# In practice, load these from your database
+def load_corpus_embeddings(model_label: str) -&gt; tuple[dict, np.ndarray]:
+    """Load document ID -&gt; index mapping and embedding matrix for a given model."""
+    # Placeholder: replace with actual DB retrieval
+    # Returns: (doc_id_to_index: dict, embedding_matrix: np.ndarray)
+    raise NotImplementedError("Connect to your vector store here")
+
+def embed_queries_openai(queries: list[str], model: str) -&gt; np.ndarray:
+    response = client.embeddings.create(input=queries, model=model)
+    return np.array([r.embedding for r in response.data])
+
+def embed_queries_st(queries: list[str], model_name: str) -&gt; np.ndarray:
+    model = SentenceTransformer(model_name)
+    return model.encode(queries, normalize_embeddings=True)
+
+def recall_at_k(
+    query_embeddings: np.ndarray,
+    corpus_embeddings: np.ndarray,
+    doc_id_to_index: dict,
+    eval_set: list,
+    k: int = 10
+) -&gt; float:
+    """Compute Recall@K across the evaluation set."""
+    index_to_doc_id = {v: k for k, v in doc_id_to_index.items()}
+    sims = cosine_similarity(query_embeddings, corpus_embeddings)
+    
+    recall_scores = []
+    for i, (query, relevant_ids) in enumerate(eval_set):
+        top_k_indices = np.argsort(sims[i])[::-1][:k]
+        top_k_doc_ids = {index_to_doc_id[idx] for idx in top_k_indices}
+        relevant_set = set(relevant_ids)
+        
+        hits = len(relevant_set & top_k_doc_ids)
+        recall_scores.append(hits / len(relevant_set))
+    
+    return float(np.mean(recall_scores))
+
+def compare_models(eval_set: list, k: int = 10):
+    queries = [q for q, _ in eval_set]
+    
+    models_to_test = [
+        {
+            "label": "ada-002",
+            "embed_fn": lambda q: embed_queries_openai(q, "text-embedding-ada-002"),
+        },
+        {
+            "label": "3-small",
+            "embed_fn": lambda q: embed_queries_openai(q, "text-embedding-3-small"),
+        },
+        {
+            "label": "3-large",
+            "embed_fn": lambda q: embed_queries_openai(q, "text-embedding-3-large"),
+        },
+        {
+            "label": "bge-large-en",
+            "embed_fn": lambda q: embed_queries_st(q, "BAAI/bge-large-en-v1.5"),
+        },
+    ]
+    
+    print(f"{'Model':&lt;20} {'Recall@' + str(k):&lt;12} {'Latency (ms)':&lt;15}")
+    print("-" * 48)
+    
+    for model_cfg in models_to_test:
+        import time
+        start = time.perf_counter()
+        query_embeddings = model_cfg["embed_fn"](queries)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        
+        try:
+            doc_id_to_index, corpus_embeddings = load_corpus_embeddings(
+                model_cfg["label"]
+            )
+            score = recall_at_k(
+                query_embeddings, corpus_embeddings, doc_id_to_index, eval_set, k
+            )
+            print(
+                f"{model_cfg['label']:&lt;20} {score:&lt;12.4f} {elapsed_ms:&lt;15.1f}"
+            )
+        except NotImplementedError:
+            print(
+                f"{model_cfg['label']:&lt;20} {'N/A (load corpus)':&lt;12} {elapsed_ms:&lt;15.1f}"
+            )
+
+if __name__ == "__main__":
+    compare_models(EVAL_SET, k=10)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Continuous monitoring in production</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run the evaluation set against your live system on a scheduled basis — every hour during a migration, daily in steady state. Store the scores in a time-series table alongside deployment metadata:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Schema for tracking embedding model quality over time
+
+CREATE TABLE embedding_model_registry (
+    model_id        SERIAL PRIMARY KEY,
+    model_name      TEXT NOT NULL,           -- 'text-embedding-3-small'
+    model_version   TEXT NOT NULL,           -- 'v1', 'v2', or commit hash
+    vector_dim      INTEGER NOT NULL,
+    provider        TEXT NOT NULL,           -- 'openai', 'cohere', 'local'
+    deployed_at     TIMESTAMPTZ,
+    deprecated_at   TIMESTAMPTZ,
+    is_active       BOOLEAN NOT NULL DEFAULT FALSE,
+    metadata        JSONB DEFAULT '{}'::jsonb,
+    UNIQUE (model_name, model_version)
+);
+
+CREATE TABLE retrieval_quality_log (
+    log_id          BIGSERIAL PRIMARY KEY,
+    recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    model_id        INTEGER REFERENCES embedding_model_registry(model_id),
+    eval_set_name   TEXT NOT NULL,
+    k               INTEGER NOT NULL,
+    recall_at_k     NUMERIC(5,4) NOT NULL,
+    ndcg_at_k       NUMERIC(5,4),
+    eval_query_count INTEGER NOT NULL,
+    notes           TEXT
+);
+
+CREATE INDEX idx_rql_recorded_at ON retrieval_quality_log (recorded_at DESC);
+CREATE INDEX idx_rql_model_id    ON retrieval_quality_log (model_id, recorded_at DESC);
+
+-- Query: detect recall drops over the last 24 hours
+WITH recent AS (
+    SELECT
+        r.model_id,
+        reg.model_name,
+        r.recorded_at,
+        r.recall_at_k,
+        AVG(r.recall_at_k) OVER (
+            PARTITION BY r.model_id
+            ORDER BY r.recorded_at
+            ROWS BETWEEN 23 PRECEDING AND CURRENT ROW
+        ) AS rolling_24h_avg
+    FROM retrieval_quality_log r
+    JOIN embedding_model_registry reg USING (model_id)
+    WHERE r.recorded_at &gt; NOW() - INTERVAL '48 hours'
+      AND r.eval_set_name = 'production_eval_v1'
+      AND r.k = 10
+)
+SELECT
+    model_name,
+    recorded_at,
+    recall_at_k,
+    rolling_24h_avg,
+    (recall_at_k - rolling_24h_avg) AS delta
+FROM recent
+WHERE ABS(recall_at_k - rolling_24h_avg) &gt; 0.05  -- alert if &gt;5 point swing
+ORDER BY recorded_at DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Migration Strategies: Zero-Downtime Approaches</h3>
+
+<p class="text-gray-300 leading-relaxed">There are three practical migration strategies. Which one you choose depends on your corpus size, your SLA requirements, and whether you have the infrastructure to run dual indexes simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 1: Big Bang (Full Re-index)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Re-embed the entire corpus with the new model, load it into a new collection or table, then atomically switch traffic. Simple to reason about, but requires 2x storage during the transition and a cutover window where you must freeze writes to the old index while completing the final sync.</p>
+
+<p class="text-gray-300 leading-relaxed">Suitable for corpora under ~5 million documents where the re-embedding job completes in under 4 hours and your application can tolerate brief read-only mode.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 2: Dual-Model Shadow Period</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run both the old model and the new model simultaneously. New documents are written to both indexes. Queries are served from the old index until you validate the new one. Then you drain the old index by re-embedding documents in batches during off-peak hours.</p>
+
+<p class="text-gray-300 leading-relaxed">This is the pattern most production teams use because it decouples the "new model is ready" decision from the "all data is migrated" state.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Dual-model write path using pgvector via psycopg2 and asyncpg
+# Demonstrates shadow-writing to both old and new embedding columns
+
+import asyncio
+import asyncpg
+from openai import AsyncOpenAI
+
+client = AsyncOpenAI()
+
+CREATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS documents (
+    id              TEXT PRIMARY KEY,
+    content         TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    -- Old model column (ada-002, 1536 dims)
+    embedding_ada002        vector(1536),
+    embedding_ada002_at     TIMESTAMPTZ,
+    
+    -- New model column (3-small, 1536 dims — different latent space)
+    embedding_3small        vector(1536),
+    embedding_3small_at     TIMESTAMPTZ,
+    
+    -- Which model is authoritative for reads
+    active_model    TEXT NOT NULL DEFAULT 'ada-002'
+        CHECK (active_model IN ('ada-002', '3-small'))
+);
+
+-- Indexes for both models
+CREATE INDEX IF NOT EXISTS idx_docs_ada002
+    ON documents USING hnsw (embedding_ada002 vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX IF NOT EXISTS idx_docs_3small
+    ON documents USING hnsw (embedding_3small vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+"""
+
+async def embed_text(text: str, model: str) -&gt; list[float]:
+    response = await client.embeddings.create(input=text, model=model)
+    return response.data[0].embedding
+
+async def upsert_document_dual_write(
+    conn: asyncpg.Connection,
+    doc_id: str,
+    content: str,
+    shadow_write_new_model: bool = True
+):
+    """
+    Write to old model always.
+    Write to new model if shadow_write_new_model=True.
+    Enables gradual validation before flipping active_model.
+    """
+    # Embed with old model (always)
+    ada_embedding = await embed_text(content, "text-embedding-ada-002")
+    
+    if shadow_write_new_model:
+        # Embed with new model simultaneously
+        small_embedding = await embed_text(content, "text-embedding-3-small")
+        
+        await conn.execute(
+            """
+            INSERT INTO documents (
+                id, content,
+                embedding_ada002, embedding_ada002_at,
+                embedding_3small, embedding_3small_at
+            )
+            VALUES ($1, $2, $3::vector, NOW(), $4::vector, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                content              = EXCLUDED.content,
+                embedding_ada002     = EXCLUDED.embedding_ada002,
+                embedding_ada002_at  = EXCLUDED.embedding_ada002_at,
+                embedding_3small     = EXCLUDED.embedding_3small,
+                embedding_3small_at  = EXCLUDED.embedding_3small_at
+            """,
+            doc_id, content,
+            str(ada_embedding),
+            str(small_embedding),
+        )
+    else:
+        await conn.execute(
+            """
+            INSERT INTO documents (id, content, embedding_ada002, embedding_ada002_at)
+            VALUES ($1, $2, $3::vector, NOW())
+            ON CONFLICT (id) DO UPDATE SET
+                content             = EXCLUDED.content,
+                embedding_ada002    = EXCLUDED.embedding_ada002,
+                embedding_ada002_at = EXCLUDED.embedding_ada002_at
+            """,
+            doc_id, content, str(ada_embedding),
+        )
+
+async def search_documents(
+    conn: asyncpg.Connection,
+    query: str,
+    model_override: str | None = None,
+    top_k: int = 10
+) -&gt; list[dict]:
+    """
+    Search using whichever model is currently active,
+    or a specific model if overriding for A/B testing.
+    """
+    # Determine active model (read from a config row or feature flag)
+    active_model = model_override or await get_active_model(conn)
+    
+    if active_model == "ada-002":
+        embedding = await embed_text(query, "text-embedding-ada-002")
+        col = "embedding_ada002"
+    else:
+        embedding = await embed_text(query, "text-embedding-3-small")
+        col = "embedding_3small"
+    
+    rows = await conn.fetch(
+        f"""
+        SELECT
+            id,
+            content,
+            active_model,
+            1 - ({col} &lt;=&gt; $1::vector) AS cosine_similarity
+        FROM documents
+        WHERE {col} IS NOT NULL
+        ORDER BY {col} &lt;=&gt; $1::vector
+        LIMIT $2
+        """,
+        str(embedding), top_k
+    )
+    return [dict(r) for r in rows]
+
+async def get_active_model(conn: asyncpg.Connection) -&gt; str:
+    # In practice, store this in a config table or read from a feature flag service
+    row = await conn.fetchrow(
+        "SELECT value FROM app_config WHERE key = 'active_embedding_model'"
+    )
+    return row["value"] if row else "ada-002"
+
+async def flip_active_model(conn: asyncpg.Connection, new_model: str):
+    """
+    Atomic model flip — called only after backfill is complete
+    and quality metrics have been validated.
+    """
+    # Verify backfill completeness before flipping
+    gap = await conn.fetchval(
+        f"""
+        SELECT COUNT(*) FROM documents
+        WHERE embedding_3small IS NULL
+          AND active_model = 'ada-002'
+        """
+    )
+    if gap &gt; 0:
+        raise RuntimeError(
+            f"Cannot flip: {gap} documents still missing new embeddings"
+        )
+    
+    await conn.execute(
+        "UPDATE app_config SET value = $1 WHERE key = 'active_embedding_model'",
+        new_model
+    )
+    # Also update all rows to reflect new authoritative model
+    await conn.execute("UPDATE documents SET active_model = $1", new_model)
+    print(f"Active model flipped to: {new_model}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Strategy 3: Rolling Backfill with Pinecone Namespaces</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone namespaces provide a clean mechanism for this pattern when you are not using a self-hosted vector database. You create a new namespace for the new model and backfill it in batches while the old namespace continues serving traffic.</p>
+
+    </div>
+    <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-cyan-600 hover:bg-cyan-500 text-white font-semibold rounded-xl text-sm transition">
+        Buy Now — $149
+      </a>
+    </div>
+    <div class="mt-8 text-xs">
+      <a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a>
+    </div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Vector Databases & AI</div>
+  </footer>
+</body>
+</html>

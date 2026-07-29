@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 9: Aurora Serverless v2: When It Saves vs When It Costs More — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 9: Aurora Serverless v2: When It Saves vs When It Costs More. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 9 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 9: Aurora Serverless v2: When It Saves vs When It Costs More</h2>
+
+<p class="text-gray-300 leading-relaxed">Aurora Serverless v2 promises the holy grail of database economics: pay only for what you use, scale instantly, and never over-provision. In practice, teams that migrate from provisioned Aurora instances without understanding the billing model often see their monthly bills *increase* by 20–40%. Teams that deploy it correctly for the right workload patterns report savings of $800–$3,000 per month compared to fixed provisioned instances. This chapter shows you how to tell which outcome you are heading toward before you commit, how to measure it after deployment, and how to automate the guardrails that keep Aurora Serverless v2 economical at scale.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.1 How Aurora Serverless v2 Actually Bills You</h3>
+
+<p class="text-gray-300 leading-relaxed">Before diagnosing cost problems, you need a precise mental model of the billing engine. Aurora Serverless v2 charges in Aurora Capacity Units (ACUs). One ACU provides approximately 2 GiB of memory and a proportional slice of CPU. As of mid-2024, the price per ACU-hour in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">us-east-1</code> is <strong class="text-white">$0.12</strong>. That sounds small until you realize a db.r6g.2xlarge provisioned instance — 8 vCPUs, 64 GiB RAM — runs at roughly <strong class="text-white">$0.48/hour</strong> ($345/month), while Aurora Serverless v2 scaled to the equivalent capacity (approximately 32 ACUs) costs <strong class="text-white">$0.12 × 32 = $3.84/hour</strong> ($2,765/month). The provisioned instance is cheaper at sustained load. Aurora Serverless v2 wins only when your database spends meaningful time at low ACU counts.</p>
+
+<p class="text-gray-300 leading-relaxed">The three billing dimensions are:</p>
+
+<p class="text-gray-300 leading-relaxed">| Dimension | How It Works | Where It Surprises Teams |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| ACU-hours | Billed per second, rounded to the nearest second | Minimum floor of 0.5 ACU means you always pay something |</p>
+<p class="text-gray-300 leading-relaxed">| Storage | Same as provisioned Aurora: $0.10/GB-month | No savings here regardless of serverless vs provisioned |</p>
+<p class="text-gray-300 leading-relaxed">| I/O | $0.20 per million requests (standard mode) | High-write workloads pay this on top of ACU costs |</p>
+
+<p class="text-gray-300 leading-relaxed">The minimum ACU setting is the most commonly misconfigured parameter. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_capacity</code> to 8 ACUs instead of 0.5 ACUs costs an extra <strong class="text-white">$414/month</strong> in idle time alone — before a single query runs. Many teams copy their old provisioned instance size as the minimum, negating the entire serverless value proposition.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run against your Aurora PostgreSQL-compatible cluster
+-- to see how much time the database has spent at different capacity levels
+-- Requires pg_stat_activity and CloudWatch integration via Performance Insights
+
+-- Step 1: Check current ACU utilization proxy via active connections and CPU
+SELECT
+    now() AS sample_time,
+    count(*) AS total_connections,
+    count(*) FILTER (WHERE state = 'active') AS active_connections,
+    count(*) FILTER (WHERE state = 'idle') AS idle_connections,
+    count(*) FILTER (WHERE state = 'idle in transaction') AS idle_in_txn,
+    round(
+        (count(*) FILTER (WHERE state = 'active'))::numeric /
+        NULLIF(count(*), 0) * 100, 2
+    ) AS active_pct
+FROM pg_stat_activity
+WHERE backend_type = 'client backend';
+
+-- Step 2: Identify queries driving ACU spikes
+-- High CPU queries are the primary driver of ACU scale-up events
+SELECT
+    queryid,
+    calls,
+    round(total_exec_time::numeric, 2) AS total_ms,
+    round(mean_exec_time::numeric, 2) AS mean_ms,
+    round((total_exec_time / sum(total_exec_time) OVER ()) * 100, 2) AS pct_total_time,
+    rows,
+    query
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The second query is your first cost signal: if the top five queries in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> account for more than 70% of total execution time and they run continuously throughout the day, Aurora Serverless v2 will spend most of its time at high ACU counts. That is a provisioned instance workload.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.2 Identifying Workloads Where Serverless v2 Wins</h3>
+
+<p class="text-gray-300 leading-relaxed">Aurora Serverless v2 generates positive ROI in four specific workload patterns. Every other pattern is either neutral or negative. Be honest about which category your database falls into.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 1: Variable Business-Hours Load</strong></p>
+<p class="text-gray-300 leading-relaxed">Traffic is genuinely low (under 10% peak) for 12+ hours per day, such as a North American SaaS application with negligible overnight traffic. If the database idles at 0.5–2 ACUs for 12 hours and peaks at 16 ACUs for 12 hours, the daily cost is roughly <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(1 ACU × 12h + 16 ACU × 12h) × $0.12 = $24.48/day</code> versus a provisioned db.r6g.xlarge (comparable to 16 ACUs) at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$0.48/hour × 24h = $11.52/day</code>. Provisioned still wins here. Aurora Serverless v2 starts winning when the idle period drops to very low ACUs (0.5) and extends beyond 16 hours per day.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 2: Development and Staging Environments</strong></p>
+<p class="text-gray-300 leading-relaxed">This is the most reliable win. A development database used 8 hours on weekdays and idle otherwise runs 40 hours/week at load and 128 hours/week idle. At 0.5 ACU minimum: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(40h × 8 ACU + 128h × 0.5 ACU) × $0.12 = $46.08/week</code> versus a provisioned db.t3.large at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$0.145/hour × 168h/week = $24.36/week</code>. Provisioned is still cheaper per week, but the comparison ignores the operational value of automatic scale-to-near-zero versus manual start/stop scripting. More importantly, if you are running db.r6g.large for a staging environment that mirrors production sizing, Aurora Serverless v2 at 0.5–16 ACU range costs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$0.12 × 0.5 × 128 + $0.12 × 16 × 40 = $84.48/week</code> versus the provisioned db.r6g.large at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$0.24 × 168 = $40.32/week</code>. For staging, provisioned with scheduled stop/start wins on pure cost. Aurora Serverless v2 wins on operational simplicity.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 3: Unpredictable Bursty Workloads</strong></p>
+<p class="text-gray-300 leading-relaxed">Marketing campaign databases, event-driven analytics, and reporting clusters that receive batch workloads at irregular intervals. The inability to predict when capacity is needed makes provisioning guesswork. Teams either over-provision and waste money, or under-provision and page incidents. Aurora Serverless v2 eliminates that tradeoff.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 4: Multi-Tenant Applications with Per-Tenant Databases</strong></p>
+<p class="text-gray-300 leading-relaxed">Running 50 tenant-specific Aurora clusters where most tenants are lightly used is wildly expensive with provisioned instances. At $0.48/hour minimum per cluster, 50 clusters cost $17,280/month in compute alone. With Aurora Serverless v2 at 0.5 ACU minimum, 50 clusters cost <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">50 × 0.5 × $0.12 × 720 = $2,160/month</code> — an <strong class="text-white">$15,120/month saving</strong>.</p>
+
+<p class="text-gray-300 leading-relaxed">The following script pulls CloudWatch metrics to classify your existing Aurora clusters automatically:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+aurora_serverless_classifier.py
+Analyzes existing Aurora provisioned clusters and classifies them by
+serverless v2 suitability based on CPU utilization patterns.
+
+Run: python aurora_serverless_classifier.py --region us-east-1 --days 30
+"""
+
+import boto3
+import argparse
+from datetime import datetime, timedelta
+from collections import defaultdict
+
+def get_aurora_clusters(region):
+    rds = boto3.client('rds', region_name=region)
+    paginator = rds.get_paginator('describe_db_clusters')
+    clusters = []
+    for page in paginator.paginate():
+        for cluster in page['DBClusters']:
+            if 'aurora' in cluster.get('Engine', '').lower():
+                clusters.append(cluster)
+    return clusters
+
+def get_cpu_stats(cw, instance_id, days):
+    end = datetime.utcnow()
+    start = end - timedelta(days=days)
+    response = cw.get_metric_statistics(
+        Namespace='AWS/RDS',
+        MetricName='CPUUtilization',
+        Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+        StartTime=start,
+        EndTime=end,
+        Period=3600,  # 1-hour granularity
+        Statistics=['Average', 'Maximum', 'Minimum']
+    )
+    datapoints = response['Datapoints']
+    if not datapoints:
+        return None
+    datapoints.sort(key=lambda x: x['Timestamp'])
+    return datapoints
+
+def classify_workload(datapoints):
+    if not datapoints:
+        return 'INSUFFICIENT_DATA', {}
+
+    averages = [dp['Average'] for dp in datapoints]
+    total_hours = len(averages)
+    low_hours = sum(1 for a in averages if a &lt; 10)
+    medium_hours = sum(1 for a in averages if 10 &lt;= a &lt; 50)
+    high_hours = sum(1 for a in averages if a &gt;= 50)
+
+    low_pct = (low_hours / total_hours) * 100
+    high_pct = (high_hours / total_hours) * 100
+    avg_cpu = sum(averages) / len(averages)
+    max_cpu = max(averages)
+
+    stats = {
+        'total_hours_sampled': total_hours,
+        'low_utilization_pct': round(low_pct, 1),
+        'high_utilization_pct': round(high_pct, 1),
+        'avg_cpu': round(avg_cpu, 1),
+        'max_cpu': round(max_cpu, 1),
+    }
+
+    # Classification logic
+    if low_pct &gt;= 60 and high_pct &lt;= 15:
+        classification = 'STRONG_SERVERLESS_CANDIDATE'
+    elif low_pct &gt;= 40 and high_pct &lt;= 30:
+        classification = 'MODERATE_SERVERLESS_CANDIDATE'
+    elif avg_cpu &gt;= 60:
+        classification = 'PROVISIONED_PREFERRED'
+    else:
+        classification = 'BORDERLINE_ANALYZE_FURTHER'
+
+    return classification, stats
+
+def estimate_serverless_savings(instance_class, stats, hours_per_month=730):
+    # Rough ACU equivalents for common instance classes
+    instance_acu_map = {
+        'db.r6g.large': 8,
+        'db.r6g.xlarge': 16,
+        'db.r6g.2xlarge': 32,
+        'db.r6g.4xlarge': 64,
+        'db.r5.large': 8,
+        'db.r5.xlarge': 16,
+        'db.r5.2xlarge': 32,
+        'db.t3.medium': 2,
+        'db.t3.large': 4,
+    }
+    # On-demand hourly prices (us-east-1, approximate)
+    instance_price_map = {
+        'db.r6g.large': 0.24,
+        'db.r6g.xlarge': 0.48,
+        'db.r6g.2xlarge': 0.96,
+        'db.r6g.4xlarge': 1.92,
+        'db.r5.large': 0.29,
+        'db.r5.xlarge': 0.58,
+        'db.r5.2xlarge': 1.16,
+        'db.t3.medium': 0.068,
+        'db.t3.large': 0.145,
+    }
+
+    peak_acus = instance_acu_map.get(instance_class, 16)
+    provisioned_hourly = instance_price_map.get(instance_class, 0.48)
+    provisioned_monthly = provisioned_hourly * hours_per_month
+
+    low_pct = stats.get('low_utilization_pct', 0) / 100
+    high_pct = stats.get('high_utilization_pct', 0) / 100
+    medium_pct = 1 - low_pct - high_pct
+
+    # Estimate average ACUs based on utilization distribution
+    avg_acus = (
+        low_pct * 0.5 +        # 0.5 ACU when idle
+        medium_pct * (peak_acus * 0.4) +
+        high_pct * peak_acus
+    )
+
+    serverless_monthly = avg_acus * 0.12 * hours_per_month
+    monthly_delta = provisioned_monthly - serverless_monthly
+
+    return {
+        'provisioned_monthly_usd': round(provisioned_monthly, 2),
+        'serverless_est_monthly_usd': round(serverless_monthly, 2),
+        'estimated_monthly_delta_usd': round(monthly_delta, 2),
+        'recommendation': 'MIGRATE' if monthly_delta &gt; 50 else 'STAY_PROVISIONED'
+    }
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--region', default='us-east-1')
+    parser.add_argument('--days', type=int, default=30)
+    args = parser.parse_args()
+
+    rds = boto3.client('rds', region_name=args.region)
+    cw = boto3.client('cloudwatch', region_name=args.region)
+    clusters = get_aurora_clusters(args.region)
+
+    print(f"\nAurora Serverless v2 Migration Classifier")
+    print(f"Region: {args.region} | Analysis Period: {args.days} days")
+    print("=" * 80)
+
+    for cluster in clusters:
+        cluster_id = cluster['DBClusterIdentifier']
+        engine = cluster['Engine']
+        members = cluster.get('DBClusterMembers', [])
+        writer = next((m for m in members if m['IsClusterWriter']), None)
+        if not writer:
+            continue
+
+        instance_id = writer['DBInstanceIdentifier']
+        instance_info = rds.describe_db_instances(
+            DBInstanceIdentifier=instance_id
+        )['DBInstances'][0]
+        instance_class = instance_info['DBInstanceClass']
+
+        datapoints = get_cpu_stats(cw, instance_id, args.days)
+        classification, stats = classify_workload(datapoints)
+        savings = estimate_serverless_savings(instance_class, stats)
+
+        print(f"\nCluster:         {cluster_id}")
+        print(f"Engine:          {engine}")
+        print(f"Instance Class:  {instance_class}")
+        print(f"Classification:  {classification}")
+        print(f"Avg CPU:         {stats.get('avg_cpu', 'N/A')}%")
+        print(f"Low Util Hrs:    {stats.get('low_utilization_pct', 'N/A')}% of sampled period")
+        print(f"Provisioned Cost: ${savings['provisioned_monthly_usd']}/month")
+        print(f"Serverless Est:   ${savings['serverless_est_monthly_usd']}/month")
+        print(f"Est. Delta:       ${savings['estimated_monthly_delta_usd']}/month")
+        print(f"Recommendation:  {savings['recommendation']}")
+
+if __name__ == '__main__':
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this script monthly as a scheduled Lambda function and feed its output into a Slack channel or email report. Teams that run this analysis regularly catch over-provisioned clusters within days rather than discovering them during quarterly budget reviews.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.3 The ACU Floor Problem and How to Fix It</h3>
+
+<p class="text-gray-300 leading-relaxed">The single most expensive mistake with Aurora Serverless v2 is setting a high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_capacity</code>. This is so common it deserves its own section.</p>
+
+<p class="text-gray-300 leading-relaxed">When you create an Aurora Serverless v2 cluster through the console, the default minimum is 0.5 ACUs for PostgreSQL-compatible and MySQL-compatible engines. But when infrastructure teams migrate from provisioned clusters using Terraform or CloudFormation templates copied from provisioned configurations, they frequently set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_capacity</code> to match the old instance class. A db.r6g.xlarge migrated to Aurora Serverless v2 with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_capacity = 16</code> costs <strong class="text-white">$1,382/month</strong> just in baseline floor costs — identical to the provisioned instance — with zero idle savings.</p>
+
+<p class="text-gray-300 leading-relaxed">The fix is straightforward once you know what to look for:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# audit_serverless_floors.sh
+# Audits all Aurora Serverless v2 clusters in an account for high min_capacity settings
+# Run with: bash audit_serverless_floors.sh us-east-1
+
+REGION=${1:-us-east-1}
+ACU_PRICE=0.12
+HOURS_PER_MONTH=730
+
+echo "Aurora Serverless v2 ACU Floor Audit"
+echo "Region: $REGION"
+echo "ACU Price: \$${ACU_PRICE}/ACU-hour"
+echo "=========================================="
+
+aws rds describe-db-clusters \
+    --region "$REGION" \
+    --query "DBClusters[?EngineMode=='provisioned'].[DBClusterIdentifier,ServerlessV2ScalingConfiguration.MinCapacity,ServerlessV2ScalingConfiguration.MaxCapacity]" \
+    --output json | \
+python3 -c "
+import json, sys
+
+data = json.load(sys.stdin)
+acu_price = float('$ACU_PRICE')
+hours = int('$HOURS_PER_MONTH')
+
+total_wasted = 0.0
+
+for row in data:
+    cluster_id, min_acu, max_acu = row
+    if min_acu is None:
+        continue
+    min_acu = float(min_acu)
+    max_acu = float(max_acu)
+
+    # Cost of floor vs optimal 0.5 ACU floor
+    floor_cost_monthly = min_acu * acu_price * hours
+    optimal_floor_cost = 0.5 * acu_price * hours
+    wasted_monthly = floor_cost_monthly - optimal_floor_cost
+
+    flag = '  *** REVIEW' if min_acu &gt; 4 else ''
+    print(f'Cluster:      {cluster_id}')
+    print(f'Min ACU:      {min_acu}  Max ACU: {max_acu}')
+    print(f'Floor Cost:   \${floor_cost_monthly:.2f}/month')
+    print(f'Optimal Floor:\${optimal_floor_cost:.2f}/month')
+    print(f'Potential Save:\${wasted_monthly:.2f}/month{flag}')
+    print('------------------------------------------')
+    total_wasted += wasted_monthly
+
+print(f'TOTAL POTENTIAL FLOOR SAVINGS: \${total_wasted:.2f}/month')
+print(f'ANNUAL POTENTIAL SAVINGS:      \${total_wasted * 12:.2f}/year')
+"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Reducing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_capacity</code> does carry a practical constraint: Aurora Serverless v2 takes 15–40 seconds to scale from 0.5 ACUs to 8+ ACUs from a cold state. For applications where the first request after an idle period must complete within 2–3 seconds, 0.5 ACU minimum is too aggressive. The practical recommendation:</p>
+
+<p class="text-gray-300 leading-relaxed">| Workload Type | Recommended min_capacity | Reasoning |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Production OLTP, latency-sensitive | 2–4 ACU | Fast enough scale response, meaningful idle savings |</p>
+<p class="text-gray-300 leading-relaxed">| Production OLAP, reporting | 1–2 ACU | Queries can tolerate 10–20s warm-up |</p>
+<p class="text-gray-300 leading-relaxed">| Staging / pre-production | 0.5 ACU | Latency tolerance acceptable |</p>
+<p class="text-gray-300 leading-relaxed">| Development / feature branches | 0.5 ACU | Maximum savings, developers expect some latency |</p>
+<p class="text-gray-300 leading-relaxed">| Multi-tenant idle databases | 0.5 ACU | Primary serverless use case |</p>
+
+<p class="text-gray-300 leading-relaxed">Lowering min_capacity on a production cluster from 16 to 2 ACUs on a system that idles 10 hours per day: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(16 - 2) ACU × $0.12 × (10h × 30days) = $504/month saved</code>. That single configuration change, applied to a cluster that was correctly sized at peak but over-floored at idle, saves $6,048/year.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">9.4 Monitoring ACU Consumption in Real Time</h3>
+
+<p class="text-gray-300 leading-relaxed">Knowing your ACU trajectory before the monthly bill arrives requires connecting three data sources: CloudWatch ACU metrics, Performance Insights query data, and your application traffic patterns. The following CloudWatch Logs Insights query and accompanying Python scheduler build a real-time ACU cost tracker.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Aurora PostgreSQL: correlate query load with ACU consumption signals
+-- This query identifies the top consumers driving scale-up events
+-- Run in Performance Insights or directly in pg_stat_statements
+
+WITH query_costs AS (
+    SELECT
+        queryid,
+        query,
+        calls,
+        total_exec_time,
+        mean_exec_time,
+        stddev_exec_time,
+        rows,
+        shared_blks_hit,
+        shared_blks_read,
+        shared_blks_dirtied,
+        -- Estimate relative CPU pressure
+        (total_exec_time * calls) / 
+            NULLIF(SUM(total_exec_time * calls) OVER (), 0) * 100 AS cpu_pressure_pct,
+        -- Flag queries with high variance (unpredictable scaling triggers)
+        CASE 
+            WHEN stddev_exec_time &gt; mean_exec_time * 2 THEN 'HIGH_VARIANCE'
+            WHEN mean_exec_time &gt; 5000 THEN 'SLOW'
+            WHEN calls &gt; 10000 THEN 'HIGH_FREQUENCY'
+            ELSE 'NORMAL'
+        END AS query_profile
+    FROM pg_stat_statements
+    WHERE total_exec_time &gt; 100  -- Filter out trivial queries
+),
+connection_pressure AS (
+    SELECT
+        state,
+        wait_event_type,
+        wait_event,
+        count(*) AS cnt
+    FROM pg_stat_activity
+    WHERE backend_type = 'client backend'
+    GROUP BY state, wait_event_type, wait_event
+)
+SELECT
+    qc.queryid,
+    qc.query_profile,
+    qc.calls,
+    round(qc.mean_exec_time::numeric, 2) AS mean_ms,
+    round(qc.total_exec_time::numeric / 1000, 2) AS total_sec,
+    round(qc.cpu_pressure_pct::numeric, 2) AS cpu_pressure_pct,
+    qc.shared_blks_read AS disk_reads,
+    -- Queries with high disk reads cause both CPU and I/O ACU pressure
+    CASE 
+        WHEN qc.shared_blks_read &gt; 10000 AND qc.cpu_pressure_pct &gt; 5 
+        THEN 'DUAL_PRESSURE_SCALE_TRIGGER'
+        WHEN qc.cpu_pressure_pct &gt; 10 
+        THEN 'CPU_SCALE_TRIGGER'
+        WHEN qc.shared_blks_read &gt; 50000 
+        THEN 'IO_SCALE_TRIGGER'
+        ELSE 'LOW_IMPACT'
+    END AS acu_impact,
+    left(qc.query, 120) AS query_preview
+FROM query_costs qc
+ORDER BY qc.cpu_pressure_pct DESC
+LIMIT 25;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now connect CloudWatch ACU metrics to build a daily cost ledger:</p>
+</div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>
