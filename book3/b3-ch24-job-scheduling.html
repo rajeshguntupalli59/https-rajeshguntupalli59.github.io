@@ -6,6 +6,10 @@
   <title>Chapter 24: Autonomous Job Scheduling — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 24: Autonomous Job Scheduling. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -437,6 +441,640 @@ if __name__ == "__main__":
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partial failures**: a multi-step procedure that committed some batches before failing — resume from checkpoint, not full restart</li>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Job execution log with failure classification
+CREATE TABLE job_runs (
+    run_id          BIGSERIAL PRIMARY KEY,
+    job_id          INT REFERENCES autonomous_jobs(job_id),
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    finished_at     TIMESTAMPTZ,
+    status          TEXT NOT NULL CHECK (status IN (
+                        'running', 'completed', 'failed_transient',
+                        'failed_resource', 'failed_logic',
+                        'suspended', 'skipped'
+                    )),
+    failure_class   TEXT,
+    error_message   TEXT,
+    rows_processed  BIGINT,
+    retry_count     INT DEFAULT 0,
+    next_retry_at   TIMESTAMPTZ,
+    checkpoint_data JSONB          -- for resumable jobs
+);
+
+-- Failure classification function
+CREATE OR REPLACE FUNCTION classify_job_failure(p_sqlerrcode TEXT, p_errmsg TEXT)
+RETURNS TEXT LANGUAGE plpgsql AS $$
+BEGIN
+    -- Transient: lock/deadlock/connection issues
+    IF p_sqlerrcode IN ('40001', '40P01', '53300', '55P03') THEN
+        RETURN 'transient';
+    END IF;
+    -- Resource: disk full, out of memory, statement timeout
+    IF p_sqlerrcode IN ('53100', '53200', '57014', '54000') THEN
+        RETURN 'resource';
+    END IF;
+    -- Logic: undefined table, division by zero, type errors
+    IF p_sqlerrcode IN ('42P01', '22012', '42703', '42883') THEN
+        RETURN 'logic';
+    END IF;
+    -- Default: treat unknown as transient with a cap
+    RETURN 'transient';
+END;
+$$;
+
+-- Retry policy table: configurable per failure class and job
+CREATE TABLE job_retry_policies (
+    policy_id           SERIAL PRIMARY KEY,
+    job_id              INT REFERENCES autonomous_jobs(job_id),
+    failure_class       TEXT NOT NULL,
+    max_retries         INT NOT NULL DEFAULT 3,
+    initial_delay_sec   INT NOT NULL DEFAULT 60,
+    backoff_multiplier  NUMERIC(4,2) NOT NULL DEFAULT 2.0,
+    max_delay_sec       INT NOT NULL DEFAULT 3600
+);
+
+-- Default retry policies for all jobs
+INSERT INTO job_retry_policies (job_id, failure_class, max_retries, initial_delay_sec, backoff_multiplier)
+SELECT j.job_id, fc.failure_class,
+       CASE fc.failure_class
+           WHEN 'transient'  THEN 5
+           WHEN 'resource'   THEN 3
+           WHEN 'logic'      THEN 0  -- never retry logic failures
+           ELSE 2
+       END,
+       CASE fc.failure_class
+           WHEN 'transient'  THEN 30
+           WHEN 'resource'   THEN 300
+           ELSE 60
+       END,
+       2.0
+FROM autonomous_jobs j
+CROSS JOIN (VALUES ('transient'), ('resource'), ('logic')) AS fc(failure_class)
+ON CONFLICT DO NOTHING;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent job run tracking for SQL Server
+CREATE TABLE dbo.job_runs (
+    run_id          BIGINT IDENTITY(1,1) PRIMARY KEY,
+    job_id          INT REFERENCES dbo.autonomous_jobs(job_id),
+    started_at      DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    finished_at     DATETIME2 NULL,
+    status          NVARCHAR(30) NOT NULL
+                    CONSTRAINT chk_status CHECK (status IN (
+                        'running', 'completed', 'failed_transient',
+                        'failed_resource', 'failed_logic',
+                        'suspended', 'skipped'
+                    )),
+    failure_class   NVARCHAR(30) NULL,
+    error_message   NVARCHAR(MAX) NULL,
+    rows_processed  BIGINT NULL,
+    retry_count     INT NOT NULL DEFAULT 0,
+    next_retry_at   DATETIME2 NULL,
+    checkpoint_data NVARCHAR(MAX) NULL  -- JSON checkpoint for resumable jobs
+                    CONSTRAINT chk_checkpoint CHECK (
+                        checkpoint_data IS NULL OR ISJSON(checkpoint_data) = 1
+                    )
+);
+
+-- SQL Server failure classifier using error number ranges
+CREATE OR ALTER FUNCTION dbo.ClassifyJobFailure(
+    @error_number INT,
+    @error_message NVARCHAR(MAX)
+)
+RETURNS NVARCHAR(30)
+AS
+BEGIN
+    -- Deadlock, lock timeout
+    IF @error_number IN (1205, 1222)        RETURN 'transient';
+    -- Connection/pool exhaustion
+    IF @error_number IN (17142, 18456, 233) RETURN 'transient';
+    -- Disk full, log full
+    IF @error_number IN (1105, 9002)        RETURN 'resource';
+    -- Query timeout (from application timeout)
+    IF @error_number = 0 AND @error_message LIKE '%timeout%'
+                                            RETURN 'resource';
+    -- Object not found, syntax, type mismatch
+    IF @error_number IN (208, 207, 245, 8144)
+                                            RETURN 'logic';
+    -- Default to transient
+    RETURN 'transient';
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The retry engine calculates the next retry timestamp using exponential backoff, capped by the policy's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_delay_sec</code>. For resource failures it adds a signal-aware component: instead of retrying after a fixed delay, it waits until the signal that caused the failure — disk utilization, connection count — returns to a safe level, then adds the backoff delay on top. This prevents the pathological case where a job on a fixed retry timer repeatedly attempts to run, fails immediately because the resource constraint is still active, and floods the error log.</p>
+
+<p class="text-gray-300 leading-relaxed">Job dependency graphs are declared in a separate edge table and enforced by the scheduling engine before dispatch. A partition-rotation job that must complete before the archival job touches the old partition, an index rebuild that should not run in parallel with a statistics update on the same table — these are first-class relationships in the schema, not comments in a runbook:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Job dependency graph
+CREATE TABLE job_dependencies (
+    dependency_id   SERIAL PRIMARY KEY,
+    upstream_job_id INT REFERENCES autonomous_jobs(job_id),
+    downstream_job_id INT REFERENCES autonomous_jobs(job_id),
+    dependency_type TEXT NOT NULL CHECK (dependency_type IN (
+        'sequential',   -- downstream runs after upstream completes
+        'exclusive',    -- downstream cannot run while upstream is running
+        'shared_table'  -- both touch the same table, cannot overlap
+    )),
+    CONSTRAINT no_self_dep CHECK (upstream_job_id != downstream_job_id)
+);
+
+-- Function: check whether a job's dependencies allow it to be dispatched now
+CREATE OR REPLACE FUNCTION check_job_dependencies(p_job_id INT)
+RETURNS BOOLEAN LANGUAGE plpgsql AS $$
+DECLARE
+    v_blocking_run_id BIGINT;
+BEGIN
+    -- Check sequential dependencies: upstream must have completed successfully
+    SELECT r.run_id INTO v_blocking_run_id
+    FROM job_dependencies d
+    JOIN job_runs r ON r.job_id = d.upstream_job_id
+    WHERE d.downstream_job_id = p_job_id
+      AND d.dependency_type = 'sequential'
+      AND r.status NOT IN ('completed')
+      AND r.started_at &gt; NOW() - INTERVAL '24 hours'
+    ORDER BY r.started_at DESC
+    LIMIT 1;
+
+    IF FOUND THEN RETURN FALSE; END IF;
+
+    -- Check exclusive dependencies: upstream must not be currently running
+    SELECT r.run_id INTO v_blocking_run_id
+    FROM job_dependencies d
+    JOIN job_runs r ON r.job_id = d.upstream_job_id
+    WHERE d.downstream_job_id = p_job_id
+      AND d.dependency_type IN ('exclusive', 'shared_table')
+      AND r.status = 'running';
+
+    IF FOUND THEN RETURN FALSE; END IF;
+
+    -- Also check the reverse: if this job is upstream to something running
+    SELECT r.run_id INTO v_blocking_run_id
+    FROM job_dependencies d
+    JOIN job_runs r ON r.job_id = d.downstream_job_id
+    WHERE d.upstream_job_id = p_job_id
+      AND d.dependency_type IN ('exclusive', 'shared_table')
+      AND r.status = 'running';
+
+    IF FOUND THEN RETURN FALSE; END IF;
+
+    RETURN TRUE;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server job dependency graph
+CREATE TABLE dbo.job_dependencies (
+    dependency_id     INT IDENTITY(1,1) PRIMARY KEY,
+    upstream_job_id   INT REFERENCES dbo.autonomous_jobs(job_id),
+    downstream_job_id INT REFERENCES dbo.autonomous_jobs(job_id),
+    dependency_type   NVARCHAR(30) NOT NULL
+                      CONSTRAINT chk_dep_type CHECK (dependency_type IN (
+                          'sequential', 'exclusive', 'shared_table'
+                      )),
+    CONSTRAINT no_self_dep CHECK (upstream_job_id != downstream_job_id)
+);
+
+-- Dependency check procedure returns 1 if job may be dispatched
+CREATE OR ALTER PROCEDURE dbo.CheckJobDependencies
+    @job_id     INT,
+    @can_run    BIT OUTPUT
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET @can_run = 1;
+
+    -- Sequential: upstream must have a completed run in the last 24 hours
+    IF EXISTS (
+        SELECT 1
+        FROM dbo.job_dependencies d
+        JOIN dbo.job_runs r ON r.job_id = d.upstream_job_id
+        WHERE d.downstream_job_id = @job_id
+          AND d.dependency_type = 'sequential'
+          AND r.status != 'completed'
+          AND r.started_at &gt; DATEADD(HOUR, -24, SYSUTCDATETIME())
+    )
+    BEGIN
+        SET @can_run = 0; RETURN;
+    END
+
+    -- Exclusive or shared_table: upstream must not be running
+    IF EXISTS (
+        SELECT 1
+        FROM dbo.job_dependencies d
+        JOIN dbo.job_runs r ON r.job_id = d.upstream_job_id
+        WHERE d.downstream_job_id = @job_id
+          AND d.dependency_type IN ('exclusive', 'shared_table')
+          AND r.status = 'running'
+    )
+    BEGIN
+        SET @can_run = 0; RETURN;
+    END
+
+    -- Reverse check: downstream sibling must not be running
+    IF EXISTS (
+        SELECT 1
+        FROM dbo.job_dependencies d
+        JOIN dbo.job_runs r ON r.job_id = d.downstream_job_id
+        WHERE d.upstream_job_id = @job_id
+          AND d.dependency_type IN ('exclusive', 'shared_table')
+          AND r.status = 'running'
+    )
+    BEGIN
+        SET @can_run = 0; RETURN;
+    END
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The combination of failure classification, signal-aware retry scheduling, and dependency enforcement means that a cascade failure — where one job's failure would previously cause a chain of cron-triggered downstream jobs to also fail — is replaced by an ordered recovery: the upstream job retries autonomously, the downstream jobs wait in a dependency-blocked state, and once the upstream job completes successfully, the downstream jobs become eligible for dispatch without any human action.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Master Scheduler Loop: Assembling the Full Decision Cycle</h3>
+
+<p class="text-gray-300 leading-relaxed">All the components built so far — signal pipeline, precondition evaluator, conflict resolver, dependency checker, retry engine — compose into a single master scheduler loop. This loop is the autonomous decision cycle, and it runs on a fixed short interval (30–60 seconds), treating each iteration as a fresh evaluation of the world state.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Cycle start: apply forecast-adjusted budgets] --> B[Next eligible job by priority]
+    B --> C{Preconditions met?}
+    C -->|no| D[Log: skipped_precondition] --> B
+    C -->|yes| E{Dependencies clear?}
+    E -->|no| F[Log: skipped_dependency] --> B
+    E -->|yes| G{Fits resource budget?}
+    G -->|no| H[Log: skipped_budget] --> B
+    G -->|yes| I[Insert running record,<br/>allocate budget]
+    I --> J[Async dispatch:<br/>pg_notify / Service Broker]
+    J --> B</pre></div>
+<p class="text-gray-300 leading-relaxed">*Every job in the priority-ordered queue passes through the same four gates each cycle — nothing runs on a clock, only on cleared preconditions, dependencies, and budget.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE run_scheduler_cycle()
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_job            RECORD;
+    v_can_run        BOOLEAN;
+    v_pre_ok         BOOLEAN;
+    v_dep_ok         BOOLEAN;
+    v_run_id         BIGINT;
+    v_resource_budget_io   INT := 4096;  -- MB available this cycle
+    v_resource_budget_cpu  NUMERIC := 60.0; -- % available this cycle
+    v_allocated_io   INT := 0;
+    v_allocated_cpu  NUMERIC := 0.0;
+BEGIN
+    -- Step 1: Apply forecast-based budget adjustments
+    -- Tighten budgets during predicted high-load hours
+    SELECT
+        v_resource_budget_io  * CASE WHEN p75_io  &gt; 60 THEN 0.5 ELSE 1.0 END,
+        v_resource_budget_cpu * CASE WHEN p75_cpu &gt; 60 THEN 0.5 ELSE 1.0 END
+    INTO v_resource_budget_io, v_resource_budget_cpu
+    FROM (
+        SELECT
+            MAX(CASE WHEN signal_name = 'active_connections_pct'
+                     THEN p75_value ELSE 0 END) AS p75_io,
+            MAX(CASE WHEN signal_name = 'cpu_utilization_pct'
+                     THEN p75_value ELSE 0 END) AS p75_cpu
+        FROM scheduler_workload_forecast
+        WHERE dow       = EXTRACT(DOW  FROM NOW())::INT
+          AND hour_of_day = EXTRACT(HOUR FROM NOW())::INT
+    ) forecast_values;
+
+    -- Step 2: Evaluate each enabled job in priority order
+    FOR v_job IN
+        SELECT j.*
+        FROM autonomous_jobs j
+        LEFT JOIN LATERAL (
+            SELECT status, next_retry_at
+            FROM job_runs
+            WHERE job_id = j.job_id
+            ORDER BY started_at DESC
+            LIMIT 1
+        ) last_run ON TRUE
+        WHERE j.enabled = TRUE
+          AND (
+              last_run.status IS NULL
+              OR last_run.status NOT IN ('running')
+              AND (last_run.next_retry_at IS NULL OR last_run.next_retry_at &lt;= NOW())
+          )
+        ORDER BY j.priority ASC, j.estimated_io_mb ASC NULLS LAST
+    LOOP
+        -- Step 3: Check preconditions
+        v_pre_ok := evaluate_job_preconditions(v_job.job_id);
+        IF NOT v_pre_ok THEN
+            INSERT INTO job_runs (job_id, status, started_at, finished_at)
+            VALUES (v_job.job_id, 'skipped', NOW(), NOW());
+            CONTINUE;
+        END IF;
+
+        -- Step 4: Check dependencies
+        v_dep_ok := check_job_dependencies(v_job.job_id);
+        IF NOT v_dep_ok THEN CONTINUE; END IF;
+
+        -- Step 5: Check resource budget
+        IF (v_allocated_io  + COALESCE(v_job.estimated_io_mb,  0)) &gt; v_resource_budget_io
+        OR (v_allocated_cpu + COALESCE(v_job.estimated_cpu_pct, 0)) &gt; v_resource_budget_cpu
+        THEN
+            -- Defer this job: budget exhausted for this cycle
+            INSERT INTO job_runs (job_id, status, started_at, finished_at,
+                                  failure_class, error_message)
+            VALUES (v_job.job_id, 'skipped', NOW(), NOW(),
+                    NULL, 'resource_budget_exhausted');
+            CONTINUE;
+        END IF;
+
+        -- Step 6: Dispatch — insert a running record and execute asynchronously
+        INSERT INTO job_runs (job_id, status, started_at)
+        VALUES (v_job.job_id, 'running', NOW())
+        RETURNING run_id INTO v_run_id;
+
+        -- Accumulate resource allocation
+        v_allocated_io  := v_allocated_io  + COALESCE(v_job.estimated_io_mb,  0);
+        v_allocated_cpu := v_allocated_cpu + COALESCE(v_job.estimated_cpu_pct, 0);
+
+        -- Actual execution happens in a background worker process
+        -- The run_id is passed so the worker can update job_runs on completion
+        PERFORM pg_notify(
+            'scheduler_dispatch',
+            json_build_object(
+                'run_id',    v_run_id,
+                'job_id',    v_job.job_id,
+                'work_unit', v_job.work_unit,
+                'max_duration_sec', v_job.max_duration_sec
+            )::text
+        );
+    END LOOP;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> call dispatches to a Python worker pool that subscribes to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scheduler_dispatch</code> channel. Each worker picks up one dispatch notification, executes the work unit, and updates the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">job_runs</code> record. The scheduler procedure itself never blocks on job execution — the 30-second loop runs cleanly regardless of how long individual jobs take.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server master scheduler cycle using Service Broker for async dispatch
+CREATE OR ALTER PROCEDURE dbo.RunSchedulerCycle
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @job_id             INT,
+        @job_name           NVARCHAR(256),
+        @work_unit          NVARCHAR(MAX),
+        @max_duration_sec   INT,
+        @estimated_io       INT,
+        @estimated_cpu      DECIMAL(5,2),
+        @run_id             BIGINT,
+        @pre_ok             BIT,
+        @dep_ok             BIT,
+        @budget_io          INT        = 4096,
+        @budget_cpu         DECIMAL(5,2) = 60.0,
+        @allocated_io       INT        = 0,
+        @allocated_cpu      DECIMAL(5,2) = 0.0;
+
+    -- Forecast-based budget tightening
+    SELECT
+        @budget_io  = @budget_io  * CASE WHEN p75_conn &gt; 60 THEN 0.5 ELSE 1.0 END,
+        @budget_cpu = @budget_cpu * CASE WHEN p75_cpu  &gt; 60 THEN 0.5 ELSE 1.0 END
+    FROM (
+        SELECT
+            MAX(CASE WHEN signal_name = 'active_connections_pct'
+                     THEN p75_value ELSE 0 END) AS p75_conn,
+            MAX(CASE WHEN signal_name = 'cpu_utilization_pct'
+                     THEN p75_value ELSE 0 END) AS p75_cpu
+        FROM dbo.scheduler_workload_forecast
+        WHERE dow        = DATEPART(WEEKDAY, SYSUTCDATETIME()) - 1
+          AND hour_of_day = DATEPART(HOUR, SYSUTCDATETIME())
+    ) f;
+
+    -- Cursor over eligible jobs in priority order
+    DECLARE job_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT j.job_id, j.job_name, j.work_unit,
+               j.max_duration_sec, j.estimated_io_mb, j.estimated_cpu_pct
+        FROM dbo.autonomous_jobs j
+        OUTER APPLY (
+            SELECT TOP 1 status, next_retry_at
+            FROM dbo.job_runs
+            WHERE job_id = j.job_id
+            ORDER BY started_at DESC
+        ) lr
+        WHERE j.enabled = 1
+          AND (lr.status IS NULL
+               OR (lr.status NOT IN ('running')
+                   AND (lr.next_retry_at IS NULL
+                        OR lr.next_retry_at &lt;= SYSUTCDATETIME())))
+        ORDER BY j.priority ASC, j.estimated_io_mb ASC;
+
+    OPEN job_cursor;
+    FETCH NEXT FROM job_cursor
+    INTO @job_id, @job_name, @work_unit,
+         @max_duration_sec, @estimated_io, @estimated_cpu;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Evaluate preconditions (called as scalar function inline)
+        SET @pre_ok = dbo.EvaluateJobPreconditions(@job_id);
+
+        IF @pre_ok = 0
+        BEGIN
+            INSERT INTO dbo.job_runs (job_id, status, started_at, finished_at)
+            VALUES (@job_id, 'skipped', SYSUTCDATETIME(), SYSUTCDATETIME());
+            GOTO next_job;
+        END
+
+        -- Dependency check
+        EXEC dbo.CheckJobDependencies @job_id = @job_id, @can_run = @dep_ok OUTPUT;
+        IF @dep_ok = 0 GOTO next_job;
+
+        -- Resource budget check
+        IF (@allocated_io  + ISNULL(@estimated_io,  0)) &gt; @budget_io
+        OR (@allocated_cpu + ISNULL(@estimated_cpu, 0)) &gt; @budget_cpu
+        BEGIN
+            INSERT INTO dbo.job_runs (job_id, status, started_at, finished_at,
+                                      error_message)
+            VALUES (@job_id, 'skipped', SYSUTCDATETIME(), SYSUTCDATETIME(),
+                    'resource_budget_exhausted');
+            GOTO next_job;
+        END
+
+        -- Insert running record
+        INSERT INTO dbo.job_runs (job_id, status, started_at)
+        VALUES (@job_id, 'running', SYSUTCDATETIME());
+        SET @run_id = SCOPE_IDENTITY();
+
+        -- Accumulate budget usage
+        SET @allocated_io  = @allocated_io  + ISNULL(@estimated_io,  0);
+        SET @allocated_cpu = @allocated_cpu + ISNULL(@estimated_cpu, 0);
+
+        -- Dispatch via Service Broker for async execution
+        DECLARE @msg NVARCHAR(MAX) = (
+            SELECT @run_id AS run_id, @job_id AS job_id,
+                   @work_unit AS work_unit,
+                   @max_duration_sec AS max_duration_sec
+            FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+        );
+        EXEC dbo.DispatchJobToServiceBroker @message = @msg;
+
+        next_job:
+        FETCH NEXT FROM job_cursor
+        INTO @job_id, @job_name, @work_unit,
+             @max_duration_sec, @estimated_io, @estimated_cpu;
+    END
+
+    CLOSE job_cursor;
+    DEALLOCATE job_cursor;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Both implementations share the same decision structure: forecast-adjusted budgets → precondition evaluation → dependency check → resource budget gate → async dispatch. The async dispatch layer is critical. Synchronous execution inside the scheduler loop would cause the loop to block behind slow-running maintenance jobs, defeating the point of a dynamic decision cycle.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability: Audit Trails, Decision Logs, and Scheduler Introspection</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous scheduler making decisions invisibly is an operations nightmare. Every decision — run, skip, defer, suspend, retry — must be logged with enough context to reconstruct why the system chose what it did. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">job_runs</code> table provides execution history, but the scheduler also needs a separate decision log that captures the signal values and precondition outcomes at the moment of each scheduling decision. When an operator asks "why didn't the index rebuild run last night?", they should get a precise answer from structured data, not a guess.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: scheduler decision audit log
+CREATE TABLE scheduler_decision_log (
+    decision_id     BIGSERIAL PRIMARY KEY,
+    decided_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    job_id          INT REFERENCES autonomous_jobs(job_id),
+    decision        TEXT NOT NULL CHECK (decision IN (
+                        'dispatched', 'skipped_precondition',
+                        'skipped_dependency', 'skipped_budget',
+                        'deferred_retry', 'suspended'
+                    )),
+    signal_snapshot JSONB,      -- signal values at decision time
+    reason_detail   TEXT
+);
+
+-- Helper to snapshot current signal values for a job's preconditions
+CREATE OR REPLACE FUNCTION snapshot_precondition_signals(p_job_id INT)
+RETURNS JSONB LANGUAGE sql AS $$
+    SELECT jsonb_object_agg(
+        s.signal_name,
+        jsonb_build_object(
+            'value',        s.signal_value,
+            'collected_at', s.collected_at,
+            'age_seconds',  EXTRACT(EPOCH FROM (NOW() - s.collected_at))
+        )
+    )
+    FROM autonomous_jobs j,
+         jsonb_array_elements(j.preconditions) AS pc,
+         LATERAL (
+             SELECT signal_name, signal_value, collected_at
+             FROM scheduler_signals
+             WHERE signal_name = pc-&gt;&gt;'signal'
+             ORDER BY collected_at DESC
+             LIMIT 1
+         ) s
+    WHERE j.job_id = p_job_id;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">signal_snapshot</code> column stores the exact state the evaluator saw when it made its decision. When queried later, an operator can see: "At 02:14 UTC, active_connections_pct was 43.2 (threshold was 40), so the precondition failed by 3.2 percentage points." This kind of precision turns autonomous behavior from a black box into an auditable system that builds operational trust over time.</p>
+
+<p class="text-gray-300 leading-relaxed">A live introspection view aggregates across the decision log and job run history to give a real-time picture of scheduler health:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: scheduler health introspection view
+CREATE VIEW v_scheduler_health AS
+WITH recent_decisions AS (
+    SELECT
+        j.job_name,
+        COUNT(*) FILTER (WHERE dl.decision = 'dispatched')           AS dispatched_24h,
+        COUNT(*) FILTER (WHERE dl.decision LIKE 'skipped%')          AS skipped_24h,
+        COUNT(*) FILTER (WHERE dl.decision = 'deferred_retry')       AS retries_24h,
+        MAX(dl.decided_at) FILTER (WHERE dl.decision = 'dispatched') AS last_dispatched
+    FROM scheduler_decision_log dl
+    JOIN autonomous_jobs j USING (job_id)
+    WHERE dl.decided_at &gt; NOW() - INTERVAL '24 hours'
+    GROUP BY j.job_name
+),
+recent_runs AS (
+    SELECT
+        j.job_name,
+        COUNT(*) FILTER (WHERE r.status = 'completed')               AS completed_24h,
+        COUNT(*) FILTER (WHERE r.status LIKE 'failed%')              AS failed_24h,
+        AVG(EXTRACT(EPOCH FROM (r.finished_at - r.started_at)))
+            FILTER (WHERE r.status = 'completed')                    AS avg_duration_sec
+    FROM job_runs r
+    JOIN autonomous_jobs j USING (job_id)
+    WHERE r.started_at &gt; NOW() - INTERVAL '24 hours'
+    GROUP BY j.job_name
+)
+SELECT
+    d.job_name,
+    d.dispatched_24h,
+    d.skipped_24h,
+    d.retries_24h,
+    r.completed_24h,
+    r.failed_24h,
+    ROUND(r.avg_duration_sec::NUMERIC, 1) AS avg_duration_sec,
+    d.last_dispatched,
+    CASE
+        WHEN r.failed_24h &gt; 3                   THEN 'degraded'
+        WHEN d.dispatched_24h = 0
+             AND d.skipped_24h &gt; 20             THEN 'starved'
+        WHEN d.dispatched_24h &gt; 0
+             AND r.completed_24h = 0            THEN 'dispatch_stuck'
+        ELSE 'healthy'
+    END AS health_status
+FROM recent_decisions d
+LEFT JOIN recent_runs r USING (job_name);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">health_status</code> column automatically surfaces three pathological states: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">degraded</code> (too many failures), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">starved</code> (a job keeps getting skipped, suggesting its preconditions are chronically unmet or too tight), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dispatch_stuck</code> (jobs are being dispatched but never completing, indicating a problem in the execution layer). These states can drive alerts through standard monitoring pipelines without requiring a human to manually review scheduler logs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Production Hardening: Scheduler Self-Protection and Graceful Degradation</h3>
+
+<p class="text-gray-300 leading-relaxed">A production autonomous scheduler must protect itself from three failure modes that can cause more damage than the problems it is meant to solve: runaway jobs that consume excessive resources, scheduler loop failures that silently stop all maintenance, and feedback loops where the scheduler's own activity becomes a signal that suppresses further scheduling.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Runaway job protection</strong> is implemented as a watchdog that runs independently of the main scheduler loop. It periodically scans <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">job_runs</code> for entries that have been in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">running</code> state longer than the job's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_duration_sec</code>, and issues a cancellation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL watchdog: cancel jobs exceeding their time budget
+CREATE OR REPLACE PROCEDURE scheduler_watchdog()
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_run RECORD;
+    v_cancelled BOOLEAN;
+BEGIN
+    FOR v_run IN
+        SELECT r.run_id, r.job_id, j.job_name,
+               j.max_duration_sec,
+               EXTRACT(EPOCH FROM (NOW() - r.started_at)) AS elapsed_sec
+        FROM job_runs r
+        JOIN autonomous_jobs j USING (job_id)
+        WHERE r.status = 'running'
+          AND EXTRACT(EPOCH FROM (NOW() - r.started_at)) &gt; j.max_duration_sec
+    LOOP
+        -- Attempt graceful cancellation via pg_cancel_backend
+        -- The worker process must register its PID in job_runs
+        UPDATE job_runs SET
+            status        = 'suspended',
+            finished_at   = NOW(),
+            failure_class = 'resource',
+            error_message = FORMAT('Exceeded max_duration_sec (%s). Elapsed: %s s',
+                                   v_run.max_duration_sec,
+                                   ROUND(v_run.elapsed_sec))
+        WHERE run_id = v_run.run_id
+          AND status = 'running';
+
+        RAISE NOTICE 'Watchdog suspended job % (run_id=%) after % seconds',
+            v_run.job_name, v_run.run_id, ROUND(v_run.elapsed_sec);
+    END LOOP;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scheduler loop liveness</strong> is monitored by a heartbeat mechanism. The scheduler loop writes a timestamp to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scheduler_heartbeat</code> table at the end of each successful cycle. A separate lightweight check — running as a true cron entry or a cloud health check endpoint — verifies that the heartbeat is recent. If the scheduler has been silent for more than three cycle intervals, it triggers an alert and attempts a self-restart through the process supervisor. The bootstrap cron entry that calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">run_scheduler_cycle()</code> every 60 seconds is thus reduced to exactly two responsibilities: collecting signals and verifying the scheduler's own heartbeat. If that minimal bootstrap cron fails, the impact is limited and recoverable.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Feedback loop prevention</strong> addresses a subtle failure mode: the scheduler running a noisy maintenance job that elevates connection counts or CPU, which causes the scheduler's own signal pipeline to read high utilization, which suppresses further scheduling, which allows maintenance debt to accumulate, which makes future maintenance more expensive when it eventually runs. The prevention mechanism exempts the scheduler's own signal collection and decision processes from the signal-based precondition evaluations, and tags scheduler-initiated connections in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sessions</code> with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">application_name</code> prefix (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scheduler_worker_</code>) so the connection percentage calculation can exclude them from the utilization signal.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Intent replaces timing**: autonomous job scheduling encodes what a job needs to be true before it runs — signal preconditions, dependency state, resource budgets — rather than when on the clock it should execute. This eliminates stale assumptions and enables the system to defer, batch, or suppress work based on real conditions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Signal quality determines decision quality**: the scheduler is only as intelligent as its inputs. A tiered signal pipeline — high-frequency DMV signals, lower-frequency semantic signals, and external cluster signals via Prometheus — gives the decision engine the context it needs to distinguish a genuinely idle window from a deceptively quiet moment before a load spike.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Failure classification drives proportionate recovery**: treating all job failures as equivalent leads to either aggressive retrying of logic errors (which will never succeed) or under-retrying of transient lock conflicts (which resolve quickly). Classifying failures at catch time — transient, resource, logic, partial — and applying class-specific retry strategies with signal-aware backoff makes recovery both faster and safer.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Async dispatch decouples decision cycles from execution time**: the scheduler loop must never block waiting for a job to finish. Using `pg_notify` with a worker pool on PostgreSQL, or Service Broker on SQL Server, keeps the 30-second decision cycle clean regardless of whether a triggered index rebuild takes 45 seconds or 45 minutes.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability is the trust mechanism**: an autonomous system that makes decisions invisibly will be overridden by humans the moment something unexpected happens. Logging every scheduling decision with its signal snapshot, surfacing scheduler health through introspection views, and detecting pathological states like job starvation or dispatch-stuck conditions transforms autonomous behavior from opaque automation into a legible, auditable system that operators can reason about and trust.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
