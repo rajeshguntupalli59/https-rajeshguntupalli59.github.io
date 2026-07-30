@@ -6,6 +6,10 @@
   <title>Chapter 35: Autonomous Cost Optimization — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 35: Autonomous Cost Optimization. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -435,6 +439,630 @@ SELECT cron.schedule(
 );</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Resource Governor workload group mapping for cost governance
+-- Each cost center maps to a resource pool with CPU/memory limits
+CREATE RESOURCE POOL DataSciencePool
+WITH (
+    MIN_CPU_PERCENT        = 0,
+    MAX_CPU_PERCENT        = 25,    -- Cap at 25% CPU for exploratory workloads
+    MIN_MEMORY_PERCENT     = 0,
+    MAX_MEMORY_PERCENT     = 20,
+    MIN_IOPS_PER_VOLUME    = 0,
+    MAX_IOPS_PER_VOLUME    = 500
+);
+
+CREATE RESOURCE POOL OLTPPool
+WITH (
+    MIN_CPU_PERCENT        = 20,
+    MAX_CPU_PERCENT        = 80,
+    MIN_MEMORY_PERCENT     = 20,
+    MAX_MEMORY_PERCENT     = 70
+);
+
+-- Classifier function: route connections to pools based on login
+CREATE FUNCTION CostOptimization.ClassifyWorkload()
+RETURNS SYSNAME
+WITH SCHEMABINDING AS
+BEGIN
+    DECLARE @PoolName SYSNAME = 'default';
+
+    SELECT @PoolName = rcp.ResourcePoolName
+    FROM CostOptimization.RoleCostPolicy rcp
+    WHERE rcp.LoginName = SUSER_SNAME()
+      AND rcp.IsActive = 1;
+
+    RETURN @PoolName;
+END;
+
+ALTER RESOURCE GOVERNOR WITH (CLASSIFIER_FUNCTION = CostOptimization.ClassifyWorkload);
+ALTER RESOURCE GOVERNOR RECONFIGURE;
+
+-- Autonomous kill of queries exceeding cost-based time limits
+-- Executed by SQL Agent job every 60 seconds
+CREATE OR REPLACE PROCEDURE CostOptimization.KillOverbudgetQueries
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @SessionID   INT;
+    DECLARE @LoginName   NVARCHAR(128);
+    DECLARE @DurationSec INT;
+    DECLARE @KillSQL     NVARCHAR(64);
+
+    DECLARE kill_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT
+            r.session_id,
+            s.login_name,
+            DATEDIFF(SECOND, r.start_time, SYSUTCDATETIME()) AS duration_sec
+        FROM sys.dm_exec_requests r
+        JOIN sys.dm_exec_sessions  s ON s.session_id = r.session_id
+        JOIN CostOptimization.RoleCostPolicy rcp
+            ON rcp.LoginName = s.login_name
+           AND rcp.IsActive   = 1
+        WHERE DATEDIFF(SECOND, r.start_time, SYSUTCDATETIME())
+              &gt; rcp.HardKillTimeoutSec
+          AND r.session_id &lt;&gt; @@SPID;
+
+    OPEN kill_cursor;
+    FETCH NEXT FROM kill_cursor INTO @SessionID, @LoginName, @DurationSec;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @KillSQL = N'KILL ' + CAST(@SessionID AS NVARCHAR(10));
+
+        INSERT INTO CostOptimization.KillLog
+            (SessionID, LoginName, DurationSec, KilledAt)
+        VALUES (@SessionID, @LoginName, @DurationSec, SYSUTCDATETIME());
+
+        EXEC sp_executesql @KillSQL;
+
+        FETCH NEXT FROM kill_cursor INTO @SessionID, @LoginName, @DurationSec;
+    END;
+
+    CLOSE kill_cursor;
+    DEALLOCATE kill_cursor;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 2 — Workload Shaping via Queue Depth Control.</strong> Rather than killing queries outright, a more sophisticated approach throttles arrival rate at the connection pooler. When the autonomous system detects that aggregate query cost (estimated compute + I/O) in a rolling 5-minute window is approaching the cost center's budget threshold, it instructs PgBouncer (PostgreSQL) or the application-tier connection pool (SQL Server) to reduce <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_client_conn</code> for the offending pool. This creates natural back-pressure without hard terminations — callers queue rather than fail, and the system bleeds off the overload gradually.</p>
+
+<p class="text-gray-300 leading-relaxed">The key metrics that drive queue depth control are:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `active_query_cost_rate_usd_per_min` — sum of estimated cost per minute across all currently running queries for a cost center</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `budget_burn_rate_pct` — how fast the monthly budget is being consumed versus expected linear burn</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `queue_depth_ratio` — ratio of waiting connections to active connections; above 3.0 indicates a pooler bottleneck that amplifies cost</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — budget burn rate monitor:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE VIEW cost_optimization.budget_burn_rate AS
+WITH daily_spend AS (
+    SELECT
+        cost_center,
+        SUM(cost_usd) AS mtd_spend_usd
+    FROM cost_attribution.daily_spend
+    WHERE spend_date &gt;= DATE_TRUNC('month', CURRENT_DATE)
+    GROUP BY cost_center
+),
+expected_linear AS (
+    SELECT
+        o.cost_center,
+        o.monthly_budget_usd,
+        -- Days elapsed in current month as fraction
+        EXTRACT(DAY FROM NOW()) / EXTRACT(DAY FROM
+            (DATE_TRUNC('month', NOW()) + INTERVAL '1 month - 1 day')
+        ) AS month_fraction
+    FROM cost_attribution.ownership o
+)
+SELECT
+    el.cost_center,
+    el.monthly_budget_usd,
+    COALESCE(ds.mtd_spend_usd, 0)                          AS mtd_spend_usd,
+    el.monthly_budget_usd * el.month_fraction               AS expected_spend_usd,
+    ROUND(
+        COALESCE(ds.mtd_spend_usd, 0)
+        / NULLIF(el.monthly_budget_usd * el.month_fraction, 0)
+        * 100
+    , 2)                                                    AS burn_rate_pct,
+    CASE
+        WHEN COALESCE(ds.mtd_spend_usd, 0)
+             &gt; el.monthly_budget_usd * el.month_fraction * 1.20
+        THEN 'THROTTLE'
+        WHEN COALESCE(ds.mtd_spend_usd, 0)
+             &gt; el.monthly_budget_usd * el.month_fraction * 1.10
+        THEN 'WARN'
+        ELSE 'NORMAL'
+    END                                                     AS budget_status
+FROM expected_linear el
+LEFT JOIN daily_spend ds USING (cost_center);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — equivalent burn rate view:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE VIEW CostOptimization.BudgetBurnRate AS
+WITH DailySpend AS (
+    SELECT
+        CostCenter,
+        SUM(CostUSD) AS MTDSpendUSD
+    FROM CostAttribution.DailySpend
+    WHERE SpendDate &gt;= DATEFROMPARTS(YEAR(SYSUTCDATETIME()), MONTH(SYSUTCDATETIME()), 1)
+    GROUP BY CostCenter
+),
+ExpectedLinear AS (
+    SELECT
+        o.CostCenter,
+        o.MonthlyBudgetUSD,
+        -- Fraction of month elapsed
+        CAST(DAY(SYSUTCDATETIME()) AS FLOAT)
+        / CAST(DAY(EOMONTH(SYSUTCDATETIME())) AS FLOAT)  AS MonthFraction
+    FROM CostAttribution.Ownership o
+)
+SELECT
+    el.CostCenter,
+    el.MonthlyBudgetUSD,
+    ISNULL(ds.MTDSpendUSD, 0)                              AS MTDSpendUSD,
+    el.MonthlyBudgetUSD * el.MonthFraction                 AS ExpectedSpendUSD,
+    ROUND(
+        ISNULL(ds.MTDSpendUSD, 0)
+        / NULLIF(el.MonthlyBudgetUSD * el.MonthFraction, 0)
+        * 100
+    , 2)                                                   AS BurnRatePct,
+    CASE
+        WHEN ISNULL(ds.MTDSpendUSD, 0)
+             &gt; el.MonthlyBudgetUSD * el.MonthFraction * 1.20
+        THEN 'THROTTLE'
+        WHEN ISNULL(ds.MTDSpendUSD, 0)
+             &gt; el.MonthlyBudgetUSD * el.MonthFraction * 1.10
+        THEN 'WARN'
+        ELSE 'NORMAL'
+    END                                                    AS BudgetStatus
+FROM ExpectedLinear el
+LEFT JOIN DailySpend ds ON ds.CostCenter = el.CostCenter;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tier 3 — Query Rewrite and Index Suggestion as a Cost Reduction Path.</strong> Before a query is killed or a workload is throttled, the system checks whether the expensive query matches a known rewrite pattern or is missing an index that would reduce its resource footprint by more than 50%. This is cost-aware query optimization: the autonomous planner asks not just "is this query slow?" but "is this query consuming more budget than its value warrants, and can we fix it without killing it?"</p>
+
+<p class="text-gray-300 leading-relaxed">This closes the loop between cost governance and the query optimization subsystems covered in earlier chapters. The cost signal from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> or Query Store feeds back into the index advisor, which prioritizes index candidates by estimated cost reduction rather than purely by execution time improvement.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.4 Predictive Cost Forecasting: Time-Series Models for Budget Protection</h3>
+
+<p class="text-gray-300 leading-relaxed">Reactive cost control — responding after a threshold is crossed — is inherently too slow for monthly budget protection. By the time a cost center is 20% over its expected burn rate, the spend has already occurred. Predictive cost forecasting shifts the control point upstream: the autonomous system builds a rolling forecast of end-of-month spend and takes throttling action when the forecast, not the current spend, exceeds the budget.</p>
+
+<p class="text-gray-300 leading-relaxed">The forecasting model does not need to be sophisticated. A linear extrapolation with a 7-day trailing average captures most of the signal in workloads that have weekly seasonality (which is the majority of business database workloads). More complex workloads — those with end-of-quarter spikes, monthly batch runs, or irregular marketing campaigns — benefit from a simple additive decomposition: trend + weekly seasonal component + a one-time event flag populated from an engineering calendar.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — rolling cost forecast with linear extrapolation:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE FUNCTION cost_optimization.forecast_month_end_spend(
+    p_cost_center TEXT
+)
+RETURNS TABLE (
+    cost_center           TEXT,
+    current_mtd_spend     NUMERIC,
+    forecast_month_end    NUMERIC,
+    monthly_budget        NUMERIC,
+    forecast_over_budget  BOOLEAN,
+    days_until_breach     INT
+) AS $$
+DECLARE
+    v_days_in_month   INT;
+    v_days_elapsed    INT;
+    v_mtd_spend       NUMERIC;
+    v_daily_avg_7d    NUMERIC;
+    v_days_remaining  INT;
+    v_forecast        NUMERIC;
+    v_budget          NUMERIC;
+BEGIN
+    v_days_in_month  := EXTRACT(DAY FROM
+        DATE_TRUNC('month', NOW()) + INTERVAL '1 month' - INTERVAL '1 day'
+    )::INT;
+    v_days_elapsed   := EXTRACT(DAY FROM NOW())::INT;
+    v_days_remaining := v_days_in_month - v_days_elapsed;
+
+    -- MTD actual spend
+    SELECT COALESCE(SUM(ds.cost_usd), 0)
+    INTO   v_mtd_spend
+    FROM   cost_attribution.daily_spend ds
+    WHERE  ds.cost_center = p_cost_center
+      AND  ds.spend_date &gt;= DATE_TRUNC('month', CURRENT_DATE);
+
+    -- 7-day trailing daily average (excludes today to avoid partial day bias)
+    SELECT COALESCE(AVG(ds.cost_usd), 0)
+    INTO   v_daily_avg_7d
+    FROM   cost_attribution.daily_spend ds
+    WHERE  ds.cost_center = p_cost_center
+      AND  ds.spend_date  &gt;= CURRENT_DATE - 7
+      AND  ds.spend_date  &lt;  CURRENT_DATE;
+
+    -- Simple linear forecast: MTD + (7d daily avg × remaining days)
+    v_forecast := v_mtd_spend + (v_daily_avg_7d * v_days_remaining);
+
+    SELECT COALESCE(o.monthly_budget_usd, 0)
+    INTO   v_budget
+    FROM   cost_attribution.ownership o
+    WHERE  o.cost_center = p_cost_center
+    LIMIT  1;
+
+    RETURN QUERY SELECT
+        p_cost_center,
+        v_mtd_spend,
+        v_forecast,
+        v_budget,
+        v_forecast &gt; v_budget,
+        CASE
+            WHEN v_daily_avg_7d &gt; 0
+            THEN GREATEST(0, FLOOR(
+                    (v_budget - v_mtd_spend) / v_daily_avg_7d
+                 )::INT)
+            ELSE v_days_remaining
+        END;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE CostOptimization.ForecastMonthEndSpend
+    @CostCenter NVARCHAR(128)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @DaysInMonth    INT,
+        @DaysElapsed    INT,
+        @DaysRemaining  INT,
+        @MTDSpend       DECIMAL(12,2),
+        @DailyAvg7D     DECIMAL(12,2),
+        @Forecast       DECIMAL(12,2),
+        @Budget         DECIMAL(12,2),
+        @DaysToBreach   INT;
+
+    SET @DaysInMonth   = DAY(EOMONTH(SYSUTCDATETIME()));
+    SET @DaysElapsed   = DAY(SYSUTCDATETIME());
+    SET @DaysRemaining = @DaysInMonth - @DaysElapsed;
+
+    SELECT @MTDSpend = ISNULL(SUM(CostUSD), 0)
+    FROM   CostAttribution.DailySpend
+    WHERE  CostCenter = @CostCenter
+      AND  SpendDate  &gt;= DATEFROMPARTS(YEAR(SYSUTCDATETIME()),
+                                       MONTH(SYSUTCDATETIME()), 1);
+
+    SELECT @DailyAvg7D = ISNULL(AVG(CostUSD), 0)
+    FROM   CostAttribution.DailySpend
+    WHERE  CostCenter = @CostCenter
+      AND  SpendDate  &gt;= CAST(DATEADD(DAY, -7, SYSUTCDATETIME()) AS DATE)
+      AND  SpendDate  &lt;  CAST(SYSUTCDATETIME() AS DATE);
+
+    SET @Forecast = @MTDSpend + (@DailyAvg7D * @DaysRemaining);
+
+    SELECT @Budget = ISNULL(MonthlyBudgetUSD, 0)
+    FROM   CostAttribution.Ownership
+    WHERE  CostCenter = @CostCenter;
+
+    SET @DaysToBreach =
+        CASE
+            WHEN @DailyAvg7D &gt; 0
+            THEN CAST(FLOOR((@Budget - @MTDSpend) / @DailyAvg7D) AS INT)
+            ELSE @DaysRemaining
+        END;
+
+    SELECT
+        @CostCenter                         AS CostCenter,
+        @MTDSpend                           AS CurrentMTDSpend,
+        @Forecast                           AS ForecastMonthEnd,
+        @Budget                             AS MonthlyBudget,
+        CASE WHEN @Forecast &gt; @Budget
+             THEN CAST(1 AS BIT) ELSE CAST(0 AS BIT) END AS ForecastOverBudget,
+        GREATEST(0, @DaysToBreach)          AS DaysUntilBreach;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The forecast output feeds a graduated response ladder. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">days_until_breach</code> is more than 14, the system logs a warning. When it drops below 7, the system automatically tightens statement timeouts by 20% for non-critical roles. When it drops below 3, the system activates hard throttling — reducing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> for the offending cost center's pool and rejecting new batch workload submissions. This graduated ladder prevents both false alarms (which erode trust in the autonomous system) and budget overruns (which erode organizational confidence in autonomous operation).</p>
+
+<p class="text-gray-300 leading-relaxed">The forecast can be enhanced with an <strong class="text-white">event calendar overlay</strong> — a simple table that records known high-cost events (end-of-quarter reporting runs, data migration windows, marketing campaign activations) with an estimated cost multiplier. On days adjacent to a calendar event, the system widens the forecast confidence band rather than triggering throttling prematurely.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: event calendar overlay table
+CREATE TABLE cost_optimization.cost_event_calendar (
+    event_id         SERIAL PRIMARY KEY,
+    cost_center      TEXT NOT NULL,
+    event_name       TEXT NOT NULL,
+    event_date       DATE NOT NULL,
+    cost_multiplier  NUMERIC(4,2) DEFAULT 1.0,   -- e.g. 2.5 = expect 2.5× normal daily spend
+    notes            TEXT,
+    created_by       TEXT,
+    created_at       TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- When forecasting, adjust daily average on event days
+-- Modified forecast query fragment:
+-- v_adjusted_daily_avg = v_daily_avg_7d * COALESCE(event_multiplier, 1.0)
+-- for each remaining day, look up whether it falls on a calendar event</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The same table structure applies in SQL Server with standard DDL substitutions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.5 Multi-Dimensional Cost Tradeoff Engine: Balancing SLA, Availability, and Spend</h3>
+
+<p class="text-gray-300 leading-relaxed">The hardest problem in autonomous cost optimization is not identifying waste — it is making the correct tradeoff when cost reduction and SLA preservation are in direct conflict. A replica that is idle 90% of the time costs money to run. But that same replica may be the one that absorbs a burst read query from a monthly finance report that arrives at an unpredictable time. Removing it saves cost; keeping it preserves latency headroom. The autonomous system needs a principled framework for resolving this tension without defaulting to the human-in-the-loop.</p>
+
+<p class="text-gray-300 leading-relaxed">The framework used here is a <strong class="text-white">multi-objective scoring function</strong> that assigns a composite score to each potential cost action. The score has three components:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Cost savings weight (W_cost)</strong> — normalized USD saved per month, scaled 0–1 against the maximum potential saving in the action set.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">SLA risk weight (W_sla)</strong> — estimated probability that this action causes an SLA breach in the next 30 days, scaled 0–1 (higher is riskier).</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Availability risk weight (W_avail)</strong> — estimated probability that removing this resource increases RTO if a primary failure occurs simultaneously, scaled 0–1.</p>
+
+<p class="text-gray-300 leading-relaxed">The composite action score is:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Action_Score = W_cost × α  −  W_sla × β  −  W_avail × γ</code></pre>
+
+<p class="text-gray-300 leading-relaxed">where α, β, and γ are organizational preference weights that encode risk tolerance. A cost-aggressive organization (a startup in growth phase) might set α=0.7, β=0.2, γ=0.1. A risk-averse organization (financial services) might set α=0.3, β=0.4, γ=0.3. Actions with positive composite scores are candidates for autonomous execution; negative-scoring actions require human approval regardless of the savings magnitude.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — multi-objective scoring implementation:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE FUNCTION cost_optimization.score_cost_actions(
+    p_alpha NUMERIC DEFAULT 0.5,   -- cost savings weight
+    p_beta  NUMERIC DEFAULT 0.3,   -- SLA risk weight
+    p_gamma NUMERIC DEFAULT 0.2    -- availability risk weight
+)
+RETURNS TABLE (
+    action_id           INT,
+    resource_id         TEXT,
+    action_type         TEXT,
+    savings_usd_mo      NUMERIC,
+    sla_risk_score      NUMERIC,
+    availability_risk   NUMERIC,
+    composite_score     NUMERIC,
+    recommended         BOOLEAN
+) AS $$
+DECLARE
+    v_max_savings NUMERIC;
+BEGIN
+    -- Normalize savings against the maximum in the candidate set
+    SELECT MAX(ca.estimated_savings_usd_mo)
+    INTO   v_max_savings
+    FROM   cost_optimization.action_candidates ca
+    WHERE  ca.status = 'PENDING';
+
+    RETURN QUERY
+    SELECT
+        ca.action_id,
+        ca.resource_id,
+        ca.action_type,
+        ca.estimated_savings_usd_mo,
+        ca.sla_risk_score,
+        ca.availability_risk_score,
+        ROUND(
+            (ca.estimated_savings_usd_mo / NULLIF(v_max_savings, 0)) * p_alpha
+            - ca.sla_risk_score   * p_beta
+            - ca.availability_risk_score * p_gamma
+        , 4)                                        AS composite_score,
+        (
+            (ca.estimated_savings_usd_mo / NULLIF(v_max_savings, 0)) * p_alpha
+            - ca.sla_risk_score   * p_beta
+            - ca.availability_risk_score * p_gamma
+        ) &gt; 0                                       AS recommended
+    FROM cost_optimization.action_candidates ca
+    WHERE ca.status = 'PENDING'
+    ORDER BY composite_score DESC;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE CostOptimization.ScoreCostActions
+    @Alpha DECIMAL(4,2) = 0.5,
+    @Beta  DECIMAL(4,2) = 0.3,
+    @Gamma DECIMAL(4,2) = 0.2
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @MaxSavings DECIMAL(12,2);
+
+    SELECT @MaxSavings = MAX(EstimatedSavingsUSDMonth)
+    FROM   CostOptimization.ActionCandidates
+    WHERE  Status = 'PENDING';
+
+    SELECT
+        ca.ActionID,
+        ca.ResourceID,
+        ca.ActionType,
+        ca.EstimatedSavingsUSDMonth,
+        ca.SLARiskScore,
+        ca.AvailabilityRiskScore,
+        ROUND(
+            (ca.EstimatedSavingsUSDMonth / NULLIF(@MaxSavings, 0)) * @Alpha
+            - ca.SLARiskScore            * @Beta
+            - ca.AvailabilityRiskScore   * @Gamma
+        , 4)                                            AS CompositeScore,
+        CASE
+            WHEN (
+                (ca.EstimatedSavingsUSDMonth / NULLIF(@MaxSavings, 0)) * @Alpha
+                - ca.SLARiskScore            * @Beta
+                - ca.AvailabilityRiskScore   * @Gamma
+            ) &gt; 0 THEN CAST(1 AS BIT)
+            ELSE CAST(0 AS BIT)
+        END                                             AS Recommended
+    FROM   CostOptimization.ActionCandidates ca
+    WHERE  ca.Status = 'PENDING'
+    ORDER  BY CompositeScore DESC;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SLA risk score and availability risk score are not static — they are populated by the system's monitoring layer based on recent behavior. A replica that has served read traffic in the last 48 hours gets a higher SLA risk score for decommissioning than one that has been idle for two weeks. A replica in a region where the primary has shown elevated error rates gets a higher availability risk score for decommissioning than one in a region with a perfect health record.</p>
+
+<p class="text-gray-300 leading-relaxed">This self-updating risk model means the scoring function adapts to changing operational context rather than operating on fixed parameters. The weights (α, β, γ) are the only parameters that require human judgment; the input scores are data-driven and continuously refreshed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.6 Feedback Loops and Continuous Calibration: Closing the Cost Optimization Cycle</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous cost optimization system that acts without measuring the effect of its actions will drift. Replicas are decommissioned, timeouts are tightened, IOPS are reduced — but without a feedback loop that measures whether these actions achieved their intended savings without degrading performance, the system has no mechanism to learn whether its models are calibrated or whether its thresholds are set appropriately.</p>
+
+<p class="text-gray-300 leading-relaxed">The feedback loop operates on a 30-day cycle aligned with the billing period:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1 — Action logging.</strong> Every autonomous action is written to an immutable audit log with the predicted outcome (expected savings, estimated SLA impact) recorded at decision time.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2 — Outcome measurement.</strong> 7 days after an action, the system queries actual spend and SLA metrics for the affected cost center and compares them against the predictions made at decision time.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3 — Calibration adjustment.</strong> If predictions consistently overestimate savings by more than 20%, the cost model's unit cost coefficients ($/vCPU-hour, $/GB-IO) are recalibrated using the measured actuals. If SLA risk predictions consistently underestimate breach probability, the β weight in the scoring function is increased automatically by 0.05 per miscalibration event, up to a maximum of 0.6.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — feedback calibration table and adjustment function:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE cost_optimization.action_outcomes (
+    outcome_id          SERIAL PRIMARY KEY,
+    action_id           INT NOT NULL REFERENCES cost_optimization.action_candidates(action_id),
+    action_taken_at     TIMESTAMPTZ NOT NULL,
+    predicted_savings   NUMERIC(12,2),
+    actual_savings_7d   NUMERIC(12,2),
+    predicted_sla_risk  NUMERIC(5,4),
+    sla_breach_occurred BOOLEAN DEFAULT FALSE,
+    measured_at         TIMESTAMPTZ DEFAULT NOW(),
+    calibration_applied BOOLEAN DEFAULT FALSE
+);
+
+CREATE OR REPLACE FUNCTION cost_optimization.calibrate_cost_model()
+RETURNS TEXT AS $$
+DECLARE
+    v_avg_savings_error   NUMERIC;
+    v_sla_mismatch_count  INT;
+    v_calibration_msg     TEXT := '';
+BEGIN
+    -- Check savings prediction accuracy over last 30 days
+    SELECT AVG(
+        (actual_savings_7d - predicted_savings)
+        / NULLIF(predicted_savings, 0) * 100
+    )
+    INTO v_avg_savings_error
+    FROM cost_optimization.action_outcomes
+    WHERE measured_at &gt;= NOW() - INTERVAL '30 days'
+      AND calibration_applied = FALSE;
+
+    IF ABS(v_avg_savings_error) &gt; 20 THEN
+        -- Adjust cost coefficients by the error fraction
+        UPDATE cost_optimization.cost_model_parameters
+        SET coefficient_value = coefficient_value * (1 + v_avg_savings_error / 100.0),
+            last_calibrated_at = NOW()
+        WHERE parameter_name IN ('cpu_cost_per_vcpu_hour', 'io_cost_per_gb');
+
+        v_calibration_msg := v_calibration_msg
+            || format('Cost model recalibrated: avg error was %s%%. ', ROUND(v_avg_savings_error, 2));
+    END IF;
+
+    -- Check SLA risk prediction accuracy
+    SELECT COUNT(*)
+    INTO v_sla_mismatch_count
+    FROM cost_optimization.action_outcomes
+    WHERE measured_at        &gt;= NOW() - INTERVAL '30 days'
+      AND sla_breach_occurred = TRUE
+      AND predicted_sla_risk  &lt; 0.2    -- predicted low risk but breach occurred
+      AND calibration_applied = FALSE;
+
+    IF v_sla_mismatch_count &gt;= 3 THEN
+        UPDATE cost_optimization.scoring_weights
+        SET weight_value = LEAST(weight_value + 0.05, 0.6),
+            last_adjusted_at = NOW()
+        WHERE weight_name = 'beta_sla_risk';
+
+        v_calibration_msg := v_calibration_msg
+            || format('SLA risk weight increased: %s under-predicted breaches. ',
+                      v_sla_mismatch_count);
+    END IF;
+
+    -- Mark these outcomes as processed
+    UPDATE cost_optimization.action_outcomes
+    SET calibration_applied = TRUE
+    WHERE measured_at &gt;= NOW() - INTERVAL '30 days'
+      AND calibration_applied = FALSE;
+
+    RETURN COALESCE(NULLIF(v_calibration_msg, ''), 'No calibration required.');
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE PROCEDURE CostOptimization.CalibrateCostModel
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @AvgSavingsError   DECIMAL(8,4),
+        @SLAMismatchCount  INT,
+        @CalibrationMsg    NVARCHAR(1000) = N'';
+
+    -- Savings prediction accuracy
+    SELECT @AvgSavingsError = AVG(
+        (ActualSavings7D - PredictedSavings)
+        / NULLIF(PredictedSavings, 0) * 100
+    )
+    FROM CostOptimization.ActionOutcomes
+    WHERE MeasuredAt          &gt;= DATEADD(DAY, -30, SYSUTCDATETIME())
+      AND CalibrationApplied  = 0;
+
+    IF ABS(@AvgSavingsError) &gt; 20
+    BEGIN
+        UPDATE CostOptimization.CostModelParameters
+        SET    CoefficientValue  = CoefficientValue * (1 + @AvgSavingsError / 100.0),
+               LastCalibratedAt = SYSUTCDATETIME()
+        WHERE  ParameterName IN (N'cpu_cost_per_vcpu_hour', N'io_cost_per_gb');
+
+        SET @CalibrationMsg = @CalibrationMsg
+            + N'Cost model recalibrated: avg error was '
+            + CAST(ROUND(@AvgSavingsError, 2) AS NVARCHAR(20)) + N'%. ';
+    END;
+
+    -- SLA risk underestimation check
+    SELECT @SLAMismatchCount = COUNT(*)
+    FROM CostOptimization.ActionOutcomes
+    WHERE MeasuredAt          &gt;= DATEADD(DAY, -30, SYSUTCDATETIME())
+      AND SLABreachOccurred   = 1
+      AND PredictedSLARisk    &lt; 0.2
+      AND CalibrationApplied  = 0;
+
+    IF @SLAMismatchCount &gt;= 3
+    BEGIN
+        UPDATE CostOptimization.ScoringWeights
+        SET    WeightValue     = CASE
+                                     WHEN WeightValue + 0.05 &gt; 0.6 THEN 0.6
+                                     ELSE WeightValue + 0.05
+                                 END,
+               LastAdjustedAt = SYSUTCDATETIME()
+        WHERE  WeightName = N'beta_sla_risk';
+
+        SET @CalibrationMsg = @CalibrationMsg
+            + N'SLA risk weight increased: '
+            + CAST(@SLAMismatchCount AS NVARCHAR(10))
+            + N' under-predicted breaches. ';
+    END;
+
+    -- Mark outcomes processed
+    UPDATE CostOptimization.ActionOutcomes
+    SET    CalibrationApplied = 1
+    WHERE  MeasuredAt        &gt;= DATEADD(DAY, -30, SYSUTCDATETIME())
+      AND  CalibrationApplied = 0;
+
+    SELECT ISNULL(NULLIF(@CalibrationMsg, N''), N'No calibration required.') AS CalibrationResult;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The calibration function is scheduled to run on the first day of each billing month, immediately after month-end actuals are available from the cloud provider. Over several billing cycles, the cost model converges toward accurate unit cost estimates for the specific instance family and region in use, and the scoring weights stabilize at values that reflect the organization's actual risk tolerance as revealed by operational history rather than aspirational policy documents.</p>
+
+<p class="text-gray-300 leading-relaxed">A reasonable target for a well-calibrated system after six months of operation is predicted savings within 10% of actual savings and an SLA breach false-negative rate in the low single digits — figures that will vary with workload volatility and forecasting horizon. Track the actual numbers in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">action_outcomes</code> table and report them in a monthly cost optimization review rather than assuming convergence.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Cost Signals: cloud billing APIs + pg_stat_statements / Query Store] --> B[Attribution & Forecast]
+    B --> C[Candidate Actions: rightsizing, query governance]
+    C --> D[Multi-Objective Scoring: cost vs SLA vs availability risk]
+    D -->|Score above 0| E[Autonomous Execution]
+    D -->|Score at or below 0| F[Human Approval Queue]
+    E --> G[(Action Outcomes Log)]
+    F --> G
+    G -->|7-day outcome measurement| H[Calibration: adjust cost coefficients and risk weights]
+    H --> B</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The closing loop for autonomous cost optimization: every action's predicted outcome is logged, measured a week later, and fed back into both the cost model coefficients and the SLA/availability risk weights.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cost must be a runtime metric, not a billing artifact.** Autonomous cost optimization starts with dimensional attribution — tagging every query, index maintenance event, and storage write to a cost center at collection time, then flowing that signal into the same monitoring stack as CPU and I/O. Without real-time cost visibility, the control loops have nothing to act on.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Rightsizing operates on three independent axes — compute tier, storage IOPS, and replica count — each with its own control loop cadence and safeguards.** Replica decommissioning is gated by minimum quorum floors, change freeze windows, and cost approval thresholds to prevent the autonomous system from undermining DR guarantees in pursuit of savings.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query-level cost governance addresses the demand side of spend through a three-tier model: statement timeout enforcement by cost center, workload shaping via connection pool queue depth control, and cost-aware index suggestion that prioritizes candidates by budget impact rather than raw execution time improvement.**</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Predictive forecasting shifts the control point upstream of threshold breaches.** A linear extrapolation on a 7-day trailing daily average, overlaid with a calendar of known high-cost events, gives the system enough lead time to apply graduated throttling before a cost center's budget is exhausted — rather than after.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The multi-objective scoring function (W_cost × α − W_sla × β − W_avail × γ) provides a principled, auditable basis for resolving cost-versus-SLA tradeoffs autonomously.** The organizational risk preference is encoded in the α/β/γ weights, while the input scores are continuously refreshed from operational data. The feedback calibration loop closes the cycle by adjusting both the cost model coefficients and the β weight when predictions diverge from measured outcomes across billing periods.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
