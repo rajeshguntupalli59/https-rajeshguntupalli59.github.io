@@ -5,6 +5,10 @@
   <title>Chapter 29: Streaming Results from AI Back into PostgreSQL — AI-Native Apps on PostgreSQL</title>
   <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 29: Streaming Results from AI Back into PostgreSQL. LLMs, RAG, agents — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -51,6 +55,17 @@
 <p class="text-gray-300 leading-relaxed">2. Accumulate chunks into a coherent buffer</p>
 <p class="text-gray-300 leading-relaxed">3. Persist the buffer to PostgreSQL at appropriate intervals</p>
 <p class="text-gray-300 leading-relaxed">4. Signal completion and write final metadata</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    LLM[LLM streams tokens] --> Fwd[Forward chunk to client via SSE]
+    LLM --> Buf[Accumulate into in-memory buffer]
+    Buf --> Write[(INSERT into message_stream_chunks)]
+    Write -->|every N chunks| Notify[pg_notify: stream_progress]
+    LLM -->|stream ends| Final[Assemble full content]
+    Final --> Update[(UPDATE messages: content, is_complete = TRUE)]
+    Update --> Done[pg_notify: stream_complete]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Four responsibilities run per chunk; only the final assembly and the completion notification happen once, after the loop ends.*</p>
 
 <p class="text-gray-300 leading-relaxed">The naive approach — buffer everything in memory, write once at the end — breaks when users close their browser tab mid-stream, when network errors interrupt the connection, or when you need audit trails of partial responses. The robust approach writes to PostgreSQL incrementally, using PostgreSQL itself as the coordination layer.</p>
 
@@ -346,6 +361,7 @@ class StreamWriter:
 import anthropic
 import asyncio
 import json
+import uuid
 from typing import AsyncGenerator
 
 import asyncpg
@@ -669,7 +685,836 @@ if __name__ == "__main__":
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">29.4 Celery Workers for Async Post-Stream Processing</h3>
 
 <p class="text-gray-300 leading-relaxed">Stream completion triggers a cascade of downstream work: embedding the assistant's response for RAG retrieval, updating the conversation summary, writing to audit logs, and invalidating Redis caches. Doing this synchronously in the streaming path adds latency. Celery absorbs it asynchronously.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># workers/tasks.py — Celery tasks triggered after stream completion
+import json
+import os
+from celery import Celery
+import redis
+import psycopg2
+from psycopg2.extras import Json
+
+from openai import OpenAI
+
+celery_app = Celery(
+    "stream_tasks",
+    broker=os.environ["REDIS_URL"],
+    backend=os.environ["REDIS_URL"],
+)
+
+openai_client = OpenAI()
+
+def get_db_conn():
+    return psycopg2.connect(os.environ["DATABASE_URL"])
+
+def get_redis():
+    return redis.from_url(os.environ["REDIS_URL"])
+
+@celery_app.task(
+    bind=True,
+    max_retries=3,
+    default_retry_delay=60,
+)
+def generate_message_embedding(self, message_id: str) -&gt; None:
+    """
+    Generates a vector embedding for a completed assistant message
+    and stores it for RAG retrieval.
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Fetch the completed message content
+            cur.execute(
+                """
+                SELECT m.content, m.conversation_id, m.model
+                FROM messages m
+                WHERE m.id = %s AND m.is_complete = TRUE AND m.role = 'assistant'
+                """,
+                (message_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return  # message not ready or already processed
+
+            content, conversation_id, model = row
+
+            if not content or len(content.strip()) &lt; 10:
+                return  # not worth embedding
+
+            # Generate embedding via OpenAI
+            response = openai_client.embeddings.create(
+                input=content,
+                model="text-embedding-3-small",
+            )
+            embedding = response.data[0].embedding
+
+            # Upsert into the message_embeddings table
+            cur.execute(
+                """
+                INSERT INTO message_embeddings (
+                    message_id, conversation_id, embedding,
+                    embedding_model, created_at
+                ) VALUES (%s, %s, %s::vector, %s, NOW())
+                ON CONFLICT (message_id) DO UPDATE SET
+                    embedding = EXCLUDED.embedding,
+                    embedding_model = EXCLUDED.embedding_model,
+                    created_at = NOW()
+                """,
+                (
+                    message_id,
+                    conversation_id,
+                    str(embedding),
+                    "text-embedding-3-small",
+                ),
+            )
+            conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise self.retry(exc=exc)
+    finally:
+        conn.close()
+
+
+@celery_app.task(bind=True, max_retries=3)
+def invalidate_conversation_cache(self, conversation_id: str) -&gt; None:
+    """
+    Clears Redis cache keys for a conversation after a new message
+    has been persisted. Downstream endpoints re-fetch from PostgreSQL.
+    """
+    r = get_redis()
+    try:
+        # Collect all cache keys related to this conversation
+        pattern = f"conv:{conversation_id}:*"
+        keys = r.keys(pattern)
+        if keys:
+            r.delete(*keys)
+
+        # Also clear the conversation list cache for the owning user
+        # (we look up user_id from the DB to construct the key)
+        conn = get_db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT user_id FROM conversations WHERE id = %s",
+                    (conversation_id,),
+                )
+                row = cur.fetchone()
+                if row:
+                    user_id = row[0]
+                    r.delete(f"user:{user_id}:conversations")
+        finally:
+            conn.close()
+
+    except Exception as exc:
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(bind=True, max_retries=2)
+def update_conversation_summary(self, conversation_id: str) -&gt; None:
+    """
+    After every few messages, regenerates a short summary of the
+    conversation for display in the sidebar. This is a non-streaming
+    LLM call since summaries are background work.
+    """
+    conn = get_db_conn()
+    try:
+        with conn.cursor() as cur:
+            # Only update summary every 5 complete assistant messages
+            cur.execute(
+                """
+                SELECT COUNT(*) FROM messages
+                WHERE conversation_id = %s
+                  AND role = 'assistant'
+                  AND is_complete = TRUE
+                """,
+                (conversation_id,),
+            )
+            count = cur.fetchone()[0]
+            if count == 0 or count % 5 != 0:
+                return
+
+            # Pull last 10 turns for summarization context
+            cur.execute(
+                """
+                SELECT role, content
+                FROM messages
+                WHERE conversation_id = %s
+                  AND is_complete = TRUE
+                  AND role IN ('user', 'assistant')
+                ORDER BY created_at DESC
+                LIMIT 10
+                """,
+                (conversation_id,),
+            )
+            rows = cur.fetchall()
+            history = [
+                {"role": r[0], "content": r[1]}
+                for r in reversed(rows)
+                if r[1]
+            ]
+
+            summary_prompt = [
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize the following conversation in one sentence, "
+                        "capturing the main topic. Be concise and factual."
+                    ),
+                },
+                *history,
+            ]
+
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=summary_prompt,
+                max_tokens=60,
+            )
+            summary = response.choices[0].message.content.strip()
+
+            cur.execute(
+                """
+                UPDATE conversations
+                SET title = %s, updated_at = NOW()
+                WHERE id = %s AND (title IS NULL OR title = '')
+                """,
+                (summary, conversation_id),
+            )
+            conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        raise self.retry(exc=exc)
+    finally:
+        conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generate_message_embedding</code> task illustrates the pgvector integration point. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">message_embeddings</code> table it writes to should be created before this runs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent uses a separate vector store or JSON column;
+-- PostgreSQL uses pgvector natively.
+
+-- PostgreSQL
+CREATE TABLE message_embeddings (
+    message_id      UUID PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    embedding       vector(1536) NOT NULL,   -- text-embedding-3-small dimension
+    embedding_model TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_message_embeddings_vector
+    ON message_embeddings
+    USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 100);
+
+CREATE INDEX idx_message_embeddings_conversation
+    ON message_embeddings(conversation_id, created_at);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server (Azure SQL / SQL Server 2025+)
+-- Native vector support via the VECTOR type (preview/GA depending on version)
+CREATE TABLE message_embeddings (
+    message_id      UNIQUEIDENTIFIER PRIMARY KEY,
+    conversation_id UNIQUEIDENTIFIER NOT NULL,
+    embedding       VECTOR(1536) NOT NULL,
+    embedding_model NVARCHAR(100) NOT NULL,
+    created_at      DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    CONSTRAINT fk_me_message    FOREIGN KEY (message_id)
+        REFERENCES messages(id) ON DELETE CASCADE,
+    CONSTRAINT fk_me_conv       FOREIGN KEY (conversation_id)
+        REFERENCES conversations(id) ON DELETE CASCADE
+);
+
+-- SQL Server 2025+ supports native vector indexes
+-- For earlier versions, use columnstore + approximate search patterns
+CREATE INDEX idx_me_conversation
+    ON message_embeddings(conversation_id, created_at);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.5 Handling Interruptions, Partial Responses, and Retries</h3>
+
+<p class="text-gray-300 leading-relaxed">Real users close tabs. Networks hiccup. LLM APIs return 503s at inconvenient moments. Your streaming pipeline needs to survive all of this gracefully.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting interrupted streams</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A message row with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stream_started_at</code> set but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_complete = FALSE</code> more than a few minutes old is almost certainly abandoned. A housekeeping job can detect and mark these:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: find and mark stale incomplete streams
+UPDATE messages
+SET
+    is_complete = TRUE,
+    finish_reason = 'interrupted',
+    stream_completed_at = NOW(),
+    content = (
+        -- Reconstruct what we got from the chunks table
+        SELECT string_agg(chunk_content, '' ORDER BY chunk_index)
+        FROM message_stream_chunks
+        WHERE message_id = messages.id
+    ),
+    error = '{"reason": "stream_interrupted", "source": "housekeeping"}'::jsonb
+WHERE
+    is_complete = FALSE
+    AND stream_started_at &lt; NOW() - INTERVAL '5 minutes'
+RETURNING id, conversation_id, stream_started_at;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
+UPDATE m
+SET
+    m.is_complete = 1,
+    m.finish_reason = 'interrupted',
+    m.stream_completed_at = SYSDATETIMEOFFSET(),
+    m.content = (
+        SELECT STRING_AGG(chunk_content, '' ORDER BY chunk_index)
+        FROM message_stream_chunks msc
+        WHERE msc.message_id = m.id
+    ),
+    m.error = '{"reason": "stream_interrupted", "source": "housekeeping"}'
+FROM messages m
+WHERE
+    m.is_complete = 0
+    AND m.stream_started_at &lt; DATEADD(MINUTE, -5, SYSDATETIMEOFFSET())
+OUTPUT inserted.id, inserted.conversation_id, inserted.stream_started_at;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Resume and replay from chunks</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Because every chunk is durably stored in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">message_stream_chunks</code>, you can reconstruct what arrived before an interruption:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>async def reconstruct_partial_response(
+    pool: asyncpg.Pool,
+    message_id: str,
+) -&gt; str:
+    """
+    Reassembles accumulated content from chunk records.
+    Useful for showing users what the model had generated
+    before the connection dropped.
+    """
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT chunk_content
+            FROM message_stream_chunks
+            WHERE message_id = $1
+            ORDER BY chunk_index ASC
+            """,
+            message_id,
+        )
+    return "".join(row["chunk_content"] for row in rows)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Retry with exponential backoff for API errors</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When the LLM API itself returns a transient error mid-stream, you want to retry from the beginning (since streaming APIs don't support resumption):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import asyncio
+import random
+from typing import AsyncGenerator
+
+async def stream_with_retry(
+    writer: StreamWriter,
+    conversation_id: str,
+    messages: list[dict],
+    model: str = "gpt-4o",
+    max_attempts: int = 3,
+) -&gt; AsyncGenerator[str, None]:
+    """
+    Wraps stream_and_persist with exponential backoff.
+    On retry, creates a fresh message record — the failed
+    attempt is left in the DB with finish_reason='error'.
+    """
+    base_delay = 1.0
+
+    for attempt in range(max_attempts):
+        try:
+            async for token in writer.stream_and_persist(
+                conversation_id=conversation_id,
+                messages=messages,
+                model=model,
+            ):
+                yield token
+            return  # success
+        except Exception as e:
+            if attempt == max_attempts - 1:
+                raise  # exhausted retries
+
+            jitter = random.uniform(0, 0.5)
+            delay = base_delay * (2 ** attempt) + jitter
+            await asyncio.sleep(delay)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.6 Logical Replication for Downstream Consumers</h3>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> works well for low-fan-out use cases: one or two background workers reacting to stream events. When you need many independent consumers — a monitoring dashboard, an audit pipeline, a real-time analytics system, a multi-tenant notification bus — logical replication gives you a durable, ordered, replayable event stream based on PostgreSQL's WAL.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up a logical replication publication</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: create a publication for the streaming tables
+-- Run as a superuser or a role with REPLICATION privilege
+
+-- First, ensure the server is configured for logical replication
+-- (already done in postgresql.conf: wal_level = logical)
+
+CREATE PUBLICATION ai_stream_events
+    FOR TABLE messages, message_stream_chunks
+    WITH (publish = 'insert, update');
+
+-- Verify
+SELECT pubname, pubtables FROM pg_publication_tables
+WHERE pubname = 'ai_stream_events';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Python consumer using pg_replication</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># replication/wal_consumer.py
+# Reads the WAL stream for messages and message_stream_chunks,
+# forwarding events to downstream systems (Kafka, webhook, analytics DB).
+
+import asyncio
+import json
+import logging
+from datetime import datetime
+
+import asyncpg
+
+logger = logging.getLogger(__name__)
+
+SLOT_NAME = "ai_stream_consumer"
+PUBLICATION_NAME = "ai_stream_events"
+
+async def create_replication_slot_if_needed(conn: asyncpg.Connection) -&gt; None:
+    """Creates the logical replication slot if it doesn't exist."""
+    existing = await conn.fetchval(
+        "SELECT slot_name FROM pg_replication_slots WHERE slot_name = $1",
+        SLOT_NAME,
+    )
+    if not existing:
+        await conn.execute(
+            f"SELECT pg_create_logical_replication_slot($1, 'pgoutput')",
+            SLOT_NAME,
+        )
+        logger.info(f"Created replication slot: {SLOT_NAME}")
+
+async def consume_wal_events(dsn: str) -&gt; None:
+    """
+    Connects to PostgreSQL in replication mode and processes WAL events
+    for the ai_stream_events publication.
+    """
+    # Replication connections require a dedicated asyncpg connection
+    # with replication=True — they cannot be pooled.
+    conn = await asyncpg.connect(dsn, replication="database")
+
+    await create_replication_slot_if_needed(conn)
+
+    logger.info("Starting logical replication consumer...")
+
+    async def process_message(lsn: int, data: bytes) -&gt; None:
+        """
+        Decodes pgoutput protocol messages.
+        In production, use a library like pg_logical_replication or
+        decode the binary protocol manually.
+        Here we show the pattern; full pgoutput decoding is involved.
+        """
+        # pgoutput sends binary-encoded tuples; in practice you'd use
+        # a decoder library. This shows the structural pattern.
+        try:
+            decoded = decode_pgoutput(data)  # your decoder here
+            if decoded["type"] == "INSERT" and decoded["relation"] == "messages":
+                await handle_message_insert(decoded["new"])
+            elif decoded["type"] == "UPDATE" and decoded["relation"] == "messages":
+                await handle_message_update(decoded["old"], decoded["new"])
+            elif decoded["type"] == "INSERT" and decoded["relation"] == "message_stream_chunks":
+                await handle_chunk_insert(decoded["new"])
+        except Exception as e:
+            logger.error(f"Error processing WAL event: {e}")
+
+    await conn.start_replication(
+        slot_name=SLOT_NAME,
+        options={
+            "publication_names": PUBLICATION_NAME,
+            "proto_version": "1",
+        },
+        decode=False,
+    )
+
+    async for message in conn.replication_messages():
+        await process_message(message.data_start, message.payload)
+        # Acknowledge receipt so PostgreSQL can advance the replication slot
+        await message.acknowledge()
+
+async def handle_message_insert(row: dict) -&gt; None:
+    """Route new message records to downstream systems."""
+    logger.info(f"New message: {row.get('id')}, complete={row.get('is_complete')}")
+    # Forward to Kafka, webhook, analytics pipeline, etc.
+
+async def handle_message_update(old: dict, new: dict) -&gt; None:
+    """Route message completions when is_complete flips to TRUE."""
+    if not old.get("is_complete") and new.get("is_complete"):
+        logger.info(f"Message completed: {new.get('id')}")
+        # Trigger downstream work
+
+async def handle_chunk_insert(row: dict) -&gt; None:
+    """Forward individual chunks to real-time dashboard."""
+    # Could push to a WebSocket hub, update a metrics counter, etc.
+    pass</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Logical replication gives you something <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> cannot: persistence and replay. If your consumer goes down for an hour, it resumes from exactly where it left off — no events are lost. The trade-off is operational complexity: you need to manage replication slots, monitor slot lag (an unbounded lag will cause WAL accumulation and disk pressure), and handle the binary pgoutput protocol.</p>
+
+<p class="text-gray-300 leading-relaxed">For most applications, the right answer is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> for low-latency local signalling and a Debezium connector (or a managed CDC service) for durable fan-out to external systems. Debezium reads PostgreSQL's WAL and forwards events to Kafka, giving you the best of both worlds without writing your own pgoutput decoder.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.7 Batched Writes and Performance Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">If your application handles thousands of concurrent streaming sessions, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">message_stream_chunks</code> table will accumulate inserts at high velocity. Three techniques manage this load:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Write-coalescing in the application layer</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Instead of inserting every chunk individually, buffer chunks in memory for a short window (50–100ms) and write them in a single multi-row INSERT:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import asyncio
+from collections import defaultdict
+from typing import NamedTuple
+
+class ChunkBuffer(NamedTuple):
+    message_id: str
+    chunk_index: int
+    content: str
+    raw: dict
+
+class BatchedStreamWriter:
+    """
+    Buffers chunks in memory and flushes to PostgreSQL periodically.
+    Reduces per-row INSERT overhead at high concurrency.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, flush_interval: float = 0.1):
+        self.pool = pool
+        self.flush_interval = flush_interval
+        self._buffer: list[ChunkBuffer] = []
+        self._lock = asyncio.Lock()
+        self._flush_task: asyncio.Task | None = None
+
+    async def start(self) -&gt; None:
+        self._flush_task = asyncio.create_task(self._periodic_flush())
+
+    async def stop(self) -&gt; None:
+        if self._flush_task:
+            self._flush_task.cancel()
+        await self._flush_now()  # drain remaining buffer
+
+    async def add_chunk(
+        self,
+        message_id: str,
+        chunk_index: int,
+        content: str,
+        raw: dict,
+    ) -&gt; None:
+        async with self._lock:
+            self._buffer.append(
+                ChunkBuffer(message_id, chunk_index, content, raw)
+            )
+
+    async def _periodic_flush(self) -&gt; None:
+        while True:
+            await asyncio.sleep(self.flush_interval)
+            await self._flush_now()
+
+    async def _flush_now(self) -&gt; None:
+        async with self._lock:
+            if not self._buffer:
+                return
+            batch = self._buffer.copy()
+            self._buffer.clear()
+
+        if not batch:
+            return
+
+        async with self.pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO message_stream_chunks
+                    (message_id, chunk_index, chunk_content, chunk_raw)
+                VALUES ($1, $2, $3, $4)
+                """,
+                [
+                    (c.message_id, c.chunk_index, c.content, json.dumps(c.raw))
+                    for c in batch
+                ],
+            )</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Partitioning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">message_stream_chunks</code> by time</strong></p>
+
+<p class="text-gray-300 leading-relaxed">At scale, this table grows fast and the old data is rarely queried. Declarative partitioning lets you drop old partitions cheaply:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: partition message_stream_chunks by week
+CREATE TABLE message_stream_chunks (
+    id              BIGSERIAL,
+    message_id      UUID NOT NULL,
+    chunk_index     INTEGER NOT NULL,
+    chunk_content   TEXT NOT NULL,
+    chunk_raw       JSONB NOT NULL,
+    received_at     TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+) PARTITION BY RANGE (received_at);
+
+-- Create partitions; automate this with pg_partman in production
+CREATE TABLE message_stream_chunks_2025_w01
+    PARTITION OF message_stream_chunks
+    FOR VALUES FROM ('2025-01-01') TO ('2025-01-08');
+
+CREATE TABLE message_stream_chunks_2025_w02
+    PARTITION OF message_stream_chunks
+    FOR VALUES FROM ('2025-01-08') TO ('2025-01-15');
+
+-- Each partition gets its own index (created automatically if
+-- the parent index was created with CREATE INDEX ... ON ONLY parent)
+CREATE INDEX ON message_stream_chunks_2025_w01 (message_id, chunk_index);
+CREATE INDEX ON message_stream_chunks_2025_w02 (message_id, chunk_index);
+
+-- Drop old partitions without VACUUM overhead:
+-- DROP TABLE message_stream_chunks_2024_w52;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: equivalent with table partitioning
+-- Create partition function and scheme first
+CREATE PARTITION FUNCTION pf_stream_chunks_weekly (DATETIME2)
+AS RANGE RIGHT FOR VALUES (
+    '2025-01-08', '2025-01-15', '2025-01-22'
+    -- add more boundaries as needed
+);
+
+CREATE PARTITION SCHEME ps_stream_chunks_weekly
+AS PARTITION pf_stream_chunks_weekly
+ALL TO ([PRIMARY]);   -- map all partitions to PRIMARY filegroup
+
+CREATE TABLE message_stream_chunks (
+    id              BIGINT IDENTITY(1,1),
+    message_id      UNIQUEIDENTIFIER NOT NULL,
+    chunk_index     INT NOT NULL,
+    chunk_content   NVARCHAR(MAX) NOT NULL,
+    chunk_raw       NVARCHAR(MAX) NOT NULL,  -- JSON
+    received_at     DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME()
+) ON ps_stream_chunks_weekly(received_at);
+
+CREATE INDEX idx_msc_message ON message_stream_chunks(message_id, chunk_index)
+ON ps_stream_chunks_weekly(received_at);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Retention policy and archival</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Chunks are most valuable immediately after a stream completes — for debugging and billing reconciliation. After a week, the assembled <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">content</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">messages</code> is sufficient. Automate chunk archival with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> or an external scheduler:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: pg_cron job to archive old chunks to cold storage
+-- (Assumes chunks older than 7 days are safe to delete since
+-- messages.content already holds the assembled text.)
+
+SELECT cron.schedule(
+    'archive-old-stream-chunks',
+    '0 3 * * *',   -- 3 AM daily
+    $$
+    DELETE FROM message_stream_chunks
+    WHERE received_at &lt; NOW() - INTERVAL '7 days';
+    $$
+);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: equivalent with SQL Server Agent job
+-- (Truncate the oldest partition instead of row-by-row DELETE for efficiency)
+DECLARE @boundary DATETIME2 = DATEADD(DAY, -7, SYSUTCDATETIME());
+
+-- Switch old partition to a staging table, then truncate it
+-- (partition switching is metadata-only, so it's instant)
+ALTER TABLE message_stream_chunks
+SWITCH PARTITION 1 TO message_stream_chunks_archive PARTITION 1;
+
+TRUNCATE TABLE message_stream_chunks_archive;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.8 Observability: Tracking Stream Health in PostgreSQL</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL can double as the observability store for your streaming pipeline. A few targeted queries give you real-time and historical health signals.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: streaming pipeline health dashboard queries
+
+-- 1. Active streams (currently in flight)
+SELECT
+    m.id          AS message_id,
+    c.id          AS conversation_id,
+    c.user_id,
+    m.model,
+    m.stream_started_at,
+    EXTRACT(EPOCH FROM (NOW() - m.stream_started_at)) AS age_seconds,
+    COUNT(msc.id) AS chunks_received
+FROM messages m
+JOIN conversations c ON c.id = m.conversation_id
+LEFT JOIN message_stream_chunks msc ON msc.message_id = m.id
+WHERE m.is_complete = FALSE
+  AND m.stream_started_at &gt; NOW() - INTERVAL '10 minutes'
+GROUP BY m.id, c.id, c.user_id, m.model, m.stream_started_at
+ORDER BY m.stream_started_at;
+
+-- 2. Stream completion rate by model (last 24 hours)
+SELECT
+    model,
+    COUNT(*)                                                         AS total_streams,
+    COUNT(*) FILTER (WHERE finish_reason = 'stop')                  AS clean_completions,
+    COUNT(*) FILTER (WHERE finish_reason = 'interrupted')           AS interrupted,
+    COUNT(*) FILTER (WHERE error IS NOT NULL)                       AS errored,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE finish_reason = 'stop')
+        / NULLIF(COUNT(*), 0), 2
+    )                                                                AS completion_pct,
+    AVG(token_count)::INTEGER                                       AS avg_tokens,
+    PERCENTILE_CONT(0.5) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (stream_completed_at - stream_started_at))
+    )                                                                AS p50_duration_s,
+    PERCENTILE_CONT(0.95) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (stream_completed_at - stream_started_at))
+    )                                                                AS p95_duration_s
+FROM messages
+WHERE role = 'assistant'
+  AND stream_started_at &gt; NOW() - INTERVAL '24 hours'
+GROUP BY model
+ORDER BY total_streams DESC;
+
+-- 3. Token throughput — tokens per second per model
+SELECT
+    model,
+    DATE_TRUNC('hour', stream_completed_at)                         AS hour,
+    SUM(token_count)                                                 AS total_tokens,
+    COUNT(*)                                                         AS message_count,
+    ROUND(
+        SUM(token_count) /
+        NULLIF(
+            SUM(EXTRACT(EPOCH FROM (stream_completed_at - stream_started_at))),
+        0), 2
+    )                                                                AS tokens_per_second
+FROM messages
+WHERE role = 'assistant'
+  AND is_complete = TRUE
+  AND stream_started_at &gt; NOW() - INTERVAL '48 hours'
+GROUP BY model, DATE_TRUNC('hour', stream_completed_at)
+ORDER BY hour DESC, tokens_per_second DESC;
+
+-- 4. Error breakdown
+SELECT
+    error-&gt;&gt;'reason'  AS error_reason,
+    COUNT(*)          AS occurrences,
+    MAX(updated_at)   AS last_seen
+FROM messages
+WHERE error IS NOT NULL
+  AND created_at &gt; NOW() - INTERVAL '7 days'
+GROUP BY error-&gt;&gt;'reason'
+ORDER BY occurrences DESC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalents
+
+-- 1. Active streams
+SELECT
+    m.id          AS message_id,
+    c.id          AS conversation_id,
+    c.user_id,
+    m.model,
+    m.stream_started_at,
+    DATEDIFF(SECOND, m.stream_started_at, SYSDATETIMEOFFSET()) AS age_seconds,
+    COUNT(msc.id) AS chunks_received
+FROM messages m
+JOIN conversations c ON c.id = m.conversation_id
+LEFT JOIN message_stream_chunks msc ON msc.message_id = m.id
+WHERE m.is_complete = 0
+  AND m.stream_started_at &gt; DATEADD(MINUTE, -10, SYSDATETIMEOFFSET())
+GROUP BY m.id, c.id, c.user_id, m.model, m.stream_started_at
+ORDER BY m.stream_started_at;
+
+-- 2. Stream completion rate by model (last 24 hours)
+SELECT
+    model,
+    COUNT(*)                                                         AS total_streams,
+    SUM(CASE WHEN finish_reason = 'stop' THEN 1 ELSE 0 END)        AS clean_completions,
+    SUM(CASE WHEN finish_reason = 'interrupted' THEN 1 ELSE 0 END) AS interrupted,
+    SUM(CASE WHEN error IS NOT NULL THEN 1 ELSE 0 END)             AS errored,
+    ROUND(
+        100.0 * SUM(CASE WHEN finish_reason = 'stop' THEN 1 ELSE 0 END)
+        / NULLIF(COUNT(*), 0), 2
+    )                                                                AS completion_pct,
+    AVG(token_count)                                                AS avg_tokens
+FROM messages
+WHERE role = 'assistant'
+  AND stream_started_at &gt; DATEADD(HOUR, -24, SYSDATETIMEOFFSET())
+GROUP BY model
+ORDER BY total_streams DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These queries give you the raw material for a Grafana dashboard (or any metrics tool that can query PostgreSQL) without needing a separate time-series database for operational data. For high-cardinality metrics like per-second token throughput, you'd eventually outgrow SQL-level aggregation and reach for a dedicated metrics store — but for most applications, PostgreSQL holds the operational picture well.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.9 End-to-End Wiring: Putting It Together</h3>
+
+<p class="text-gray-300 leading-relaxed">The following shows how all the pieces integrate in a minimal but production-structured application. The entry point is a FastAPI app with startup lifecycle management, the streaming path runs through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">StreamWriter</code>, background work flows through Celery, and PostgreSQL sits at the center.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># main.py — application entry point
+import asyncio
+import logging
+import os
+
+import asyncpg
+from fastapi import FastAPI
+from contextlib import asynccontextmanager
+
+from api.stream_endpoint import app as stream_router
+from workers.stream_listener import run_listener
+
+logger = logging.getLogger(__name__)
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    # Startup: create the connection pool
+    dsn = os.environ["DATABASE_URL"]
+    application.state.pool = await asyncpg.create_pool(
+        dsn,
+        min_size=5,
+        max_size=20,
+        command_timeout=60,
+    )
+    logger.info("Database pool created")
+
+    # Start the pg_notify listener as a background task
+    listener_task = asyncio.create_task(run_listener(dsn))
+
+    yield  # application runs
+
+    # Shutdown: clean up
+    listener_task.cancel()
+    await application.state.pool.close()
+    logger.info("Database pool closed")
+
+app = FastAPI(lifespan=lifespan)
+app.include_router(stream_router)</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># docker-compose.yml structure (abbreviated)
+# services:
+#   postgres:
+#     image: pgvector/pgvector:pg17
+#     environment:
+#       POSTGRES_DB: aiapp
+#     command: &gt;
+#       postgres -c wal_level=logical
+#                -c max_replication_slots=5
+#                -c max_wal_senders=5
+#   redis:
+#     image: redis:7-alpine
+#   api:
+#     build: .
+#     depends_on: [postgres, redis]
+#   celery:
+#     build: .
+#     command: celery -A workers.tasks worker --loglevel=info
+#     depends_on: [postgres, redis]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_level=logical</code> PostgreSQL configuration flag is necessary if you want to use logical replication (Section 29.6). It has no meaningful overhead for typical OLTP workloads and should be set from day one on any PostgreSQL instance that hosts AI application data.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Stream first, write incrementally.** The `message_stream_chunks` table captures every delta durably, giving you a complete audit trail, billing-reconciliation data, and the ability to reconstruct partial responses after interruption — without blocking the streaming path.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Use a single persistent connection per stream.** Acquiring a new connection per chunk introduces latency and breaks under PgBouncer transaction-mode pooling. Hold one `asyncpg` connection for the full lifetime of a streaming session and release it only after finalization.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`pg_notify` for low-latency local signalling; logical replication for durable fan-out.** `pg_notify` is the right tool for a small number of co-located consumers that need sub-second reaction times. For external systems, Kafka integration via Debezium and PostgreSQL logical replication provides persistence, replay, and consumer independence.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partition `message_stream_chunks` by time and enforce a retention policy.** Chunk data accumulates at high velocity in busy applications. Weekly partitions let you drop old data with a metadata-only operation rather than a slow DELETE, and a `pg_cron` job keeps disk usage bounded without touching the assembled `messages.content` that clients actually read.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL is your observability layer too.** The completion-rate, token-throughput, and error-breakdown queries in Section 29.8 give you a real-time operational picture without a separate time-series database. As traffic grows, these queries scale to a read replica or a materialized view before you need to reach for dedicated metrics infrastructure.</li></div>
     <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>

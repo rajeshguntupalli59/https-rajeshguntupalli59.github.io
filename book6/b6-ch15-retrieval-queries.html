@@ -5,6 +5,10 @@
   <title>Chapter 15: Query-Time Retrieval: Writing Efficient Vector Queries — AI-Native Apps on PostgreSQL</title>
   <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 15: Query-Time Retrieval: Writing Efficient Vector Queries. LLMs, RAG, agents — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -477,7 +481,7 @@ class RetrievalClient:
                 title=row["title"],
                 content=row["content"],
                 metadata=dict(row["metadata"]) if row["metadata"] else {},
-                published_at=str(row["published_at"]) if row["published_after"] else None,
+                published_at=str(row["published_at"]) if row["published_at"] else None,
                 similarity=float(row["similarity"]),
                 rank_position=int(row["rank_position"]),
             )
@@ -544,11 +548,654 @@ async def create_retrieval_client(
 
     return RetrievalClient(pg_pool, redis_client, openai_client)</code></pre>
 
+<p class="text-gray-300 leading-relaxed">The end-to-end shape of a single retrieval call — from incoming query to LLM-ready context — looks like this:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[User query] --> B[embed_query]
+    B --> C{Redis cache hit?}
+    C -->|yes| E[Cached embedding]
+    C -->|no| D[OpenAI embeddings API]
+    D --> F[Cache in Redis]
+    F --> E
+    E --> G[hybrid_search SQL function]
+    G --> H[(document_chunks + documents)]
+    H --> I[Ranked chunks]
+    I --> J[format_context_for_prompt]
+    J --> K[LLM completion]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Retrieval client flow: the embedding step is cached, the SQL function does the relational-plus-vector ranking, and only the survivors are formatted into the LLM prompt.*</p>
+
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Plugging Retrieval into a FastAPI RAG Endpoint</h3>
 
-<p class="text-gray-300 leading-relaxed">The retrieval client needs to live inside a request/response lifecycle. Here's a complete FastAPI</p></div>
+<p class="text-gray-300 leading-relaxed">The retrieval client needs to live inside a request/response lifecycle. Here's a complete FastAPI endpoint that wires together the retrieval layer, LLM call, and response streaming, using the client built in 15.4:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># api/rag_endpoint.py
+# FastAPI RAG endpoint: retrieval + LLM prompt assembly + streaming response
+
+import json
+import os
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Optional
+
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
+from openai import AsyncOpenAI
+from pydantic import BaseModel, Field
+
+from retrieval.client import (
+    RetrievalClient,
+    RetrievalConfig,
+    create_retrieval_client,
+)
+
+
+# ---------------------------------------------------------------------------
+# App lifecycle: create shared pools once at startup
+# ---------------------------------------------------------------------------
+
+retrieval_client: Optional[RetrievalClient] = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global retrieval_client
+    retrieval_client = await create_retrieval_client(
+        postgres_dsn=os.environ["POSTGRES_DSN"],
+        redis_url=os.environ["REDIS_URL"],
+        openai_api_key=os.environ["OPENAI_API_KEY"],
+    )
+    yield
+    # Cleanup on shutdown (asyncpg pool closes gracefully)
+    if retrieval_client:
+        await retrieval_client._pool.close()
+
+
+app = FastAPI(title="RAG API", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# Request / response models
+# ---------------------------------------------------------------------------
+
+class RAGRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000)
+    doc_types: Optional[list[str]] = None
+    tags: Optional[list[str]] = None
+    published_after: Optional[str] = None
+    top_k: int = Field(default=8, ge=1, le=50)
+    min_similarity: float = Field(default=0.65, ge=0.0, le=1.0)
+    stream: bool = False
+
+
+class RAGSource(BaseModel):
+    chunk_id: int
+    document_id: int
+    title: str
+    doc_type: str
+    similarity: float
+    rank_position: int
+
+
+class RAGResponse(BaseModel):
+    answer: str
+    sources: list[RAGSource]
+    embed_cached: bool
+    chunks_retrieved: int
+
+
+# ---------------------------------------------------------------------------
+# Tenant resolution (simplified — replace with your auth middleware)
+# ---------------------------------------------------------------------------
+
+async def get_tenant_id(x_tenant_id: str = Header(...)) -&gt; int:
+    try:
+        return int(x_tenant_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="X-Tenant-Id must be an integer")
+
+
+# ---------------------------------------------------------------------------
+# System prompt builder
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_TEMPLATE = """You are a helpful assistant answering questions \
+based on the provided document excerpts.
+
+Rules:
+- Answer only from the provided context. Do not use prior knowledge.
+- If the context does not contain enough information to answer, say so explicitly.
+- Cite sources by title when you reference specific information.
+- Be concise and accurate.
+
+Context:
+{context}
+"""
+
+
+def build_messages(query: str, context: str) -&gt; list[dict]:
+    return [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT_TEMPLATE.format(context=context),
+        },
+        {
+            "role": "user",
+            "content": query,
+        },
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Non-streaming RAG handler
+# ---------------------------------------------------------------------------
+
+@app.post("/rag/query", response_model=RAGResponse)
+async def rag_query(
+    body: RAGRequest,
+    tenant_id: int = Depends(get_tenant_id),
+):
+    config = RetrievalConfig(
+        top_k=body.top_k,
+        min_similarity=body.min_similarity,
+        doc_types=body.doc_types,
+        tags=body.tags,
+        published_after=body.published_after,
+    )
+
+    chunks = await retrieval_client.retrieve(body.query, tenant_id, config)
+
+    if not chunks:
+        return RAGResponse(
+            answer=(
+                "I could not find any relevant documents for your query. "
+                "Try rephrasing or broadening your search filters."
+            ),
+            sources=[],
+            embed_cached=False,
+            chunks_retrieved=0,
+        )
+
+    context = retrieval_client.format_context_for_prompt(chunks, max_chars=12000)
+    messages = build_messages(body.query, context)
+
+    openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    completion = await openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=messages,
+        temperature=0.2,
+        max_tokens=1024,
+    )
+
+    answer = completion.choices[0].message.content or ""
+
+    sources = [
+        RAGSource(
+            chunk_id=c.chunk_id,
+            document_id=c.document_id,
+            title=c.title,
+            doc_type=c.doc_type,
+            similarity=c.similarity,
+            rank_position=c.rank_position,
+        )
+        for c in chunks
+    ]
+
+    return RAGResponse(
+        answer=answer,
+        sources=sources,
+        embed_cached=False,   # wire up cache-hit tracking if needed
+        chunks_retrieved=len(chunks),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming RAG handler — sends answer tokens as SSE, then sources as JSON
+# ---------------------------------------------------------------------------
+
+@app.post("/rag/stream")
+async def rag_stream(
+    body: RAGRequest,
+    tenant_id: int = Depends(get_tenant_id),
+):
+    config = RetrievalConfig(
+        top_k=body.top_k,
+        min_similarity=body.min_similarity,
+        doc_types=body.doc_types,
+        tags=body.tags,
+        published_after=body.published_after,
+    )
+
+    chunks = await retrieval_client.retrieve(body.query, tenant_id, config)
+
+    async def event_stream() -&gt; AsyncIterator[str]:
+        if not chunks:
+            yield "data: " + json.dumps({
+                "type": "error",
+                "message": "No relevant documents found.",
+            }) + "\n\n"
+            return
+
+        # Send source metadata immediately so the client can render citations
+        # before the LLM has finished generating
+        sources_payload = [
+            {
+                "chunk_id": c.chunk_id,
+                "document_id": c.document_id,
+                "title": c.title,
+                "doc_type": c.doc_type,
+                "similarity": c.similarity,
+                "rank_position": c.rank_position,
+            }
+            for c in chunks
+        ]
+        yield "data: " + json.dumps({
+            "type": "sources",
+            "sources": sources_payload,
+        }) + "\n\n"
+
+        context = retrieval_client.format_context_for_prompt(
+            chunks, max_chars=12000
+        )
+        messages = build_messages(body.query, context)
+
+        openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        stream = await openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            temperature=0.2,
+            max_tokens=1024,
+            stream=True,
+        )
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                yield "data: " + json.dumps({
+                    "type": "token",
+                    "content": delta,
+                }) + "\n\n"
+
+        yield "data: " + json.dumps({"type": "done"}) + "\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",   # disable nginx buffering for SSE
+        },
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The streaming endpoint separates source metadata from answer tokens in the SSE stream. Clients receive <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">type: sources</code> first (so citations can appear in the UI immediately), then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">type: token</code> events as the LLM generates, then <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">type: done</code> to signal completion. This pattern avoids the common mistake of waiting for the full LLM response before returning anything to the user.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.6 Pagination and Cursor-Based Result Retrieval</h3>
+
+<p class="text-gray-300 leading-relaxed">Vector search with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT</code> is not paginated — running the same query twice with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT 10 OFFSET 10</code> is not safe for vector search because approximate indexes do not guarantee stable ordering between executions. The result set at positions 11–20 may not be the "next 10 most similar" items; it depends on the execution path through the graph or inverted file.</p>
+
+<p class="text-gray-300 leading-relaxed">For the rare cases where you need pagination over vector results, the correct approach is to fetch a larger candidate pool upfront, store it server-side, and paginate over that stable set:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Server-side cursor pagination over vector results
+-- Step 1: Materialize a retrieval session (run once per user query)
+CREATE TABLE retrieval_sessions (
+    session_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       BIGINT NOT NULL,
+    query_text      TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL
+        DEFAULT NOW() + INTERVAL '10 minutes'
+);
+
+CREATE TABLE retrieval_session_results (
+    session_id      UUID NOT NULL REFERENCES retrieval_sessions(session_id)
+                        ON DELETE CASCADE,
+    rank_position   INTEGER NOT NULL,
+    chunk_id        BIGINT NOT NULL,
+    similarity      FLOAT NOT NULL,
+    PRIMARY KEY (session_id, rank_position)
+);
+
+-- Step 2: Populate a session with top-100 candidates
+CREATE OR REPLACE FUNCTION create_retrieval_session(
+    p_tenant_id         BIGINT,
+    p_query_embedding   VECTOR(1536),
+    p_query_text        TEXT,
+    p_candidate_pool    INTEGER DEFAULT 100
+)
+RETURNS UUID
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_session_id UUID;
+BEGIN
+    INSERT INTO retrieval_sessions(tenant_id, query_text)
+    VALUES (p_tenant_id, p_query_text)
+    RETURNING session_id INTO v_session_id;
+
+    INSERT INTO retrieval_session_results(session_id, rank_position, chunk_id, similarity)
+    SELECT
+        v_session_id,
+        ROW_NUMBER() OVER (ORDER BY dc.embedding &lt;=&gt; p_query_embedding),
+        dc.id,
+        1 - (dc.embedding &lt;=&gt; p_query_embedding)
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    WHERE d.tenant_id = p_tenant_id
+      AND d.is_active = TRUE
+      AND dc.embedding IS NOT NULL
+    ORDER BY dc.embedding &lt;=&gt; p_query_embedding
+    LIMIT p_candidate_pool;
+
+    RETURN v_session_id;
+END;
+$$;
+
+-- Step 3: Stable paginated fetch from the materialized session
+CREATE OR REPLACE FUNCTION fetch_session_page(
+    p_session_id    UUID,
+    p_page          INTEGER DEFAULT 1,
+    p_page_size     INTEGER DEFAULT 10
+)
+RETURNS TABLE (
+    rank_position   INTEGER,
+    chunk_id        BIGINT,
+    content         TEXT,
+    title           TEXT,
+    similarity      FLOAT
+)
+LANGUAGE sql STABLE AS $$
+    SELECT
+        rsr.rank_position,
+        rsr.chunk_id,
+        dc.content,
+        d.title,
+        rsr.similarity
+    FROM retrieval_session_results rsr
+    JOIN document_chunks dc ON dc.id = rsr.chunk_id
+    JOIN documents d ON d.id = dc.document_id
+    WHERE rsr.session_id = p_session_id
+      AND rsr.rank_position BETWEEN
+            (p_page - 1) * p_page_size + 1
+        AND p_page * p_page_size
+    ORDER BY rsr.rank_position;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In practice, most RAG applications never need pagination — they retrieve 5–20 chunks and feed them all to the LLM. The session pattern above is useful for search-UI applications where users browse results and expect stable pages, not for the inner loop of an LLM pipeline.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.7 SQL Server Companion: Vector Search with Azure SQL and Fabric</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server introduced native vector support in Azure SQL Database and SQL Server 2025, using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR</code> data type and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_DISTANCE</code> function. The pattern is similar to pgvector but with different syntax and index mechanics.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL / SQL Server 2025: vector search schema
+CREATE TABLE document_chunks (
+    id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+    document_id     BIGINT NOT NULL,
+    chunk_index     INT NOT NULL,
+    content         NVARCHAR(MAX) NOT NULL,
+    token_count     INT NOT NULL,
+    embedding       VECTOR(1536),          -- native VECTOR type
+    embedding_model VARCHAR(64) NOT NULL DEFAULT 'text-embedding-3-small',
+    metadata        NVARCHAR(MAX) NOT NULL DEFAULT '{}',  -- JSON as NVARCHAR
+    created_at      DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    UNIQUE (document_id, chunk_index)
+);
+
+-- Vector index (DiskANN-based in Azure SQL)
+CREATE VECTOR INDEX idx_chunks_embedding
+    ON document_chunks (embedding)
+    WITH (metric = 'cosine');
+
+-- Basic similarity search using VECTOR_DISTANCE
+-- Lower distance = more similar (same convention as pgvector operators)
+SELECT TOP 10
+    id,
+    content,
+    1 - VECTOR_DISTANCE('cosine', embedding, CAST(@query_embedding AS VECTOR(1536)))
+        AS similarity
+FROM document_chunks
+WHERE embedding IS NOT NULL
+ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(@query_embedding AS VECTOR(1536)));
+
+-- Hybrid search: relational filter + vector distance
+DECLARE @tenant_id BIGINT = 42;
+DECLARE @query_vec VECTOR(1536) = CAST(@query_embedding_json AS VECTOR(1536));
+DECLARE @min_sim FLOAT = 0.65;
+DECLARE @top_k INT = 10;
+
+SELECT TOP (@top_k)
+    dc.id                 AS chunk_id,
+    d.id                  AS document_id,
+    d.doc_type,
+    d.title,
+    dc.content,
+    1 - VECTOR_DISTANCE('cosine', dc.embedding, @query_vec) AS similarity
+FROM document_chunks dc
+JOIN documents d ON dc.document_id = d.id
+WHERE d.tenant_id = @tenant_id
+  AND d.is_active = 1
+  AND dc.embedding IS NOT NULL
+  AND 1 - VECTOR_DISTANCE('cosine', dc.embedding, @query_vec) &gt;= @min_sim
+ORDER BY VECTOR_DISTANCE('cosine', dc.embedding, @query_vec);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key differences from pgvector are:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`VECTOR_DISTANCE(metric, col, value)`** is a function rather than an infix operator. You must specify the metric (`'cosine'`, `'euclidean'`, `'dot'`) as an explicit argument.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector indexes** in Azure SQL use DiskANN under the hood (a Microsoft Research graph-based ANN algorithm comparable to HNSW). You create them with `CREATE VECTOR INDEX` rather than `USING hnsw` or `USING ivfflat`.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Casting** from JSON string to `VECTOR` uses `CAST(... AS VECTOR(1536))`, where the input is a JSON array string like `'[0.1, 0.2, ...]'`.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`TOP` instead of `LIMIT`** follows standard T-SQL convention; `TOP (@variable)` allows parameterized limits.</li>
+
+<p class="text-gray-300 leading-relaxed">Reciprocal Rank Fusion in T-SQL follows the same logic as the PostgreSQL version but uses CTEs with T-SQL syntax:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- RRF hybrid search in T-SQL (Azure SQL / SQL Server 2025)
+DECLARE @query_vec   VECTOR(1536) = CAST(@embedding_json AS VECTOR(1536));
+DECLARE @query_text  NVARCHAR(1000) = N'quarterly revenue forecast';
+DECLARE @tenant_id   BIGINT = 42;
+DECLARE @k           FLOAT = 60.0;
+
+WITH vector_results AS (
+    SELECT TOP 50
+        dc.id,
+        ROW_NUMBER() OVER (
+            ORDER BY VECTOR_DISTANCE('cosine', dc.embedding, @query_vec)
+        ) AS vector_rank
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    WHERE d.tenant_id = @tenant_id
+      AND d.is_active = 1
+      AND dc.embedding IS NOT NULL
+    ORDER BY VECTOR_DISTANCE('cosine', dc.embedding, @query_vec)
+),
+fulltext_results AS (
+    SELECT TOP 50
+        dc.id,
+        ROW_NUMBER() OVER (
+            ORDER BY ft.[RANK] DESC
+        ) AS text_rank
+    FROM document_chunks dc
+    JOIN documents d ON dc.document_id = d.id
+    JOIN CONTAINSTABLE(document_chunks, content,
+         @query_text) AS ft ON dc.id = ft.[KEY]
+    WHERE d.tenant_id = @tenant_id
+      AND d.is_active = 1
+    ORDER BY ft.[RANK] DESC
+),
+rrf_scores AS (
+    SELECT
+        COALESCE(v.id, f.id) AS chunk_id,
+        ISNULL(1.0 / (@k + v.vector_rank), 0) +
+        ISNULL(1.0 / (@k + f.text_rank), 0)    AS rrf_score
+    FROM vector_results v
+    FULL OUTER JOIN fulltext_results f ON v.id = f.id
+)
+SELECT TOP 10
+    rs.chunk_id,
+    dc.content,
+    dc.document_id,
+    rs.rrf_score
+FROM rrf_scores rs
+JOIN document_chunks dc ON dc.id = rs.chunk_id
+ORDER BY rs.rrf_score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note that SQL Server full-text search uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code> for ranked results rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ts_rank_cd</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">@@</code>. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">[RANK]</code> column from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONTAINSTABLE</code> is SQL Server's term-frequency–based score on a 0–1000 scale, which you convert to a per-row rank for RRF using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ROW_NUMBER()</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.8 Observability: Measuring Retrieval Quality</h3>
+
+<p class="text-gray-300 leading-relaxed">Retrieval quality is separate from LLM answer quality, and you need to measure both independently. The retrieval layer can fail in ways the LLM partially masks: if the wrong chunks are retrieved, the LLM may hallucinate, hedge, or answer a slightly different question. Catching this requires offline evaluation, not just watching whether users are satisfied.</p>
+
+<p class="text-gray-300 leading-relaxed">The standard offline metric is <strong class="text-white">recall@k</strong>: for a set of labeled query-document pairs, what fraction of the ground-truth relevant documents appear in the top-k retrieved results? Build a small evaluation harness that runs against your production PostgreSQL instance:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># eval/retrieval_eval.py
+# Offline recall@k evaluation for the retrieval layer
+
+import asyncio
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+from retrieval.client import RetrievalClient, RetrievalConfig
+
+
+@dataclass
+class EvalCase:
+    query: str
+    tenant_id: int
+    relevant_chunk_ids: list[int]    # ground truth
+    relevant_document_ids: list[int] # document-level ground truth
+
+
+def load_eval_set(path: str) -&gt; list[EvalCase]:
+    """
+    Load evaluation cases from a JSON file.
+    Format:
+    [
+      {
+        "query": "What is the refund policy?",
+        "tenant_id": 1,
+        "relevant_chunk_ids": [101, 102],
+        "relevant_document_ids": [5]
+      },
+      ...
+    ]
+    """
+    cases = []
+    for item in json.loads(Path(path).read_text()):
+        cases.append(EvalCase(**item))
+    return cases
+
+
+async def evaluate_recall(
+    client: RetrievalClient,
+    eval_cases: list[EvalCase],
+    k_values: list[int] = (1, 3, 5, 10),
+    min_similarity: float = 0.0,   # disable threshold for eval to see full ranking
+) -&gt; dict:
+    results = {f"recall@{k}": [] for k in k_values}
+    results["mrr"] = []   # mean reciprocal rank
+
+    for case in eval_cases:
+        config = RetrievalConfig(
+            top_k=max(k_values),
+            min_similarity=min_similarity,
+        )
+        chunks = await client.retrieve(case.query, case.tenant_id, config)
+        retrieved_chunk_ids = [c.chunk_id for c in chunks]
+
+        # recall@k: fraction of relevant chunks found in top k
+        for k in k_values:
+            top_k_ids = set(retrieved_chunk_ids[:k])
+            relevant = set(case.relevant_chunk_ids)
+            recall = len(top_k_ids & relevant) / len(relevant) if relevant else 0.0
+            results[f"recall@{k}"].append(recall)
+
+        # mean reciprocal rank: 1/rank of first relevant result
+        rr = 0.0
+        for rank, chunk_id in enumerate(retrieved_chunk_ids, start=1):
+            if chunk_id in case.relevant_chunk_ids:
+                rr = 1.0 / rank
+                break
+        results["mrr"].append(rr)
+
+    # Aggregate
+    summary = {}
+    for metric, values in results.items():
+        summary[metric] = round(sum(values) / len(values), 4) if values else 0.0
+
+    return summary
+
+
+async def main():
+    import os
+    from retrieval.client import create_retrieval_client
+
+    client = await create_retrieval_client(
+        postgres_dsn=os.environ["POSTGRES_DSN"],
+        redis_url=os.environ["REDIS_URL"],
+        openai_api_key=os.environ["OPENAI_API_KEY"],
+    )
+
+    eval_cases = load_eval_set("eval/cases.json")
+    summary = await evaluate_recall(client, eval_cases)
+
+    print(json.dumps(summary, indent=2))
+    # Example output:
+    # {
+    #   "recall@1": 0.61,
+    #   "recall@3": 0.78,
+    #   "recall@5": 0.84,
+    #   "recall@10": 0.91,
+    #   "mrr": 0.69
+    # }
+
+
+if __name__ == "__main__":
+    asyncio.run(main())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this evaluation suite on a schedule (nightly, or after any schema or index change) and track the numbers over time. A drop in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recall@5</code> after a schema migration or embedding model upgrade is a signal to investigate before it affects users in production.</p>
+
+<p class="text-gray-300 leading-relaxed">In addition to offline recall metrics, instrument your live retrieval with per-query observability stored back into PostgreSQL:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retrieval observability: log per-query metrics
+CREATE TABLE retrieval_logs (
+    id              BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    tenant_id       BIGINT NOT NULL,
+    session_id      UUID,
+    query_hash      CHAR(64) NOT NULL,  -- SHA-256 of query text
+    query_preview   TEXT NOT NULL,      -- first 120 chars, safe to log
+    top_k_requested INTEGER NOT NULL,
+    results_count   INTEGER NOT NULL,
+    top_similarity  FLOAT,
+    min_similarity  FLOAT,
+    embed_ms        FLOAT,
+    query_ms        FLOAT,
+    doc_types       TEXT[],
+    tags_filter     TEXT[],
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_retrieval_logs_tenant_time
+    ON retrieval_logs(tenant_id, created_at DESC);
+
+CREATE INDEX idx_retrieval_logs_zero_results
+    ON retrieval_logs(tenant_id, created_at DESC)
+    WHERE results_count = 0;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The partial index on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">results_count = 0</code> makes it cheap to query "what searches returned nothing?" — a high-value signal for identifying gaps in your corpus or overly aggressive similarity thresholds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Match the distance operator to your embedding model.** Most API-served embedding models produce L2-normalized vectors and are designed for cosine similarity; use `<=>` in pgvector and `VECTOR_DISTANCE('cosine', ...)` in Azure SQL. Using L2 distance on normalized vectors produces correct rankings but wastes compute and can mislead index configuration.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pre-filter with relational predicates, not post-filter.** Applying `tenant_id`, `doc_type`, date range, and tag filters inside the `WHERE` clause before the vector ranking produces correct results at lower cost. Post-filtering after a vector scan risks missing relevant results when your top-k window is small.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tune `ef_search` and `ivfflat.probes` per workload, not per table.** Real-time user-facing queries need low-latency settings; offline batch evaluation or RAG pipeline evaluation runs can trade latency for recall using `SET hnsw.ef_search = 200` within a session, without affecting other connections.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RRF hybrid search outperforms either vector or full-text ranking alone for keyword-heavy queries.** Combining pgvector cosine distance ranking with PostgreSQL full-text `ts_rank_cd` using Reciprocal Rank Fusion improves result quality on queries containing proper nouns, version numbers, or technical abbreviations that embedding models may not distinguish well.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Measure retrieval quality independently from LLM answer quality.** An LLM can sometimes produce plausible-sounding answers even when given partially wrong context, masking retrieval failures. Build and run a recall@k evaluation harness against labeled query-document pairs on a regular cadence so that index changes, model upgrades, or schema migrations don't silently degrade retrieval before users notice.</li></div>
     <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>

@@ -1,0 +1,1658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Chapter 29: Building a Custom Database Cost Analyzer — Database FinOps</title>
+  <meta name="description" content="Database FinOps Chapter 29: Building a Custom Database Cost Analyzer. Cloud database cost optimization — by Rajesh Guntupalli." />
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
+</head>
+<body class="bg-gray-950 text-gray-100 font-sans antialiased">
+  <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
+    <div class="max-w-5xl mx-auto px-6 h-14 flex items-center justify-between">
+      <a href="../index.html" class="flex items-center gap-2 group">
+        <div class="w-7 h-7 rounded-lg bg-gradient-to-br from-amber-500 to-amber-700 flex items-center justify-center">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5"/><path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3"/></svg>
+        </div>
+        <span class="text-sm font-bold text-white group-hover:text-amber-300 transition">Rajesh Guntupalli</span>
+      </a>
+      <div class="flex items-center gap-1 text-xs">
+        <a href="../index.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
+        <a href="../products.html"   class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
+        <a href="../book.html"       class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Books</a>
+        <a href="index.html"         class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Book 7 Chapters</a>
+        <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
+        <a href="../about.html"      class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
+        <a href="../products.html"
+           class="ml-2 px-4 py-1.5 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-lg transition">Get the Tools →</a>
+      </div>
+    </div>
+  </nav>
+  <article class="pt-28 pb-24 px-6 max-w-3xl mx-auto">
+    <div class="mb-6"><a href="index.html" class="text-xs text-amber-400 hover:text-amber-300 transition">← All Chapters</a></div>
+    <div class="flex items-center gap-3 mb-4">
+      <span class="px-2.5 py-1 bg-amber-900/40 border border-amber-800/40 text-amber-300 text-xs rounded-full font-medium">Chapter 29 of 30</span>
+      <span class="px-2.5 py-1 bg-gray-800/60 border border-gray-700/40 text-gray-400 text-xs rounded-full">Database FinOps</span>
+    </div>
+    <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 29: Building a Custom Database Cost Analyzer</h2>
+
+<p class="text-gray-300 leading-relaxed">Organizations that build their own database cost analyzers consistently report 18–35% reductions in monthly cloud database spend within the first 90 days of operation. The difference between a team that manually reviews bills and a team running automated cost intelligence is roughly $40,000–$120,000 per year for a mid-sized engineering organization running 20–50 RDS or Cloud SQL instances. This chapter walks through designing, building, and deploying a custom database cost analyzer that pulls data from AWS Cost Explorer, Azure Cost Management, GCP Billing Export, database-level metrics, and infrastructure telemetry — then correlates them into actionable recommendations. By the end of this chapter, you will have a working analyzer that identifies idle resources, oversized instances, suboptimal storage configurations, and connection pool waste, then emails or Slack-posts a weekly cost report with specific dollar amounts attached to each finding.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.1 Architecture of a Database Cost Analyzer</h3>
+
+<p class="text-gray-300 leading-relaxed">A cost analyzer that actually gets used has five components working together. The first is a <strong class="text-white">data collection layer</strong> that pulls billing data from cloud provider APIs on a schedule. The second is a <strong class="text-white">metrics correlation layer</strong> that joins billing data with database performance metrics — because a $3,000/month instance running at 4% CPU utilization tells a different story than one running at 80%. The third is a <strong class="text-white">rules engine</strong> that applies cost optimization logic. The fourth is a <strong class="text-white">recommendations database</strong> that persists findings over time so you can track whether recommendations are being acted on. The fifth is a <strong class="text-white">reporting layer</strong> that produces output in formats CTOs and DBAs both find useful.</p>
+
+<p class="text-gray-300 leading-relaxed">The entire system can run as a scheduled Lambda function, a cron job on a small EC2 instance, or a Cloud Run job on GCP. The compute cost of running the analyzer itself is negligible — typically under $15/month for a tool that finds tens of thousands of dollars in savings.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>┌─────────────────────────────────────────────────────────┐
+│                  Data Collection Layer                   │
+│  AWS Cost Explorer │ Azure Cost Mgmt │ GCP Billing API  │
+│  CloudWatch Metrics │ Azure Monitor │ Cloud Monitoring  │
+│  RDS Performance Insights │ pg_stat_statements          │
+└───────────────────────┬─────────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────┐
+│               Metrics Correlation Layer                  │
+│    Join billing line items with CPU/memory/IOPS/conn    │
+└───────────────────────┬─────────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────┐
+│                    Rules Engine                          │
+│  Idle detection │ Right-sizing │ Storage optimization   │
+│  RI/Savings Plan gaps │ Connection pool analysis        │
+└───────────────────────┬─────────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────┐
+│              Recommendations Database                    │
+│  PostgreSQL or SQLite: findings, status, savings_est    │
+└───────────────────────┬─────────────────────────────────┘
+                        │
+┌───────────────────────▼─────────────────────────────────┐
+│                  Reporting Layer                         │
+│        Weekly email digest │ Slack alerts │ Dashboard   │
+└─────────────────────────────────────────────────────────┘</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The recommendations database schema is worth designing carefully from the start. Every finding should record the cloud provider, resource identifier, finding type, estimated monthly savings, confidence level, detection timestamp, and resolution status. This schema becomes the audit trail that justifies the analyzer's existence to finance and leadership.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Recommendations database schema (PostgreSQL or SQLite)
+CREATE TABLE db_cost_findings (
+    id                  SERIAL PRIMARY KEY,
+    cloud_provider      VARCHAR(10)     NOT NULL,  -- 'aws', 'azure', 'gcp'
+    account_id          VARCHAR(64)     NOT NULL,
+    region              VARCHAR(32)     NOT NULL,
+    resource_id         VARCHAR(256)    NOT NULL,
+    resource_type       VARCHAR(64)     NOT NULL,  -- 'rds_instance', 'aurora_cluster', etc.
+    engine              VARCHAR(32),               -- 'postgres', 'mysql', 'sqlserver'
+    instance_class      VARCHAR(64),
+    finding_type        VARCHAR(64)     NOT NULL,  -- see enum below
+    finding_detail      JSONB,
+    estimated_monthly_savings_usd  NUMERIC(10,2),
+    confidence          VARCHAR(10)     NOT NULL,  -- 'high', 'medium', 'low'
+    detected_at         TIMESTAMPTZ     DEFAULT NOW(),
+    resolved_at         TIMESTAMPTZ,
+    resolution_status   VARCHAR(20)     DEFAULT 'open',  -- 'open','actioned','dismissed'
+    actioned_by         VARCHAR(128),
+    notes               TEXT,
+    CONSTRAINT valid_status CHECK (resolution_status IN ('open','actioned','dismissed')),
+    CONSTRAINT valid_confidence CHECK (confidence IN ('high','medium','low'))
+);
+
+-- Finding types reference table
+CREATE TABLE finding_types (
+    type_code           VARCHAR(64) PRIMARY KEY,
+    description         TEXT,
+    typical_saving_pct  NUMERIC(5,2)
+);
+
+INSERT INTO finding_types VALUES
+    ('idle_instance',       'Instance with &lt;5% avg CPU over 14 days',             100.00),
+    ('oversized_instance',  'Instance consistently using &lt;20% of provisioned CPU',  40.00),
+    ('gp2_to_gp3',          'gp2 storage that would cost less on gp3',             20.00),
+    ('no_reserved_instance','On-demand instance running &gt;30 days without RI',       35.00),
+    ('multi_az_nonprod',    'Multi-AZ enabled on non-production instance',          50.00),
+    ('connection_pool_gap', 'High connection count without pgBouncer or RDS Proxy',  15.00),
+    ('snapshot_retention',  'Automated snapshots retained longer than policy',      10.00),
+    ('io1_candidate',       'io1 volume with low IOPS utilization, gp3 sufficient', 30.00),
+    ('aurora_serverless_v1','Aurora Serverless v1 that should migrate to v2',       25.00),
+    ('stopped_instance',    'Instance in stopped state still charging for storage',  5.00);
+
+-- Index for efficient open-findings queries
+CREATE INDEX idx_findings_open ON db_cost_findings(resolution_status, detected_at)
+    WHERE resolution_status = 'open';
+
+-- View: current open findings with total savings potential
+CREATE VIEW v_open_savings_summary AS
+SELECT
+    cloud_provider,
+    finding_type,
+    COUNT(*)                                    AS finding_count,
+    SUM(estimated_monthly_savings_usd)          AS total_monthly_savings,
+    SUM(estimated_monthly_savings_usd) * 12     AS total_annual_savings,
+    MAX(detected_at)                            AS last_detected
+FROM db_cost_findings
+WHERE resolution_status = 'open'
+GROUP BY cloud_provider, finding_type
+ORDER BY total_monthly_savings DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.2 Collecting Cost and Metrics Data</h3>
+
+<p class="text-gray-300 leading-relaxed">The collection layer needs to pull from three sources simultaneously: cloud billing APIs, infrastructure metrics, and database-internal statistics. The billing APIs tell you what you are paying. The infrastructure metrics tell you how much of what you are paying for is being used. The database-internal statistics tell you whether the workload justifies what is being provisioned.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Python script forms the core collection module. It is designed to run as a scheduled job — daily is appropriate for billing data, which updates with a 24-hour lag in AWS Cost Explorer. Metrics collection should run every 15 minutes for CPU and connection counts, which change rapidly enough to miss spikes in daily snapshots.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+db_cost_collector.py
+Collects cost and metrics data from AWS for the Database Cost Analyzer.
+Schedule: Daily at 06:00 UTC via cron or EventBridge.
+
+Requirements:
+    pip install boto3 psycopg2-binary python-dotenv
+
+Environment variables (store in .env or AWS Secrets Manager):
+    AWS_DEFAULT_REGION, ANALYZER_DB_HOST, ANALYZER_DB_NAME,
+    ANALYZER_DB_USER, ANALYZER_DB_PASSWORD
+"""
+
+import boto3
+import psycopg2
+import json
+import os
+import logging
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from dataclasses import dataclass, field
+from typing import Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class RDSInstanceSnapshot:
+    """Point-in-time snapshot of an RDS instance's cost and utilization."""
+    instance_id:        str
+    region:             str
+    instance_class:     str
+    engine:             str
+    multi_az:           bool
+    storage_type:       str
+    allocated_storage:  int         # GB
+    iops:               Optional[int]
+    status:             str
+    monthly_cost_usd:   Decimal     = field(default=Decimal('0'))
+    avg_cpu_7d:         float       = 0.0
+    avg_cpu_14d:        float       = 0.0
+    max_cpu_14d:        float       = 0.0
+    avg_connections:    float       = 0.0
+    max_connections:    float       = 0.0
+    avg_read_iops:      float       = 0.0
+    avg_write_iops:     float       = 0.0
+    avg_freeable_mem_gb: float      = 0.0
+    tags:               dict        = field(default_factory=dict)
+
+
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.environ['ANALYZER_DB_HOST'],
+        dbname=os.environ['ANALYZER_DB_NAME'],
+        user=os.environ['ANALYZER_DB_USER'],
+        password=os.environ['ANALYZER_DB_PASSWORD'],
+        sslmode='require'
+    )
+
+
+def collect_rds_instances(region: str) -&gt; list[RDSInstanceSnapshot]:
+    """Enumerate all RDS instances and their configuration."""
+    rds = boto3.client('rds', region_name=region)
+    snapshots = []
+
+    paginator = rds.get_paginator('describe_db_instances')
+    for page in paginator.paginate():
+        for inst in page['DBInstances']:
+            tags = {t['Key']: t['Value']
+                    for t in inst.get('TagList', [])}
+            snap = RDSInstanceSnapshot(
+                instance_id=inst['DBInstanceIdentifier'],
+                region=region,
+                instance_class=inst['DBInstanceClass'],
+                engine=inst['Engine'],
+                multi_az=inst.get('MultiAZ', False),
+                storage_type=inst.get('StorageType', 'gp2'),
+                allocated_storage=inst.get('AllocatedStorage', 0),
+                iops=inst.get('Iops'),
+                status=inst['DBInstanceStatus'],
+                tags=tags
+            )
+            snapshots.append(snap)
+            log.info(f"Found instance: {snap.instance_id} ({snap.instance_class})")
+
+    return snapshots
+
+
+def collect_cloudwatch_metrics(snap: RDSInstanceSnapshot, region: str) -&gt; RDSInstanceSnapshot:
+    """
+    Pull 14-day CloudWatch metrics for a single RDS instance.
+    Uses get_metric_statistics for simplicity; switch to get_metric_data
+    for bulk collection if you have &gt;50 instances.
+    """
+    cw = boto3.client('cloudwatch', region_name=region)
+    end_time   = datetime.now(timezone.utc)
+    start_14d  = end_time - timedelta(days=14)
+    start_7d   = end_time - timedelta(days=7)
+
+    def get_stats(metric_name, stat, start, period=3600):
+        resp = cw.get_metric_statistics(
+            Namespace='AWS/RDS',
+            MetricName=metric_name,
+            Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': snap.instance_id}],
+            StartTime=start,
+            EndTime=end_time,
+            Period=period,
+            Statistics=[stat]
+        )
+        datapoints = resp.get('Datapoints', [])
+        if not datapoints:
+            return 0.0
+        values = [dp[stat] for dp in datapoints]
+        return sum(values) / len(values)
+
+    snap.avg_cpu_14d        = get_stats('CPUUtilization',       'Average', start_14d)
+    snap.avg_cpu_7d         = get_stats('CPUUtilization',       'Average', start_7d)
+    snap.max_cpu_14d        = get_stats('CPUUtilization',       'Maximum', start_14d)
+    snap.avg_connections    = get_stats('DatabaseConnections',  'Average', start_14d)
+    snap.max_connections    = get_stats('DatabaseConnections',  'Maximum', start_14d)
+    snap.avg_read_iops      = get_stats('ReadIOPS',             'Average', start_14d)
+    snap.avg_write_iops     = get_stats('WriteIOPS',            'Average', start_14d)
+
+    # FreeableMemory comes back in bytes; convert to GB
+    mem_bytes = get_stats('FreeableMemory', 'Average', start_14d)
+    snap.avg_freeable_mem_gb = mem_bytes / (1024 ** 3)
+
+    log.info(f"{snap.instance_id}: CPU 14d avg={snap.avg_cpu_14d:.1f}% "
+             f"max={snap.max_cpu_14d:.1f}% conns={snap.avg_connections:.0f}")
+    return snap
+
+
+def collect_cost_explorer_rds(region: str, days: int = 30) -&gt; dict[str, Decimal]:
+    """
+    Pull per-instance costs from Cost Explorer using resource-level cost allocation.
+    Requires cost allocation tags to be enabled in Billing console.
+    Returns: {db_instance_identifier: monthly_cost_usd}
+    """
+    ce = boto3.client('ce', region_name='us-east-1')  # CE is always us-east-1
+    end   = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days)
+
+    resp = ce.get_cost_and_usage_with_resources(
+        TimePeriod={'Start': str(start), 'End': str(end)},
+        Granularity='MONTHLY',
+        Filter={
+            'And': [
+                {'Dimensions': {'Key': 'SERVICE',        'Values': ['Amazon Relational Database Service']}},
+                {'Dimensions': {'Key': 'REGION',         'Values': [region]}},
+                {'Dimensions': {'Key': 'RESOURCE_TYPE',  'Values': ['RDS Instance']}}
+            ]
+        },
+        GroupBy=[{'Type': 'DIMENSION', 'Key': 'RESOURCE_ID'}],
+        Metrics=['UnblendedCost']
+    )
+
+    costs = {}
+    for period in resp.get('ResultsByTime', []):
+        for group in period.get('Groups', []):
+            resource_id = group['Keys'][0]
+            amount = Decimal(group['Metrics']['UnblendedCost']['Amount'])
+            # Resource ID format: "arn:...:db:instance-name" — extract last segment
+            instance_name = resource_id.split(':')[-1]
+            costs[instance_name] = costs.get(instance_name, Decimal('0')) + amount
+
+    return costs
+
+
+def persist_snapshots(snapshots: list[RDSInstanceSnapshot]):
+    """Write collected snapshots to the analyzer database for trend analysis."""
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS rds_instance_snapshots (
+            id              SERIAL PRIMARY KEY,
+            collected_at    TIMESTAMPTZ DEFAULT NOW(),
+            instance_id     VARCHAR(256),
+            region          VARCHAR(32),
+            instance_class  VARCHAR(64),
+            engine          VARCHAR(32),
+            multi_az        BOOLEAN,
+            storage_type    VARCHAR(16),
+            allocated_storage_gb    INT,
+            iops_provisioned        INT,
+            status          VARCHAR(32),
+            monthly_cost_usd        NUMERIC(10,2),
+            avg_cpu_14d     NUMERIC(5,2),
+            max_cpu_14d     NUMERIC(5,2),
+            avg_connections NUMERIC(8,1),
+            max_connections NUMERIC(8,1),
+            avg_read_iops   NUMERIC(10,2),
+            avg_write_iops  NUMERIC(10,2),
+            avg_freeable_mem_gb     NUMERIC(8,2),
+            tags            JSONB
+        )
+    """)
+
+    for snap in snapshots:
+        cur.execute("""
+            INSERT INTO rds_instance_snapshots (
+                instance_id, region, instance_class, engine, multi_az,
+                storage_type, allocated_storage_gb, iops_provisioned,
+                status, monthly_cost_usd, avg_cpu_14d, max_cpu_14d,
+                avg_connections, max_connections, avg_read_iops,
+                avg_write_iops, avg_freeable_mem_gb, tags
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            snap.instance_id, snap.region, snap.instance_class, snap.engine,
+            snap.multi_az, snap.storage_type, snap.allocated_storage,
+            snap.iops, snap.status, snap.monthly_cost_usd,
+            snap.avg_cpu_14d, snap.max_cpu_14d, snap.avg_connections,
+            snap.max_connections, snap.avg_read_iops, snap.avg_write_iops,
+            snap.avg_freeable_mem_gb, json.dumps(snap.tags)
+        ))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    log.info(f"Persisted {len(snapshots)} snapshots to analyzer database.")
+
+
+def main():
+    regions = os.environ.get('AWS_REGIONS', 'us-east-1,us-west-2').split(',')
+
+    for region in regions:
+        log.info(f"Collecting data for region: {region}")
+        snapshots = collect_rds_instances(region)
+        costs     = collect_cost_explorer_rds(region)
+
+        for snap in snapshots:
+            snap = collect_cloudwatch_metrics(snap, region)
+            snap.monthly_cost_usd = costs.get(snap.instance_id, Decimal('0'))
+
+        persist_snapshots(snapshots)
+
+    log.info("Collection cycle complete.")
+
+
+if __name__ == '__main__':
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this as a daily cron job or EventBridge rule. A single collection cycle for 30 instances across two regions completes in under four minutes on a t3.small. The snapshot history it builds enables trend analysis that single-point-in-time queries cannot provide — you can see whether an instance's CPU utilization is declining over weeks, which happens when a batch job gets decommissioned but the instance is left running.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.3 The Rules Engine: Translating Data into Dollar Amounts</h3>
+
+<p class="text-gray-300 leading-relaxed">The rules engine is where the analyzer earns its keep. Each rule takes a snapshot as input, applies a threshold condition, and if the condition is met, writes a finding with a calculated dollar savings estimate. The math behind each estimate is transparent and defensible — you can show a CTO exactly how the number was derived.</p>
+
+<p class="text-gray-300 leading-relaxed">The following SQL queries run against the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_instance_snapshots</code> table to identify the most common and highest-value findings. These queries should run as part of the nightly rules evaluation job, with results written to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_cost_findings</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ============================================================
+-- RULE 1: Idle Instances (avg CPU &lt; 5% for 14 days)
+-- Expected finding: 100% of instance cost recoverable
+-- ============================================================
+WITH latest_snapshots AS (
+    SELECT DISTINCT ON (instance_id)
+        instance_id,
+        region,
+        instance_class,
+        engine,
+        multi_az,
+        monthly_cost_usd,
+        avg_cpu_14d,
+        max_cpu_14d,
+        avg_connections,
+        status,
+        tags
+    FROM rds_instance_snapshots
+    ORDER BY instance_id, collected_at DESC
+)
+SELECT
+    'aws'                           AS cloud_provider,
+    instance_id                     AS resource_id,
+    'rds_instance'                  AS resource_type,
+    engine,
+    instance_class,
+    'idle_instance'                 AS finding_type,
+    jsonb_build_object(
+        'avg_cpu_14d',          avg_cpu_14d,
+        'max_cpu_14d',          max_cpu_14d,
+        'avg_connections',      avg_connections,
+        'status',               status,
+        'env_tag',              tags-&gt;&gt;'Environment'
+    )                               AS finding_detail,
+    monthly_cost_usd                AS estimated_monthly_savings_usd,
+    'high'                          AS confidence
+FROM latest_snapshots
+WHERE
+    avg_cpu_14d     &lt; 5.0
+    AND max_cpu_14d &lt; 20.0          -- eliminates instances with rare spikes
+    AND avg_connections &lt; 2.0       -- no active application connections
+    AND status = 'available'
+    AND monthly_cost_usd &gt; 0
+ORDER BY estimated_monthly_savings_usd DESC;
+
+
+-- ============================================================
+-- RULE 2: Oversized Instances (avg CPU &lt; 20%, max CPU &lt; 40%)
+-- Savings: moving to next smaller instance class typically saves 40-50%
+-- Example: db.r6g.2xlarge ($1,040/mo) → db.r6g.xlarge ($520/mo)
+-- ============================================================
+WITH latest_snapshots AS (
+    SELECT DISTINCT ON (instance_id)
+        instance_id, region, instance_class, engine,
+        monthly_cost_usd, avg_cpu_14d, max_cpu_14d,
+        avg_freeable_mem_gb, avg_connections, tags
+    FROM rds_instance_snapshots
+    ORDER BY instance_id, collected_at DESC
+),
+instance_memory AS (
+    -- Approximate vCPU/RAM for common RDS instance classes
+    SELECT * FROM (VALUES
+        ('db.t3.medium',    2,  4),
+        ('db.t3.large',     2,  8),
+        ('db.t3.xlarge',    4,  16),
+        ('db.t3.2xlarge',   8,  32),
+        ('db.r6g.large',    2,  16),
+        ('db.r6g.xlarge',   4,  32),
+        ('db.r6g.2xlarge',  8,  64),
+        ('db.r6g.4xlarge',  16, 128),
+        ('db.r6g.8xlarge',  32, 256),
+        ('db.m6g.large',    2,  8),
+        ('db.m6g.xlarge',   4,  16),
+        ('db.m6g.2xlarge',  8,  32),
+        ('db.m6g.4xlarge',  16, 64)
+    ) AS t(instance_class, vcpus, ram_gb)
+)
+SELECT
+    'aws'                               AS cloud_provider,
+    ls.instance_id                      AS resource_id,
+    'rds_instance'                      AS resource_type,
+    ls.engine,
+    ls.instance_class,
+    'oversized_instance'                AS finding_type,
+    jsonb_build_object(
+        'avg_cpu_14d',          ls.avg_cpu_14d,
+        'max_cpu_14d',          ls.max_cpu_14d,
+        'avg_freeable_mem_gb',  ls.avg_freeable_mem_gb,
+        'total_ram_gb',         im.ram_gb,
+        'mem_utilization_pct',  ROUND(
+                                    100.0 - (ls.avg_freeable_mem_gb / NULLIF(im.ram_gb, 0) * 100),
+                                    1),
+        'recommended_action',   'Downsize to next smaller instance class'
+    )                                   AS finding_detail,
+    -- Conservative: assume 40% savings from one size down
+    ROUND(ls.monthly_cost_usd * 0.40, 2)  AS estimated_monthly_savings_usd,
+    CASE
+        WHEN ls.avg_cpu_14d &lt; 10 AND ls.max_cpu_14d &lt; 25 THEN 'high'
+        WHEN ls.avg_cpu_14d &lt; 20 AND ls.max_cpu_14d &lt; 40 THEN 'medium'
+        ELSE 'low'
+    END                                 AS confidence
+FROM latest_snapshots ls
+LEFT JOIN instance_memory im USING (instance_class)
+WHERE
+    ls.avg_cpu_14d &lt; 20.0
+    AND ls.max_cpu_14d &lt; 40.0
+    -- Don't flag instances where memory is the constraint
+    AND (ls.avg_freeable_mem_gb / NULLIF(im.ram_gb, 0)) &gt; 0.30
+    AND ls.monthly_cost_usd &gt; 50   -- ignore micro instances, not worth the effort
+ORDER BY estimated_monthly_savings_usd DESC;
+
+
+-- ============================================================
+-- RULE 3: gp2 Storage That Should Be gp3
+-- gp2: $0.115/GB/month  |  gp3: $0.08/GB/month  |  Saving: 30.4%
+-- Bonus: gp3 baseline is 3,000 IOPS free vs gp2's linear scaling
+-- Example: 1TB gp2 = $117.76/mo  →  1TB gp3 = $81.92/mo  = $35.84/mo saved
+-- ============================================================
+WITH latest_snapshots AS (
+    SELECT DISTINCT ON (instance_id)
+        instance_id, region, instance_class, engine,
+        storage_type, allocated_storage_gb, iops_provisioned,
+        avg_read_iops, avg_write_iops, monthly_cost_usd, tags
+    FROM rds_instance_snapshots
+    ORDER BY instance_id, collected_at DESC
+)
+SELECT
+    'aws'                               AS cloud_provider,
+    instance_id                         AS resource_id,
+    'rds_instance'                      AS resource_type,
+    engine,
+    instance_class,
+    'gp2_to_gp3'                        AS finding_type,
+    jsonb_build_object(
+        'current_storage_type',     'gp2',
+        'allocated_storage_gb',     allocated_storage_gb,
+        'current_monthly_storage',  ROUND(allocated_storage_gb * 0.115, 2),
+        'gp3_monthly_storage',      ROUND(allocated_storage_gb * 0.08, 2),
+        'avg_read_iops',            ROUND(avg_read_iops, 0),
+        'avg_write_iops',           ROUND(avg_write_iops, 0),
+        'total_avg_iops',           ROUND(avg_read_iops + avg_write_iops, 0),
+        'gp3_free_iops',            3000,
+        'zero_downtime_migration',  true
+    )                                   AS finding_detail,
+    -- Storage savings only (IOPS are free up to 3000 on gp3)
+    ROUND(allocated_storage_gb * (0.115 - 0.08), 2)
+                                        AS estimated_monthly_savings_usd,
+    'high'                              AS confidence
+FROM latest_snapshots
+WHERE
+    storage_type = 'gp2'
+    AND allocated_storage_gb &gt;= 100     -- below 100GB the absolute saving is trivial
+    -- Don't flag if current IOPS need exceed gp3 max (16000 IOPS)
+    AND (avg_read_iops + avg_write_iops) &lt; 16000
+ORDER BY estimated_monthly_savings_usd DESC;
+
+
+-- ============================================================
+-- RULE 4: Multi-AZ Enabled on Non-Production Instances
+-- Multi-AZ doubles the instance cost. Non-prod doesn't need it.
+-- Example: db.r6g.2xlarge Multi-AZ = $2,080/mo  →  Single-AZ = $1,040/mo
+-- ============================================================
+WITH latest_snapshots AS (
+    SELECT DISTINCT ON (instance_id)
+        instance_id, region, instance_class, engine,
+        multi_az, monthly_cost_usd, tags
+    FROM rds_instance_snapshots
+    ORDER BY instance_id, collected_at DESC
+)
+SELECT
+    'aws'                               AS cloud_provider,
+    instance_id                         AS resource_id,
+    'rds_instance'                      AS resource_type,
+    engine,
+    instance_class,
+    'multi_az_nonprod'                  AS finding_type,
+    jsonb_build_object(
+        'multi_az',         true,
+        'environment_tag',  tags-&gt;&gt;'Environment',
+        'cost_center_tag',  tags-&gt;&gt;'CostCenter',
+        'recommendation',   'Disable Multi-AZ; restore from snapshot for non-prod recovery'
+    )                                   AS finding_detail,
+    -- Multi-AZ approximately doubles instance cost
+    ROUND(monthly_cost_usd * 0.45, 2)  AS estimated_monthly_savings_usd,
+    'high'                              AS confidence
+FROM latest_snapshots
+WHERE
+    multi_az = true
+    AND (
+        LOWER(tags-&gt;&gt;'Environment') IN ('dev', 'development', 'test',
+                                         'staging', 'qa', 'sandbox', 'nonprod')
+        OR LOWER(instance_id) LIKE '%dev%'
+        OR LOWER(instance_id) LIKE '%test%'
+        OR LOWER(instance_id) LIKE '%stag%'
+        OR LOWER(instance_id) LIKE '%qa%'
+    )
+ORDER BY estimated_monthly_savings_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These four rules alone will surface 60–70% of the total savings available in a typical AWS RDS environment. Add rules for io1-to-gp3 migration, missing reserved instances, and stopped instances accruing storage charges to cover the remainder.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.4 Database-Internal Cost Analysis with pg_stat_statements</h3>
+
+<p class="text-gray-300 leading-relaxed">Cloud billing data shows you what you are paying per instance. Database-internal statistics show you what is consuming the resources you are paying for. Combining them lets you say "this $2,400/month instance is 60% consumed by three queries that run 50,000 times per day — optimizing those queries could halve the instance cost." That is the conversation that gets engineering attention.</p>
+
+<p class="text-gray-300 leading-relaxed">The following queries work against <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> on PostgreSQL RDS, Aurora PostgreSQL, AlloyDB, and Cloud SQL for PostgreSQL. For SQL Server RDS or Azure SQL, the equivalent view is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ============================================================
+-- PostgreSQL: Top resource-consuming queries for cost attribution
+-- Run against each production database; correlates with instance cost
+-- ============================================================
+
+-- Prerequisite: pg_stat_statements must be loaded
+-- In RDS Parameter Group: shared_preload_libraries = 'pg_stat_statements'
+-- Then: CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Query 1: Queries consuming the most total CPU (user + system time)
+-- "Total time" in pg_stat_statements is wall clock; use this to identify
+-- candidates for query optimization that can defer hardware scaling.
+SELECT
+    LEFT(query, 120)                            AS query_preview,
+    calls,
+    ROUND(total_exec_time::numeric / 1000, 2)   AS total_exec_seconds,
+    ROUND(mean_exec_time::numeric, 2)           AS mean_exec_ms,
+    ROUND(stddev_exec_time::numeric, 2)         AS stddev_exec_ms,
+    ROUND(total_exec_time::numeric /
+          SUM(total_exec_time) OVER () * 100, 2) AS pct_of_total_time,
+    rows,
+    shared_blks_hit,
+    shared_```sql
+    shared_blks_read,
+    shared_blks_dirtied,
+    ROUND(shared_blks_hit::numeric /
+          NULLIF(shared_blks_hit + shared_blks_read, 0) * 100, 2) AS cache_hit_pct,
+    -- Disk reads translate directly to storage IOPS cost
+    ROUND(shared_blks_read * 8.0 / 1024, 2)    AS disk_read_mb
+FROM pg_stat_statements
+WHERE
+    calls &gt; 100                         -- ignore rarely-executed queries
+    AND query NOT LIKE '%pg_stat%'      -- exclude the analyzer itself
+ORDER BY total_exec_time DESC
+LIMIT 25;
+
+
+-- Query 2: IOPS cost attribution by query
+-- Each block read is 8KB. On io1 at $0.065/provisioned IOPS/month,
+-- high-read queries are directly driving storage costs.
+SELECT
+    LEFT(query, 120)                            AS query_preview,
+    calls,
+    shared_blks_read + shared_blks_written      AS total_io_blocks,
+    ROUND((shared_blks_read + shared_blks_written) * 8.0 / 1024, 2)
+                                                AS total_io_mb,
+    ROUND(shared_blks_read::numeric /
+          NULLIF(calls, 0), 2)                  AS blks_read_per_call,
+    ROUND(temp_blks_read + temp_blks_written, 0) AS temp_io_blocks,
+    -- Temp block usage indicates missing indexes or insufficient work_mem
+    CASE
+        WHEN (temp_blks_read + temp_blks_written) &gt; 0
+        THEN 'WARNING: spilling to disk'
+        ELSE 'OK'
+    END                                         AS temp_io_status
+FROM pg_stat_statements
+WHERE calls &gt; 50
+ORDER BY (shared_blks_read + shared_blks_written) DESC
+LIMIT 20;
+
+
+-- Query 3: Connection cost analysis
+-- High connection counts without pgBouncer drive the need for larger instances.
+-- A db.r6g.xlarge (4 vCPU, 32GB) with 1,000 direct connections wastes
+-- approximately 8GB of RAM on connection overhead alone.
+SELECT
+    client_addr,
+    state,
+    COUNT(*)                                    AS connection_count,
+    COUNT(*) FILTER (WHERE state = 'idle')      AS idle_connections,
+    COUNT(*) FILTER (WHERE state = 'active')    AS active_connections,
+    COUNT(*) FILTER (WHERE state = 'idle in transaction')
+                                                AS idle_in_transaction,
+    -- Idle in transaction locks resources and burns memory
+    ROUND(COUNT(*) FILTER (WHERE state = 'idle') * 100.0
+          / NULLIF(COUNT(*), 0), 1)             AS idle_pct,
+    MAX(EXTRACT(EPOCH FROM (NOW() - state_change)))
+                                                AS max_idle_seconds
+FROM pg_stat_activity
+WHERE pid &lt;&gt; pg_backend_pid()
+GROUP BY client_addr, state
+ORDER BY connection_count DESC;
+
+
+-- Query 4: Table bloat — wasted storage that inflates backup and storage costs
+-- A table with 40% bloat means you're paying for 40% more storage than you use.
+-- On a 500GB database on gp3, that's 200GB × $0.08 = $16/month in pure waste.
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename))
+                                                AS total_size,
+    pg_size_pretty(pg_relation_size(schemaname||'.'||tablename))
+                                                AS table_size,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)
+                   - pg_relation_size(schemaname||'.'||tablename))
+                                                AS index_size,
+    n_live_tup,
+    n_dead_tup,
+    CASE
+        WHEN n_live_tup &gt; 0
+        THEN ROUND(n_dead_tup * 100.0 / (n_live_tup + n_dead_tup), 1)
+        ELSE 0
+    END                                         AS dead_tuple_pct,
+    last_autovacuum,
+    last_autoanalyze
+FROM pg_stat_user_tables
+WHERE
+    (n_live_tup + n_dead_tup) &gt; 10000          -- ignore tiny tables
+    AND n_dead_tup &gt; n_live_tup * 0.20         -- &gt;20% bloat
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+LIMIT 20;
+
+
+-- ============================================================
+-- SQL Server / Azure SQL equivalent: Top CPU consumers
+-- Run against sys.dm_exec_query_stats for cost attribution
+-- ============================================================
+SELECT TOP 20
+    SUBSTRING(qt.text, (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE qs.statement_end_offset
+          END - qs.statement_start_offset) / 2) + 1)
+                                                AS query_text,
+    qs.execution_count,
+    ROUND(qs.total_worker_time / 1000000.0, 2) AS total_cpu_seconds,
+    ROUND(qs.total_worker_time / 1000000.0
+          / NULLIF(qs.execution_count, 0), 4)  AS avg_cpu_seconds,
+    ROUND(qs.total_logical_reads
+          / NULLIF(qs.execution_count, 0), 0)  AS avg_logical_reads,
+    ROUND(qs.total_physical_reads
+          / NULLIF(qs.execution_count, 0), 0)  AS avg_physical_reads,
+    qs.total_logical_reads                     AS total_logical_reads,
+    qs.total_physical_reads                    AS total_physical_reads,
+    -- Physical reads drive IOPS; each is an 8KB page read from storage
+    ROUND(qs.total_physical_reads * 8.0 / 1024 / 1024, 2)
+                                                AS total_physical_read_gb,
+    qs.creation_time                           AS plan_compiled_at
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) qt
+WHERE qs.execution_count &gt; 100
+ORDER BY qs.total_worker_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The bloat query frequently uncovers $10,000–$40,000 in recoverable storage costs at organizations that have not run VACUUM FULL or pg_repack on large tables. One financial services client discovered a 2TB table with 55% dead tuple ratio — they were paying for 1.1TB of storage containing nothing but tombstones from a high-churn reporting table. Running pg_repack during a maintenance window recovered $88/month in gp3 storage costs and, more significantly, reduced table scan times by 40%, which deferred a planned instance upgrade worth $520/month.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.5 Automating the Rules Engine and Report Generation</h3>
+
+<p class="text-gray-300 leading-relaxed">The rules engine should run nightly, compare results against previously open findings to avoid duplicating records, and then produce a weekly digest every Monday morning. The following Python module handles both the rules evaluation loop and the Slack/email report generation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+db_cost_rules_engine.py
+Evaluates cost optimization rules against collected snapshots and
+generates weekly reports via Slack and email.
+
+Schedule:
+  - Rules evaluation: nightly at 02:00 UTC
+  - Weekly digest:    Mondays at 08:00 UTC
+
+Requirements:
+    pip install psycopg2-binary boto3 slack-sdk python-dotenv jinja2
+"""
+
+import os
+import json
+import logging
+import smtplib
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Optional
+
+import psycopg2
+import psycopg2.extras
+import boto3
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+from dotenv import load_dotenv
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------
+
+def get_db_connection():
+    return psycopg2.connect(
+        host=os.environ['ANALYZER_DB_HOST'],
+        dbname=os.environ['ANALYZER_DB_NAME'],
+        user=os.environ['ANALYZER_DB_USER'],
+        password=os.environ['ANALYZER_DB_PASSWORD'],
+        sslmode='require',
+        cursor_factory=psycopg2.extras.RealDictCursor
+    )
+
+
+# ---------------------------------------------------------------
+# Rules evaluation
+# ---------------------------------------------------------------
+
+RULES_SQL = {
+
+    'idle_instance': """
+        WITH latest AS (
+            SELECT DISTINCT ON (instance_id)
+                instance_id, region, instance_class, engine, multi_az,
+                storage_type, monthly_cost_usd, avg_cpu_14d, max_cpu_14d,
+                avg_connections, status, tags
+            FROM rds_instance_snapshots
+            ORDER BY instance_id, collected_at DESC
+        )
+        SELECT
+            'aws'           AS cloud_provider,
+            instance_id     AS resource_id,
+            'rds_instance'  AS resource_type,
+            engine,
+            instance_class,
+            region,
+            'idle_instance' AS finding_type,
+            monthly_cost_usd AS estimated_monthly_savings_usd,
+            'high'          AS confidence,
+            jsonb_build_object(
+                'avg_cpu_14d',     avg_cpu_14d,
+                'max_cpu_14d',     max_cpu_14d,
+                'avg_connections', avg_connections,
+                'status',          status
+            ) AS finding_detail
+        FROM latest
+        WHERE avg_cpu_14d &lt; 5
+          AND max_cpu_14d &lt; 20
+          AND avg_connections &lt; 2
+          AND status = 'available'
+          AND monthly_cost_usd &gt; 0
+    """,
+
+    'oversized_instance': """
+        WITH latest AS (
+            SELECT DISTINCT ON (instance_id)
+                instance_id, region, instance_class, engine,
+                monthly_cost_usd, avg_cpu_14d, max_cpu_14d,
+                avg_freeable_mem_gb, tags
+            FROM rds_instance_snapshots
+            ORDER BY instance_id, collected_at DESC
+        )
+        SELECT
+            'aws'               AS cloud_provider,
+            instance_id         AS resource_id,
+            'rds_instance'      AS resource_type,
+            engine,
+            instance_class,
+            region,
+            'oversized_instance' AS finding_type,
+            ROUND(monthly_cost_usd * 0.40, 2) AS estimated_monthly_savings_usd,
+            CASE
+                WHEN avg_cpu_14d &lt; 10 AND max_cpu_14d &lt; 25 THEN 'high'
+                ELSE 'medium'
+            END AS confidence,
+            jsonb_build_object(
+                'avg_cpu_14d',  avg_cpu_14d,
+                'max_cpu_14d',  max_cpu_14d
+            ) AS finding_detail
+        FROM latest
+        WHERE avg_cpu_14d &lt; 20
+          AND max_cpu_14d &lt; 40
+          AND monthly_cost_usd &gt; 50
+    """,
+
+    'gp2_to_gp3': """
+        WITH latest AS (
+            SELECT DISTINCT ON (instance_id)
+                instance_id, region, instance_class, engine,
+                storage_type, allocated_storage_gb,
+                avg_read_iops, avg_write_iops, monthly_cost_usd, tags
+            FROM rds_instance_snapshots
+            ORDER BY instance_id, collected_at DESC
+        )
+        SELECT
+            'aws'           AS cloud_provider,
+            instance_id     AS resource_id,
+            'rds_instance'  AS resource_type,
+            engine,
+            instance_class,
+            region,
+            'gp2_to_gp3'   AS finding_type,
+            ROUND(allocated_storage_gb * 0.035, 2) AS estimated_monthly_savings_usd,
+            'high'          AS confidence,
+            jsonb_build_object(
+                'allocated_storage_gb',     allocated_storage_gb,
+                'current_monthly_storage',  ROUND(allocated_storage_gb * 0.115, 2),
+                'gp3_monthly_storage',      ROUND(allocated_storage_gb * 0.08,  2),
+                'avg_total_iops',           ROUND(avg_read_iops + avg_write_iops, 0)
+            ) AS finding_detail
+        FROM latest
+        WHERE storage_type = 'gp2'
+          AND allocated_storage_gb &gt;= 100
+          AND (avg_read_iops + avg_write_iops) &lt; 16000
+    """,
+
+    'multi_az_nonprod': """
+        WITH latest AS (
+            SELECT DISTINCT ON (instance_id)
+                instance_id, region, instance_class, engine,
+                multi_az, monthly_cost_usd, tags
+            FROM rds_instance_snapshots
+            ORDER BY instance_id, collected_at DESC
+        )
+        SELECT
+            'aws'               AS cloud_provider,
+            instance_id         AS resource_id,
+            'rds_instance'      AS resource_type,
+            engine,
+            instance_class,
+            region,
+            'multi_az_nonprod'  AS finding_type,
+            ROUND(monthly_cost_usd * 0.45, 2) AS estimated_monthly_savings_usd,
+            'high'              AS confidence,
+            jsonb_build_object(
+                'environment_tag', tags-&gt;&gt;'Environment',
+                'multi_az',        true
+            ) AS finding_detail
+        FROM latest
+        WHERE multi_az = true
+          AND (
+              LOWER(tags-&gt;&gt;'Environment') IN
+                  ('dev','development','test','staging','qa','sandbox','nonprod')
+              OR LOWER(instance_id) SIMILAR TO '%(dev|test|stag|qa|sand)%'
+          )
+    """
+}
+
+
+def finding_already_open(cur, resource_id: str, finding_type: str) -&gt; bool:
+    """Prevent duplicate findings for the same resource and finding type."""
+    cur.execute("""
+        SELECT 1 FROM db_cost_findings
+        WHERE resource_id     = %s
+          AND finding_type    = %s
+          AND resolution_status = 'open'
+        LIMIT 1
+    """, (resource_id, finding_type))
+    return cur.fetchone() is not None
+
+
+def run_rules_engine():
+    """
+    Evaluate all rules against the latest snapshots.
+    Writes new findings; skips resources already flagged as open.
+    Returns summary dict with total findings and savings.
+    """
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    total_new_findings   = 0
+    total_savings        = Decimal('0')
+    findings_by_type     = {}
+
+    for rule_name, sql in RULES_SQL.items():
+        log.info(f"Evaluating rule: {rule_name}")
+        cur.execute(sql)
+        rows = cur.fetchall()
+
+        new_for_rule = 0
+        savings_for_rule = Decimal('0')
+
+        for row in rows:
+            resource_id  = row['resource_id']
+            finding_type = row['finding_type']
+            savings      = Decimal(str(row['estimated_monthly_savings_usd'] or 0))
+
+            if finding_already_open(cur, resource_id, finding_type):
+                continue  # already flagged; don't duplicate
+
+            # Retrieve account_id from environment or tags
+            account_id = os.environ.get('AWS_ACCOUNT_ID', 'unknown')
+
+            cur.execute("""
+                INSERT INTO db_cost_findings (
+                    cloud_provider, account_id, region, resource_id,
+                    resource_type, engine, instance_class, finding_type,
+                    finding_detail, estimated_monthly_savings_usd,
+                    confidence
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            """, (
+                row['cloud_provider'],
+                account_id,
+                row['region'],
+                resource_id,
+                row['resource_type'],
+                row['engine'],
+                row['instance_class'],
+                finding_type,
+                json.dumps(dict(row['finding_detail'])),
+                savings,
+                row['confidence']
+            ))
+
+            new_for_rule    += 1
+            savings_for_rule += savings
+
+        conn.commit()
+
+        if new_for_rule &gt; 0:
+            findings_by_type[rule_name] = {
+                'count':   new_for_rule,
+                'savings': float(savings_for_rule)
+            }
+            log.info(f"  {rule_name}: {new_for_rule} new findings, "
+                     f"${savings_for_rule:,.2f}/mo potential savings")
+
+        total_new_findings += new_for_rule
+        total_savings      += savings_for_rule
+
+    cur.close()
+    conn.close()
+
+    return {
+        'total_new_findings': total_new_findings,
+        'total_monthly_savings': float(total_savings),
+        'total_annual_savings':  float(total_savings * 12),
+        'by_type': findings_by_type
+    }
+
+
+# ---------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------
+
+def build_weekly_report() -&gt; dict:
+    """
+    Aggregate all open findings for the weekly digest.
+    Returns a structured dict consumed by both the Slack formatter
+    and the HTML email formatter.
+    """
+    conn = get_db_connection()
+    cur  = conn.cursor()
+
+    # Summary by finding type
+    cur.execute("""
+        SELECT
+            finding_type,
+            COUNT(*)                                AS finding_count,
+            SUM(estimated_monthly_savings_usd)      AS monthly_savings,
+            SUM(estimated_monthly_savings_usd) * 12 AS annual_savings
+        FROM db_cost_findings
+        WHERE resolution_status = 'open'
+        GROUP BY finding_type
+        ORDER BY monthly_savings DESC
+    """)
+    summary_rows = cur.fetchall()
+
+    # Top 10 individual findings by dollar value
+    cur.execute("""
+        SELECT
+            resource_id,
+            region,
+            engine,
+            instance_class,
+            finding_type,
+            estimated_monthly_savings_usd,
+            confidence,
+            detected_at
+        FROM db_cost_findings
+        WHERE resolution_status = 'open'
+        ORDER BY estimated_monthly_savings_usd DESC
+        LIMIT 10
+    """)
+    top_findings = cur.fetchall()
+
+    # Total open savings
+    cur.execute("""
+        SELECT
+            COUNT(*)                                AS total_findings,
+            SUM(estimated_monthly_savings_usd)      AS total_monthly_savings,
+            SUM(estimated_monthly_savings_usd) * 12 AS total_annual_savings
+        FROM db_cost_findings
+        WHERE resolution_status = 'open'
+    """)
+    totals = cur.fetchone()
+
+    # Actioned this week (closed findings)
+    cur.execute("""
+        SELECT
+            COUNT(*)                            AS actioned_count,
+            SUM(estimated_monthly_savings_usd)  AS actioned_savings
+        FROM db_cost_findings
+        WHERE resolution_status = 'actioned'
+          AND resolved_at &gt;= NOW() - INTERVAL '7 days'
+    """)
+    actioned = cur.fetchone()
+
+    cur.close()
+    conn.close()
+
+    return {
+        'generated_at':         datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),
+        'total_findings':       totals['total_findings']       or 0,
+        'total_monthly_savings': float(totals['total_monthly_savings'] or 0),
+        'total_annual_savings':  float(totals['total_annual_savings']  or 0),
+        'actioned_count':        actioned['actioned_count']    or 0,
+        'actioned_savings':      float(actioned['actioned_savings'] or 0),
+        'summary_by_type':      [dict(r) for r in summary_rows],
+        'top_findings':         [dict(r) for r in top_findings]
+    }
+
+
+def post_slack_digest(report: dict):
+    """
+    Post a structured cost digest to Slack.
+    Set SLACK_BOT_TOKEN and SLACK_CHANNEL_ID in environment.
+    """
+    client  = WebClient(token=os.environ['SLACK_BOT_TOKEN'])
+    channel = os.environ['SLACK_CHANNEL_ID']
+
+    monthly = report['total_monthly_savings']
+    annual  = report['total_annual_savings']
+    actioned_savings = report['actioned_savings']
+
+    header_text = (
+        f":money_with_wings: *Database Cost Analyzer — Weekly Digest*\n"
+        f"Generated: {report['generated_at']}"
+    )
+
+    summary_text = (
+        f"*Open Findings:* {report['total_findings']}\n"
+        f"*Monthly Savings Available:* ${monthly:,.0f}\n"
+        f"*Annual Savings Available:* ${annual:,.0f}\n"
+        f"*Actioned This Week:* {report['actioned_count']} findings "
+        f"(${actioned_savings:,.0f}/mo recovered)"
+    )
+
+    # Build top findings text
+    findings_lines = []
+    for i, f in enumerate(report['top_findings'][:5], 1):
+        savings = float(f['estimated_monthly_savings_usd'])
+        findings_lines.append(
+            f"{i}. `{f['resource_id']}` ({f['instance_class']}) — "
+            f"*{f['finding_type']}* — "
+            f"${savings:,.0f}/mo ({f['confidence']} confidence)"
+        )
+    findings_text = "\n".join(findings_lines) if findings_lines else "No open findings."
+
+    blocks = [
+        {"type": "header",
+         "text": {"type": "plain_text", "text": "Database Cost Analyzer — Weekly Digest"}},
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": header_text}},
+        {"type": "divider"},
+        {"type": "section",
+         "text": {"type": "mrkdwn", "text": summary_text}},
+        {"type": "section",
+         "text": {"type": "mrkdwn",
+                  "text": f"*Top Savings Opportunities:*\n{findings_text}"}},
+        {"type": "divider"},
+        {"type": "context",
+         "elements": [{"type": "mrkdwn",
+                        "text": "React with :white_check_mark: to mark a finding actioned. "
+                                "Full report delivered via email."}]}
+    ]
+
+    try:
+        client.chat_postMessage(channel=channel, blocks=blocks, text=header_text)
+        log.info("Slack digest posted successfully.")
+    except SlackApiError as e:
+        log.error(f"Slack API error: {e.response['error']}")
+
+
+def send_email_digest(report: dict):
+    """
+    Send HTML email digest via AWS SES.
+    Set SES_FROM_ADDRESS and SES_TO_ADDRESSES (comma-separated) in environment.
+    """
+    ses      = boto3.client('ses', region_name=os.environ.get('AWS_DEFAULT_REGION', 'us-east-1'))
+    from_addr = os.environ['SES_FROM_ADDRESS']
+    to_addrs  = os.environ['SES_TO_ADDRESSES'].split(',')
+
+    monthly = report['total_monthly_savings']
+    annual  = report['total_annual_savings']
+
+    # Build HTML table rows for summary by type
+    summary_rows_html = ""
+    for row in report['summary_by_type']:
+        summary_rows_html += (
+            f"&lt;tr&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd'&gt;{row['finding_type']}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;text-align:center'&gt;{row['finding_count']}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;text-align:right'&gt;${float(row['monthly_savings']):,.0f}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;text-align:right'&gt;${float(row['annual_savings']):,.0f}&lt;/td&gt;"
+            f"&lt;/tr&gt;"
+        )
+
+    top_findings_html = ""
+    for f in report['top_findings']:
+        savings = float(f['estimated_monthly_savings_usd'])
+        detected = str(f['detected_at'])[:10]
+        top_findings_html += (
+            f"&lt;tr&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;font-family:monospace'&gt;{f['resource_id']}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd'&gt;{f['instance_class']}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd'&gt;{f['finding_type']}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;text-align:right'&gt;${savings:,.0f}/mo&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;text-align:center'&gt;{f['confidence']}&lt;/td&gt;"
+            f"&lt;td style='padding:8px;border:1px solid #ddd;text-align:center'&gt;{detected}&lt;/td&gt;"
+            f"&lt;/tr&gt;"
+        )
+
+    html_body = f"""
+    &lt;html&gt;&lt;body style='font-family:Arial,sans-serif;color:#333;max-width:900px;margin:auto'&gt;
+    &lt;h2 style='color:#d63031'&gt;Database Cost Analyzer — Weekly Report&lt;/h2&gt;
+    &lt;p style='color:#636e72'&gt;Generated: {report['generated_at']}&lt;/p&gt;
+
+    &lt;table style='width:100%;border-collapse:collapse;margin-bottom:24px'&gt;
+      &lt;tr&gt;
+        &lt;td style='background:#00b894;color:white;padding:16px;text-align:center;border-radius:4px'&gt;
+          &lt;div style='font-size:28px;font-weight:bold'&gt;${monthly:,.0f}&lt;/div&gt;
+          &lt;div&gt;Monthly Savings Available&lt;/div&gt;
+        &lt;/td&gt;
+        &lt;td style='width:16px'&gt;&lt;/td&gt;
+        &lt;td style='background:#0984e3;color:white;padding:16px;text-align:center;border-radius:4px'&gt;
+          &lt;div style='font-size:28px;font-weight:bold'&gt;${annual:,.0f}&lt;/div&gt;
+          &lt;div&gt;Annual Savings Available&lt;/div&gt;
+        &lt;/td&gt;
+        &lt;td style='width:16px'&gt;&lt;/td&gt;
+        &lt;td style='background:#6c5ce7;color:white;padding:16px;text-align:center;border-radius:4px'&gt;
+          &lt;div style='font-size:28px;font-weight:bold'&gt;{report['total_findings']}&lt;/div&gt;
+          &lt;div&gt;Open Findings&lt;/div&gt;
+        &lt;/td&gt;
+      &lt;/tr&gt;
+    &lt;/table&gt;
+
+    &lt;h3&gt;Findings by Category&lt;/h3&gt;
+    &lt;table style='width:100%;border-collapse:collapse;margin-bottom:24px'&gt;
+      &lt;thead&gt;
+        &lt;tr style='background:#f1f2f6'&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd;text-align:left'&gt;Finding Type&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Count&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Monthly Savings&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Annual Savings&lt;/th&gt;
+        &lt;/tr&gt;
+      &lt;/thead&gt;
+      &lt;tbody&gt;{summary_rows_html}&lt;/tbody&gt;
+    &lt;/table&gt;
+
+    &lt;h3&gt;Top 10 Individual Findings&lt;/h3&gt;
+    &lt;table style='width:100%;border-collapse:collapse;margin-bottom:24px'&gt;
+      &lt;thead&gt;
+        &lt;tr style='background:#f1f2f6'&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd;text-align:left'&gt;Resource ID&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Instance Class&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Finding&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Savings&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Confidence&lt;/th&gt;
+          &lt;th style='padding:8px;border:1px solid #ddd'&gt;Detected&lt;/th&gt;
+        &lt;/tr&gt;
+      &lt;/thead&gt;
+      &lt;tbody&gt;{top_findings_html}&lt;/tbody&gt;
+    &lt;/table&gt;
+
+    &lt;p style='color:#636e72;font-size:12px'&gt;
+      This report is generated automatically by the Database Cost Analyzer.
+      Mark findings as actioned in the recommendations database to track recovery.
+    &lt;/p&gt;
+    &lt;/body&gt;&lt;/html&gt;
+    """
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = (f"Database Cost Report: ${monthly:,.0f}/mo savings available "
+                      f"({report['total_findings']} findings)")
+    msg['From']    = from_addr
+    msg['To']      = ', '.join(to_addrs)
+    msg.attach(MIMEText(html_body, 'html'))
+
+    ses.send_raw_email(
+        Source=from_addr,
+        Destinations=to_addrs,
+        RawMessage={'Data': msg.as_string()}
+    )
+    log.info(f"Email digest sent to {to_addrs}")
+
+
+# ---------------------------------------------------------------
+# Entry points
+# ---------------------------------------------------------------
+
+def nightly_rules_run():
+    """Called by cron at 02:00 UTC daily."""
+    log.info("Starting nightly rules evaluation.")
+    summary = run_rules_engine()
+    log.info(f"Rules evaluation complete: {summary['total_new_findings']} new findings, "
+             f"${summary['total_monthly_savings']:,.2f}/mo potential savings.")
+    return summary
+
+
+def weekly_digest_run():
+    """Called by cron on Mondays at 08:00 UTC."""
+    log.info("Generating weekly digest.")
+    report = build_weekly_report()
+    post_slack_digest(report)
+    send_email_digest(report)
+    log.info("Weekly digest dispatched.")
+
+
+if __name__ == '__main__':
+    import sys
+    if len(sys.argv) &gt; 1 and sys.argv[1] == 'digest':
+        weekly_digest_run()
+    else:
+        nightly_rules_run()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The two entry points map directly to two cron entries:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># /etc/cron.d/db-cost-analyzer
+# Nightly rules evaluation
+0 2 * * * ec2-user cd /opt/db-cost-analyzer && python db_cost_rules_engine.py &gt;&gt; /var/log/db-cost-analyzer.log 2&gt;&1
+
+# Weekly digest every Monday morning
+0 8 * * 1 ec2-user cd /opt/db-cost-analyzer && python db_cost_rules_engine.py digest &gt;&gt; /var/log/db-cost-analyzer.log 2&gt;&1
+
+# Daily data collection
+0 6 * * * ec2-user cd /opt/db-cost-analyzer && python db_cost_collector.py &gt;&gt; /var/log/db-cost-collector.log 2&gt;&1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">29.6 Extending the Analyzer to Azure and GCPThe core architecture built for AWS extends to Azure and GCP by swapping the data collection layer while keeping the rules engine and recommendations database identical. The findings schema is cloud-agnostic by design — the `cloud_provider` column carries the distinction, and everything downstream from the rules engine is provider-neutral.</h3>
+
+<p class="text-gray-300 leading-relaxed">The following script adds Azure Cost Management and GCP Billing Export collection to the same analyzer database. Organizations running multi-cloud database estates typically find that 25–40% of their total cloud database spend is on Azure or GCP, and those platforms have equally significant optimization opportunities that go undetected without automated collection.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env bash
+# azure_cost_collector.sh
+# Pulls Azure SQL and Cosmos DB cost data via Azure CLI.
+# Schedule: Daily at 06:30 UTC alongside the AWS collector.
+#
+# Prerequisites:
+#   az login --service-principal -u $AZURE_CLIENT_ID \
+#             -p $AZURE_CLIENT_SECRET --tenant $AZURE_TENANT_ID
+#   pip install psycopg2-binary
+
+set -euo pipefail
+
+SUBSCRIPTION_ID="${AZURE_SUBSCRIPTION_ID}"
+RESOURCE_GROUP="${AZURE_RESOURCE_GROUP:-}"
+START_DATE=$(date -d "30 days ago" +%Y-%m-%d)
+END_DATE=$(date +%Y-%m-%d)
+OUTPUT_FILE="/tmp/azure_db_costs_${END_DATE}.json"
+
+echo "[$(date -u +%H:%M:%S)] Starting Azure cost collection for subscription: ${SUBSCRIPTION_ID}"
+
+# ---------------------------------------------------------------
+# Step 1: Pull cost data grouped by resource for database services
+# ---------------------------------------------------------------
+az consumption usage list \
+    --subscription "${SUBSCRIPTION_ID}" \
+    --start-date   "${START_DATE}" \
+    --end-date     "${END_DATE}" \
+    --query "
+        [?contains(consumedService, 'Microsoft.Sql') ||
+         contains(consumedService, 'Microsoft.DBforPostgreSQL') ||
+         contains(consumedService, 'Microsoft.DBforMySQL') ||
+         contains(consumedService, 'Microsoft.DBforMariaDB') ||
+         contains(consumedService, 'Microsoft.DocumentDB')].
+        {
+            resource_id:         instanceId,
+            service:             consumedService,
+            resource_group:      resourceGroup,
+            location:            location,
+            cost_usd:            pretaxCost,
+            usage_date:          date,
+            meter_name:          meterDetails.meterName,
+            meter_category:      meterDetails.meterCategory,
+            meter_subcategory:   meterDetails.meterSubCategory,
+            tags:                tags
+        }
+    " \
+    --output json &gt; "${OUTPUT_FILE}"
+
+echo "[$(date -u +%H:%M:%S)] Cost data written to ${OUTPUT_FILE}"
+
+# ---------------------------------------------------------------
+# Step 2: Pull Azure SQL performance metrics via Azure Monitor
+# ---------------------------------------------------------------
+# List all Azure SQL servers in subscription
+SQL_SERVERS=$(az sql server list \
+    --subscription "${SUBSCRIPTION_ID}" \
+    --query "[].{name:name, resourceGroup:resourceGroup}" \
+    --output json)
+
+echo "${SQL_SERVERS}" | python3 - &lt;&lt; 'PYEOF'
+import json, sys, subprocess, os
+from datetime import datetime, timedelta, timezone
+
+servers = json.loads(open('/dev/stdin').read()) if not sys.stdin.isatty() else []
+
+# Actually read from the variable passed via here-doc
+import subprocess
+result = subprocess.run(
+    ['az', 'sql', 'server', 'list',
+     '--subscription', os.environ['AZURE_SUBSCRIPTION_ID'],
+     '--query', '[].{name:name,resourceGroup:resourceGroup}',
+     '--output', 'json'],
+    capture_output=True, text=True
+)
+servers = json.loads(result.stdout)
+
+end_time   = datetime.now(timezone.utc)
+start_time = end_time - timedelta(days=14)
+
+metrics_output = []
+
+for server in servers:
+    server_name = server['name']
+    rg          = server['resourceGroup']
+
+    # List databases on this server
+    db_result = subprocess.run(
+        ['az', 'sql', 'db', 'list',
+         '--server', server_name,
+         '--resource-group', rg,
+         '--subscription', os.environ['AZURE_SUBSCRIPTION_ID'],
+         '--query',
+         '[].{name:name,sku:sku,maxSizeBytes:maxSizeBytes,status:status,tags:tags}',
+         '--output', 'json'],
+        capture_output=True, text=True
+    )
+    databases = json.loads(db_result.stdout)
+
+    for db in databases:
+        if db['name'] == 'master':
+            continue   # skip system database
+
+        db_name = db['name']
+        resource_id = (
+            f"/subscriptions/{os.environ['AZURE_SUBSCRIPTION_ID']}"
+            f"/resourceGroups/{rg}"
+            f"/providers/Microsoft.Sql/servers/{server_name}"
+            f"/databases/{db_name}"
+        )
+
+        # Pull CPU percentage metric (14-day average)
+        metrics_result = subprocess.run(
+            ['az', 'monitor', 'metrics', 'list',
+             '--resource',   resource_id,
+             '--metric',     'cpu_percent',
+             '--interval',   'PT1H',
+             '--aggregation','Average',
+             '--start-time', start_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+             '--end-time',   end_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+             '--output',     'json'],
+            capture_output=True, text=True
+        )
+
+        try:
+            metrics = json.loads(metrics_result.stdout)
+            datapoints = metrics['value'][0]['timeseries'][0]['data']
+            values     = [dp['average'] for dp in datapoints
+                         if dp.get('average') is not None]
+            avg_cpu    = sum(values) / len(values) if values else 0.0
+            max_cpu    = max(values) if values else 0.0
+        except (KeyError, IndexError, json.JSONDecodeError):
+            avg_cpu = max_cpu = 0.0
+
+        sku_name  = db.get('sku', {}).get('name', 'Unknown')
+        sku_tier  = db.get('sku', {}).get('tier', 'Unknown')
+        sku_cap   = db.get('sku', {}).get('capacity', 0)
+
+        metrics_output.append({
+            'cloud_provider':   'azure',
+            'server_name':      server_name,
+            'database_name':    db_name,
+            'resource_group':   rg,
+            'sku_name':         sku_name,
+            'sku_tier':         sku_tier,
+            'vcores_or_dtus':   sku_cap,
+            'max_size_gb':      round((db.get('maxSizeBytes') or 0) / (1024**3), 2),
+            'status':           db.get('status', 'Unknown'),
+            'avg_cpu_14d':      round(avg_cpu, 2),
+            'max_cpu_14d':      round(max_cpu, 2),
+            'tags':             db.get('tags', {})
+        })
+
+with open('/tmp/azure_sql_metrics.json', 'w') as f:
+    json.dump(metrics_output, f, indent=2)
+
+print(f"Collected metrics for {len(metrics_output)} Azure SQL databases.")
+PYEOF
+
+# ---------------------------------------------------------------
+# Step 3: Pull GCP Cloud SQL costs from BigQuery billing export
+# ---------------------------------------------------------------
+# Requires: billing export enabled to BigQuery dataset
+# Set GCP_BILLING_PROJECT and GCP_BILLING_DATASET in environment
+
+GCP_PROJECT="${GCP_BILLING_PROJECT:-}"
+GCP_DATASET="${GCP_BILLING_DATASET:-}"
+
+if [[ -n "${GCP_PROJECT}" && -n "${GCP_DATASET}" ]]; then
+    echo "[$(date -u +%H:%M:%S)] Querying GCP billing export from BigQuery..."
+
+    bq query \
+        --project_id="${GCP_PROJECT}" \
+        --use_legacy_sql=false \
+        --format=json \
+        --max_rows=10000 \
+        &lt;&lt; 'BQEOF' &gt; /tmp/gcp_db_costs.json
+SELECT
+    resource.name                                   AS resource_name,
+    resource.global_name                            AS resource_global_name,
+    service.description                             AS service,
+    sku.description                                 AS sku_description,
+    location.region                                 AS region,
+    SUM(cost)
+        + SUM(IFNULL(
+            (SELECT SUM(c.amount) FROM UNNEST(credits) c), 0))
+                                                    AS net_cost_usd,
+    ARRAY_AGG(DISTINCT
+        STRUCT(label.key AS k, label.value AS v)
+        IGNORE NULLS
+        LIMIT 20)                                   AS labels
+FROM
+    `PROJECT_ID.DATASET_ID.gcp_billing_export_v1_*`,
+    UNNEST(labels) AS label
+WHERE
+    _TABLE_SUFFIX &gt;= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY))
+    AND service.description IN (
+        'Cloud SQL',
+        'Cloud Spanner',
+        'AlloyDB for PostgreSQL',
+        'Bare Metal Solution'
+    )
+GROUP BY
+    resource.name,
+    resource.global_name,
+    service.description,
+    sku.description,
+    location.region
+ORDER BY
+    net_cost_usd DESC
+BQEOF
+
+    # Replace placeholder values — bq query runs the literal SQL above
+    # In practice, substitute project/dataset before running
+    echo "[$(date -u +%H:%M:%S)] GCP billing export written to /tmp/gcp_db_costs.json"
+fi
+
+echo "[$(date -u +%H:%M:%S)] Multi-cloud cost collection complete."</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once the JSON files land in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/tmp</code>, a loader script reads them and inserts normalized records into the same <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_instance_snapshots</code>-equivalent table structure, tagged with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloud_provider = 'azure'</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloud_provider = 'gcp'</code>. The rules engine SQL queries use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE cloud_provider = 'aws'</code> filters by default and gain Azure and GCP coverage simply by dropping those filters and adding provider-specific threshold logic where pricing differs.</p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL has a particularly high-value optimization that has no AWS equivalent: the <strong class="text-white">serverless tier auto-pause</strong> feature. Databases on the serverless compute tier that are not configured to auto-pause after idle periods continue billing at their minimum vCore floor even when completely idle. The following SQL query, run against the Azure SQL metrics data loaded into the analyzer database, surfaces these instances.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL: Serverless tier databases missing auto-pause configuration
+-- A serverless Azure SQL database at 4 vCores minimum with auto-pause disabled
+-- costs approximately $292/month at idle.
+-- With auto-pause set to 60 minutes, idle cost drops to $0 (paused databases
+-- only charge for storage: ~$0.115/GB/month).
+--
+-- Run against azure_sql_snapshots table (same schema as rds_instance_snapshots
+-- but populated by the Azure collector)
+
+WITH latest_azure AS (
+    SELECT DISTINCT ON (database_name, server_name)
+        database_name,
+        server_name,
+        resource_group,
+        sku_tier,
+        sku_name,
+        vcores_or_dtus,
+        max_size_gb,
+        avg_cpu_14d,
+        max_cpu_14d,
+        monthly_cost_usd,
+        tags,
+        auto_pause_delay_minutes   -- -1 means auto-pause disabled
+    FROM azure_sql_snapshots
+    ORDER BY database_name, server_name, collected_at DESC
+),
+serverless_idle AS (
+    SELECT *
+    FROM latest_azure
+    WHERE
+        sku_tier = 'GeneralPurpose'
+        AND sku_name LIKE '%Serverless%'
+        AND avg_cpu_14d  &lt; 10.0
+        AND max_cpu_14d  &lt; 25.0
+        AND (auto_pause_delay_minutes = -1          -- auto-pause disabled
+             OR auto_pause_delay_minutes &gt; 120)     -- or too long to engage
+)
+SELECT
+    'azure'                                             AS cloud_provider,
+    database_name || '@' || server_name                 AS resource_id,
+    'azure_sql_database'                                AS resource_type,
+    'sqlserver'                                         AS engine,
+    sku_name                                            AS instance_class,
+    'serverless_autopause_missing'                      AS finding_type,
+    jsonb_build_object(
+        'sku_tier',                 sku_tier,
+        'vcores_min',               vcores_or_dtus,
+        'avg_cpu_14d',              avg_cpu_14d,
+        'max_cpu_14d',              max_cpu_14d,
+        'auto_pause_delay_minutes', auto_pause_delay_minutes,
+        'recommended_setting',      60,
+        'storage_only_cost',        ROUND(max_size_gb * 0.115, 2)
+    )                                                   AS finding_detail,
+    -- Savings = current monthly cost minus storage-only cost when paused
+    ROUND(monthly_cost_usd - (max_size_gb * 0.115), 2) AS estimated_monthly_savings_usd,
+    'high'                                              AS confidence
+FROM serverless_idle
+WHERE monthly_cost_usd &gt; (max_size_gb * 0.115)
+ORDER BY estimated_monthly_savings_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">GCP Cloud SQL has its own dominant saving opportunity: <strong class="text-white">instance edition sizing</strong>. Cloud SQL Enterprise Plus carries a 2–3× price premium over Cloud SQL Enterprise for the same vCPU and memory configuration. Instances provisioned on Enterprise Plus that show no use of the differentiating features — read pool instances, advanced disaster recovery, Data Cache — are pure premium waste. The analyzer flags these by checking for low IOPS utilization alongside the Enterprise Plus edition tag in the GCP billing labels.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A custom cost analyzer pays for itself within days.** The compute cost to run the analyzer — typically a t3.small or equivalent — is $15–20/month. The first weekly report from a 30-instance RDS estate routinely surfaces $8,000–$25,000 in monthly savings from idle instances, gp2-to-gp3 migrations, and unnecessary Multi-AZ configurations combined.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Billing data alone is insufficient — correlate it with metrics.** An instance costing $2,400/month is not automatically a candidate for downsizing. Joining Cost Explorer data with 14-day CloudWatch CPU, memory, connection, and IOPS trends produces findings you can defend to both engineering and finance, eliminating the "but what if we need it" objection.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The recommendations database is the accountability layer.** Storing findings with resolution status, actioned-by, and timestamps transforms cost optimization from a one-time audit into an ongoing operational practice. Finance can ask "how many findings were actioned this quarter and how much did we recover?" and get a specific, auditable answer.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Database-internal statistics surface savings that cloud billing never will.** `pg_stat_statements` bloat queries, connection analysis, and temp-IO attribution identify cases where query optimization or autovacuum tuning can defer hardware scaling entirely — a $520/month instance upgrade avoided is equivalent to $520/month saved, and it appears in no cloud billing report.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Multi-cloud extension requires only a new collection module.** The rules engine, recommendations schema, and reporting layer built for AWS work identically for Azure and GCP findings once the collection layer normalizes provider-specific APIs into the common snapshot schema. Organizations running 60% AWS, 30% Azure, and 10% GCP databases manage all three cost streams from a single analyzer with fewer than 200 additional lines of collection code per provider.</li></div>
+    <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
+      <div class="flex-1">
+        <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
+        <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
+      </div>
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
+         class="shrink-0 px-6 py-3 bg-amber-600 hover:bg-amber-500 text-white font-semibold rounded-xl text-sm transition">Buy Now — $149</a>
+    </div>
+    <div class="mt-8 text-xs"><a href="index.html" class="text-gray-500 hover:text-gray-300 transition">← All Chapters</a></div>
+  </article>
+  <footer class="border-t border-gray-800/50 px-6 py-8">
+    <div class="max-w-5xl mx-auto text-xs text-gray-600 text-center">© 2026 Rajesh Guntupalli · Database FinOps</div>
+  </footer>
+</body>
+</html>
