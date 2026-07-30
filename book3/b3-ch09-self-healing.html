@@ -6,6 +6,10 @@
   <title>Chapter 9: Self-Healing Database Operations — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 9: Self-Healing Database Operations. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -148,6 +152,18 @@ class RemediationLoop:
         ctx.state = RemediationState.FAILED
         self.escalation_hook(ctx)
         return ctx.state</code></pre>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    Idle --> Detected
+    Detected --> Classified
+    Classified -->|no playbook found| Escalated
+    Classified --> Acting
+    Acting -->|exception, retries exhausted| Escalated
+    Acting --> Verifying
+    Verifying -->|condition healthy| Resolved
+    Verifying -->|still unhealthy after 5 checks| Failed
+    Failed --> Escalated</pre></div>
+<p class="text-gray-300 leading-relaxed">*The remediation loop's state machine: detect, classify, act, verify — with every failure path routing to escalation rather than silently retrying forever.*</p>
 
 <p class="text-gray-300 leading-relaxed">This structure enforces the invariant that no action is taken without a classification, no incident is closed without verification, and repeated failures escalate rather than loop indefinitely. Every production self-healing system must enforce these three invariants. Systems that don't eventually create automation storms — a well-documented failure mode where remediation logic runs in a tight loop and makes the outage worse.</p>
 
@@ -465,6 +481,38 @@ LIMIT 20;</code></pre>
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server space management</strong> operates differently. Filegroup capacity management, index fragmentation, and log file growth are the primary targets. The autonomous system monitors filegroup utilization and pre-emptively extends data files before they hit autogrowth events — because autogrowth during peak traffic causes latency spikes:</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor filegroup utilization and project time-to-full based on recent growth rate
+SELECT
+    DB_NAME(mf.database_id)                         AS database_name,
+    mf.name                                          AS file_name,
+    mf.type_desc,
+    CAST(fs.size / 128.0 AS DECIMAL(15,2))           AS current_size_mb,
+    CAST(FILEPROPERTY(mf.name, 'SpaceUsed') / 128.0 AS DECIMAL(15,2)) AS used_mb,
+    CAST(
+        (fs.size - FILEPROPERTY(mf.name, 'SpaceUsed')) / 128.0
+        AS DECIMAL(15,2)
+    )                                                 AS free_mb,
+    mf.growth,
+    mf.is_percent_growth
+FROM sys.master_files mf
+JOIN sys.database_files fs
+    ON mf.database_id = DB_ID() AND fs.name = mf.name
+WHERE mf.database_id = DB_ID()
+ORDER BY free_mb ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When free space in a data file drops below a configured floor (for example, less than the volume of one day's typical growth), the autonomous system proactively grows the file during a low-traffic window using an explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER DATABASE ... MODIFY FILE</code> with a fixed-size increment, rather than allowing autogrowth to fire unplanned mid-transaction. The same pattern applies to transaction log files, where an unplanned autogrowth event is especially costly because it briefly halts all write activity while the log is zero-initialized (unless instant file initialization is enabled for data files — a setting that does not extend to log files).</p>
+
+<p class="text-gray-300 leading-relaxed">Index fragmentation is handled the same way as the PostgreSQL bloat case: a scheduled scan of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> identifies indexes above a fragmentation threshold, and the system chooses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REORGANIZE</code> for moderate fragmentation (10–30%) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REBUILD WITH (ONLINE = ON)</code> for severe fragmentation (>30%), scheduling the rebuild during a maintenance window if the table is large enough that even an online rebuild would add meaningful I/O load.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A self-healing loop is not complete unless it implements all four control-system stages — detect, classify, act, verify — and every production remediation loop should enforce bounded retries with exponential backoff and mandatory escalation on repeated failure, to prevent automation storms.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Connection and lock-storm healing (killing root blockers, recycling idle connections) is the highest-value, lowest-risk starting point for self-healing because the actions are fast, reversible, and easy to verify — but the kill decision must still check protected workloads and tolerance windows before acting.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Automated failover is the highest-stakes self-healing action; Patroni, pg_auto_failover, and SQL Server AG on Kubernetes all converge on the same design principle — require corroborating evidence before promoting, and never automate a decision when split-brain is detected. That case always escalates to a human.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Space management problems (autovacuum falling behind, transaction ID wraparound, filegroup exhaustion) are slow-moving and well-suited to graduated autonomous response: escalating intervention tiers tied to how close the system is to the actual emergency, rather than a single binary trigger.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Every self-healing action must be idempotent and paired with verification against the original signal — an incident is not resolved because an action executed successfully, it is resolved because the measured condition that triggered the incident has returned to a healthy range.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
