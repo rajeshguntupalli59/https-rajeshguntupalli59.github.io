@@ -6,6 +6,10 @@
   <title>Chapter 24: Building a RAG Pipeline on PostgreSQL and pgvector — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 24: Building a RAG Pipeline on PostgreSQL and pgvector. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -66,7 +70,7 @@
 <p class="text-gray-300 leading-relaxed">| ANN throughput (vectors/sec) | ~5k–50k QPS at 1536-dim | ~50k–500k QPS |</p>
 <p class="text-gray-300 leading-relaxed">| Hybrid search (BM25 + vector) | Yes, via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ts_rank</code> + vector | Weaviate, Qdrant natively |</p>
 <p class="text-gray-300 leading-relaxed">| Transactional consistency | Full ACID | Eventually consistent |</p>
-<p class="text-gray-300 leading-relaxed">| Max vector dimensions | 16,000 (HNSW), 2,000 (IVFFlat indexed) | Typically 20,000+ |</p>
+<p class="text-gray-300 leading-relaxed">| Max vector dimensions | 16,000 (unindexed column); 2,000 for either HNSW or IVFFlat index | Typically 20,000+ |</p>
 
 <p class="text-gray-300 leading-relaxed">For most enterprise RAG workloads under a few hundred QPS, pgvector is sufficient and the operational simplicity is worth it.</p>
 
@@ -505,6 +509,436 @@ LIMIT 10;
 
 <p class="text-gray-300 leading-relaxed">With a retrieval function in place, prompt assembly is the next design decision. The quality of the prompt structure affects answer quality more than almost any other variable in a RAG system.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# requirements: openai, psycopg2-binary
+
+import json
+from typing import Any
+
+# Reuse openai_client, retrieve() from prior sections
+
+
+def build_rag_prompt(
+    query: str,
+    chunks: list[RetrievedChunk],
+    system_instruction: str | None = None,
+) -&gt; list[dict]:
+    """
+    Assemble an OpenAI chat messages array for RAG.
+
+    Key decisions:
+    - Context comes before the question (reduces "lost in the middle" effect)
+    - Each chunk is labeled with its source for citation
+    - Explicit instructions prevent hallucination when context is insufficient
+    """
+    if system_instruction is None:
+        system_instruction = (
+            "You are a helpful assistant. Answer questions using ONLY the provided context. "
+            "If the context does not contain enough information to answer the question, "
+            "say 'I don't have enough information to answer that.' "
+            "Cite the source document for each claim using [Source: &lt;title&gt;] notation."
+        )
+
+    # Deduplicate chunks from the same document that are consecutive
+    # (consecutive chunks from the same document often repeat context)
+    deduped_chunks = []
+    seen_texts = set()
+    for chunk in chunks:
+        # Normalize whitespace before dedup check
+        normalized = " ".join(chunk.chunk_text.split())
+        if normalized not in seen_texts:
+            seen_texts.add(normalized)
+            deduped_chunks.append(chunk)
+
+    # Build the context block
+    context_parts = []
+    for i, chunk in enumerate(deduped_chunks):
+        source_label = chunk.title or chunk.source_uri
+        context_parts.append(
+            f"[{i+1}] Source: {source_label}\n{chunk.chunk_text.strip()}"
+        )
+    context_block = "\n\n---\n\n".join(context_parts)
+
+    messages = [
+        {"role": "system", "content": system_instruction},
+        {
+            "role": "user",
+            "content": (
+                f"Context:\n\n{context_block}\n\n"
+                f"---\n\nQuestion: {query}"
+            ),
+        },
+    ]
+    return messages
+
+
+def rag_query(
+    conn,
+    query: str,
+    tenant_id: str,
+    top_k: int = 6,
+    doc_type_filter: str | None = None,
+    llm_model: str = "gpt-4o-mini",
+    temperature: float = 0.0,
+    max_tokens: int = 1024,
+    stream: bool = False,
+) -&gt; dict[str, Any]:
+    """
+    End-to-end RAG query: retrieve → assemble prompt → generate.
+
+    Returns a dict with 'answer', 'sources', and 'chunks' for downstream use.
+    Setting temperature=0.0 maximizes determinism for factual Q&A.
+    """
+    # --- Retrieval ---
+    chunks = retrieve(
+        conn,
+        query=query,
+        tenant_id=tenant_id,
+        top_k=top_k,
+        doc_type_filter=doc_type_filter,
+    )
+
+    if not chunks:
+        return {
+            "answer": "I don't have enough information to answer that.",
+            "sources": [],
+            "chunks": [],
+        }
+
+    # --- Prompt assembly ---
+    messages = build_rag_prompt(query, chunks)
+
+    # --- Generation ---
+    if stream:
+        # For streaming responses (e.g., websocket or SSE endpoints)
+        response_stream = openai_client.chat.completions.create(
+            model=llm_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+        )
+        # Caller handles the stream iterator; return it with metadata
+        return {
+            "answer_stream": response_stream,
+            "sources": [c.source_uri for c in chunks],
+            "chunks": chunks,
+        }
+
+    response = openai_client.chat.completions.create(
+        model=llm_model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+
+    answer = response.choices[0].message.content
+
+    return {
+        "answer": answer,
+        "sources": list({c.source_uri for c in chunks}),  # deduplicated
+        "chunks": chunks,
+        "usage": {
+            "prompt_tokens": response.usage.prompt_tokens,
+            "completion_tokens": response.usage.completion_tokens,
+        },
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Prompt design choices that matter:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Context before question:** Research on LLM attention patterns consistently shows that content near the beginning and end of a long prompt receives more "attention" than content in the middle. Placing context before the question keeps the question close to the end where the model generates, reducing the "lost in the middle" degradation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Explicit no-answer instruction:** Without explicit instruction, LLMs tend to confabulate answers when retrieved context is insufficient. The phrase "say I don't have enough information" dramatically reduces hallucinations on out-of-scope queries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Citation notation:** Requiring `[Source: <title>]` in the output gives downstream systems and users a signal to verify claims. It also makes evaluation easier—you can check whether cited sources actually appear in the retrieved context.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Temperature = 0.0 for factual Q&A:** For RAG over enterprise documents (policies, technical manuals, support articles), determinism is more valuable than creativity. Reserve higher temperatures for generative tasks like summarization or drafting.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.6 Multi-Tenancy and Row-Level Security</h3>
+
+<p class="text-gray-300 leading-relaxed">A production RAG system almost always serves multiple tenants. PostgreSQL Row-Level Security (RLS) lets you enforce tenant isolation at the database layer, which is safer than relying solely on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = ?</code> clauses in application code.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Enable RLS on the chunks table
+ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
+ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
+
+-- Create a policy: each application role can only see its own tenant's rows.
+-- The application sets the current tenant via a session variable.
+CREATE POLICY tenant_isolation_chunks ON document_chunks
+    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+
+CREATE POLICY tenant_isolation_documents ON documents
+    USING (tenant_id = current_setting('app.current_tenant_id')::uuid);
+
+-- Create a restricted application role that cannot bypass RLS
+CREATE ROLE rag_app_role LOGIN PASSWORD 'strong-password-here';
+GRANT SELECT, INSERT, UPDATE, DELETE ON document_chunks TO rag_app_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON documents TO rag_app_role;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO rag_app_role;
+-- Note: superusers and table owners bypass RLS by default.
+-- Force RLS even for table owner if needed:
+ALTER TABLE document_chunks FORCE ROW LEVEL SECURITY;
+ALTER TABLE documents FORCE ROW LEVEL SECURITY;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Activate tenant context in the connection before any query
+
+def set_tenant_context(conn, tenant_id: str) -&gt; None:
+    """
+    Set the tenant_id session variable for RLS enforcement.
+    Call this immediately after acquiring a connection from the pool.
+    Validate that tenant_id is a valid UUID before passing to avoid injection.
+    """
+    import uuid
+    # Validate UUID format to prevent injection via session variable
+    uuid.UUID(tenant_id)  # raises ValueError if malformed
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT set_config('app.current_tenant_id', %s, false)",
+            (tenant_id,),
+        )
+    conn.commit()
+
+
+# Usage pattern with a connection pool (psycopg2 + psycopg2-pool)
+from psycopg2 import pool as pg_pool
+
+connection_pool = pg_pool.ThreadedConnectionPool(
+    minconn=2,
+    maxconn=20,
+    dsn=DB_DSN,
+)
+
+def get_tenant_conn(tenant_id: str):
+    """Context manager: acquire connection, set tenant, release on exit."""
+    conn = connection_pool.getconn()
+    try:
+        set_tenant_context(conn, tenant_id)
+        yield conn
+    finally:
+        connection_pool.putconn(conn)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RLS caveats:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `set_config(..., false)` makes the setting local to the current transaction. If your connection pool reuses connections across tenants (which it will), always set the tenant context at the start of each request, not at connection creation time.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `set_config(..., true)` would make the setting local to the current session, which is wrong for pooled connections—the value persists across requests from different tenants on the same connection.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> HNSW index scans with RLS applied can show higher latency than without RLS, because the planner must apply the predicate after the ANN scan. Ensure `tenant_id` is included as a leading column in any composite indexes, and test `EXPLAIN ANALYZE` output with RLS enabled in your load test environment.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.7 Evaluation: Knowing Whether Your RAG Pipeline Works</h3>
+
+<p class="text-gray-300 leading-relaxed">A RAG pipeline that returns *something* is easy to build. A RAG pipeline that returns *correct, grounded, relevant* answers requires systematic evaluation. Database professionals are well-positioned to reason about this: evaluation is fundamentally a join between ground truth and predictions.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Three metrics to track from day one:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | What it measures | How to compute |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Retrieval Recall@K | Are the truly relevant chunks in the top K results? | Compare retrieved IDs against a human-labeled relevance set |</p>
+<p class="text-gray-300 leading-relaxed">| Answer Faithfulness | Does the answer only contain claims supported by context? | LLM-as-judge or NLI model scoring |</p>
+<p class="text-gray-300 leading-relaxed">| Answer Relevance | Does the answer address the question? | LLM-as-judge or human rating |</p>
+
+<p class="text-gray-300 leading-relaxed">A minimal evaluation harness using the retrieval log table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Evaluation query: for a labeled test set, compute recall@K
+
+-- Assume a table: eval_set(query_id, query_text, relevant_chunk_ids bigint[])
+-- And retrieval_log has been populated with results for each eval query
+
+WITH eval_results AS (
+    SELECT
+        e.query_id,
+        e.relevant_chunk_ids,
+        r.retrieved_ids,
+        -- Count how many relevant chunks appear in retrieved_ids
+        (
+            SELECT COUNT(*)
+            FROM unnest(e.relevant_chunk_ids) AS rel(id)
+            WHERE rel.id = ANY(r.retrieved_ids)
+        ) AS hits,
+        array_length(e.relevant_chunk_ids, 1) AS total_relevant
+    FROM eval_set e
+    JOIN retrieval_log r ON r.query_text = e.query_text
+    WHERE r.created_at &gt; now() - interval '24 hours'
+)
+SELECT
+    AVG(hits::float / NULLIF(total_relevant, 0)) AS recall_at_k,
+    AVG(hits::float / NULLIF(array_length(retrieved_ids, 1), 0)) AS precision_at_k,
+    COUNT(*) AS eval_queries
+FROM eval_results;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LLM-as-judge faithfulness check (Python):</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def evaluate_faithfulness(
+    query: str,
+    context_chunks: list[RetrievedChunk],
+    answer: str,
+) -&gt; dict:
+    """
+    Ask the LLM to judge whether every claim in the answer
+    is supported by the provided context. Returns a structured score.
+    """
+    context_text = "\n\n".join(c.chunk_text for c in context_chunks)
+    judge_prompt = [
+        {
+            "role": "system",
+            "content": (
+                "You are an evaluator. Your task is to assess whether an AI-generated "
+                "answer is fully grounded in the provided context. "
+                "Respond with JSON: {\"faithful\": true/false, \"unsupported_claims\": [...]}"
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Context:\n{context_text}\n\n"
+                f"Question: {query}\n\n"
+                f"Answer: {answer}\n\n"
+                "Is every claim in the answer supported by the context?"
+            ),
+        },
+    ]
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=judge_prompt,
+        temperature=0.0,
+        response_format={"type": "json_object"},
+    )
+    return json.loads(response.choices[0].message.content)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connecting evaluation to schema evolution:</strong> When you upgrade embedding models (e.g., from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>), store both embeddings in separate columns during the transition period and run your eval set against both. This gives you an empirical recall delta before committing to a re-ingestion of the full corpus—which can be expensive at scale.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Dual-embedding schema for model migration evaluation
+ALTER TABLE document_chunks
+    ADD COLUMN embedding_large vector(3072);  -- text-embedding-3-large dim
+
+CREATE INDEX idx_chunks_embedding_large_hnsw ON document_chunks
+    USING hnsw (embedding_large vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- After evaluating both models, drop the old column:
+-- ALTER TABLE document_chunks DROP COLUMN embedding;
+-- ALTER TABLE document_chunks RENAME COLUMN embedding_large TO embedding;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.8 Production Patterns and Operational Checklist</h3>
+
+<p class="text-gray-300 leading-relaxed">Building a RAG demo takes hours. Making it production-ready takes weeks. This section distills the operational concerns that most commonly cause production incidents.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling:</strong> pgvector queries hold connections for the duration of the ANN scan plus the embedding API call latency. At even moderate concurrency (20–50 users), a naive connection-per-request model will exhaust <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>. Use PgBouncer in transaction mode, or asyncpg + asyncio for async connection management. Set the pool size to roughly 2–3× the number of CPU cores on your PostgreSQL instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index health monitoring:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Monitor HNSW index size and fragmentation
+SELECT
+    schemaname,
+    tablename,
+    indexname,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE indexname LIKE '%hnsw%';
+
+-- Check for sequential scans (may indicate index is not being used)
+SELECT
+    relname,
+    seq_scan,
+    seq_tup_read,
+    idx_scan
+FROM pg_stat_user_tables
+WHERE relname = 'document_chunks';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Autovacuum configuration for high-write tables:</strong> Chunk tables under active ingestion accumulate dead tuples quickly. Tighten autovacuum for the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+ALTER TABLE document_chunks SET (
+    autovacuum_vacuum_scale_factor = 0.01,  -- vacuum when 1% of table is dead tuples
+    autovacuum_analyze_scale_factor = 0.005,
+    autovacuum_vacuum_cost_delay = 2        -- reduce I/O throttling for this table
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query timeout safeguards:</strong> An ANN scan over a large unindexed partition, or one where the HNSW index is temporarily unavailable, can run for many seconds. Set statement timeouts at the role level:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+ALTER ROLE rag_app_role SET statement_timeout = '5000ms';  -- 5 seconds max per query
+ALTER ROLE rag_app_role SET lock_timeout = '1000ms';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embedding model version locking:</strong> Pin the exact embedding model version in your application configuration and store it in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_model</code> column. OpenAI periodically updates model internals even under the same model name slug. Embeddings from different model versions are not comparable—mixing them silently degrades retrieval quality without any error signal.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Observability schema:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Extend retrieval_log for operational monitoring
+ALTER TABLE retrieval_log
+    ADD COLUMN llm_model       TEXT,
+    ADD COLUMN prompt_tokens   INT,
+    ADD COLUMN completion_tokens INT,
+    ADD COLUMN faithfulness_score FLOAT,    -- from LLM-as-judge eval
+    ADD COLUMN answer_text     TEXT,        -- store answers for offline eval
+    ADD COLUMN user_feedback   SMALLINT;    -- thumbs up/down: 1 / -1 / NULL
+
+-- Aggregate dashboard query
+SELECT
+    date_trunc('hour', created_at)        AS hour,
+    COUNT(*)                               AS total_queries,
+    AVG(latency_ms)                        AS avg_latency_ms,
+    PERCENTILE_CONT(0.95)
+        WITHIN GROUP (ORDER BY latency_ms) AS p95_latency_ms,
+    AVG(faithfulness_score)                AS avg_faithfulness,
+    SUM(CASE WHEN user_feedback = 1 THEN 1 ELSE 0 END)::float
+        / NULLIF(COUNT(user_feedback), 0)  AS thumbs_up_rate
+FROM retrieval_log
+WHERE created_at &gt; now() - interval '7 days'
+GROUP BY 1
+ORDER BY 1 DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup and point-in-time recovery:</strong> Vector indexes are not included in logical backups (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> exports the index definition but not the index data structure; the index is rebuilt on restore). For pgvector HNSW indexes on large tables, index rebuild time after a restore can be significant—test this in your DR runbook. Physical backups (pg_basebackup, WAL archiving) capture index files and are preferred for large vector tables.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scaling beyond a single PostgreSQL instance:</strong> When a single Postgres node is no longer sufficient—either due to write throughput from ingestion or read throughput from retrieval—the standard playbook applies: read replicas for retrieval queries, partitioning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> (using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PARTITION BY HASH</code>) to distribute data across tablespaces, and eventually Citus for horizontal sharding if the dataset reaches hundreds of millions of vectors.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Hash-partition document_chunks by tenant for large multi-tenant deployments
+CREATE TABLE document_chunks (
+    -- same column definitions as before
+) PARTITION BY HASH (tenant_id);
+
+CREATE TABLE document_chunks_p0 PARTITION OF document_chunks
+    FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+CREATE TABLE document_chunks_p1 PARTITION OF document_chunks
+    FOR VALUES WITH (MODULUS 4, REMAINDER 1);
+CREATE TABLE document_chunks_p2 PARTITION OF document_chunks
+    FOR VALUES WITH (MODULUS 4, REMAINDER 2);
+CREATE TABLE document_chunks_p3 PARTITION OF document_chunks
+    FOR VALUES WITH (MODULUS 4, REMAINDER 3);
+
+-- HNSW indexes must be created per partition
+CREATE INDEX ON document_chunks_p0 USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON document_chunks_p1 USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON document_chunks_p2 USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+CREATE INDEX ON document_chunks_p3 USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This partitioning strategy keeps per-partition HNSW index sizes manageable and allows partition pruning when a query includes a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> filter—which every well-formed RAG query should.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RAG is a query architecture problem.** The database's job is to serve relevant document chunks fast and safely; the LLM's job is to synthesize them into language. Keeping these responsibilities separate simplifies both design and debugging.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Schema foundations matter disproportionately.** Multi-tenant isolation via `tenant_id` and row-level security, content hashing for idempotent ingestion, and a generated `tsvector` column for hybrid search are all much cheaper to add at design time than to retrofit into a live system.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid search (vector + BM25) outperforms pure vector search** on factual and technical queries. The `tsvector` generated column plus `plainto_tsquery` gives you BM25 in pure SQL with no additional infrastructure.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Evaluation must be systematic from the start.** Logging queries, retrieved chunk IDs, latencies, and LLM outputs into a `retrieval_log` table gives you the raw material for recall, faithfulness, and relevance metrics—and makes model and prompt changes measurable rather than speculative.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Operational discipline separates demos from production systems.** Connection pool sizing, autovacuum tuning for high-write chunk tables, statement timeouts, HNSW index health monitoring, and physical backups that include index files are all table-stakes requirements before going live with a pgvector RAG pipeline.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
