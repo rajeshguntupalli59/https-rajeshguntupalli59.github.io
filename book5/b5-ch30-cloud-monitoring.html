@@ -6,6 +6,10 @@
   <title>Chapter 30: Monitoring Cloud Databases: CloudWatch, Azure Monitor, Cloud Logging — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 30: Monitoring Cloud Databases: CloudWatch, Azure Monitor, Cloud Logging. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -60,7 +64,7 @@
 <p class="text-gray-300 leading-relaxed">| Query-level performance | Performance Insights, Query Store, Query Insights | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, Profiler traces |</p>
 <p class="text-gray-300 leading-relaxed">| Replication and HA state | Platform events, replica lag metrics | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code>, AlwaysOn DMVs |</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">A note on metric resolution and cost.</strong> All three platforms charge for high-resolution metrics and extended retention. CloudWatch detailed monitoring costs roughly $0.01 per metric per month beyond the first ten. Azure Monitor logs ingestion costs approximately $2.76 per GB. Cloud Monitoring custom metrics cost $0.18 per metric-month after the first 150 MB. Understand your cost exposure before enabling everything at maximum resolution on a large fleet.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">A note on metric resolution and cost.</strong> All three platforms charge for high-resolution metrics and extended retention beyond a free tier — CloudWatch bills per metric beyond an initial free allotment, Azure Monitor bills on ingested log volume, and Cloud Monitoring bills per custom metric beyond a free byte threshold. Check current pricing for your account before enabling maximum-resolution monitoring across a large fleet; the bill scales directly with instance count and metric cardinality.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -123,14 +127,15 @@ aws rds describe-db-instances \
     PIRetention: PerformanceInsightsRetentionPeriod
   }'</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Performance Insights retention of 731 days (two years) is the maximum. The default is 7 days free; anything beyond that costs approximately $0.02 per vCPU per hour. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> (16 vCPUs), two-year retention costs roughly $5,500 per year per instance — budget for this explicitly.</p>
+<p class="text-gray-300 leading-relaxed">Performance Insights retention of 731 days (two years) is the maximum. The default is 7 days free; anything beyond that is billed per vCPU-hour of retained history, and the cost scales with both instance size and how far back you extend the window. For a large multi-vCPU instance, two-year retention is a meaningful recurring line item — check current Performance Insights pricing and budget for it explicitly before enabling extended retention fleet-wide.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating a CloudWatch alarm for connection saturation:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Alert when DatabaseConnections exceeds 80% of max_connections.
-# For db.r6g.large with default PostgreSQL max_connections of 87,
-# the threshold is approximately 69 connections.
-# Always verify max_connections from Parameter Groups before setting this.
+# The default max_connections value is derived from instance memory and
+# varies by instance class — always verify the actual value from your
+# Parameter Group before calculating this threshold; do not assume a
+# stock number.
 
 aws cloudwatch put-metric-alarm \
   --alarm-name "rds-prod-postgres-01-connection-saturation" \
@@ -141,7 +146,7 @@ aws cloudwatch put-metric-alarm \
   --statistic Average \
   --period 60 \
   --evaluation-periods 3 \
-  --threshold 69 \
+  --threshold "${CONNECTION_ALARM_THRESHOLD}" \
   --comparison-operator GreaterThanOrEqualToThreshold \
   --alarm-actions arn:aws:sns:us-east-1:123456789012:prod-db-alerts \
   --ok-actions arn:aws:sns:us-east-1:123456789012:prod-db-alerts \
@@ -413,7 +418,754 @@ az monitor metrics alert create \
 <p class="text-gray-300 leading-relaxed">| Deadlock count | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloudsql.googleapis.com/database/postgresql/deadlock_count</code> | Any non-zero trend |</p>
 <p class="text-gray-300 leading-relaxed">| Transaction ID utilization | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloudsql.googleapis.com/database/postgresql/transaction_id_utilization</code> | > 0.70 |</p>
 
-<p class="text-gray-300 leading-relaxed">`transaction_id_utilization</p>
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">transaction_id_utilization</code> is specific to PostgreSQL and has no equivalent in SQL Server monitoring. It measures the fraction of the 2^31 transaction ID space that has been consumed since the last <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FREEZE</code> cycle. On-premises DBAs who ran <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum</code> aggressively often never encountered transaction ID wraparound; in Cloud SQL, autovacuum still runs, but understanding this metric is important because a Cloud SQL instance under heavy write load can approach the wraparound limit if autovacuum is tuned too conservatively. Alert at 70% utilization and treat 80% as an emergency requiring manual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FREEZE</code> intervention.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enabling the PostgreSQL slow query log and Cloud Logging export using gcloud:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable the slow query log for a Cloud SQL PostgreSQL instance.
+# log_min_duration_statement is set in milliseconds.
+# Setting it to 1000 logs any query taking longer than 1 second.
+
+gcloud sql instances patch prod-cloudsql-pg01 \
+  --database-flags \
+    log_min_duration_statement=1000,\
+    log_checkpoints=on,\
+    log_connections=off,\
+    log_disconnections=off,\
+    log_lock_waits=on,\
+    log_temp_files=10240,\
+    log_autovacuum_min_duration=500
+
+# Verify the flags were applied
+gcloud sql instances describe prod-cloudsql-pg01 \
+  --format="value(settings.databaseFlags)"
+
+# Cloud SQL logs flow automatically to Cloud Logging.
+# Create a log sink to export slow query logs to BigQuery for long-term analysis.
+# The filter captures log entries from the postgres database log.
+gcloud logging sinks create prod-cloudsql-slowquery-bq \
+  bigquery.googleapis.com/projects/prod-project/datasets/db_monitoring \
+  --log-filter='
+    resource.type="cloudsql_database"
+    resource.labels.database_id="prod-project:prod-cloudsql-pg01"
+    log_id("cloudsql.googleapis.com/postgres.log")
+    textPayload=~"duration:"
+  ' \
+  --use-partitioned-tables
+
+# Grant the sink service account write access to the BigQuery dataset
+SINK_SA=$(gcloud logging sinks describe prod-cloudsql-slowquery-bq \
+  --format="value(writerIdentity)")
+
+bq add-iam-policy-binding \
+  --member="$SINK_SA" \
+  --role="roles/bigquery.dataEditor" \
+  prod-project:db_monitoring</code></pre>
+
+<p class="text-gray-300 leading-relaxed">After the sink is in place, slow query logs accumulate in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_monitoring</code> dataset partitioned by date. This allows long-term trend analysis — comparing this week's p99 query latency against the same period last month — that would be impractical inside Cloud Logging's 30-day default retention window.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying Cloud SQL slow query logs in BigQuery:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- BigQuery SQL: Find the top 20 slowest queries from the Cloud SQL PostgreSQL
+-- slow query log over the last 7 days, grouped by normalized query pattern.
+-- The textPayload field contains the raw log line from PostgreSQL.
+
+SELECT
+  REGEXP_EXTRACT(textPayload, r'duration: ([0-9.]+) ms') AS duration_ms_str,
+  CAST(REGEXP_EXTRACT(textPayload, r'duration: ([0-9.]+) ms') AS FLOAT64) AS duration_ms,
+  -- Normalize the statement by removing literal values (basic normalization)
+  REGEXP_REPLACE(
+    REGEXP_EXTRACT(textPayload, r'statement: (.+)$'),
+    r"'[^']*'|[0-9]+",
+    '?'
+  ) AS normalized_query,
+  textPayload AS raw_log,
+  timestamp
+FROM
+  `prod-project.db_monitoring.prod-project_prod-cloudsql-pg01_*`
+WHERE
+  _TABLE_SUFFIX &gt;= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+  AND textPayload LIKE '%duration:%'
+ORDER BY
+  duration_ms DESC
+LIMIT 20;
+
+-- Aggregate by normalized pattern to find the highest cumulative load
+SELECT
+  REGEXP_REPLACE(
+    REGEXP_EXTRACT(textPayload, r'statement: (.+)$'),
+    r"'[^']*'|[0-9]+",
+    '?'
+  ) AS normalized_query,
+  COUNT(*) AS execution_count,
+  ROUND(AVG(CAST(REGEXP_EXTRACT(textPayload, r'duration: ([0-9.]+) ms') AS FLOAT64)), 2) AS avg_duration_ms,
+  ROUND(MAX(CAST(REGEXP_EXTRACT(textPayload, r'duration: ([0-9.]+) ms') AS FLOAT64)), 2) AS max_duration_ms,
+  ROUND(SUM(CAST(REGEXP_EXTRACT(textPayload, r'duration: ([0-9.]+) ms') AS FLOAT64)) / 1000.0, 1) AS total_cpu_seconds
+FROM
+  `prod-project.db_monitoring.prod-project_prod-cloudsql-pg01_*`
+WHERE
+  _TABLE_SUFFIX &gt;= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY))
+  AND textPayload LIKE '%duration:%'
+GROUP BY
+  normalized_query
+HAVING
+  execution_count &gt; 10
+ORDER BY
+  total_cpu_seconds DESC
+LIMIT 25;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The regex-based normalization above is a reasonable first pass, but it does not handle all cases — dollar-quoted strings, array literals, and multi-line queries will not normalize cleanly. For production use, consider using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> extension in Cloud SQL, which PostgreSQL normalizes internally, and exporting its contents periodically to BigQuery using a scheduled job or a Dataflow pipeline.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating a Cloud Monitoring alerting policy for transaction ID utilization:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an alerting policy that fires when transaction ID utilization
+# exceeds 70% on any Cloud SQL PostgreSQL instance in the project.
+# This uses a JSON policy file for precision.
+
+cat &gt; txid-alert-policy.json &lt;&lt; 'EOF'
+{
+  "displayName": "Cloud SQL PostgreSQL - Transaction ID Wraparound Warning",
+  "conditions": [
+    {
+      "displayName": "TXID utilization above 70%",
+      "conditionThreshold": {
+        "filter": "resource.type = \"cloudsql_database\" AND metric.type = \"cloudsql.googleapis.com/database/postgresql/transaction_id_utilization\"",
+        "aggregations": [
+          {
+            "alignmentPeriod": "300s",
+            "perSeriesAligner": "ALIGN_MEAN",
+            "crossSeriesReducer": "REDUCE_MAX"
+          }
+        ],
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 0.70,
+        "duration": "300s",
+        "trigger": {
+          "count": 1
+        }
+      }
+    }
+  ],
+  "alertStrategy": {
+    "autoClose": "3600s"
+  },
+  "combiner": "OR",
+  "enabled": true,
+  "notificationChannels": [],
+  "severity": "WARNING"
+}
+EOF
+
+# Create the policy (notification channels must be added separately or via the console)
+gcloud alpha monitoring policies create \
+  --policy-from-file=txid-alert-policy.json \
+  --project=prod-project
+
+# List existing notification channels to attach to the policy
+gcloud alpha monitoring channels list \
+  --project=prod-project \
+  --format="table(name, displayName, type)"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AlloyDB-specific monitoring considerations:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">AlloyDB exposes metrics in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alloydb.googleapis.com</code> namespace and shares the same Cloud Monitoring and Cloud Logging infrastructure as Cloud SQL. The key metrics that are specific to AlloyDB's columnar engine and distributed storage architecture include:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `alloydb.googleapis.com/database/memory/columnar_engine_fill_ratio` — the fraction of the columnar engine cache that is occupied. If this consistently approaches 1.0, the columnar engine is evicting data before it can be used effectively.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `alloydb.googleapis.com/database/replication/log_archive_lag_seconds` — the lag in archiving WAL to AlloyDB's distributed storage. Unlike standard PostgreSQL replication lag, this measures the pipeline between the primary's WAL writer and the durable storage layer, not the replica application lag.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `alloydb.googleapis.com/database/postgresql/num_backends` — shared with the Cloud SQL metric name for consistency, but the threshold context differs. AlloyDB's connection pooling architecture through AlloyDB Auth Proxy or PgBouncer affects how this number relates to application concurrency.</li>
+
+<p class="text-gray-300 leading-relaxed">For AlloyDB, enabling the columnar engine requires setting the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">google_columnar_engine.enabled</code> database flag and then explicitly marking tables for columnar storage or letting the auto-columnarization feature select candidates. Monitoring <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">columnar_engine_fill_ratio</code> without first verifying that the engine is actually enabled for your workload is a common instrumentation mistake.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.5 Building Effective Dashboards Across All Three Platforms</h3>
+
+<p class="text-gray-300 leading-relaxed">A monitoring system that generates alerts but has no dashboard is a fire alarm with no sprinkler system. Alerts tell you something is wrong; dashboards tell you why, in what context, and how it compares to recent history. Every production cloud database environment should have at minimum two dashboard tiers: a <strong class="text-white">fleet overview</strong> dashboard visible to anyone on-call, and a <strong class="text-white">per-instance deep-dive</strong> dashboard used during active troubleshooting.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Fleet overview dashboard — what to include:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The fleet overview should answer the question "which of my databases is sick right now?" in under 30 seconds. Design for this use case explicitly:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> One row per database instance, with CPU, memory, connections, storage, and replication lag displayed as colored status indicators (green/yellow/red) rather than raw numbers.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> An alert count widget showing open alarms grouped by severity.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A timeline of alert state changes over the last 24 hours — this lets on-call engineers see whether a current alert is a new event or something that has been flapping.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Storage growth trend over 7 days, not current utilization — current utilization at 72% is a different situation depending on whether it was 60% last week or 71% yesterday.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Per-instance deep-dive dashboard — structure by signal type:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>┌─────────────────────────────────────────────────────────────────────┐
+│  Instance: prod-postgres-01  │  Region: us-east-1  │  Class: r6g.4xl│
+├─────────────┬───────────────┬──────────────────────┬────────────────┤
+│  CPU %      │  FreeableMem  │  DatabaseConnections  │  StorageFree   │
+│  (1h line)  │  (1h line)    │  (1h line, max_conn   │  (7d line)     │
+│             │               │   reference line)     │                │
+├─────────────┴───────────────┴──────────────────────┴────────────────┤
+│  Read Latency (ms)    │  Write Latency (ms)    │  Network Throughput │
+│  (1h, p50/p95/p99)   │  (1h, p50/p95/p99)    │  (1h line)          │
+├───────────────────────┴────────────────────────┴─────────────────────┤
+│  Top 10 Wait Events (Performance Insights / Query Insights)          │
+│  [stacked bar chart by wait type over time]                          │
+├──────────────────────────────────────────────────────────────────────┤
+│  ReplicaLag (seconds)  │  Active Transactions  │  Deadlocks/min      │
+│  (1h line)             │  (1h line)            │  (1h bar)           │
+└──────────────────────────────────────────────────────────────────────┘</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key design principle: place the <strong class="text-white">top wait events chart</strong> in the center of the deep-dive dashboard. When CPU is high, the wait event breakdown immediately reveals whether it is CPU-bound work (CPU wait types), lock contention (lock wait types), or I/O pressure (I/O wait types). This is the single widget that most accelerates root cause identification.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">CloudWatch dashboard defined as code using AWS CLI:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Define a CloudWatch dashboard for a single RDS PostgreSQL instance
+# as a JSON body, then create it via the CLI.
+# This approach allows dashboards to be version-controlled and deployed via CI/CD.
+
+cat &gt; rds-instance-dashboard.json &lt;&lt; 'DASHBOARD_EOF'
+{
+  "widgets": [
+    {
+      "type": "metric",
+      "x": 0, "y": 0, "width": 6, "height": 4,
+      "properties": {
+        "title": "CPU Utilization %",
+        "metrics": [
+          ["AWS/RDS", "CPUUtilization", "DBInstanceIdentifier", "prod-postgres-01",
+           {"stat": "Average", "period": 60, "label": "CPU %"}],
+          [{"expression": "85", "label": "Alert Threshold", "color": "#d62728"}]
+        ],
+        "view": "timeSeries",
+        "period": 60,
+        "yAxis": {"left": {"min": 0, "max": 100}}
+      }
+    },
+    {
+      "type": "metric",
+      "x": 6, "y": 0, "width": 6, "height": 4,
+      "properties": {
+        "title": "Database Connections",
+        "metrics": [
+          ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "prod-postgres-01",
+           {"stat": "Maximum", "period": 60, "label": "Active Connections"}],
+          [{"expression": "69", "label": "80% of max_connections", "color": "#ff7f0e"}]
+        ],
+        "view": "timeSeries",
+        "period": 60
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 0, "width": 6, "height": 4,
+      "properties": {
+        "title": "Read / Write Latency (ms)",
+        "metrics": [
+          ["AWS/RDS", "ReadLatency", "DBInstanceIdentifier", "prod-postgres-01",
+           {"stat": "p99", "period": 60, "label": "Read p99", "color": "#1f77b4"}],
+          ["AWS/RDS", "WriteLatency", "DBInstanceIdentifier", "prod-postgres-01",
+           {"stat": "p99", "period": 60, "label": "Write p99", "color": "#e377c2"}]
+        ],
+        "view": "timeSeries",
+        "period": 60
+      }
+    },
+    {
+      "type": "metric",
+      "x": 18, "y": 0, "width": 6, "height": 4,
+      "properties": {
+        "title": "Free Storage Space (GB)",
+        "metrics": [
+          [{"expression": "m1/1073741824", "label": "Free Storage GB", "id": "e1"}],
+          ["AWS/RDS", "FreeStorageSpace", "DBInstanceIdentifier", "prod-postgres-01",
+           {"id": "m1", "visible": false, "stat": "Minimum", "period": 300}]
+        ],
+        "view": "timeSeries",
+        "period": 300
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0, "y": 4, "width": 12, "height": 4,
+      "properties": {
+        "title": "Replica Lag (seconds)",
+        "metrics": [
+          ["AWS/RDS", "ReplicaLag", "DBInstanceIdentifier", "prod-postgres-01-replica-1",
+           {"stat": "Maximum", "period": 60, "label": "Replica 1 Lag"}],
+          [{"expression": "30", "label": "Alert Threshold (30s)", "color": "#d62728"}]
+        ],
+        "view": "timeSeries",
+        "period": 60
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12, "y": 4, "width": 12, "height": 4,
+      "properties": {
+        "title": "Freeable Memory (GB)",
+        "metrics": [
+          [{"expression": "m1/1073741824", "label": "Freeable Memory GB", "id": "e1"}],
+          ["AWS/RDS", "FreeableMemory", "DBInstanceIdentifier", "prod-postgres-01",
+           {"id": "m1", "visible": false, "stat": "Minimum", "period": 60}]
+        ],
+        "view": "timeSeries",
+        "period": 60
+      }
+    }
+  ]
+}
+DASHBOARD_EOF
+
+aws cloudwatch put-dashboard \
+  --dashboard-name "RDS-ProdPostgres01-DeepDive" \
+  --dashboard-body file://rds-instance-dashboard.json
+
+echo "Dashboard URL:"
+echo "https://console.aws.amazon.com/cloudwatch/home#dashboards:name=RDS-ProdPostgres01-DeepDive"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The "80% of max_connections" threshold line in the Database Connections widget above uses a literal expression value — substitute your own instance's actual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> (queried from the parameter group, per the gotcha above) times 0.8 before deploying this dashboard. Do not copy the placeholder number as-is.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Monitor workbook for Azure SQL — defined as an ARM template snippet:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure Monitor Workbooks are the dashboard mechanism for Azure SQL. They support KQL queries, metric charts, and parameter-driven filtering, and they can be exported as ARM templates for version control.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 9,
+      "content": {
+        "version": "KqlParameterItem/1.0",
+        "parameters": [
+          {
+            "id": "db-param",
+            "version": "KqlParameterItem/1.0",
+            "name": "DatabaseName",
+            "type": 2,
+            "query": "AzureDiagnostics | where ResourceType == 'DATABASES' | summarize by Resource | project value = Resource, label = Resource",
+            "queryType": 0,
+            "resourceType": "microsoft.operationalinsights/workspaces"
+          },
+          {
+            "id": "time-param",
+            "version": "KqlParameterItem/1.0",
+            "name": "TimeRange",
+            "type": 4,
+            "value": { "durationMs": 86400000 }
+          }
+        ]
+      },
+      "name": "parameters"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "query": "AzureDiagnostics\n| where Category == 'QueryStoreWaitStatistics'\n| where TimeGenerated {TimeRange}\n| where Resource == '{DatabaseName}'\n| summarize TotalWait_ms = sum(delta_wait_time_ms_d) by wait_type_s, bin(TimeGenerated, 5m)\n| render areachart",
+        "queryType": 0,
+        "title": "Wait Statistics Over Time (stacked area)",
+        "timeContext": { "durationMs": 86400000 }
+      },
+      "name": "wait-stats-chart"
+    }
+  ]
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store workbook definitions in source control and deploy them using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">az portal</code> CLI extensions or ARM deployments. This prevents dashboards from drifting between environments and ensures new team members start with the same view as experienced engineers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.6 Alerting Strategy: Avoiding Alert Fatigue Without Missing Real Incidents</h3>
+
+<p class="text-gray-300 leading-relaxed">Every DBA who has operated a cloud database for more than a few months has experienced alert fatigue — a state where the volume of alerts is high enough that engineers begin to ignore them, which is worse than having no alerts at all. The root cause is almost always over-alerting on symptoms rather than on actionable signals.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The three tests for a well-designed alert:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Actionability test</strong>: When this alert fires at 3 a.m., is there a specific action an on-call engineer can take within 15 minutes that will resolve or mitigate the condition? If the answer is "they need to wait for business hours to investigate," the alert severity should be at most a warning, not a page.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Specificity test</strong>: Does the alert condition uniquely identify a real problem, or does it fire frequently for transient conditions that resolve themselves? CPU at 85% for 60 seconds might be a routine batch job; CPU at 85% for 5 continuous minutes is more likely to be an actual problem.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Freshness test</strong>: Has this alert been reviewed in the last 90 days? Thresholds that were correct when set often become wrong as workloads evolve, instances are resized, or application behavior changes.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Metric crosses threshold] --> B{Actionable within<br/>15 minutes?}
+    B -->|No| C[Downgrade to warning<br/>or dashboard-only]
+    B -->|Yes| D{Fires only on<br/>real problems?}
+    D -->|No, noisy| E[Tighten condition:<br/>duration, aggregation]
+    D -->|Yes| F{Reviewed in<br/>last 90 days?}
+    F -->|No| G[Re-validate threshold<br/>before trusting it]
+    F -->|Yes| H[Route to P1-P4 tier<br/>and page on-call]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The three tests applied as a gate before an alert is allowed to page anyone.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Alert tiering for production databases:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Tier | Criteria | Response expectation |</p>
+<p class="text-gray-300 leading-relaxed">|------|----------|---------------------|</p>
+<p class="text-gray-300 leading-relaxed">| P1 — Page immediately | Database unavailable, replica lag > 5 minutes, storage > 95%, workers at 100% | Wake on-call engineer immediately |</p>
+<p class="text-gray-300 leading-relaxed">| P2 — Page within 30 min | CPU > 85% for 10 min, connections > 90% of max, storage > 90%, deadlock rate spike | On-call responds before next check cycle |</p>
+<p class="text-gray-300 leading-relaxed">| P3 — Ticket during business hours | CPU > 75% for 30 min, storage growth rate anomaly, slow query count increase | Engineer reviews within next business day |</p>
+<p class="text-gray-300 leading-relaxed">| P4 — Dashboard annotation | Configuration drift, index recommendation events, autovacuum duration spikes | Visible but does not generate a notification |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Multi-step alert suppression during maintenance windows:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">All three platforms support alert suppression or maintenance window configuration, but the mechanisms differ:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **CloudWatch**: Use CloudWatch Alarms in `ALARM` state with an SNS topic that has a subscription filter. During maintenance, disable the SNS subscription rather than the alarm. This preserves alarm state history.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure Monitor**: Use Action Groups with webhooks and Logic Apps to implement time-based suppression, or use the built-in **Alert suppression rules** (now called **Action rules**) which can suppress by resource, resource group, or tag during a defined time window.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cloud Monitoring**: Use **Alerting Policy** snoozes, which can be created programmatically via the Cloud Monitoring API and scoped to a specific policy or resource.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Google Cloud Monitoring: Create a snooze for maintenance window
+# This suppresses the TXID wraparound alert during a planned VACUUM FREEZE operation
+
+POLICY_NAME=$(gcloud alpha monitoring policies list \
+  --project=prod-project \
+  --filter="displayName:'Cloud SQL PostgreSQL - Transaction ID Wraparound Warning'" \
+  --format="value(name)")
+
+# Calculate maintenance window times (UTC)
+START_TIME=$(date -u -d "+30 minutes" +"%Y-%m-%dT%H:%M:%SZ")
+END_TIME=$(date -u -d "+3 hours" +"%Y-%m-%dT%H:%M:%SZ")
+
+cat &gt; maintenance-snooze.json &lt;&lt; EOF
+{
+  "displayName": "Planned VACUUM FREEZE maintenance snooze",
+  "interval": {
+    "startTime": "$START_TIME",
+    "endTime": "$END_TIME"
+  },
+  "criteria": {
+    "policies": ["$POLICY_NAME"]
+  }
+}
+EOF
+
+gcloud alpha monitoring snoozes create \
+  --snooze-from-file=maintenance-snooze.json \
+  --project=prod-project</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The storage runaway alert pattern:</strong> One alert that every cloud DBA should implement but frequently omits is not a threshold alert but a <strong class="text-white">rate-of-change alert</strong>. Disk at 80% is concerning; disk growing at 5 GB per hour when it was growing at 200 MB per hour yesterday is an emergency — a runaway batch job, a missing partition pruning condition, or an accidental cross join is generating data at an anomalous rate. All three platforms support rate-of-change alerting through metric math (CloudWatch), dynamic thresholds (Azure Monitor Metric Alerts), and absent data plus threshold combination (Cloud Monitoring).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># CloudWatch metric math alert for storage growth rate
+# RATE() computes the per-second rate of change of the metric
+# Multiply by 3600 to convert to GB per hour
+
+aws cloudwatch put-metric-alarm \
+  --alarm-name "rds-prod-postgres-01-storage-growth-anomaly" \
+  --alarm-description "Storage shrinking faster than 1 GB/hour (FreeStorageSpace decreasing rapidly)" \
+  --metrics '[
+    {
+      "Id": "m1",
+      "MetricStat": {
+        "Metric": {
+          "Namespace": "AWS/RDS",
+          "MetricName": "FreeStorageSpace",
+          "Dimensions": [{"Name": "DBInstanceIdentifier", "Value": "prod-postgres-01"}]
+        },
+        "Period": 300,
+        "Stat": "Minimum"
+      },
+      "ReturnData": false
+    },
+    {
+      "Id": "growth_rate",
+      "Expression": "RATE(m1) * 3600 / -1073741824",
+      "Label": "Storage consumption GB/hour",
+      "ReturnData": true
+    }
+  ]' \
+  --comparison-operator GreaterThanThreshold \
+  --threshold 1.0 \
+  --evaluation-periods 2 \
+  --alarm-actions arn:aws:sns:us-east-1:123456789012:prod-db-alerts \
+  --treat-missing-data notBreaching</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RATE()</code> function returns the per-second change; the sign is negative when free space is shrinking (consumption is growing), so we multiply by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">-1</code> to make the threshold comparison intuitive. If free storage is decreasing by more than 1 GB per hour for two consecutive 5-minute periods, the alarm fires.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.7 Common Instrumentation Gaps and How to Close Them</h3>
+
+<p class="text-gray-300 leading-relaxed">After reviewing how monitoring is configured across a range of production cloud database environments, a set of instrumentation gaps appears consistently. These are conditions that the platform does not alert on by default, that engineers assume are covered when they are not.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gap 1: Missing connection pool exhaustion detection</strong></p>
+
+<p class="text-gray-300 leading-relaxed">CloudWatch's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> metric counts connections at the RDS level. If you use PgBouncer, RDS Proxy, or a connection pool in front of RDS, the application-side pool can be exhausted while RDS shows a healthy connection count. You need application-side metrics (PgBouncer's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHOW POOLS</code> output, RDS Proxy's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnectionRequests</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QueryRequests</code> metrics in CloudWatch) to detect pool starvation. RDS Proxy specifically surfaces <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QueryRequests</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnectionsClosed</code> as distinct metrics.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># CloudWatch alarm for RDS Proxy client connection saturation
+# RDS Proxy max client connections depend on instance class and max_connections
+aws cloudwatch put-metric-alarm \
+  --alarm-name "rds-proxy-prod-client-saturation" \
+  --metric-name ClientConnections \
+  --namespace AWS/RDS \
+  --dimensions Name=ProxyName,Value=prod-rds-proxy \
+  --statistic Maximum \
+  --period 60 \
+  --evaluation-periods 3 \
+  --threshold 900 \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --alarm-actions arn:aws:sns:us-east-1:123456789012:prod-db-alerts</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gap 2: Autovacuum and dead tuple accumulation (PostgreSQL on all platforms)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Neither CloudWatch, Azure Monitor, nor Cloud Monitoring alerts on dead tuple accumulation by default. A table with millions of dead tuples causes index bloat, query plan degradation, and eventually transaction ID wraparound risk. You must push this data from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> to your monitoring system manually.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python script to push pg_stat_user_tables dead tuple metrics to CloudWatch.
+# Run this as a scheduled Lambda function every 5 minutes on RDS PostgreSQL,
+# or as a Cloud Run job for Cloud SQL.
+
+import boto3
+import psycopg2
+from datetime import datetime, timezone
+import os
+
+def push_dead_tuple_metrics():
+    conn = psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        sslmode="require"
+    )
+    cw = boto3.client("cloudwatch", region_name="us-east-1")
+    db_instance = os.environ["DB_INSTANCE_ID"]
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                schemaname,
+                relname,
+                n_dead_tup,
+                n_live_tup,
+                CASE WHEN (n_live_tup + n_dead_tup) &gt; 0
+                     THEN ROUND(n_dead_tup::numeric / (n_live_tup + n_dead_tup) * 100, 2)
+                     ELSE 0
+                END AS dead_ratio_pct,
+                last_autovacuum,
+                last_autoanalyze
+            FROM pg_stat_user_tables
+            WHERE n_dead_tup &gt; 10000
+            ORDER BY n_dead_tup DESC
+            LIMIT 20
+        """)
+        rows = cur.fetchall()
+
+    metric_data = []
+    now = datetime.now(timezone.utc)
+
+    for schema, table, dead, live, dead_pct, last_vac, last_analyze in rows:
+        table_name = f"{schema}.{table}"
+        metric_data.extend([
+            {
+                "MetricName": "DeadTuples",
+                "Dimensions": [
+                    {"Name": "DBInstanceIdentifier", "Value": db_instance},
+                    {"Name": "TableName", "Value": table_name}
+                ],
+                "Timestamp": now,
+                "Value": float(dead),
+                "Unit": "Count"
+            },
+            {
+                "MetricName": "DeadTupleRatioPct",
+                "Dimensions": [
+                    {"Name": "DBInstanceIdentifier", "Value": db_instance},
+                    {"Name": "TableName", "Value": table_name}
+                ],
+                "Timestamp": now,
+                "Value": float(dead_pct),
+                "Unit": "Percent"
+            }
+        ])
+
+    # CloudWatch PutMetricData accepts max 20 metrics per call
+    for i in range(0, len(metric_data), 20):
+        cw.put_metric_data(
+            Namespace="CustomRDS/PostgreSQL",
+            MetricData=metric_data[i:i+20]
+        )
+
+    conn.close()
+    print(f"Pushed {len(metric_data)} dead tuple metrics to CloudWatch.")
+
+if __name__ == "__main__":
+    push_dead_tuple_metrics()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">After this runs, create CloudWatch alarms on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CustomRDS/PostgreSQL/DeadTupleRatioPct > 20</code> filtered by table name to catch tables where autovacuum is not keeping up. The same pattern applies on Azure SQL (using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code> for fragmentation) and on Cloud SQL (using the same <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> query with metrics pushed to Cloud Monitoring custom metrics).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gap 3: Long-running transaction detection</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Long-running transactions block autovacuum, hold locks, and inflate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeableMemory</code> consumption through WAL retention. None of the three platforms alert on long-running transactions by default.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query to push to a monitoring system.
+-- Works on both RDS PostgreSQL and Cloud SQL PostgreSQL.
+-- Returns sessions with open transactions older than 5 minutes.
+
+-- PostgreSQL version
+SELECT
+    pid,
+    usename AS username,
+    application_name,
+    client_addr,
+    EXTRACT(EPOCH FROM (now() - xact_start))::INT AS xact_age_seconds,
+    state,
+    LEFT(query, 200) AS current_query
+FROM pg_stat_activity
+WHERE xact_start IS NOT NULL
+  AND state != 'idle'
+  AND now() - xact_start &gt; INTERVAL '5 minutes'
+ORDER BY xact_age_seconds DESC;
+
+-- SQL Server equivalent (Azure SQL)
+SELECT
+    s.session_id,
+    s.login_name,
+    s.program_name,
+    s.client_interface_name,
+    DATEDIFF(SECOND, t.transaction_begin_time, GETUTCDATE()) AS xact_age_seconds,
+    r.status AS session_status,
+    LEFT(st.text, 200) AS current_query
+FROM sys.dm_tran_active_transactions t
+JOIN sys.dm_exec_sessions s ON t.transaction_id = s.transaction_id
+LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) st
+WHERE DATEDIFF(SECOND, t.transaction_begin_time, GETUTCDATE()) &gt; 300
+  AND s.session_id != @@SPID
+ORDER BY xact_age_seconds DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Push the row count from the PostgreSQL version as a custom metric. Alert when any transaction has been open for more than 30 minutes — at that point, it is almost never intentional and is very likely to be causing collateral damage to other queries waiting on locks.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gap 4: Logical replication slot lag</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Logical replication slots in PostgreSQL retain WAL indefinitely if a consumer stops consuming. This causes storage to grow unboundedly and is not reflected in the standard <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeStorageSpace</code> metric until the situation is already severe. On RDS PostgreSQL, logical replication slots are used by AWS DMS, Debezium, and pglogical consumers. Monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code> directly.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Check logical replication slot lag
+-- Works on RDS PostgreSQL, Cloud SQL PostgreSQL, and AlloyDB
+SELECT
+    slot_name,
+    plugin,
+    slot_type,
+    active,
+    active_pid,
+    pg_size_pretty(
+        pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+    ) AS retained_wal_size,
+    pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_wal_bytes,
+    confirmed_flush_lsn
+FROM pg_replication_slots
+WHERE slot_type = 'logical'
+ORDER BY retained_wal_bytes DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">retained_wal_bytes</code> exceeds your available storage headroom, the instance will eventually run out of space. Alert when any logical slot retains more than 5 GB of WAL. On RDS, you can set the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_slot_wal_keep_size</code> parameter (available in PostgreSQL 13+) to cap WAL retention per slot, but doing so means a lagging consumer will have its slot invalidated — a trade-off you must manage at the application level.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gap 5: Backup window overlap with production load</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Automated backups on RDS and Cloud SQL cause brief I/O elevation during the backup window. On heavily loaded instances, this can push I/O latency above alert thresholds, generating pages that resolve themselves once the backup completes. The fix is not to raise the alert threshold — it is to annotate the dashboard with the backup window and ensure the backup window is scheduled during the lowest-traffic period. Both RDS and Cloud SQL allow the backup window to be configured.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># RDS: Move the backup window to 02:00-03:00 UTC (lowest traffic window)
+aws rds modify-db-instance \
+  --db-instance-identifier prod-postgres-01 \
+  --preferred-backup-window "02:00-03:00" \
+  --preferred-maintenance-window "sun:03:30-sun:04:30" \
+  --apply-immediately
+
+# Cloud SQL: Move the backup window start time
+gcloud sql instances patch prod-cloudsql-pg01 \
+  --backup-start-time 02:00</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Separate the backup window from the maintenance window by at least 30 minutes to prevent overlap between backup I/O and any parameter or minor version updates.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">30.8 Integrating Cloud Database Monitoring with Existing Observability Stacks</h3>
+
+<p class="text-gray-300 leading-relaxed">Most engineering organizations already have a Prometheus/Grafana stack, a Datadog deployment, or a Splunk environment before they migrate databases to the cloud. Bridging cloud-native metrics into these existing systems is preferable to maintaining parallel alert configurations in two places.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Exporting CloudWatch metrics to Prometheus:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">yet-another-cloudwatch-exporter</code> (YACE) project is the most widely deployed solution for pulling CloudWatch metrics into Prometheus. Deploy it as a Kubernetes Deployment or an ECS task in the same VPC as your RDS instances.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># yace-config.yaml — configuration for pulling RDS metrics into Prometheus
+apiVersion: v1alpha1
+discovery:
+  jobs:
+    - type: AWS/RDS
+      regions:
+        - us-east-1
+      metrics:
+        - name: CPUUtilization
+          statistics: [Average]
+          period: 60
+          length: 300
+        - name: DatabaseConnections
+          statistics: [Maximum]
+          period: 60
+          length: 300
+        - name: FreeStorageSpace
+          statistics: [Minimum]
+          period: 300
+          length: 900
+        - name: ReadLatency
+          statistics: [p99]
+          period: 60
+          length: 300
+        - name: WriteLatency
+          statistics: [p99]
+          period: 60
+          length: 300
+        - name: ReplicaLag
+          statistics: [Maximum]
+          period: 60
+          length: 300
+        - name: FreeableMemory
+          statistics: [Minimum]
+          period: 60
+          length: 300
+      dimensionNameRequirements:
+        - DBInstanceIdentifier</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once YACE is running, the RDS metrics appear in Prometheus as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws_rds_cpu_utilization_average</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws_rds_database_connections_maximum</code>, and so on. You can then build Grafana dashboards and Prometheus alerting rules using these metrics exactly as you would for self-managed databases.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Monitor to Prometheus using the Azure Monitor Metrics Exporter:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure provides a managed Prometheus offering through Azure Monitor managed service for Prometheus, available when using Azure Kubernetes Service. For non-AKS environments, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">azure-metrics-exporter</code> project provides similar functionality to YACE.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud Monitoring to Prometheus:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stackdriver_exporter</code> (now maintained as part of the prometheus-community Helm charts) scrapes Cloud Monitoring metrics and exposes them in Prometheus format. The configuration maps <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cloudsql.googleapis.com/database/cpu/utilization</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stackdriver_cloudsql_database_cpu_utilization</code> in Prometheus.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Sending cloud database alerts to PagerDuty via SNS (AWS example):</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Configure SNS to forward RDS CloudWatch alerts to PagerDuty
+# PagerDuty provides an SNS integration endpoint per service
+
+PAGERDUTY_ENDPOINT="https://events.pagerduty.com/integration/YOUR_INTEGRATION_KEY/enqueue"
+
+# Create a subscription on the existing prod-db-alerts SNS topic
+aws sns subscribe \
+  --topic-arn arn:aws:sns:us-east-1:123456789012:prod-db-alerts \
+  --protocol https \
+  --notification-endpoint "$PAGERDUTY_ENDPOINT"
+
+# After subscribing, PagerDuty sends a confirmation URL.
+# CloudWatch SNS messages include the alarm name, state, and metric values,
+# which PagerDuty maps to incident fields automatically.
+
+# Verify the subscription is confirmed
+aws sns list-subscriptions-by-topic \
+  --topic-arn arn:aws:sns:us-east-1:123456789012:prod-db-alerts \
+  --query 'Subscriptions[].{Protocol:Protocol, Endpoint:Endpoint, Status:SubscriptionArn}'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When integrating with PagerDuty, Opsgenie, or VictorOps, pay attention to the deduplication key. CloudWatch sends both ALARM and OK state change notifications. Your incident management tool should close incidents automatically when it receives the OK notification. Configure this deduplication explicitly — the default behavior differs by integration and by the incident tool's version.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The monitoring mental model shift is from pull to push.** Cloud-managed databases remove your direct access to the OS and log files, but replace it with pre-wired telemetry pipelines. Your job is to define thresholds and subscriptions before incidents occur, not to react to them with ad-hoc CLI commands during an outage.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Platform-specific layers serve different purposes.** CloudWatch Metrics, Azure Monitor Metrics, and Cloud Monitoring handle pre-aggregated, low-cost, high-availability signal collection. CloudWatch Logs Insights, Log Analytics (KQL), and Cloud Logging with BigQuery export handle raw query-level and event-level forensics. Use each layer for what it is designed for — routing everything into logs is expensive; keeping everything in metrics loses detail.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Several critical signals require custom instrumentation.** Dead tuple accumulation, long-running transactions, logical replication slot lag, and connection pool saturation at the proxy layer are not covered by any platform's default alerting. These gaps are responsible for a disproportionate share of production incidents that seem surprising because engineers assumed the platform would have flagged the condition.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Alert design determines whether your monitoring system is an asset or a liability.** Apply the three tests — actionability, specificity, and freshness — to every alert rule. Tier alerts into P1 through P4 based on what response they require. Rate-of-change alerts for storage catch runaway data growth events far earlier than simple threshold alerts on current utilization.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cloud-native monitoring integrates with existing observability stacks through well-supported exporters.** YACE for CloudWatch-to-Prometheus, the azure-metrics-exporter for Azure Monitor, and the stackdriver-exporter for Cloud Monitoring all allow you to surface cloud database metrics in Grafana dashboards and Prometheus alerting rules alongside your application and infrastructure metrics, preserving a single pane of glass without duplicating alert logic across two systems.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
