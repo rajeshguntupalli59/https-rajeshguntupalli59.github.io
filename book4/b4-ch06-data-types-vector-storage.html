@@ -6,6 +6,10 @@
   <title>Chapter 6: Data Types in Vector Storage: Text, Images, Audio, Code — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 6: Data Types in Vector Storage: Text, Images, Audio, Code. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -395,6 +399,311 @@ def search_audio_by_text(query: str, top_k: int = 5):
 
 <p class="text-gray-300 leading-relaxed">File-level embedding loses too much precision; function-level or class-level chunking is the practical standard. Parse the AST of each source file and extract functions, methods, and classes as individual embedding units. Include the docstring, signature, and body as the text passed to the embedding model. For Python, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ast</code> module handles this natively; for multi-language codebases, tree-sitter provides a consistent AST interface across languages.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Code embedding pipeline using tree-sitter + Pinecone + Voyage AI
+# Requirements: pinecone-client&gt;=3.0, voyageai, tree-sitter, tree-sitter-python
+
+import ast
+import textwrap
+from pathlib import Path
+import voyageai
+from pinecone import Pinecone, ServerlessSpec
+
+voyage = voyageai.Client()  # reads VOYAGE_API_KEY from environment
+pc = Pinecone()             # reads PINECONE_API_KEY from environment
+
+INDEX_NAME = "codebase-search"
+DIMENSION  = 1536           # voyage-code-2 output dimension
+
+# ── Create Pinecone index (serverless, cosine) ─────────────────────────────
+if INDEX_NAME not in [idx.name for idx in pc.list_indexes()]:
+    pc.create_index(
+        name=INDEX_NAME,
+        dimension=DIMENSION,
+        metric="cosine",
+        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+    )
+
+index = pc.Index(INDEX_NAME)
+
+# ── Extract Python functions from source ──────────────────────────────────
+def extract_python_functions(source_path: str) -&gt; list[dict]:
+    """
+    Parse a Python file and return one dict per function/method,
+    containing the name, source text, and file path.
+    """
+    source = Path(source_path).read_text(encoding="utf-8")
+    tree   = ast.parse(source)
+    units  = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            func_lines = source.splitlines()[
+                node.lineno - 1 : node.end_lineno
+            ]
+            func_text = textwrap.dedent("\n".join(func_lines))
+            units.append({
+                "name":       node.name,
+                "file_path":  source_path,
+                "start_line": node.lineno,
+                "end_line":   node.end_lineno,
+                "source":     func_text,
+            })
+
+    return units
+
+def embed_code_units(units: list[dict]) -&gt; list[list[float]]:
+    """Embed a list of code units using voyage-code-2."""
+    texts = [u["source"] for u in units]
+    response = voyage.embed(texts, model="voyage-code-2", input_type="document")
+    return response.embeddings
+
+def ingest_python_file(file_path: str, namespace: str = ""):
+    """Parse, embed, and upsert all functions from a Python file."""
+    units = extract_python_functions(file_path)
+    if not units:
+        return
+
+    embeddings = embed_code_units(units)
+
+    vectors = []
+    for unit, embedding in zip(units, embeddings):
+        # Pinecone IDs must be strings; use file+line as a stable key
+        vec_id = f"{unit['file_path']}::{unit['name']}::{unit['start_line']}"
+        vectors.append({
+            "id":     vec_id,
+            "values": embedding,
+            "metadata": {
+                "name":       unit["name"],
+                "file_path":  unit["file_path"],
+                "start_line": unit["start_line"],
+                "end_line":   unit["end_line"],
+                "source":     unit["source"][:1000],  # Pinecone metadata is size-limited
+            },
+        })
+
+    # Pinecone recommends upsert batches of 100 or fewer
+    batch_size = 100
+    for i in range(0, len(vectors), batch_size):
+        index.upsert(vectors=vectors[i : i + batch_size], namespace=namespace)
+
+def ingest_directory(root_dir: str, namespace: str = ""):
+    """Walk a directory tree and ingest all .py files."""
+    for path in Path(root_dir).rglob("*.py"):
+        print(f"Ingesting {path}")
+        ingest_python_file(str(path), namespace=namespace)
+
+# ── Search ────────────────────────────────────────────────────────────────────
+def search_code(query: str, top_k: int = 5, namespace: str = "") -&gt; list[dict]:
+    """
+    Embed a natural language or code query and retrieve matching functions.
+    """
+    response = voyage.embed([query], model="voyage-code-2", input_type="query")
+    query_vector = response.embeddings[0]
+
+    results = index.query(
+        vector=query_vector,
+        top_k=top_k,
+        include_metadata=True,
+        namespace=namespace,
+    )
+
+    matches = []
+    for match in results.matches:
+        matches.append({
+            "score":      match.score,
+            "name":       match.metadata["name"],
+            "file_path":  match.metadata["file_path"],
+            "start_line": match.metadata["start_line"],
+            "source":     match.metadata["source"],
+        })
+    return matches
+
+# ── Usage ─────────────────────────────────────────────────────────────────────
+# ingest_directory("/home/user/myproject/src")
+# results = search_code("function that validates JWT tokens")
+# for r in results:
+#     print(f"{r['score']:.4f} | {r['file_path']}:{r['start_line']} | {r['name']}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Multi-language codebases</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When your codebase spans multiple languages — Go services, Python scripts, TypeScript frontends, SQL stored procedures — you have two practical options:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Single shared index:</strong> Embed all code regardless of language into the same Pinecone or pgvector index. This works well when queries are natural language ("find the function that handles payment retries"), because the model maps both the query and code across languages into a shared semantic space. Include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">language</code> as a metadata field and filter when needed.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Per-language indexes:</strong> Maintain separate indexes or namespaces per language. This is useful when queries are themselves code ("find Go functions similar to this Python function") because it lets you tune chunking, model selection, and distance thresholds per language without cross-contamination.</p>
+
+<p class="text-gray-300 leading-relaxed">For most teams, the single shared index is simpler to operate and surprisingly effective.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL and database code</strong></p>
+
+<p class="text-gray-300 leading-relaxed">SQL stored procedures, views, and migration scripts are a special case worth calling out. Developers routinely need to find queries that JOIN a particular table, update a specific column, or implement a pattern like a slowly changing dimension. Embedding SQL is straightforward — feed the SQL text to the embedding model — but chunking differs: a SQL file may contain dozens of independent statements. Split on statement boundaries (semicolons, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GO</code> delimiters in SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$$</code> delimiters in PostgreSQL) and embed each statement independently.</p>
+
+<p class="text-gray-300 leading-relaxed">The metadata fields that pay off for SQL code search: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">database_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">schema_name</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">object_type</code> (table, view, procedure, trigger), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tables_referenced</code> (extracted by parsing), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_modified</code>. This turns your vector database into a semantic catalog layer on top of your existing database assets.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.5 Multi-Modal Pipelines: Combining Modalities in One Index</h3>
+
+<p class="text-gray-300 leading-relaxed">Real applications rarely deal with a single modality in isolation. A product catalog has a name (text), a description (text), images, and potentially a promotional audio clip. A customer support system has transcribed calls (text derived from audio), agent notes (text), and screenshots of error messages (images). Building a single search experience across all of these requires a decision: do you use a single unified embedding space, or do you maintain separate indexes and fuse results at query time?</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Unified embedding space with CLIP/CLAP</strong></p>
+
+<p class="text-gray-300 leading-relaxed">CLIP and CLAP models are trained to project images and text (or audio and text) into a shared vector space using contrastive learning. A text query lands near matching images, and image queries land near matching captions. This makes it possible to maintain a single index and query it with any modality.</p>
+
+<p class="text-gray-300 leading-relaxed">The limitation is that these shared spaces are trained for specific modality pairs. CLIP handles image↔text; CLAP handles audio↔text; there is no single off-the-shelf model that embeds text, images, audio, and code into one coherent space. Unified multi-modal models exist (Google's Gemini, Meta's ImageBind) but they are not yet standardized in the same way that CLIP is for image-text tasks.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Late fusion with per-modality indexes</strong></p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    T[Text] --> ET[Text embedding model]
+    I[Image] --> EI[CLIP image encoder]
+    A[Audio] --> EA[CLAP audio encoder]
+    C[Code] --> EC[Code embedding model]
+    ET --> IDX1[(Text index)]
+    EI --> IDX2[(Image index)]
+    EA --> IDX3[(Audio index)]
+    EC --> IDX4[(Code index)]
+    IDX1 --> RRF[Reciprocal Rank Fusion]
+    IDX2 --> RRF
+    IDX3 --> RRF
+    IDX4 --> RRF
+    RRF --> R[Fused results]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Each modality gets its own embedding model and index; results are merged at query time via Reciprocal Rank Fusion rather than forced into one shared vector space.*</p>
+
+<p class="text-gray-300 leading-relaxed">The alternative is to maintain separate indexes per modality and fuse results at query time. A search query is embedded by each relevant model, each index returns its top-K results, and a fusion layer combines the ranked lists. Reciprocal Rank Fusion (RRF) is the standard algorithm for this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Reciprocal Rank Fusion for multi-modal result merging
+from collections import defaultdict
+from typing import Any
+
+def reciprocal_rank_fusion(
+    ranked_lists: list[list[Any]],
+    id_key: str = "id",
+    k: int = 60,
+) -&gt; list[dict]:
+    """
+    Merge multiple ranked result lists using RRF.
+    Each item in a ranked_list must be a dict with a unique id_key.
+    k=60 is the standard constant that dampens the influence of high ranks.
+    """
+    scores: dict[Any, float] = defaultdict(float)
+    items:  dict[Any, dict]  = {}
+
+    for ranked_list in ranked_lists:
+        for rank, item in enumerate(ranked_list, start=1):
+            item_id = item[id_key]
+            scores[item_id] += 1.0 / (k + rank)
+            items[item_id]   = item  # keep the last-seen metadata
+
+    fused = sorted(
+        [{"rrf_score": score, **items[item_id]} for item_id, score in scores.items()],
+        key=lambda x: x["rrf_score"],
+        reverse=True,
+    )
+    return fused
+
+# Example: fuse text search and image search results for a product catalog
+# text_results  = [{"id": "prod_001", "name": "Red Sneaker", ...}, ...]
+# image_results = [{"id": "prod_003", "name": "Trail Runner", ...}, ...]
+# fused = reciprocal_rank_fusion([text_results, image_results])</code></pre>
+
+<p class="text-gray-300 leading-relaxed">RRF does not require score normalization across modalities, which is a significant practical advantage: cosine similarity scores from a text index are not directly comparable to distance scores from an image index, but rank positions are comparable.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metadata alignment across modalities</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When operating a multi-modal pipeline, the metadata schema becomes the spine that connects records across indexes. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">product_id</code> field that exists in both the text chunk table and the image vector collection is what makes post-retrieval joining possible. Design your metadata schema before you build the ingestion pipelines, or you will find yourself with three indexes that cannot be joined without a full table scan.</p>
+
+<p class="text-gray-300 leading-relaxed">A practical metadata pattern for a product catalog:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: unified metadata table that all modality indexes reference
+CREATE TABLE product_assets (
+    asset_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    product_id    TEXT NOT NULL,
+    modality      TEXT NOT NULL CHECK (modality IN ('text', 'image', 'audio', 'code')),
+    source_ref    TEXT NOT NULL,   -- chunk text, S3 path, git SHA, etc.
+    embedding_dim INTEGER NOT NULL,
+    index_name    TEXT NOT NULL,   -- which external index holds the vector
+    external_id   TEXT NOT NULL,   -- the vector's ID in that index
+    created_at    TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX ON product_assets (product_id);
+CREATE INDEX ON product_assets (modality, index_name);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This table acts as a reverse-lookup registry: given a vector ID returned by Pinecone or Weaviate, you can join back to the canonical <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">product_id</code> and fetch any other modality's vectors or metadata.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.6 Distance Metrics by Modality</h3>
+
+<p class="text-gray-300 leading-relaxed">Not all vector spaces are created equal, and the choice of distance metric affects both retrieval quality and index performance. The table below summarizes the practical defaults by modality:</p>
+
+<p class="text-gray-300 leading-relaxed">| Modality | Typical Model Family | Recommended Metric | Notes |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Text | Sentence-transformers, OpenAI | Cosine similarity | Vectors are L2-normalized by most models |</p>
+<p class="text-gray-300 leading-relaxed">| Text (dot product tuned) | Matryoshka / OpenAI v3 | Dot product | Only if model is trained with dot product objective |</p>
+<p class="text-gray-300 leading-relaxed">| Images | CLIP variants | Cosine similarity | L2-normalize outputs before storage |</p>
+<p class="text-gray-300 leading-relaxed">| Audio (semantic) | CLAP | Cosine similarity | Same contrastive training as CLIP |</p>
+<p class="text-gray-300 leading-relaxed">| Audio (speaker ID) | ECAPA-TDNN, x-vectors | Cosine similarity | Speaker embeddings respond well to cosine |</p>
+<p class="text-gray-300 leading-relaxed">| Code | voyage-code-2, CodeBERT | Cosine similarity | Normalize outputs |</p>
+<p class="text-gray-300 leading-relaxed">| Binary / hash | SimHash, MinHash | Hamming distance | Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bit</code> type in pgvector 0.7+ |</p>
+
+<p class="text-gray-300 leading-relaxed">The near-universal answer is cosine similarity, which is why most production systems normalize vectors to unit length at ingestion time and then use dot product as a fast approximation (dot product on unit vectors equals cosine similarity). The pgvector operators <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><=></code> (cosine distance) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs"><#></code> (negative dot product) let you switch without changing the schema.</p>
+
+<p class="text-gray-300 leading-relaxed">Euclidean (L2) distance is appropriate when the magnitude of the vector carries semantic information, which is rare in embedding models designed for retrieval — those models are typically trained with normalization objectives. Hamming distance is useful for binary fingerprinting and near-duplicate detection in image or document deduplication pipelines.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.7 Storage Sizing and Cost Modeling</h3>
+
+<p class="text-gray-300 leading-relaxed">Before committing to a database architecture, teams need to estimate how much vector data they are actually dealing with. The arithmetic is simple but frequently underestimated.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Per-vector storage</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A single float32 (4-byte) vector of dimension *d* consumes *4d* bytes on disk. The HNSW index — the dominant index type in production vector stores — adds roughly 1.5–2× the raw vector size in graph structure overhead. A 1536-dimensional OpenAI embedding therefore consumes:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Raw vector: 4 × 1536 = 6,144 bytes (≈ 6 KB)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> With HNSW overhead: ≈ 12–15 KB per vector</li>
+
+<p class="text-gray-300 leading-relaxed">At one million documents with five chunks each (five million vectors):</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Raw data: 5M × 6 KB = 30 GB</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Index: 5M × 15 KB = 75 GB total on-disk</li>
+
+<p class="text-gray-300 leading-relaxed">That is a meaningful infrastructure commitment. Dimensionality reduction strategies — Matryoshka representation learning (MRL), PCA post-processing, or switching to a smaller model — can cut that by 50–75% at a modest quality cost.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quantization</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Scalar quantization (SQ8) and binary quantization (BQ) reduce vector storage at the cost of some retrieval precision. pgvector supports <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">halfvec</code> (float16, half the storage of float32) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bit</code> (binary, 32× reduction from float32). Pinecone offers built-in int8 quantization. Weaviate supports both scalar and product quantization natively.</p>
+
+<p class="text-gray-300 leading-relaxed">A common production pattern:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Store the full-precision vectors on disk for re-ranking.</p>
+<p class="text-gray-300 leading-relaxed">2. Use a quantized version for the HNSW index to reduce memory footprint.</p>
+<p class="text-gray-300 leading-relaxed">3. After ANN retrieval returns top-100 candidates, re-rank with exact dot product on the full-precision vectors.</p>
+
+<p class="text-gray-300 leading-relaxed">This two-stage pattern maintains high recall while reducing the memory needed to serve the HNSW index, which must fit in RAM for low-latency queries.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cost across platforms</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Managed vector databases price on stored vectors, queries per second, and sometimes on the hosting tier (pod-based vs. serverless). Self-hosted pgvector running on a compute instance with adequate RAM is often the most cost-effective option at moderate scale — tens of millions of vectors — because you pay only for compute and storage, not a per-vector premium. Beyond a few hundred million vectors, the operational overhead of running a purpose-built system like Qdrant or Weaviate at scale often justifies the higher unit cost.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Modality determines the embedding pipeline, not the storage layer.** pgvector, Pinecone, Weaviate, and Qdrant are all modality-agnostic; what changes is the model you call before writing a vector to the index. Design your ingestion pipeline first, then select the database that fits your operational constraints.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chunking and segmentation are first-class engineering problems.** Whether you are splitting a legal document into 512-token windows, extracting Python functions from an AST, or segmenting a call recording by voice activity, how you divide data before embedding determines retrieval granularity more than model choice does.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **CLIP and CLAP enable cross-modal text-to-X queries without a separate query path.** By embedding images or audio into the same vector space as text, you avoid maintaining a specialized query interface for each modality — a single near-vector query handles both image similarity and text-to-image retrieval.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cosine similarity with L2-normalized vectors is the safe default across all modalities.** Euclidean distance is rarely appropriate for embedding-based retrieval; Hamming distance applies only to binary fingerprinting. When in doubt, normalize at ingestion and use cosine.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Size your infrastructure before you build.** A 1536-dimensional embedding model applied to five million vectors produces roughly 75 GB of indexed data. Factor in HNSW overhead, quantization trade-offs, and the distinction between disk storage and RAM residency before selecting a hosting tier — vector indexes must fit in memory to serve low-latency queries.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
