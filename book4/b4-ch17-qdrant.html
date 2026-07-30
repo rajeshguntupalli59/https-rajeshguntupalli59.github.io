@@ -6,6 +6,10 @@
   <title>Chapter 17: Qdrant: Payload Filtering and Precision Tuning — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 17: Qdrant: Payload Filtering and Precision Tuning. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -449,7 +453,7 @@ print(f"High-selectivity filtered search avg latency: {narrow_ms:.2f}ms")
 # Note: at very high selectivity, Qdrant switches to brute-force over
 # the matching subset, which is often faster than graph traversal</code></pre>
 
-<p class="text-gray-300 leading-relaxed">In practice on commodity hardware with this dataset size, you should see unfiltered search at 1–3ms, 1%-selectivity filtered search at 2–6ms, and high-selectivity search (where brute-force kicks in) at under 2ms because the matching set is small. The filtered HNSW penalty is far smaller than the equivalent post-filter architecture.</p>
+<p class="text-gray-300 leading-relaxed">Exact numbers depend heavily on hardware, dataset size, and dimensionality, so run this benchmark against your own deployment rather than trusting a printed figure — but the general shape holds: unfiltered and 1%-selectivity filtered search land in a similar low-millisecond range, and high-selectivity search (where brute-force kicks in) is often just as fast because the matching set is small. The filtered HNSW penalty is far smaller than the equivalent post-filter architecture.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -478,6 +482,621 @@ print(f"High-selectivity filtered search avg latency: {narrow_ms:.2f}ms")
 
 <p class="text-gray-300 leading-relaxed">All three support <strong class="text-white">rescoring</strong>: after the initial quantized search narrows the candidate set, Qdrant fetches the original full-precision vectors for the top candidates and re-ranks them. This recovers most of the accuracy penalty. The tradeoff is I/O for the rescore step.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import (
+    ScalarQuantizationConfig,
+    ProductQuantizationConfig,
+    BinaryQuantizationConfig,
+    QuantizationConfig,
+    ScalarType,
+    CompressionRatio,
+)
+
+# ---------------------------------------------------------------
+# Creating a collection with scalar quantization (recommended default)
+# ---------------------------------------------------------------
+client.create_collection(
+    collection_name="quantized_products",
+    vectors_config=VectorParams(
+        size=1536,          # OpenAI text-embedding-3-small dimension
+        distance=Distance.COSINE,
+        hnsw_config={
+            "m": 16,
+            "ef_construct": 128,
+            "full_scan_threshold": 10_000,
+        },
+    ),
+    quantization_config=ScalarQuantizationConfig(
+        type=ScalarType.INT8,
+        quantile=0.99,      # clip outliers; 0.99 is conservative
+        always_ram=True,    # keep quantized vectors in RAM, originals on disk
+    ),
+)
+
+# ---------------------------------------------------------------
+# Creating a collection with product quantization for memory-constrained environments
+# 1536-dim OpenAI vectors compressed to ~192 bytes (8x reduction at m=256)
+# ---------------------------------------------------------------
+client.create_collection(
+    collection_name="compressed_products",
+    vectors_config=VectorParams(
+        size=1536,
+        distance=Distance.COSINE,
+    ),
+    quantization_config=ProductQuantizationConfig(
+        compression=CompressionRatio.X16,  # 16x compression
+        always_ram=True,
+    ),
+)
+
+# ---------------------------------------------------------------
+# Per-query control over quantization behavior
+# ---------------------------------------------------------------
+from qdrant_client.models import QuantizationSearchParams
+
+results = client.search(
+    collection_name="quantized_products",
+    query_vector=query_vector,
+    limit=10,
+    search_params=SearchParams(
+        hnsw_ef=256,           # higher ef compensates for quantization noise
+        quantization=QuantizationSearchParams(
+            ignore=False,       # use quantization
+            rescore=True,       # rescore top candidates with original vectors
+            oversampling=2.5,   # fetch 2.5x candidates for rescore pool
+        ),
+    ),
+)
+
+# ---------------------------------------------------------------
+# Optimizer and segment configuration
+# These control how Qdrant manages internal storage segments
+# ---------------------------------------------------------------
+from qdrant_client.models import OptimizersConfigDiff
+
+client.update_collection(
+    collection_name="quantized_products",
+    optimizer_config=OptimizersConfigDiff(
+        # Flush segments to disk when they exceed this size (in KB)
+        max_segment_size=200_000,      # 200MB per segment
+        # How many points trigger a segment merge
+        memmap_threshold=50_000,
+        # Minimum number of vectors before HNSW index is built
+        # (below this, brute force is used instead)
+        indexing_threshold=20_000,
+        # Number of concurrent optimizer threads
+        max_optimization_threads=2,
+        # Flush interval in seconds
+        flush_interval_sec=5,
+        # Vacuum deleted vectors (tombstone cleanup)
+        deleted_threshold=0.2,
+        vacuum_min_vector_number=1000,
+    ),
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Understanding segments:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant partitions each collection into <strong class="text-white">segments</strong> — immutable or appendable units of storage that each contain a subset of points. New points land in a mutable "appendable" segment. When that segment grows beyond <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">memmap_threshold</code>, the optimizer merges it into a larger immutable segment backed by a memory-mapped file. The immutable segment then gets an HNSW index built on it (once it exceeds <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">indexing_threshold</code>).</p>
+
+<p class="text-gray-300 leading-relaxed">This architecture means that very fresh data that hasn't been incorporated into a segment HNSW index yet is searched via brute force, while indexed segments use HNSW. If your collection receives a heavy write burst followed immediately by queries, you may see temporarily elevated latency or reduced recall until the optimizer catches up. Monitoring <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">indexed_vectors_count</code> vs. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">points_count</code> from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">get_collection()</code> gives you visibility into this lag.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.5 Named Vectors and Multivector Collections</h3>
+
+<p class="text-gray-300 leading-relaxed">A practical scenario that arises frequently: you want to search the same items with multiple embeddings — perhaps a text embedding for semantic search and a separate image embedding for visual similarity. Qdrant handles this natively with <strong class="text-white">named vectors</strong>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import NamedVector, NamedSparseVector, SparseVector
+
+# Create a collection with multiple named vector spaces
+client.create_collection(
+    collection_name="multimodal_products",
+    vectors_config={
+        "text": VectorParams(
+            size=384,
+            distance=Distance.COSINE,
+        ),
+        "image": VectorParams(
+            size=512,
+            distance=Distance.COSINE,
+        ),
+        "price_embedding": VectorParams(
+            size=32,
+            distance=Distance.EUCLID,
+        ),
+    },
+)
+
+# Insert a point with all three vector representations
+client.upsert(
+    collection_name="multimodal_products",
+    points=[
+        PointStruct(
+            id=1,
+            vector={
+                "text":            [0.1, 0.2, 0.3] * 128,   # 384-dim placeholder
+                "image":           [0.4, 0.5, 0.6] * (512 // 3) + [0.4] * (512 % 3),
+                "price_embedding": [0.7] * 32,
+            },
+            payload={"name": "Wireless Headphones", "price": 149.99},
+        )
+    ],
+    wait=True,
+)
+
+# Search using only one named vector
+text_query = [0.15, 0.25, 0.35] * 128  # placeholder 384-dim query
+
+results = client.search(
+    collection_name="multimodal_products",
+    query_vector=NamedVector(name="text", vector=text_query),
+    limit=5,
+    with_payload=True,
+)
+
+# Hybrid search: combine results from text and image vectors
+# using Qdrant's query API (v1.7+)
+from qdrant_client.models import (
+    Prefetch,
+    FusionQuery,
+    Fusion,
+)
+
+image_query = [0.45, 0.55, 0.65] * (512 // 3) + [0.45] * (512 % 3)
+
+# Reciprocal Rank Fusion across two vector spaces
+hybrid_results = client.query_points(
+    collection_name="multimodal_products",
+    prefetch=[
+        Prefetch(
+            query=NamedVector(name="text", vector=text_query),
+            limit=20,
+        ),
+        Prefetch(
+            query=NamedVector(name="image", vector=image_query),
+            limit=20,
+        ),
+    ],
+    query=FusionQuery(fusion=Fusion.RRF),
+    limit=10,
+    with_payload=True,
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Named vectors let you avoid maintaining separate collections per modality, which simplifies payload management considerably — you only need one set of payload indexes rather than synchronized copies across multiple collections.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Sparse vectors for hybrid dense+sparse search:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant also supports sparse vectors natively, enabling BM25-style keyword search alongside dense semantic search within the same system.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import SparseVectorParams
+
+# Collection with both dense and sparse vector slots
+client.create_collection(
+    collection_name="hybrid_search_products",
+    vectors_config={
+        "dense": VectorParams(size=384, distance=Distance.COSINE),
+    },
+    sparse_vectors_config={
+        "sparse": SparseVectorParams(),
+    },
+)
+
+# Simulate BM25 sparse weights (in production, use a sparse encoder like SPLADE)
+def mock_sparse_vector(text: str) -&gt; SparseVector:
+    """Toy TF-weighted sparse representation."""
+    tokens = text.lower().split()
+    token_ids = [hash(t) % 30_000 for t in tokens]
+    weights  = [1.0 / (tokens.count(t) ** 0.5) for t in tokens]
+    # deduplicate by index
+    combined = {}
+    for idx, w in zip(token_ids, weights):
+        combined[idx] = combined.get(idx, 0.0) + w
+    indices = list(combined.keys())
+    values  = list(combined.values())
+    return SparseVector(indices=indices, values=values)
+
+# Upsert a point with both dense and sparse vectors
+import numpy as np
+
+client.upsert(
+    collection_name="hybrid_search_products",
+    points=[
+        PointStruct(
+            id=1,
+            vector={
+                "dense":  np.random.rand(384).tolist(),
+                "sparse": mock_sparse_vector("wireless noise canceling headphones"),
+            },
+            payload={"name": "Wireless Headphones"},
+        )
+    ],
+    wait=True,
+)
+
+# Hybrid query: fuse dense semantic search with sparse keyword search
+dense_query  = np.random.rand(384).tolist()
+sparse_query = mock_sparse_vector("wireless headphones long battery")
+
+hybrid_results = client.query_points(
+    collection_name="hybrid_search_products",
+    prefetch=[
+        Prefetch(
+            query=NamedVector(name="dense", vector=dense_query),
+            limit=20,
+        ),
+        Prefetch(
+            query=NamedSparseVector(name="sparse", vector=sparse_query),
+            limit=20,
+        ),
+    ],
+    query=FusionQuery(fusion=Fusion.RRF),
+    limit=10,
+    with_payload=True,
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Scroll, Recommendation, and Discovery APIs</h3>
+
+<p class="text-gray-300 leading-relaxed">Qdrant exposes several query modes beyond the standard <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">search()</code> endpoint. Each addresses a different retrieval pattern.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scroll — paginated full collection scan with filters:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When you need to iterate over all matching points (not just the nearest neighbors), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">scroll()</code> provides cursor-based pagination. This is useful for bulk exports, backfill operations, and building recommendation candidate sets from structured criteria alone.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import ScrollRequest
+
+# Retrieve all in-stock electronics, paginated
+offset = None  # start from the beginning
+all_electronics = []
+
+while True:
+    results, next_offset = client.scroll(
+        collection_name=COLLECTION_NAME,
+        scroll_filter=Filter(
+            must=[
+                FieldCondition(key="category", match=MatchValue(value="electronics")),
+                FieldCondition(key="in_stock",  match=MatchValue(value=True)),
+            ]
+        ),
+        limit=100,
+        offset=offset,
+        with_payload=True,
+        with_vectors=False,
+    )
+    all_electronics.extend(results)
+    if next_offset is None:
+        break
+    offset = next_offset
+
+print(f"Total matching points: {len(all_electronics)}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recommendation API — finding similar items without a query vector:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The recommendation endpoint accepts one or more positive example point IDs and optional negative example IDs. Qdrant internally fetches those points' vectors, computes an average positive direction, and performs the search. This is the correct abstraction for "more like this" UI patterns without requiring the client to store or re-encode vectors.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import RecommendRequest
+
+# "More like this product, but not like that one"
+recommendations = client.recommend(
+    collection_name=COLLECTION_NAME,
+    positive=["product-id-1", "product-id-2"],   # IDs of liked items
+    negative=["product-id-3"],                    # IDs of disliked items
+    query_filter=Filter(
+        must=[FieldCondition(key="in_stock", match=MatchValue(value=True))]
+    ),
+    limit=5,
+    with_payload=True,
+)
+
+for rec in recommendations:
+    print(f"Score: {rec.score:.4f} | {rec.payload['description']}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Discovery API — constrained exploration:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The discovery endpoint extends the recommendation concept with <strong class="text-white">context pairs</strong> — pairs of (positive, negative) examples that define a preference direction without requiring query vectors. It is useful when you want to explore a region of the vector space defined by relative preferences rather than absolute query proximity.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client.models import DiscoverRequest, ContextExamplePair
+
+discovery_results = client.discover(
+    collection_name=COLLECTION_NAME,
+    target="product-id-1",   # item to find neighbors of
+    context=[
+        ContextExamplePair(
+            positive="product-id-4",
+            negative="product-id-3",
+        )
+    ],
+    query_filter=Filter(
+        must=[FieldCondition(key="category", match=MatchValue(value="electronics"))]
+    ),
+    limit=5,
+    with_payload=True,
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.7 Production Deployment Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">Running Qdrant in production involves decisions about persistence, sharding, replication, and access control. This section covers the patterns that matter most for teams moving from prototype to production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Persistence and snapshots:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant stores its data in a configurable <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">storage_path</code> directory. The default on-disk format uses memory-mapped files for large segments, which means the OS page cache provides an implicit read buffer. For cloud deployments, map this path to a persistent volume — losing the storage directory means losing all data.</p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant provides a snapshot API for point-in-time backups:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Create a snapshot of a collection
+snapshot_info = client.create_snapshot(collection_name=COLLECTION_NAME)
+print(f"Snapshot created: {snapshot_info.name}")
+
+# List available snapshots
+snapshots = client.list_snapshots(collection_name=COLLECTION_NAME)
+for s in snapshots:
+    print(f"  {s.name} — {s.size} bytes — created at {s.creation_time}")
+
+# Restore from snapshot (via REST, since Python SDK uses the same endpoint)
+# POST /collections/{collection_name}/snapshots/recover
+# { "location": "file:///qdrant/snapshots/collection-name/snapshot-name.snapshot" }</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Distributed mode — shards and replication:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant's distributed mode partitions a collection into <strong class="text-white">shards</strong>, each of which is an independent HNSW index. Shards can be replicated across nodes for fault tolerance. The configuration happens at collection creation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Create a distributed collection — requires Qdrant cluster mode
+client.create_collection(
+    collection_name="distributed_catalog",
+    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+    shard_number=4,           # 4 shards distributed across nodes
+    replication_factor=2,     # each shard replicated to 2 nodes
+    write_consistency_factor=1,  # 1 replica must confirm writes
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Queries in distributed mode are automatically broadcast to all shards, and results are merged. The write consistency factor controls the durability vs. latency tradeoff: requiring all replicas to confirm (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">write_consistency_factor=replication_factor</code>) maximizes durability but adds write latency proportional to replica count.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">API key authentication and TLS:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant supports simple API key authentication and TLS termination, configured via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">config.yaml</code> file rather than the client:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># qdrant config.yaml (server-side)
+service:
+  api_key: "your-secret-api-key"
+  enable_tls: true
+  tls:
+    cert: /path/to/server.crt
+    key:  /path/to/server.key
+
+storage:
+  storage_path: /qdrant/storage
+  snapshots_path: /qdrant/snapshots
+
+# Distributed mode
+cluster:
+  enabled: true
+  p2p:
+    port: 6335
+  consensus:
+    tick_period_ms: 100</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On the client side, pass the API key at construction:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+client = QdrantClient(
+    host="your-qdrant-host",
+    port=6333,
+    api_key="your-secret-api-key",
+    https=True,               # enables TLS verification
+    prefix="optional/prefix", # useful when behind a path-routing reverse proxy
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring collection health:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def collection_health_report(client: QdrantClient, collection_name: str) -&gt; dict:
+    """
+    Returns a structured health summary useful for alerting dashboards.
+    """
+    info = client.get_collection(collection_name)
+    config = info.config
+
+    total_points    = info.points_count
+    indexed_vectors = info.indexed_vectors_count
+    index_lag       = total_points - indexed_vectors
+
+    segments = client.get_collection(collection_name).segments_count
+
+    return {
+        "collection":       collection_name,
+        "status":           info.status.value,
+        "total_points":     total_points,
+        "indexed_vectors":  indexed_vectors,
+        "index_lag":        index_lag,
+        "index_lag_pct":    round(index_lag / max(total_points, 1) * 100, 2),
+        "segments":         segments,
+        "vector_size":      config.params.vectors.size,
+        "distance":         config.params.vectors.distance.value,
+        "m":                config.hnsw_config.m,
+        "ef_construct":     config.hnsw_config.ef_construct,
+    }
+
+report = collection_health_report(client, COLLECTION_NAME)
+for k, v in report.items():
+    print(f"  {k:&lt;22} {v}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Write-ahead log and crash recovery:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant uses a write-ahead log (WAL) to ensure that accepted writes survive crashes even before segments are flushed. The WAL is replayed on startup. This means your data is safe after <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wait=True</code> upserts, but a large WAL that hasn't been checkpointed will slow down restart time. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">flush_interval_sec</code> optimizer setting controls how frequently WAL entries are checkpointed to segments.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.8 Practical Integration Pattern: Tenant-Isolated Search</h3>
+
+<p class="text-gray-300 leading-relaxed">A common production pattern when building multi-tenant SaaS applications on Qdrant is to use a single collection with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> payload field and a keyword index, rather than a separate collection per tenant. This avoids the overhead of managing thousands of collections while still delivering tenant-isolated results.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import hashlib
+from qdrant_client.models import (
+    Filter, FieldCondition, MatchValue,
+    PointStruct, VectorParams, Distance,
+)
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+
+client   = QdrantClient(host="localhost", port=6333)
+encoder  = SentenceTransformer("all-MiniLM-L6-v2")
+
+COLLECTION = "saas_documents"
+
+# One-time setup
+client.recreate_collection(
+    collection_name=COLLECTION,
+    vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+)
+client.create_payload_index(
+    collection_name=COLLECTION,
+    field_name="tenant_id",
+    field_schema="keyword",
+)
+client.create_payload_index(
+    collection_name=COLLECTION,
+    field_name="doc_type",
+    field_schema="keyword",
+)
+client.create_payload_index(
+    collection_name=COLLECTION,
+    field_name="created_at",
+    field_schema="integer",  # Unix timestamp — integer index supports range queries
+)
+
+def deterministic_point_id(tenant_id: str, doc_id: str) -&gt; int:
+    """
+    Generate a stable integer point ID from tenant + document ID.
+    Qdrant integer IDs must be uint64, so we truncate the hash.
+    """
+    h = hashlib.sha256(f"{tenant_id}:{doc_id}".encode()).digest()
+    return int.from_bytes(h[:8], "big") &gt;&gt; 1  # shift to keep within signed range
+
+def upsert_document(
+    tenant_id: str,
+    doc_id: str,
+    text: str,
+    doc_type: str,
+    created_at: int,
+) -&gt; None:
+    vector = encoder.encode(text).tolist()
+    point_id = deterministic_point_id(tenant_id, doc_id)
+    client.upsert(
+        collection_name=COLLECTION,
+        points=[
+            PointStruct(
+                id=point_id,
+                vector=vector,
+                payload={
+                    "tenant_id":  tenant_id,
+                    "doc_id":     doc_id,
+                    "doc_type":   doc_type,
+                    "created_at": created_at,
+                    "text":       text,
+                },
+            )
+        ],
+        wait=True,
+    )
+
+def tenant_search(
+    tenant_id: str,
+    query: str,
+    doc_type: str | None = None,
+    min_created_at: int | None = None,
+    limit: int = 10,
+) -&gt; list[dict]:
+    """
+    Vector search scoped strictly to a single tenant,
+    with optional document type and recency filters.
+    """
+    must_conditions = [
+        FieldCondition(key="tenant_id", match=MatchValue(value=tenant_id))
+    ]
+    if doc_type is not None:
+        must_conditions.append(
+            FieldCondition(key="doc_type", match=MatchValue(value=doc_type))
+        )
+    if min_created_at is not None:
+        must_conditions.append(
+            FieldCondition(key="created_at", range=Range(gte=min_created_at))
+        )
+
+    query_vector = encoder.encode(query).tolist()
+
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=query_vector,
+        query_filter=Filter(must=must_conditions),
+        limit=limit,
+        with_payload=["doc_id", "doc_type", "text", "created_at"],
+    )
+
+    return [
+        {
+            "score":      r.score,
+            "doc_id":     r.payload["doc_id"],
+            "doc_type":   r.payload["doc_type"],
+            "text":       r.payload["text"],
+            "created_at": r.payload["created_at"],
+        }
+        for r in results
+    ]
+
+# Example usage
+import time
+
+upsert_document(
+    tenant_id="acme_corp",
+    doc_id="kb-001",
+    text="How to reset your password using the account settings page",
+    doc_type="knowledge_base",
+    created_at=int(time.time()),
+)
+
+upsert_document(
+    tenant_id="acme_corp",
+    doc_id="ticket-0042",
+    text="User reports login failure after password reset attempt",
+    doc_type="support_ticket",
+    created_at=int(time.time()),
+)
+
+results = tenant_search(
+    tenant_id="acme_corp",
+    query="login problems after changing password",
+    limit=5,
+)
+
+for r in results:
+    print(f"[{r['score']:.4f}] ({r['doc_type']}) {r['text'][:80]}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern has one significant consideration: if a single tenant accounts for a very large fraction of all points (say, one tenant holds 80% of the data), that tenant's searches will traverse more nodes during HNSW graph construction and querying than a balanced distribution would imply. For severely skewed tenants, the dedicated-collection approach for that specific tenant is worth the operational complexity.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Qdrant's filtered HNSW** integrates payload conditions directly into graph traversal rather than applying them as a post-filter step. This keeps filtered search latency close to unfiltered latency even at selectivities of 1% or lower, and automatically falls back to brute-force over the matching subset when the result set is very small.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Payload indexes must be created explicitly** before those fields become efficient filter predicates. The field type you choose — keyword, integer, float, geo, or text — determines which comparison operators are available and how the index is physically structured. Creating indexes before bulk insert is faster than creating them afterward.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Quantization (scalar, product, or binary) combined with rescoring** is the primary lever for reducing memory footprint without sacrificing meaningful recall. The `always_ram=True` option for quantized vectors keeps the compressed representation in memory for fast candidate retrieval while the full-precision originals can live on disk and are only read for the rescore step.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Named vectors and sparse vector support** allow a single collection to serve multiple retrieval modalities — dense semantic search, sparse keyword search, and cross-modal fusion — without synchronizing parallel collections. The `prefetch` + `FusionQuery(RRF)` pattern is the idiomatic way to implement hybrid search in Qdrant v1.7+.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Multi-tenant isolation via payload filtering** (single collection, `tenant_id` keyword index) is operationally simpler than per-tenant collections at moderate tenant counts. The pattern breaks down when tenant data is severely skewed, at which point dedicated collections for the largest tenants become preferable.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
