@@ -6,6 +6,10 @@
   <title>Chapter 16: Weaviate: Schema Design and Hybrid Search — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 16: Weaviate: Schema Design and Hybrid Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -444,7 +448,7 @@ client.close()</code></pre>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Dynamic batching (`batch.dynamic()`) outperforms fixed-size batching in most cases because Weaviate's server-side admission control adapts to memory pressure during HNSW graph construction.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> With external vectorization (OpenAI, Cohere), the embedding API call is the bottleneck — not Weaviate's insert throughput. Use async batching or parallel chunk pipelines with a semaphore to control concurrent embedding calls.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> With built-in vectorizers (`text2vec-transformers` running locally), GPU availability dominates throughput. A single T4 GPU handles roughly 2,000–4,000 tokens per second for `sentence-transformers/all-MiniLM-L6-v2`.</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Set `WEAVIATE_GRPC_PORT` and use gRPC transport for batch inserts in v1.23+. gRPC batch ingestion is 40–60% faster than the REST API for large payloads because it avoids JSON serialization overhead.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Set `WEAVIATE_GRPC_PORT` and use gRPC transport for batch inserts in v1.23+. gRPC batch ingestion is meaningfully faster than the REST API for large payloads because it avoids JSON serialization overhead — benchmark against your own payload shapes rather than assuming a fixed improvement.</li>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Query latency benchmarks (approximate, single-node Weaviate, 1M objects):</strong></p>
 
@@ -455,7 +459,240 @@ client.close()</code></pre>
 <p class="text-gray-300 leading-relaxed">| Hybrid (RRF) | ~12ms | ~18ms | ~30ms |</p>
 <p class="text-gray-300 leading-relaxed">| Hybrid + filter | ~15ms | ~22ms | ~38ms |</p>
 
-<p class="text-gray-300 leading-relaxed">BM25 latency is largely independent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> because it uses a separate inverted</p>
+<p class="text-gray-300 leading-relaxed">BM25 latency is largely independent of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> because it uses a separate inverted index path. Hybrid latency is dominated by the vector search component, so <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> tuning applies to hybrid queries the same way it applies to pure vector queries.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.6 Filtering Strategies: Pre-Filter vs. Post-Filter</h3>
+
+<p class="text-gray-300 leading-relaxed">Weaviate's approach to filtered vector search has evolved significantly. Early versions used post-filtering — execute ANN search, then discard results that don't match the filter predicate. Post-filtering is simple to implement but statistically problematic: if your filter eliminates 90% of the dataset, you may retrieve only 1–2 results even when you asked for 10, because the ANN graph was built over the full dataset and doesn't know which nodes will survive the filter.</p>
+
+<p class="text-gray-300 leading-relaxed">Weaviate v1.17+ implements <strong class="text-white">flat search fallback</strong> and <strong class="text-white">ACORN-style filtered ANN</strong>, where the execution strategy adapts based on filter selectivity:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **High selectivity filter** (small result set, e.g., 0.1% of objects match): Weaviate falls back to flat (brute-force) search over the filtered subset. This is faster than navigating the HNSW graph when the candidate pool is small enough.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Low selectivity filter** (large result set, e.g., 80% of objects match): standard HNSW graph traversal with filter evaluation at candidate inspection time.</li>
+
+<p class="text-gray-300 leading-relaxed">The threshold for switching strategies is configurable via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">flat_search_cutoff</code> in the collection's vector index configuration. The default threshold is typically around 40,000 objects — if fewer objects match the filter, flat search is used.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from weaviate.classes.config import Configure, VectorDistances
+
+client.collections.create(
+    name="ProductCatalog",
+    vector_index_config=Configure.VectorIndex.hnsw(
+        distance_metric=VectorDistances.COSINE,
+        ef_construction=128,
+        max_connections=16,
+        ef=96,
+        flat_search_cutoff=40_000,  # tune based on your filter distribution
+    ),
+    # ... properties omitted for brevity
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Filter composition rules that matter:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Filter.by_property("field").equal()</code> for equality filters — these hit the roaring bitmap index directly.</p>
+<p class="text-gray-300 leading-relaxed">2. Avoid filtering on cross-references when a scalar property would suffice. Cross-reference filters require graph traversal before the vector search even begins.</p>
+<p class="text-gray-300 leading-relaxed">3. Combine multiple filters with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Filter.all_of([...])</code> (AND) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Filter.any_of([...])</code> (OR). The query planner intersects roaring bitmaps, which is fast.</p>
+<p class="text-gray-300 leading-relaxed">4. Range filters on numeric properties require <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index_range_filters=True</code> at schema definition time. Without this flag, numeric range queries fall back to a full-scan of the property store — expensive at scale.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from weaviate.classes.query import Filter, MetadataQuery
+
+collection = client.collections.get("ProductCatalog")
+
+# Compound filter: category AND price range AND in-stock
+response = collection.query.hybrid(
+    query="wireless noise-cancelling headphones",
+    alpha=0.65,
+    limit=20,
+    filters=Filter.all_of([
+        Filter.by_property("category").equal("electronics"),
+        Filter.by_property("price_usd").greater_than(50.0),
+        Filter.by_property("price_usd").less_than(500.0),
+        Filter.by_property("in_stock").equal(True),
+    ]),
+    return_metadata=MetadataQuery(score=True),
+)
+
+for obj in response.objects:
+    print(f"{obj.properties['name']:40s}  score={obj.metadata.score:.4f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.7 Generative Search and RAG Modules</h3>
+
+<p class="text-gray-300 leading-relaxed">Weaviate's generative search module (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generative-openai</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generative-cohere</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generative-anthropic</code>, and others) integrates LLM generation directly into the query pipeline. Instead of retrieving objects and then calling an LLM in application code, you declare the generation step in the query itself.</p>
+
+<p class="text-gray-300 leading-relaxed">This is architecturally convenient but not always the right choice. The tradeoff is flexibility vs. simplicity: Weaviate's built-in generative module handles the simplest RAG patterns well, but complex prompt engineering, multi-step retrieval, and retrieval with re-ranking often require application-layer orchestration anyway.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">When to use the generative module:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Prototyping RAG systems quickly</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Simple question-answering over a well-bounded corpus</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Single-turn queries with straightforward summarization requirements</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">When to move generation to the application layer:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Multi-turn conversations requiring context management</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Re-ranking retrieved results before generation</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Prompt templates that depend on user-specific data</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cost optimization across multiple providers based on query type</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from weaviate.classes.generate import GenerativeConfig
+from weaviate.classes.query import MetadataQuery
+
+client = weaviate.connect_to_local()  # Weaviate configured with generative-openai module
+
+collection = client.collections.get("DocumentChunk")
+
+# Single-prompt generation: apply one prompt to all retrieved objects
+response = collection.generate.hybrid(
+    query="climate change mitigation strategies",
+    alpha=0.65,
+    limit=5,
+    single_prompt="Summarize the key point of this passage in one sentence: {content}",
+    return_metadata=MetadataQuery(score=True),
+)
+
+for obj in response.objects:
+    print(f"Source: {obj.properties['source_document']}")
+    print(f"Generated: {obj.generated}")
+    print()
+
+# Grouped task: synthesize a response across all retrieved objects
+response_grouped = collection.generate.hybrid(
+    query="what are the main approaches to carbon capture?",
+    alpha=0.65,
+    limit=8,
+    grouped_task=(
+        "Based on the provided passages, write a concise technical summary "
+        "of the main carbon capture approaches discussed, citing specific methods."
+    ),
+    grouped_properties=["content", "source_document"],
+)
+
+print("Synthesized answer:")
+print(response_grouped.generated)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">single_prompt</code> mode calls the LLM once per retrieved object — useful for per-passage annotation or extraction. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">grouped_task</code> mode sends all retrieved passages to the LLM in a single call — the standard RAG synthesis pattern.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Module configuration in the Weaviate instance settings</strong> (set at startup, not per-query):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># docker-compose.yml excerpt
+environment:
+  ENABLE_MODULES: "text2vec-openai,generative-openai"
+  OPENAI_APIKEY: "${OPENAI_API_KEY}"
+  # For Azure OpenAI:
+  # AZURE_APIKEY: "${AZURE_OPENAI_API_KEY}"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If you operate Weaviate in a zero-trust network where outbound API calls are restricted, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text2vec-transformers</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">generative-ollama</code> modules run fully locally using self-hosted models — no external API calls.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.8 Backup, Restore, and Operational Concerns</h3>
+
+<p class="text-gray-300 leading-relaxed">Weaviate's backup system operates at the collection level and supports pluggable backends: filesystem, S3, GCS, and Azure Blob Storage. Backups are <strong class="text-white">live</strong> — they do not require stopping the database or taking it offline.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import weaviate
+
+client = weaviate.connect_to_local()
+
+# Trigger a backup to S3 (requires backup-s3 module enabled)
+result = client.backup.create(
+    backup_id="backup-2024-01-15-prod",
+    backend="s3",
+    include_collections=["DocumentChunk", "ResearchPaper"],
+    wait_for_completion=True,
+)
+print(f"Backup status: {result.status}")
+
+# Restore from backup
+restore_result = client.backup.restore(
+    backup_id="backup-2024-01-15-prod",
+    backend="s3",
+    include_collections=["DocumentChunk"],
+    wait_for_completion=True,
+)
+print(f"Restore status: {restore_result.status}")
+
+client.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Operational checklist for production Weaviate deployments:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Concern | Recommendation |</p>
+<p class="text-gray-300 leading-relaxed">|---------|---------------|</p>
+<p class="text-gray-300 leading-relaxed">| Memory sizing | 2× the HNSW memory estimate; leave headroom for batch ingestion spikes |</p>
+<p class="text-gray-300 leading-relaxed">| Disk sizing | 3–4× raw vector data size (inverted index, WAL, metadata) |</p>
+<p class="text-gray-300 leading-relaxed">| Replication | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">replication_factor=3</code> for production; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">consistency_level=QUORUM</code> for reads |</p>
+<p class="text-gray-300 leading-relaxed">| Backup cadence | Daily backup to object storage; verify restore quarterly |</p>
+<p class="text-gray-300 leading-relaxed">| Module isolation | Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text2vec-transformers</code> as a separate container; GPU contention with Weaviate's own Go runtime causes latency spikes |</p>
+<p class="text-gray-300 leading-relaxed">| Schema versioning | Treat class definitions as code; store in version control alongside migration scripts |</p>
+<p class="text-gray-300 leading-relaxed">| Monitoring | Export Prometheus metrics via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/v1/metrics</code>; alert on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">batch_durations_ms_bucket</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_dimensions_ms_bucket</code>, and heap memory |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication configuration:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from weaviate.classes.config import Configure, Reconfigure
+
+# At class creation time
+client.collections.create(
+    name="DocumentChunk",
+    replication_config=Configure.replication(factor=3),
+    # ... other config
+)
+
+# Consistency level at query time
+from weaviate.classes.query import MetadataQuery
+from weaviate.classes.config import ConsistencyLevel
+
+collection = client.collections.get("DocumentChunk")
+
+# Read with quorum consistency
+response = collection.with_consistency_level(
+    ConsistencyLevel.QUORUM
+).query.hybrid(
+    query="distributed systems consensus",
+    alpha=0.6,
+    limit=10,
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Weaviate uses a leaderless replication model similar to Cassandra's — all replica nodes are equal, and consistency is controlled per-operation via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUORUM</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALL</code>. For RAG workloads, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUORUM</code> reads with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">QUORUM</code> writes provides the right balance between consistency and availability.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.9 Weaviate vs. pgvector: Decision Framework</h3>
+
+<p class="text-gray-300 leading-relaxed">After the preceding chapters on pgvector and this chapter on Weaviate, the natural question is when to choose one over the other. This is not a "best database wins" comparison — it is a context-dependent architectural decision.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Choose pgvector when:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Your application data already lives in PostgreSQL and you want to avoid a second operational system</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Your team's operational expertise is SQL and relational databases</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Your vector dataset is under ~10M objects and hybrid search requirements are modest</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Strong ACID transactions matter (financial records, inventory, anything with coordinated writes)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You need arbitrary JOIN semantics between vector results and relational data</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Choose Weaviate when:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You need production-grade hybrid search (BM25 + vector) with minimal configuration</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Multi-tenancy with per-tenant shard isolation is a hard requirement</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Built-in vectorization modules remove embedding pipeline complexity from your architecture</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Your dataset grows to tens or hundreds of millions of objects with demanding recall/latency SLAs</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Named vectors (multi-representation objects) fit your retrieval model</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You want generative search integrated into the query layer for prototyping</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The operational cost of adding Weaviate to a PostgreSQL shop is real.</strong> You now operate two stateful systems, two backup procedures, two monitoring stacks. Many teams start with pgvector, hit a concrete limitation (multi-tenancy isolation, hybrid search quality, recall at scale), and then migrate to Weaviate for the specific workload that needs it while keeping PostgreSQL for transactional data.</p>
+
+<p class="text-gray-300 leading-relaxed">The reverse migration — from Weaviate back to pgvector — is rare but happens when teams underestimate PostgreSQL's capacity or overestimate the complexity of their vector workload.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Weaviate's class-and-property schema is a design contract**: tokenization choices, `skip_vectorization` flags, and index configuration flags (`index_filterable`, `index_searchable`, `index_range_filters`) have permanent performance consequences that cannot be changed without rebuilding the index, so schema design deserves the same rigor as DDL in a relational database.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid search with Reciprocal Rank Fusion combines BM25 and vector ANN into a single ranked result**: the `alpha` parameter blends the two signals, and empirical tuning against labeled relevance judgments — rather than theoretical defaults — consistently produces the best retrieval quality for a specific domain and query type.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Multi-tenancy is a first-class Weaviate feature backed by shard isolation**: each tenant gets an independent HNSW graph, enabling per-tenant lifecycle management (ACTIVE, INACTIVE, OFFLOADED) that controls memory consumption in large-scale SaaS deployments, but active-tenant memory budgeting must be part of node sizing from day one.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Named vectors (Weaviate v1.24+) allow one object to carry multiple independent vector representations**: this supports cross-modal and multi-granularity retrieval strategies — for example, searching by abstract embedding and full-text embedding independently — at the cost of roughly proportional additional storage and index memory.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Filter selectivity drives Weaviate's execution strategy**: high-selectivity filters trigger a flat brute-force search over the matching subset, which is faster than HNSW graph traversal when the candidate pool is small; schema-time flags like `index_range_filters=True` on numeric properties are prerequisites for efficient range filtering, and omitting them causes silent full-scan fallbacks at query time.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
