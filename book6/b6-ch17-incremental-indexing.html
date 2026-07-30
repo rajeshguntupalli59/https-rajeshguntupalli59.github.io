@@ -5,6 +5,10 @@
   <title>Chapter 17: Knowledge Base Updates: Incremental Indexing — AI-Native Apps on PostgreSQL</title>
   <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 17: Knowledge Base Updates: Incremental Indexing. LLMs, RAG, agents — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -51,7 +55,7 @@
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Core tables for an incremental indexing system
 
-CREATE EXTENSION IF NOT EXISTS pgvector;
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
 -- Source documents: the raw content before chunking
@@ -602,7 +606,676 @@ if __name__ == "__main__":
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.4 Conflict-Free Re-indexing Under Concurrent Load</h3>
 
 <p class="text-gray-300 leading-relaxed">Production knowledge bases see concurrent writes. Multiple sync jobs, webhook handlers, and user actions can modify documents simultaneously. The naive queue approach fails here: two workers might both claim the same document, embed it twice, and race to write results. PostgreSQL's locking primitives solve this cleanly.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>--Function to safely claim the next available queue item
+CREATE OR REPLACE FUNCTION fn_claim_queue_item(p_worker_id TEXT)
+RETURNS TABLE (
+    queue_id    BIGINT,
+    document_id UUID,
+    operation   TEXT,
+    payload     JSONB
+) AS $$
+BEGIN
+    RETURN QUERY
+    UPDATE indexing_queue q
+    SET status     = 'processing',
+        started_at = NOW(),
+        attempts   = attempts + 1,
+        payload    = payload || jsonb_build_object('worker_id', p_worker_id)
+    FROM (
+        SELECT id
+        FROM indexing_queue
+        WHERE status = 'pending'
+          AND scheduled_at &lt;= NOW()
+        ORDER BY priority ASC, scheduled_at ASC
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED
+    ) sub
+    WHERE q.id = sub.id
+    RETURNING q.id, q.document_id, q.operation, q.payload;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function to detect and recover stalled items (worker crashed mid-job)
+CREATE OR REPLACE FUNCTION fn_recover_stalled_items(p_stall_threshold_minutes INTEGER DEFAULT 15)
+RETURNS INTEGER AS $$
+DECLARE
+    v_recovered INTEGER;
+BEGIN
+    UPDATE indexing_queue
+    SET status     = 'pending',
+        started_at = NULL,
+        last_error = FORMAT(
+            'Recovered from stall after %s minutes (attempt %s)',
+            p_stall_threshold_minutes,
+            attempts
+        )
+    WHERE status = 'processing'
+      AND started_at &lt; NOW() - (p_stall_threshold_minutes || ' minutes')::INTERVAL
+      AND attempts &lt; 3;
+
+    GET DIAGNOSTICS v_recovered = ROW_COUNT;
+
+    -- Permanently fail items that have exceeded retry limit
+    UPDATE indexing_queue
+    SET status     = 'failed',
+        last_error = FORMAT('Exceeded maximum attempts (%s)', attempts)
+    WHERE status = 'processing'
+      AND started_at &lt; NOW() - (p_stall_threshold_minutes || ' minutes')::INTERVAL
+      AND attempts &gt;= 3;
+
+    RETURN v_recovered;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Prevent duplicate pending items for the same document+operation
+CREATE UNIQUE INDEX idx_queue_dedup
+    ON indexing_queue (document_id, operation)
+    WHERE status = 'pending';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The partial unique index <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE status = 'pending'</code> is the concurrency safety net. No matter how many processes try to enqueue the same document, the database enforces exactly one pending item per document-operation combination. The trigger's cancel-and-reinsert pattern works precisely because this constraint allows only one pending row: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE ... SET status = 'cancelled'</code> removes the uniqueness conflict before the new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> runs.</p>
+
+<p class="text-gray-300 leading-relaxed">On the SQL Server side, the equivalent pattern uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (UPDLOCK, READPAST)</code> hints rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FOR UPDATE SKIP LOCKED</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: safe queue claim with READPAST
+-- Requires a queue table equivalent to indexing_queue
+
+CREATE OR ALTER PROCEDURE dbo.usp_ClaimQueueItem
+    @WorkerId NVARCHAR(100)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @ClaimedId BIGINT;
+
+    BEGIN TRANSACTION;
+
+    SELECT TOP 1 @ClaimedId = id
+    FROM dbo.indexing_queue WITH (UPDLOCK, READPAST)
+    WHERE status = N'pending'
+      AND scheduled_at &lt;= GETUTCDATE()
+    ORDER BY priority ASC, scheduled_at ASC;
+
+    IF @ClaimedId IS NOT NULL
+    BEGIN
+        UPDATE dbo.indexing_queue
+        SET status     = N'processing',
+            started_at = GETUTCDATE(),
+            attempts   = attempts + 1,
+            payload    = JSON_MODIFY(payload, '$.worker_id', @WorkerId)
+        WHERE id = @ClaimedId;
+
+        SELECT id         AS queue_id,
+               document_id,
+               operation,
+               payload
+        FROM dbo.indexing_queue
+        WHERE id = @ClaimedId;
+    END
+
+    COMMIT TRANSACTION;
+END;
+GO
+
+-- SQL Server: recover stalled items
+CREATE OR ALTER PROCEDURE dbo.usp_RecoverStalledItems
+    @StallThresholdMinutes INT = 15
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE dbo.indexing_queue
+    SET status     = N'pending',
+        started_at = NULL,
+        last_error = CONCAT(
+            N'Recovered from stall after ', @StallThresholdMinutes,
+            N' minutes (attempt ', CAST(attempts AS NVARCHAR(10)), N')'
+        )
+    WHERE status = N'processing'
+      AND started_at &lt; DATEADD(MINUTE, -@StallThresholdMinutes, GETUTCDATE())
+      AND attempts &lt; 3;
+
+    UPDATE dbo.indexing_queue
+    SET status     = N'failed',
+        last_error = CONCAT(N'Exceeded maximum attempts (', CAST(attempts AS NVARCHAR(10)), N')')
+    WHERE status = N'processing'
+      AND started_at &lt; DATEADD(MINUTE, -@StallThresholdMinutes, GETUTCDATE())
+      AND attempts &gt;= 3;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Both approaches achieve the same goal: exactly-once processing under concurrent workers, with automatic recovery from crashes. The PostgreSQL version is more composable — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SKIP LOCKED</code> works inside any query, not just stored procedures — but the pattern of lock-then-update is identical.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.5 Hash-Based Diffing: Avoiding Redundant API Calls</h3>
+
+<p class="text-gray-300 leading-relaxed">The content hash comparison in the trigger handles the document level, but embedding costs are determined at the chunk level. A document with a hundred chunks where only one paragraph changed should generate exactly one embedding API call, not a hundred.</p>
+
+<p class="text-gray-300 leading-relaxed">The worker already implements this with the per-chunk hash comparison in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_handle_index</code>. This section formalizes the diffing strategy and adds an important optimization: chunk-level deduplication across documents.</p>
+
+<p class="text-gray-300 leading-relaxed">If your knowledge base contains duplicate or near-duplicate content across documents — a legal disclaimer repeated in fifty contracts, a standard introduction in every support article — you should not embed the same text multiple times. A chunk hash cache lets you look up an embedding by hash and reuse it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Embedding cache: store embeddings by content hash
+-- This table is append-only; hashes are immutable
+CREATE TABLE embedding_cache (
+    chunk_hash      TEXT PRIMARY KEY,
+    embedding       VECTOR(1536) NOT NULL,
+    embedding_model TEXT NOT NULL,
+    token_count     INTEGER,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    hit_count       INTEGER NOT NULL DEFAULT 0
+);
+
+-- Index for the cache itself (lookup by hash is the PK, but we also want
+-- analytics on hit_count and cleanup of stale model versions)
+CREATE INDEX idx_cache_model ON embedding_cache (embedding_model);
+
+-- Function to look up or register a cache hit
+CREATE OR REPLACE FUNCTION fn_cache_lookup(p_chunk_hash TEXT)
+RETURNS TABLE (embedding VECTOR(1536), model TEXT) AS $$
+BEGIN
+    UPDATE embedding_cache
+    SET hit_count = hit_count + 1
+    WHERE chunk_hash = p_chunk_hash;
+
+    RETURN QUERY
+    SELECT ec.embedding, ec.embedding_model
+    FROM embedding_cache ec
+    WHERE ec.chunk_hash = p_chunk_hash;
+END;
+$$ LANGUAGE plpgsql;
+
+-- View: cache efficiency report
+CREATE VIEW v_embedding_cache_stats AS
+SELECT
+    embedding_model,
+    COUNT(*)                            AS cached_embeddings,
+    SUM(hit_count)                      AS total_cache_hits,
+    SUM(hit_count) * 1.0 / NULLIF(COUNT(*) + SUM(hit_count), 0)
+                                        AS hit_rate,
+    pg_size_pretty(
+        SUM(octet_length(embedding::text))::BIGINT
+    )                                   AS approx_storage
+FROM embedding_cache
+GROUP BY embedding_model;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Now update the Python worker to consult this cache before calling the API:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># worker/embedding_cache.py
+
+def embed_texts_with_cache(
+    texts: list[str],
+    hashes: list[str],
+    cur,  # psycopg2 cursor
+) -&gt; list[list[float]]:
+    """
+    Embed a list of texts, using the database cache to skip
+    texts whose hash is already known.
+    """
+    result_map: dict[int, list[float]] = {}
+    uncached_indices: list[int] = []
+    uncached_texts: list[str] = []
+
+    # Batch lookup in cache
+    cur.execute(
+        """
+        SELECT chunk_hash, embedding
+        FROM embedding_cache
+        WHERE chunk_hash = ANY(%s)
+          AND embedding_model = %s
+        """,
+        (hashes, EMBEDDING_MODEL),
+    )
+    cache_hits = {row["chunk_hash"]: row["embedding"] for row in cur.fetchall()}
+
+    # Update hit counts in bulk
+    if cache_hits:
+        cur.execute(
+            """
+            UPDATE embedding_cache
+            SET hit_count = hit_count + 1
+            WHERE chunk_hash = ANY(%s)
+            """,
+            (list(cache_hits.keys()),),
+        )
+
+    for idx, (text, hash_val) in enumerate(zip(texts, hashes)):
+        if hash_val in cache_hits:
+            result_map[idx] = cache_hits[hash_val]
+        else:
+            uncached_indices.append(idx)
+            uncached_texts.append(text)
+
+    logger.info(
+        f"Cache: {len(cache_hits)} hits, {len(uncached_texts)} misses "
+        f"out of {len(texts)} chunks"
+    )
+
+    # Call API only for cache misses
+    if uncached_texts:
+        new_embeddings = embed_texts(uncached_texts)
+
+        # Store new embeddings in cache
+        cache_rows = []
+        for i, (text, embedding) in enumerate(zip(uncached_texts, new_embeddings)):
+            original_idx = uncached_indices[i]
+            result_map[original_idx] = embedding
+            cache_rows.append((
+                hashes[uncached_indices[i]],
+                f"[{','.join(str(v) for v in embedding)}]",
+                EMBEDDING_MODEL,
+                len(tokenizer.encode(text)),
+            ))
+
+        # Bulk insert into cache (ignore conflicts — another worker may have
+        # inserted the same hash concurrently)
+        psycopg2.extras.execute_values(
+            cur,
+            """
+            INSERT INTO embedding_cache (chunk_hash, embedding, embedding_model, token_count)
+            VALUES %s
+            ON CONFLICT (chunk_hash) DO NOTHING
+            """,
+            cache_rows,
+            template="(%s, %s::vector, %s, %s)",
+        )
+
+    # Return in original order
+    return [result_map[i] for i in range(len(texts))]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO NOTHING</code> on cache insertion handles the race condition where two workers simultaneously embed the same chunk. One wins, the other silently discards its result. The embedding stored is identical regardless of which worker wins, so consistency is preserved.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Monitoring Freshness and Index Lag</h3>
+
+<p class="text-gray-300 leading-relaxed">An incremental indexing system that silently falls behind is worse than one that fails loudly. You need metrics that answer: how many documents are waiting to be indexed, how old is the oldest unprocessed item, and which documents have never been indexed at all.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Comprehensive freshness dashboard
+CREATE VIEW v_indexing_freshness AS
+WITH queue_summary AS (
+    SELECT
+        status,
+        COUNT(*) AS count,
+        MIN(scheduled_at) AS oldest_scheduled,
+        MAX(attempts) AS max_attempts
+    FROM indexing_queue
+    WHERE status IN ('pending', 'processing', 'failed')
+    GROUP BY status
+),
+document_summary AS (
+    SELECT
+        status,
+        COUNT(*) AS count,
+        MAX(updated_at) AS most_recent_update,
+        MIN(indexed_at) AS oldest_indexed,
+        COUNT(*) FILTER (WHERE indexed_at IS NULL) AS never_indexed,
+        COUNT(*) FILTER (
+            WHERE indexed_at IS NOT NULL
+              AND updated_at &gt; indexed_at
+        ) AS stale_indexed
+    FROM documents
+    GROUP BY status
+)
+SELECT
+    'queue'         AS category,
+    qs.status       AS sub_category,
+    qs.count,
+    qs.oldest_scheduled AS reference_time,
+    EXTRACT(EPOCH FROM (NOW() - qs.oldest_scheduled)) / 60
+                    AS lag_minutes,
+    qs.max_attempts AS extra_info_int,
+    NULL::TEXT      AS extra_info_text
+FROM queue_summary qs
+UNION ALL
+SELECT
+    'documents'     AS category,
+    ds.status       AS sub_category,
+    ds.count,
+    ds.most_recent_update AS reference_time,
+    NULL            AS lag_minutes,
+    ds.never_indexed AS extra_info_int,
+    ds.stale_indexed::TEXT AS extra_info_text
+FROM document_summary ds
+ORDER BY category, sub_category;
+
+-- Alert query: documents that should have been indexed but weren't
+CREATE OR REPLACE FUNCTION fn_check_indexing_health()
+RETURNS TABLE (
+    check_name      TEXT,
+    severity        TEXT,
+    count           BIGINT,
+    details         TEXT
+) AS $$
+BEGIN
+    -- Check 1: Pending items older than 10 minutes
+    RETURN QUERY
+    SELECT
+        'stale_pending_queue_items'::TEXT,
+        CASE WHEN COUNT(*) &gt; 100 THEN 'critical'
+             WHEN COUNT(*) &gt; 20  THEN 'warning'
+             ELSE 'ok' END::TEXT,
+        COUNT(*),
+        FORMAT('%s items waiting more than 10 minutes', COUNT(*))
+    FROM indexing_queue
+    WHERE status = 'pending'
+      AND scheduled_at &lt; NOW() - INTERVAL '10 minutes';
+
+    -- Check 2: Failed items that haven't been retried
+    RETURN QUERY
+    SELECT
+        'failed_queue_items'::TEXT,
+        CASE WHEN COUNT(*) &gt; 0 THEN 'warning' ELSE 'ok' END::TEXT,
+        COUNT(*),
+        FORMAT('%s items permanently failed', COUNT(*))
+    FROM indexing_queue
+    WHERE status = 'failed';
+
+    -- Check 3: Documents with stale embeddings
+    RETURN QUERY
+    SELECT
+        'stale_documents'::TEXT,
+        CASE WHEN COUNT(*) &gt; 50 THEN 'warning' ELSE 'ok' END::TEXT,
+        COUNT(*),
+        FORMAT('%s documents updated after last index run', COUNT(*))
+    FROM documents
+    WHERE updated_at &gt; indexed_at
+      AND status NOT IN ('deleted', 'pending');
+
+    -- Check 4: Documents with no embedding at all
+    RETURN QUERY
+    SELECT
+        'unindexed_documents'::TEXT,
+        CASE WHEN COUNT(*) &gt; 0 THEN 'warning' ELSE 'ok' END::TEXT,
+        COUNT(*),
+        FORMAT('%s documents have never been indexed', COUNT(*))
+    FROM documents
+    WHERE indexed_at IS NULL
+      AND status NOT IN ('deleted', 'pending', 'indexing');
+
+    -- Check 5: Chunks with NULL embeddings
+    RETURN QUERY
+    SELECT
+        'chunks_missing_embeddings'::TEXT,
+        CASE WHEN COUNT(*) &gt; 0 THEN 'critical' ELSE 'ok' END::TEXT,
+        COUNT(*),
+        FORMAT('%s chunks exist with no embedding vector', COUNT(*))
+    FROM document_chunks
+    WHERE embedding IS NULL;
+END;
+$$ LANGUAGE plpgsql;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT * FROM fn_check_indexing_health()</code> from your monitoring system (Datadog, Grafana, or a simple cron job) and alert on any row where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">severity != 'ok'</code>. The five checks together cover queue backlog, permanent failures, stale content, never-indexed content, and the most dangerous state of all: chunks that exist in your vector store without embeddings, which will silently return wrong similarity scores.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: freshness monitoring
+-- Assumes equivalent tables: documents, indexing_queue, document_chunks
+
+CREATE OR ALTER PROCEDURE dbo.usp_CheckIndexingHealth
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Stale pending items
+    SELECT
+        N'stale_pending_queue_items' AS check_name,
+        CASE
+            WHEN COUNT(*) &gt; 100 THEN N'critical'
+            WHEN COUNT(*) &gt; 20  THEN N'warning'
+            ELSE N'ok'
+        END AS severity,
+        COUNT(*) AS item_count,
+        CONCAT(CAST(COUNT(*) AS NVARCHAR(20)), N' items waiting more than 10 minutes') AS details
+    FROM dbo.indexing_queue
+    WHERE status = N'pending'
+      AND scheduled_at &lt; DATEADD(MINUTE, -10, GETUTCDATE())
+
+    UNION ALL
+
+    -- Failed items
+    SELECT
+        N'failed_queue_items',
+        CASE WHEN COUNT(*) &gt; 0 THEN N'warning' ELSE N'ok' END,
+        COUNT(*),
+        CONCAT(CAST(COUNT(*) AS NVARCHAR(20)), N' items permanently failed')
+    FROM dbo.indexing_queue
+    WHERE status = N'failed'
+
+    UNION ALL
+
+    -- Stale documents
+    SELECT
+        N'stale_documents',
+        CASE WHEN COUNT(*) &gt; 50 THEN N'warning' ELSE N'ok' END,
+        COUNT(*),
+        CONCAT(CAST(COUNT(*) AS NVARCHAR(20)), N' documents updated after last index run')
+    FROM dbo.documents
+    WHERE updated_at &gt; indexed_at
+      AND status NOT IN (N'deleted', N'pending')
+
+    UNION ALL
+
+    -- Chunks missing embeddings (stored as NULL in a VARBINARY or JSON column)
+    SELECT
+        N'chunks_missing_embeddings',
+        CASE WHEN COUNT(*) &gt; 0 THEN N'critical' ELSE N'ok' END,
+        COUNT(*),
+        CONCAT(CAST(COUNT(*) AS NVARCHAR(20)), N' chunks exist with no embedding vector')
+    FROM dbo.document_chunks
+    WHERE embedding IS NULL;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.7 Handling Document Deletion and Versioning</h3>
+
+<p class="text-gray-300 leading-relaxed">Deletion is trickier than it appears. When a document is deleted from the source system, you need to remove its chunks from the vector store — but you may also want to preserve a history of what was indexed for audit purposes. The soft-delete pattern handles both requirements.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extend the documents table with soft-delete support
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+-- Function to soft-delete a document and queue chunk cleanup
+CREATE OR REPLACE FUNCTION fn_soft_delete_document(p_document_id UUID)
+RETURNS VOID AS $$
+BEGIN
+    UPDATE documents
+    SET status     = 'deleted',
+        deleted_at = NOW(),
+        updated_at = NOW()
+    WHERE id = p_document_id
+      AND status != 'deleted';
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Document % not found or already deleted', p_document_id;
+    END IF;
+
+    -- The UPDATE trigger will fire fn_document_change_trigger,
+    -- but because content_hash didn't change, it won't queue a reindex.
+    -- We need to explicitly queue the delete operation:
+    INSERT INTO indexing_queue (document_id, operation, priority, payload)
+    VALUES (
+        p_document_id,
+        'delete',
+        1,
+        jsonb_build_object('reason', 'soft_delete', 'deleted_at', NOW())
+    )
+    ON CONFLICT DO NOTHING;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Document version history: optional but valuable for audit trails
+CREATE TABLE document_versions (
+    id              BIGSERIAL PRIMARY KEY,
+    document_id     UUID NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    index_version   INTEGER NOT NULL,
+    content_hash    TEXT NOT NULL,
+    chunk_count     INTEGER,
+    indexed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    metadata        JSONB NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX idx_doc_versions_document ON document_versions (document_id, index_version DESC);
+
+-- Trigger to record version history on each successful index
+CREATE OR REPLACE FUNCTION fn_record_document_version()
+RETURNS TRIGGER AS $$
+BEGIN
+    -- Fire when status changes to 'indexed'
+    IF NEW.status = 'indexed' AND (OLD.status != 'indexed' OR OLD.index_version != NEW.index_version) THEN
+        INSERT INTO document_versions (document_id, index_version, content_hash, indexed_at, metadata)
+        SELECT
+            NEW.id,
+            NEW.index_version,
+            NEW.content_hash,
+            NOW(),
+            jsonb_build_object(
+                'chunk_count', (
+                    SELECT COUNT(*) FROM document_chunks WHERE document_id = NEW.id
+                ),
+                'source_uri', NEW.source_uri
+            );
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_document_version
+    AFTER UPDATE ON documents
+    FOR EACH ROW EXECUTE FUNCTION fn_record_document_version();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The version history table makes it possible to answer questions like "what did the knowledge base know about topic X before last Tuesday's update?" — a capability that becomes important when users report incorrect answers that trace back to recently changed documents.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.8 Backpressure and Rate Limiting</h3>
+
+<p class="text-gray-300 leading-relaxed">Embedding API providers enforce rate limits measured in tokens per minute. A large batch of document updates — a site migration, an import from a legacy system — can exhaust your quota and cause the worker to fail with 429 errors. Backpressure in the queue prevents this.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># worker/rate_limiter.py
+
+import time
+import threading
+from collections import deque
+
+
+class TokenBucketRateLimiter:
+    """
+    Token bucket rate limiter for embedding API calls.
+    Tracks tokens-per-minute to stay within provider limits.
+    """
+    def __init__(self, tokens_per_minute: int):
+        self.tokens_per_minute = tokens_per_minute
+        self.tokens_per_second = tokens_per_minute / 60.0
+        self._lock = threading.Lock()
+        self._usage_window: deque[tuple[float, int]] = deque()
+
+    def wait_for_capacity(self, token_count: int) -&gt; None:
+        """Block until there is capacity to process token_count tokens."""
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                window_start = now - 60.0
+
+                # Remove usage records outside the 1-minute window
+                while self._usage_window and self._usage_window[0][0] &lt; window_start:
+                    self._usage_window.popleft()
+
+                tokens_used = sum(t for _, t in self._usage_window)
+                available = self.tokens_per_minute - tokens_used
+
+                if available &gt;= token_count:
+                    self._usage_window.append((now, token_count))
+                    return
+
+                # Calculate how long to wait for enough tokens to free up
+                if self._usage_window:
+                    oldest_ts, oldest_tokens = self._usage_window[0]
+                    wait_seconds = (oldest_ts + 60.0) - now
+                else:
+                    wait_seconds = 0.1
+
+            time.sleep(max(0.1, wait_seconds))
+
+
+# Global limiter: text-embedding-3-small allows up to 1,000,000 TPM
+# on paid tiers; use a conservative limit here
+_rate_limiter = TokenBucketRateLimiter(tokens_per_minute=500_000)
+
+
+def embed_texts_rate_limited(texts: list[str], token_counts: list[int]) -&gt; list[list[float]]:
+    """Embed texts, respecting rate limits."""
+    total_tokens = sum(token_counts)
+    _rate_limiter.wait_for_capacity(total_tokens)
+    return embed_texts(texts)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In addition to per-worker rate limiting, the queue itself should implement a global throttle. If the queue depth exceeds a configurable threshold, new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> dispatches should pause rather than flood the worker pool:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># In run_notify_listener():
+# Before dispatching a task, check queue depth
+
+def _should_throttle() -&gt; bool:
+    """Return True if the queue is deep enough to warrant slowing dispatch."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS cnt FROM indexing_queue WHERE status = 'processing'"
+            )
+            processing = cur.fetchone()["cnt"]
+            return processing &gt; 50  # Tune based on your worker count
+    finally:
+        conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.9 Putting It Together: A Complete Update Scenario</h3>
+
+<p class="text-gray-300 leading-relaxed">Walk through what happens when a technical writer edits a support article and saves it through a CMS:</p>
+
+<p class="text-gray-300 leading-relaxed">1. The CMS calls a REST endpoint that executes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE documents SET raw_content = $1, content_hash = $2 WHERE source_uri = $3</code>.</p>
+<p class="text-gray-300 leading-relaxed">2. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trg_document_update</code> trigger fires. It compares <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OLD.content_hash != NEW.content_hash</code>, cancels any existing pending queue item, inserts a new <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">reindex</code> queue item, sets <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'pending'</code>, and calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify('indexing_events', ...)</code>.</p>
+<p class="text-gray-300 leading-relaxed">3. The notify listener receives the notification within milliseconds and dispatches <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">process_indexing_job.apply_async(args=[queue_id])</code>.</p>
+<p class="text-gray-300 leading-relaxed">4. A Celery worker claims the job using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE indexing_queue SET status = 'processing' WHERE id = %s AND status IN ('pending', 'failed')</code>. If another worker tries the same claim, it gets zero rows back and stops.</p>
+<p class="text-gray-300 leading-relaxed">5. The worker loads the document, generates new chunks, and computes hashes. It compares chunk hashes against the existing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> rows.</p>
+<p class="text-gray-300 leading-relaxed">6. For chunks that changed, it consults <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_cache</code>. Cache hits reuse stored embeddings. Cache misses call the OpenAI API, subject to rate limiting.</p>
+<p class="text-gray-300 leading-relaxed">7. New embeddings are inserted into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_cache</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO NOTHING</code>.</p>
+<p class="text-gray-300 leading-relaxed">8. All chunks are upserted into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COALESCE</code> to preserve embeddings for unchanged chunks.</p>
+<p class="text-gray-300 leading-relaxed">9. Chunks beyond the new document length are deleted.</p>
+<p class="text-gray-300 leading-relaxed">10. The document's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status</code> is set to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'indexed'</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">indexed_at</code> is updated, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index_version</code> increments.</p>
+<p class="text-gray-300 leading-relaxed">11. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trg_document_version</code> trigger fires and records a row in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_versions</code>.</p>
+<p class="text-gray-300 leading-relaxed">12. The queue item is marked <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">completed</code>.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[CMS UPDATE documents] --> B[trg_document_update trigger]
+    B --> C[Cancel pending queue items]
+    C --> D[Insert reindex queue item]
+    D --> E[pg_notify indexing_events]
+    E --> F[Notify listener dispatches Celery task]
+    F --> G[Worker claims job FOR UPDATE SKIP LOCKED]
+    G --> H[Diff chunk hashes vs existing]
+    H --> I{Chunk changed?}
+    I -->|yes, cache miss| J[Call embeddings API]
+    I -->|yes, cache hit| K[Reuse embedding_cache]
+    I -->|no| L[Keep existing embedding]
+    J --> M[Upsert document_chunks]
+    K --> M
+    L --> M
+    M --> N[Mark document indexed + record version]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The full incremental-update path: a single content edit triggers hash comparison, queuing, and re-embedding of only the chunks that actually changed.*</p>
+
+<p class="text-gray-300 leading-relaxed">The support article is now searchable in your RAG system within seconds of the writer hitting save, at a cost proportional only to the content that actually changed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hash-based change detection at two levels** — document hashes prevent unnecessary queue entries; chunk hashes within the worker prevent unnecessary API calls. Together they make the system cost-proportional to the actual delta.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`SELECT ... FOR UPDATE SKIP LOCKED` is the correct primitive for job queues in PostgreSQL.** Combined with a partial unique index on pending items, it guarantees exactly-once processing under concurrent workers without external coordination.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`pg_notify` converts a polling queue into an event-driven system.** Workers wake up within milliseconds of a change, but the fallback `_poll_missed_items` ensures no work is lost if a worker restarts between a notification and its handler.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **An embedding cache keyed on chunk hash eliminates redundant API calls** for duplicate and near-duplicate content across your corpus. The `ON CONFLICT DO NOTHING` pattern handles concurrent insertions safely without requiring distributed locks.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Operational visibility requires monitoring at three layers:** queue depth and lag (are items being processed fast enough?), document freshness (are indexed documents current with their source?), and chunk integrity (do all chunks have valid embeddings?). A health-check function that returns severity-coded rows integrates naturally with any alerting system.</li></div>
     <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
