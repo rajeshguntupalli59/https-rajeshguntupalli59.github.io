@@ -6,6 +6,10 @@
   <title>Chapter 26: Autonomous Data Lifecycle Management — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 26: Autonomous Data Lifecycle Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -132,6 +136,14 @@ GO</code></pre>
 <p class="text-gray-300 leading-relaxed">Partitioning is the mechanical prerequisite for autonomous lifecycle management at scale. Without partition boundaries that map to time ranges, the engine cannot act on lifecycle stages without expensive full-table scans and row-by-row deletions. Both PostgreSQL declarative partitioning and SQL Server partition switching give the autonomous engine atomic, low-lock operations on complete data segments.</p>
 
 <p class="text-gray-300 leading-relaxed">The autonomous partition manager has three jobs running continuously: <strong class="text-white">proactive creation</strong> (ensure future partitions exist before they're needed), <strong class="text-white">lifecycle transition</strong> (move partitions to warm/cold storage based on policy), and <strong class="text-white">expiry processing</strong> (detach and drop partitions that have crossed their retention ceiling).</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Hot<br/>within temp_hot_days] -->|age crosses threshold| B[Warm<br/>compress / columnstore]
+    B -->|age crosses threshold| C[Cold<br/>archive to object storage]
+    C -->|past retain_max_days| D[Expired<br/>anonymize + drop/detach]
+    W[Late write detected] -. re-heats .-> A
+    Gate[IO headroom gate] -. defers heavy ops .-> C</pre></div>
+<p class="text-gray-300 leading-relaxed">*Every partition moves through the same policy-driven stages; a late write re-heats it back to hot, and the IO headroom gate can hold a partition at its current stage rather than risk a heavy operation under load.*</p>
 
 <p class="text-gray-300 leading-relaxed">In PostgreSQL, partition maintenance uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_partman</code> as the underlying engine, with the autonomous layer sitting above it as a policy executor:</p>
 
@@ -488,6 +500,1046 @@ if __name__ == "__main__":
 <p class="text-gray-300 leading-relaxed">The compliance enforcement layer maintains a PII column registry, applies deterministic or one-way transformations at lifecycle boundaries, and records signed attestations of the operations performed:</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PII column registry with transformation strategy
+CREATE TABLE lifecycle.pii_columns (
+    id              SERIAL PRIMARY KEY,
+    schema_name     TEXT NOT NULL,
+    table_name      TEXT NOT NULL,
+    column_name     TEXT NOT NULL,
+    pii_type        TEXT NOT NULL CHECK (pii_type IN (
+                        'email','phone','ssn','name','address',
+                        'ip_address','payment_card','health_record'
+                    )),
+    transform       TEXT NOT NULL CHECK (transform IN (
+                        'hash_sha256',    -- one-way, non-reversible
+                        'pseudonymize',   -- reversible with key, stored separately
+                        'null_out',       -- replace with NULL
+                        'generalize',     -- e.g., truncate DOB to year
+                        'tokenize'        -- replace with opaque token
+                    )),
+    salt_column     TEXT,   -- for pseudonymization: which column holds the per-row salt
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    UNIQUE (schema_name, table_name, column_name)
+);
+
+-- Compliance attestation log: cryptographic proof of anonymization
+CREATE TABLE lifecycle.compliance_attestation (
+    attestation_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id       INTEGER REFERENCES lifecycle.policy(policy_id),
+    partition_name  TEXT NOT NULL,
+    table_name      TEXT NOT NULL,
+    operation       TEXT NOT NULL,   -- 'anonymize_before_archive', 'delete', 'pseudonymize'
+    row_count       BIGINT,
+    columns_touched TEXT[],
+    checksum        TEXT,            -- SHA-256 of (partition_name || row_count || columns_touched || timestamp)
+    performed_by    TEXT NOT NULL DEFAULT current_user,
+    performed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    regulation      TEXT             -- 'GDPR', 'CCPA', 'HIPAA'
+);
+
+-- Function: anonymize a partition's PII columns in-place before archival or deletion
+CREATE OR REPLACE FUNCTION lifecycle.anonymize_partition(
+    p_schema    TEXT,
+    p_table     TEXT,
+    p_partition TEXT,
+    p_policy_id INTEGER,
+    p_regulation TEXT DEFAULT 'GDPR'
+) RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_col       RECORD;
+    v_set_parts TEXT[] := '{}';
+    v_sql       TEXT;
+    v_row_count BIGINT;
+    v_cols      TEXT[] := '{}';
+    v_checksum  TEXT;
+    v_attest_id UUID;
+BEGIN
+    -- Build UPDATE SET clause from PII registry
+    FOR v_col IN
+        SELECT column_name, pii_type, transform, salt_column
+        FROM lifecycle.pii_columns
+        WHERE schema_name = p_schema
+          AND table_name  = p_table
+          AND enabled     = TRUE
+    LOOP
+        v_cols := v_cols || v_col.column_name;
+        CASE v_col.transform
+            WHEN 'hash_sha256' THEN
+                v_set_parts := v_set_parts ||
+                    format('%I = encode(sha256(%I::text::bytea), ''hex'')',
+                           v_col.column_name, v_col.column_name);
+            WHEN 'null_out' THEN
+                v_set_parts := v_set_parts ||
+                    format('%I = NULL', v_col.column_name);
+            WHEN 'generalize' THEN
+                -- For dates: truncate to year; caller must verify column type
+                v_set_parts := v_set_parts ||
+                    format('%I = date_trunc(''year'', %I)',
+                           v_col.column_name, v_col.column_name);
+            WHEN 'pseudonymize' THEN
+                -- Reversible: encrypt with per-row salt stored in salt_column
+                v_set_parts := v_set_parts ||
+                    format('%I = encode(sha256((%I::text || %I::text)::bytea), ''hex'')',
+                           v_col.column_name, v_col.column_name,
+                           COALESCE(v_col.salt_column, 'ctid'));
+            WHEN 'tokenize' THEN
+                v_set_parts := v_set_parts ||
+                    format('%I = ''tok_'' || encode(sha256(%I::text::bytea), ''hex'')',
+                           v_col.column_name, v_col.column_name);
+            ELSE
+                RAISE EXCEPTION 'Unknown transform: %', v_col.transform;
+        END CASE;
+    END LOOP;
+
+    IF array_length(v_set_parts, 1) IS NULL THEN
+        RAISE NOTICE 'No PII columns registered for %.%, skipping anonymization', p_schema, p_table;
+        RETURN NULL;
+    END IF;
+
+    v_sql := format('UPDATE %s SET %s',
+                    p_partition,
+                    array_to_string(v_set_parts, ', '));
+    EXECUTE v_sql;
+    GET DIAGNOSTICS v_row_count = ROW_COUNT;
+
+    -- Generate attestation checksum
+    v_checksum := encode(
+        sha256((p_partition || v_row_count::text ||
+                array_to_string(v_cols, ',') ||
+                NOW()::text)::bytea),
+        'hex'
+    );
+
+    INSERT INTO lifecycle.compliance_attestation (
+        policy_id, partition_name, table_name, operation,
+        row_count, columns_touched, checksum, regulation
+    ) VALUES (
+        p_policy_id, p_partition, p_table, 'anonymize_before_archive',
+        v_row_count, v_cols, v_checksum, p_regulation
+    )
+    RETURNING attestation_id INTO v_attest_id;
+
+    RAISE NOTICE 'Anonymized % rows in %, attestation: %',
+        v_row_count, p_partition, v_attest_id;
+    RETURN v_attest_id;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PII column registry
+CREATE TABLE lifecycle.PiiColumns (
+    Id              INT IDENTITY(1,1) PRIMARY KEY,
+    SchemaName      NVARCHAR(128) NOT NULL,
+    TableName       NVARCHAR(128) NOT NULL,
+    ColumnName      NVARCHAR(128) NOT NULL,
+    PiiType         NVARCHAR(50)  NOT NULL
+                        CHECK (PiiType IN (
+                            'email','phone','ssn','name','address',
+                            'ip_address','payment_card','health_record'
+                        )),
+    Transform       NVARCHAR(50)  NOT NULL
+                        CHECK (Transform IN (
+                            'hash_sha256','null_out','generalize',
+                            'pseudonymize','tokenize'
+                        )),
+    SaltColumn      NVARCHAR(128),
+    Enabled         BIT NOT NULL DEFAULT 1,
+    CONSTRAINT UQ_PiiColumns UNIQUE (SchemaName, TableName, ColumnName)
+);
+GO
+
+-- Compliance attestation log
+CREATE TABLE lifecycle.ComplianceAttestation (
+    AttestationId   UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    PolicyId        INT,
+    PartitionName   NVARCHAR(256) NOT NULL,
+    TableName       NVARCHAR(128) NOT NULL,
+    Operation       NVARCHAR(100) NOT NULL,
+    RowCount        BIGINT,
+    ColumnsTouched  NVARCHAR(MAX),   -- JSON array
+    Checksum        NVARCHAR(64),
+    PerformedBy     NVARCHAR(128) NOT NULL DEFAULT SUSER_SNAME(),
+    PerformedAt     DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    Regulation      NVARCHAR(50)
+);
+GO
+
+-- Stored procedure: anonymize a partition before archival
+CREATE OR ALTER PROCEDURE lifecycle.AnonymizePartition
+    @SchemaName     NVARCHAR(128),
+    @TableName      NVARCHAR(128),
+    @PartitionNum   INT,
+    @PolicyId       INT,
+    @Regulation     NVARCHAR(50) = 'GDPR'
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Sql            NVARCHAR(MAX) = N'';
+    DECLARE @SetParts       NVARCHAR(MAX) = N'';
+    DECLARE @ColName        NVARCHAR(128);
+    DECLARE @Transform      NVARCHAR(50);
+    DECLARE @SaltCol        NVARCHAR(128);
+    DECLARE @RowCount       BIGINT;
+    DECLARE @AttestId       UNIQUEIDENTIFIER = NEWID();
+    DECLARE @ColumnList     NVARCHAR(MAX) = N'[]';
+    DECLARE @Checksum       NVARCHAR(64);
+    DECLARE @FullTable      NVARCHAR(256) = QUOTENAME(@SchemaName) + '.' + QUOTENAME(@TableName);
+
+    -- Build SET clause dynamically from PII registry
+    DECLARE col_cursor CURSOR LOCAL FAST_FORWARD FOR
+        SELECT ColumnName, Transform, SaltColumn
+        FROM lifecycle.PiiColumns
+        WHERE SchemaName = @SchemaName
+          AND TableName  = @TableName
+          AND Enabled    = 1;
+
+    OPEN col_cursor;
+    FETCH NEXT FROM col_cursor INTO @ColName, @Transform, @SaltCol;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF @SetParts &lt;&gt; N'' SET @SetParts += N', ';
+
+        IF @Transform = 'hash_sha256'
+            SET @SetParts += QUOTENAME(@ColName) +
+                N' = CONVERT(NVARCHAR(64), HASHBYTES(''SHA2_256'', ' +
+                QUOTENAME(@ColName) + N'), 2)';
+        ELSE IF @Transform = 'null_out'
+            SET @SetParts += QUOTENAME(@ColName) + N' = NULL';
+        ELSE IF @Transform = 'generalize'
+            SET @SetParts += QUOTENAME(@ColName) +
+                N' = DATEFROMPARTS(YEAR(' + QUOTENAME(@ColName) + N'), 1, 1)';
+        ELSE IF @Transform = 'pseudonymize'
+            SET @SetParts += QUOTENAME(@ColName) +
+                N' = CONVERT(NVARCHAR(64), HASHBYTES(''SHA2_256'', ' +
+                QUOTENAME(@ColName) + N' + COALESCE(' +
+                ISNULL(QUOTENAME(@SaltCol), N'CAST(%%physloc%% AS NVARCHAR)') +
+                N', '''')), 2)';
+        ELSE IF @Transform = 'tokenize'
+            SET @SetParts += QUOTENAME(@ColName) +
+                N' = N''tok_'' + CONVERT(NVARCHAR(64), HASHBYTES(''SHA2_256'', ' +
+                QUOTENAME(@ColName) + N'), 2)';
+
+        -- Accumulate column list for attestation
+        SET @ColumnList = JSON_MODIFY(@ColumnList, 'append $', @ColName);
+
+        FETCH NEXT FROM col_cursor INTO @ColName, @Transform, @SaltCol;
+    END;
+
+    CLOSE col_cursor;
+    DEALLOCATE col_cursor;
+
+    IF @SetParts = N''
+    BEGIN
+        RAISERROR('No PII columns found for %s.%s — skipping anonymization.',
+                  10, 1, @SchemaName, @TableName);
+        RETURN;
+    END;
+
+    -- Apply to the specific partition via $PARTITION filter
+    SET @Sql = N'UPDATE ' + @FullTable +
+               N' SET ' + @SetParts +
+               N' WHERE $PARTITION.' +
+               -- Assumes partition function name follows naming convention
+               QUOTENAME(@SchemaName + '_' + @TableName + '_pf') +
+               N'(' + QUOTENAME((
+                   SELECT PartitionKey FROM lifecycle.Policy
+                   WHERE SchemaName = @SchemaName AND TableName = @TableName
+               )) + N') = ' + CAST(@PartitionNum AS NVARCHAR(10));
+
+    EXEC sp_executesql @Sql;
+    SET @RowCount = @@ROWCOUNT;
+
+    -- Record attestation
+    SET @Checksum = CONVERT(NVARCHAR(64),
+        HASHBYTES('SHA2_256',
+            @TableName + CAST(@RowCount AS NVARCHAR) +
+            @ColumnList + CAST(SYSDATETIMEOFFSET() AS NVARCHAR(50))
+        ), 2);
+
+    INSERT INTO lifecycle.ComplianceAttestation
+        (AttestationId, PolicyId, PartitionName, TableName, Operation,
+         RowCount, ColumnsTouched, Checksum, Regulation)
+    VALUES
+        (@AttestId, @PolicyId,
+         @SchemaName + '.' + @TableName + ':p' + CAST(@PartitionNum AS NVARCHAR),
+         @TableName, 'anonymize_before_archive',
+         @RowCount, @ColumnList, @Checksum, @Regulation);
+
+    SELECT @AttestId AS AttestationId, @RowCount AS RowsAnonymized;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The attestation record is the audit artifact that satisfies regulatory review. When a data protection authority asks "prove that this user's data was anonymized before archival," the compliance team queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.compliance_attestation</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle.ComplianceAttestation</code> for the affected table, finds the attestation with its checksum, and can demonstrate that the operation was performed by the lifecycle service account at a specific timestamp before archival. The checksum is not a cryptographic proof of data content — it proves that the system recorded the operation atomically within the same transaction as the archival log entry.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Retention Enforcement: Preventing Both Over-Retention and Under-Retention</h3>
+
+<p class="text-gray-300 leading-relaxed">Retention violations come in two directions. Under-retention deletes data before the regulatory floor is met, creating evidence destruction liability. Over-retention keeps PII or financial data beyond what policies permit, creating privacy liability and expanding breach impact radius. An autonomous system must enforce both bounds with equal vigilance.</p>
+
+<p class="text-gray-300 leading-relaxed">The retention enforcement engine runs daily, evaluates every table against its policy, and raises alerts or blocks actions when bounds would be violated:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retention violation detection function
+CREATE OR REPLACE FUNCTION lifecycle.check_retention_violations()
+RETURNS TABLE (
+    schema_name     TEXT,
+    table_name      TEXT,
+    partition_name  TEXT,
+    data_age_days   INTEGER,
+    retain_min_days INTEGER,
+    retain_max_days INTEGER,
+    violation_type  TEXT,
+    severity        TEXT
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH partition_ages AS (
+        SELECT
+            lp.schema_name,
+            lp.table_name,
+            pi.partition_name,
+            EXTRACT(DAY FROM NOW() - pi.range_start)::INTEGER AS data_age_days,
+            lp.retain_min_days,
+            lp.retain_max_days
+        FROM lifecycle.partition_lifecycle_view pi
+        JOIN lifecycle.policy lp
+            ON lp.schema_name = pi.schema_name
+            AND lp.table_name = pi.parent_table
+        WHERE lp.enabled = TRUE
+    )
+    SELECT
+        schema_name,
+        table_name,
+        partition_name,
+        data_age_days,
+        retain_min_days,
+        retain_max_days,
+        CASE
+            WHEN retain_max_days IS NOT NULL
+             AND data_age_days &gt; retain_max_days
+                THEN 'over_retention'
+            WHEN data_age_days &lt; retain_min_days
+             AND EXISTS (
+                 SELECT 1 FROM lifecycle.archival_log al
+                 WHERE al.partition_name = partition_name
+                   AND al.status = 'completed'
+             )
+                THEN 'premature_deletion'
+            ELSE 'compliant'
+        END AS violation_type,
+        CASE
+            WHEN retain_max_days IS NOT NULL
+             AND data_age_days &gt; retain_max_days + 30
+                THEN 'critical'
+            WHEN retain_max_days IS NOT NULL
+             AND data_age_days &gt; retain_max_days
+                THEN 'warning'
+            WHEN data_age_days &lt; retain_min_days
+                THEN 'critical'
+            ELSE 'ok'
+        END AS severity
+    FROM partition_ages
+    WHERE
+        (retain_max_days IS NOT NULL AND data_age_days &gt; retain_max_days)
+        OR (data_age_days &lt; retain_min_days)
+$$;
+
+-- Scheduled enforcement job: called by the lifecycle daemon
+CREATE OR REPLACE FUNCTION lifecycle.enforce_retention()
+RETURNS VOID
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_violation RECORD;
+BEGIN
+    FOR v_violation IN
+        SELECT * FROM lifecycle.check_retention_violations()
+        WHERE violation_type &lt;&gt; 'compliant'
+    LOOP
+        -- Log every violation to the compliance event table
+        INSERT INTO lifecycle.compliance_event (
+            event_type, schema_name, table_name, partition_name,
+            data_age_days, violation_type, severity, detected_at
+        ) VALUES (
+            'retention_violation',
+            v_violation.schema_name,
+            v_violation.table_name,
+            v_violation.partition_name,
+            v_violation.data_age_days,
+            v_violation.violation_type,
+            v_violation.severity,
+            NOW()
+        );
+
+        -- For critical over-retention: raise NOTIFY for the archival engine to act immediately
+        IF v_violation.violation_type = 'over_retention'
+           AND v_violation.severity = 'critical' THEN
+            PERFORM pg_notify(
+                'lifecycle_critical',
+                json_build_object(
+                    'event', 'over_retention',
+                    'partition', v_violation.partition_name,
+                    'age_days', v_violation.data_age_days,
+                    'max_days', v_violation.retain_max_days
+                )::text
+            );
+        END IF;
+
+        -- For premature deletion attempts: raise an exception to block the action
+        IF v_violation.violation_type = 'premature_deletion' THEN
+            RAISE WARNING
+                'RETENTION FLOOR VIOLATION: % is % days old but minimum retention is % days',
+                v_violation.partition_name,
+                v_violation.data_age_days,
+                v_violation.retain_min_days;
+        END IF;
+    END LOOP;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retention violation detection
+CREATE OR ALTER VIEW lifecycle.RetentionViolations AS
+WITH PartitionAges AS (
+    SELECT
+        pol.SchemaName,
+        pol.TableName,
+        pr.partition_number,
+        pr.RangeStart,
+        DATEDIFF(DAY, CAST(pr.RangeStart AS DATETIMEOFFSET), SYSDATETIMEOFFSET()) AS DataAgeDays,
+        pol.RetainMinDays,
+        pol.RetainMaxDays,
+        pol.PolicyId
+    FROM lifecycle.Policy pol
+    CROSS APPLY (
+        SELECT p.partition_number,
+               LAG(rv.value) OVER (
+                   PARTITION BY i.object_id ORDER BY p.partition_number
+               ) AS RangeStart
+        FROM sys.partitions p
+        JOIN sys.indexes i ON i.object_id = p.object_id AND i.index_id = p.index_id
+        JOIN sys.partition_schemes ps ON i.data_space_id = ps.data_space_id
+        JOIN sys.partition_functions pf ON ps.function_id = pf.function_id
+        LEFT JOIN sys.partition_range_values rv
+            ON rv.function_id = pf.function_id AND rv.boundary_id = p.partition_number
+        WHERE OBJECT_SCHEMA_NAME(i.object_id) = pol.SchemaName
+          AND OBJECT_NAME(i.object_id) = pol.TableName
+          AND i.index_id &lt;= 1
+    ) pr
+    WHERE pol.Enabled = 1
+      AND pr.RangeStart IS NOT NULL
+),
+Classified AS (
+    SELECT
+        SchemaName,
+        TableName,
+        partition_number,
+        DataAgeDays,
+        RetainMinDays,
+        RetainMaxDays,
+        CASE
+            WHEN RetainMaxDays IS NOT NULL AND DataAgeDays &gt; RetainMaxDays
+                THEN 'over_retention'
+            WHEN DataAgeDays &lt; RetainMinDays
+                THEN 'under_retention'
+            ELSE 'compliant'
+        END AS ViolationType,
+        CASE
+            WHEN RetainMaxDays IS NOT NULL AND DataAgeDays &gt; RetainMaxDays + 30
+                THEN 'critical'
+            WHEN RetainMaxDays IS NOT NULL AND DataAgeDays &gt; RetainMaxDays
+                THEN 'warning'
+            WHEN DataAgeDays &lt; RetainMinDays
+                THEN 'critical'
+            ELSE 'ok'
+        END AS Severity
+    FROM PartitionAges
+)
+SELECT * FROM Classified WHERE ViolationType &lt;&gt; 'compliant';
+GO
+
+-- Enforcement procedure: called by SQL Agent job daily
+CREATE OR ALTER PROCEDURE lifecycle.EnforceRetention
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO lifecycle.ComplianceEvent
+        (EventType, SchemaName, TableName, PartitionNumber,
+         DataAgeDays, ViolationType, Severity, DetectedAt)
+    SELECT
+        'retention_violation',
+        SchemaName,
+        TableName,
+        partition_number,
+        DataAgeDays,
+        ViolationType,
+        Severity,
+        SYSDATETIMEOFFSET()
+    FROM lifecycle.RetentionViolations;
+
+    -- Surface critical violations as error messages caught by monitoring
+    DECLARE @msg NVARCHAR(500);
+    SELECT @msg = STRING_AGG(
+        SchemaName + '.' + TableName + ' partition ' +
+        CAST(partition_number AS NVARCHAR) +
+        ': ' + ViolationType + ' (' + Severity + ')',
+        '; '
+    )
+    FROM lifecycle.RetentionViolations
+    WHERE Severity = 'critical';
+
+    IF @msg IS NOT NULL
+        RAISERROR('LIFECYCLE CRITICAL VIOLATIONS: %s', 16, 1, @msg);
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> channel in the PostgreSQL implementation is the real-time escalation path: the Python orchestrator listens on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lifecycle_critical</code> and can preempt its normal hourly cycle to immediately process a critical over-retention violation. This event-driven escalation is what distinguishes an autonomous system from a scheduled batch job — the system reacts to its own compliance state in near real time rather than waiting for the next cron window.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Data Temperature Monitoring and Automatic Compression</h3>
+
+<p class="text-gray-300 leading-relaxed">Compression decisions in most databases are made once at table creation and then forgotten. In an autonomous system, compression is adaptive: it monitors actual access patterns, identifies warm data that has crossed into low-access territory, and applies compression autonomously without rebuilding entire tables.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL uses table-level storage parameters and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_toast</code> behavior, but for serious compression autonomy the engine works with partition-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CLUSTER</code> operations and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_column_size</code> analytics. SQL Server's columnstore index promotion is the production mechanism on that platform.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — access pattern monitoring for compression decisions:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track per-partition access frequency using pg_stat_user_tables
+CREATE TABLE lifecycle.access_temperature_log (
+    log_id          BIGSERIAL PRIMARY KEY,
+    schema_name     TEXT NOT NULL,
+    table_name      TEXT NOT NULL,
+    seq_scan        BIGINT,
+    idx_scan        BIGINT,
+    n_tup_hot_upd   BIGINT,
+    snapshot_time   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Periodic snapshot (called every 6 hours by lifecycle daemon)
+CREATE OR REPLACE FUNCTION lifecycle.snapshot_access_temperature()
+RETURNS VOID
+LANGUAGE sql
+AS $$
+    INSERT INTO lifecycle.access_temperature_log
+        (schema_name, table_name, seq_scan, idx_scan, n_tup_hot_upd)
+    SELECT
+        schemaname,
+        relname,
+        COALESCE(seq_scan, 0),
+        COALESCE(idx_scan, 0),
+        COALESCE(n_tup_hot_upd, 0)
+    FROM pg_stat_user_tables
+    WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'lifecycle');
+$$;
+
+-- Compression candidate detection: partitions with no reads in 14 days
+CREATE OR REPLACE VIEW lifecycle.compression_candidates AS
+WITH recent_activity AS (
+    SELECT
+        schema_name,
+        table_name,
+        SUM(seq_scan + idx_scan) AS total_scans,
+        MAX(snapshot_time)       AS last_snapshot
+    FROM lifecycle.access_temperature_log
+    WHERE snapshot_time &gt; NOW() - INTERVAL '14 days'
+    GROUP BY schema_name, table_name
+)
+SELECT
+    pi.partition_name,
+    pi.schema_name,
+    pi.parent_table AS table_name,
+    pg_size_pretty(pi.size_bytes) AS current_size,
+    COALESCE(ra.total_scans, 0)   AS scans_14d,
+    pi.lifecycle_stage
+FROM lifecycle.partition_lifecycle_view pi
+LEFT JOIN recent_activity ra
+    ON ra.schema_name = pi.schema_name
+    AND ra.table_name = pi.parent_table
+JOIN lifecycle.policy lp
+    ON lp.schema_name = pi.schema_name
+    AND lp.table_name = pi.parent_table
+WHERE COALESCE(ra.total_scans, 0) = 0
+  AND pi.lifecycle_stage IN ('warm', 'cold')
+  AND lp.action_warm = 'compress'
+  AND lp.enabled = TRUE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — autonomous columnstore promotion for cold partitions:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Columnstore promotion candidates: partitions with no seeks/scans in 14 days
+CREATE OR ALTER VIEW lifecycle.ColumnstorePromotionCandidates AS
+WITH PartitionActivity AS (
+    SELECT
+        OBJECT_SCHEMA_NAME(i.object_id)  AS SchemaName,
+        OBJECT_NAME(i.object_id)         AS TableName,
+        p.partition_number,
+        SUM(ios.user_seeks + ios.user_scans + ios.user_lookups) AS TotalAccesses,
+        MAX(ios.last_user_scan)          AS LastScan
+    FROM sys.dm_db_index_usage_stats ios
+    JOIN sys.indexes i ON i.object_id = ios.object_id AND i.index_id = ios.index_id
+    JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+    WHERE ios.database_id = DB_ID()
+    GROUP BY i.object_id, p.partition_number
+),
+PolicyJoined AS (
+    SELECT
+        pa.SchemaName,
+        pa.TableName,
+        pa.partition_number,
+        pa.TotalAccesses,
+        pa.LastScan,
+        pol.ActionWarm,
+        pol.Enabled
+    FROM PartitionActivity pa
+    JOIN lifecycle.Policy pol
+        ON pol.SchemaName = pa.SchemaName
+        AND pol.TableName = pa.TableName
+    WHERE pol.Enabled = 1
+      AND pol.ActionWarm = 'compress'
+)
+SELECT
+    SchemaName,
+    TableName,
+    partition_number,
+    TotalAccesses,
+    LastScan,
+    DATEDIFF(DAY, LastScan, GETDATE()) AS DaysSinceLastScan
+FROM PolicyJoined
+WHERE TotalAccesses = 0
+   OR LastScan &lt; DATEADD(DAY, -14, GETDATE());
+GO
+
+-- Procedure: promote a partition's rowstore to columnstore (partition-aligned nonclustered CCI)
+CREATE OR ALTER PROCEDURE lifecycle.PromotePartitionToColumnstore
+    @SchemaName     NVARCHAR(128),
+    @TableName      NVARCHAR(128),
+    @PartitionNum   INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @IndexName  NVARCHAR(256);
+    DECLARE @Sql        NVARCHAR(MAX);
+
+    SET @IndexName = 'NCCI_' + @TableName + '_p' + CAST(@PartitionNum AS NVARCHAR);
+
+    -- Check if already columnstore
+    IF EXISTS (
+        SELECT 1 FROM sys.indexes
+        WHERE name = @IndexName
+          AND object_id = OBJECT_ID(@SchemaName + '.' + @TableName)
+          AND type = 6  -- NONCLUSTERED COLUMNSTORE
+    )
+    BEGIN
+        RAISERROR('Columnstore index %s already exists.', 10, 1, @IndexName);
+        RETURN;
+    END;
+
+    -- Build partition-filtered columnstore index
+    SET @Sql = N'CREATE NONCLUSTERED COLUMNSTORE INDEX ' +
+               QUOTENAME(@IndexName) +
+               N' ON ' + QUOTENAME(@SchemaName) + N'.' + QUOTENAME(@TableName) +
+               N' WHERE $PARTITION.' +
+               QUOTENAME(@SchemaName + '_' + @TableName + '_pf') +
+               N'(' + QUOTENAME((
+                   SELECT PartitionKey FROM lifecycle.Policy
+                   WHERE SchemaName = @SchemaName AND TableName = @TableName
+               )) + N') = ' + CAST(@PartitionNum AS NVARCHAR(10)) +
+               N' WITH (DATA_COMPRESSION = COLUMNSTORE_ARCHIVE)';
+
+    EXEC sp_executesql @Sql;
+
+    INSERT INTO lifecycle.LifecycleActionLog
+        (SchemaName, TableName, PartitionNumber, Action, PerformedAt)
+    VALUES
+        (@SchemaName, @TableName, @PartitionNum, 'columnstore_promotion', SYSDATETIMEOFFSET());
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COLUMNSTORE_ARCHIVE</code> compression mode in SQL Server applies XPRESS compression on top of the columnstore encoding, providing substantially higher compression ratios than standard columnstore for data that is rarely accessed — the ideal disposition for cold lifecycle partitions that must be retained but are almost never queried.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Lifecycle Orchestration Daemon</h3>
+
+<p class="text-gray-300 leading-relaxed">All the components above — policy evaluation, archival, anonymization, retention enforcement, and compression promotion — need a coordinating process that runs continuously, sequences operations safely, and exposes its own health for monitoring. The lifecycle daemon is a long-running Python process with a state machine per table, a work queue, and a watchdog that reports its heartbeat to the database itself:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+import psycopg2.extensions
+import select
+import time
+import logging
+import threading
+import signal
+import sys
+from datetime import datetime, timezone
+from enum import Enum
+from dataclasses import dataclass, field
+from typing import Callable
+
+logger = logging.getLogger("lifecycle.daemon")
+
+class LifecycleAction(Enum):
+    SNAPSHOT_TEMPERATURE    = "snapshot_temperature"
+    EVALUATE_PARTITIONS     = "evaluate_partitions"
+    RUN_ARCHIVAL            = "run_archival"
+    ENFORCE_RETENTION       = "enforce_retention"
+    PROMOTE_COMPRESSION     = "promote_compression"
+    HEARTBEAT               = "heartbeat"
+
+@dataclass
+class ScheduledTask:
+    action: LifecycleAction
+    interval_seconds: int
+    last_run: float = field(default_factory=lambda: 0.0)
+    handler: Callable = field(default=None)
+
+    def is_due(self) -&gt; bool:
+        return time.monotonic() - self.last_run &gt;= self.interval_seconds
+
+    def mark_run(self):
+        self.last_run = time.monotonic()
+
+class LifecycleDaemon:
+    def __init__(self, pg_dsn: str, archival_engine):
+        self.pg_dsn = pg_dsn
+        self.archival_engine = archival_engine
+        self._stop = threading.Event()
+        self._listen_conn = None
+
+        self.tasks = [
+            ScheduledTask(LifecycleAction.HEARTBEAT,            60,    handler=self._heartbeat),
+            ScheduledTask(LifecycleAction.SNAPSHOT_TEMPERATURE, 21600, handler=self._snapshot_temperature),
+            ScheduledTask(LifecycleAction.EVALUATE_PARTITIONS,  3600,  handler=self._evaluate_partitions),
+            ScheduledTask(LifecycleAction.RUN_ARCHIVAL,         3600,  handler=self._run_archival),
+            ScheduledTask(LifecycleAction.ENFORCE_RETENTION,    86400, handler=self._enforce_retention),
+            ScheduledTask(LifecycleAction.PROMOTE_COMPRESSION,  43200, handler=self._promote_compression),
+        ]
+
+    def _connect(self):
+        return psycopg2.connect(self.pg_dsn)
+
+    def _heartbeat(self):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO lifecycle.daemon_heartbeat (daemon_id, heartbeat_at)
+                    VALUES (inet_server_addr()::text || ':lifecycle', NOW())
+                    ON CONFLICT (daemon_id) DO UPDATE
+                        SET heartbeat_at = EXCLUDED.heartbeat_at
+                """)
+            conn.commit()
+        logger.debug("Heartbeat recorded")
+
+    def _snapshot_temperature(self):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT lifecycle.snapshot_access_temperature()")
+            conn.commit()
+        logger.info("Access temperature snapshot complete")
+
+    def _evaluate_partitions(self):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE lifecycle.policy
+                    SET last_evaluated = NOW()
+                    WHERE enabled = TRUE
+                """)
+            conn.commit()
+        logger.info("Partition lifecycle evaluation cycle complete")
+
+    def _run_archival(self):
+        try:
+            self.archival_engine.run_cycle()
+        except Exception as e:
+            logger.error("Archival cycle error: %s", e)
+
+    def _enforce_retention(self):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT lifecycle.enforce_retention()")
+            conn.commit()
+        logger.info("Retention enforcement cycle complete")
+
+    def _promote_compression(self):
+        with self._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT partition_name
+                    FROM lifecycle.compression_candidates
+                    LIMIT 10
+                """)
+                candidates = [row[0] for row in cur.fetchall()]
+        for partition in candidates:
+            try:
+                with self._connect() as conn:
+                    with conn.cursor() as cur:
+                        # CLUSTER rewrites the partition in physical order; use with care
+                        cur.execute(f"VACUUM FULL ANALYZE {partition}")
+                    conn.commit()
+                logger.info("Compression applied to partition %s", partition)
+            except Exception as e:
+                logger.error("Compression failed for %s: %s", partition, e)
+
+    def _setup_listen(self):
+        """Open a persistent connection to receive pg_notify alerts."""
+        self._listen_conn = psycopg2.connect(self.pg_dsn)
+        self._listen_conn.set_isolation_level(
+            psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT
+        )
+        cur = self._listen_conn.cursor()
+        cur.execute("LISTEN lifecycle_critical;")
+        logger.info("Listening on lifecycle_critical channel")
+
+    def _drain_notifications(self):
+        """Non-blocking poll for pg_notify messages; act immediately on critical alerts."""
+        if self._listen_conn is None:
+            return
+        r, _, _ = select.select([self._listen_conn], [], [], 0)
+        if r:
+            self._listen_conn.poll()
+            while self._listen_conn.notifies:
+                notify = self._listen_conn.notifies.pop(0)
+                logger.warning("Critical lifecycle alert received: %s", notify.payload)
+                # Preempt the normal archival schedule
+                self._run_archival()
+
+    def _handle_signal(self, signum, frame):
+        logger.info("Shutdown signal received (%d), stopping daemon", signum)
+        self._stop.set()
+
+    def run(self):
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT,  self._handle_signal)
+
+        self._setup_listen()
+        logger.info("Lifecycle daemon started")
+
+        while not self._stop.is_set():
+            self._drain_notifications()
+
+            for task in self.tasks:
+                if task.is_due():
+                    logger.info("Running task: %s", task.action.value)
+                    try:
+                        task.handler()
+                        task.mark_run()
+                    except Exception as e:
+                        logger.error("Task %s failed: %s", task.action.value, e)
+
+            time.sleep(5)  # main loop granularity: 5-second tick
+
+        if self._listen_conn:
+            self._listen_conn.close()
+        logger.info("Lifecycle daemon stopped cleanly")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The daemon's architecture has three important properties. First, every task is independently scheduled with its own interval so that a slow archival run does not delay the heartbeat or the retention enforcement check. Second, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> listener runs on a separate autocommit connection with a non-blocking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">select()</code> poll on each main loop tick, so the daemon can react to critical alerts within five seconds without spawning threads for the listener. Third, the shutdown path is clean: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SIGTERM</code> sets the stop event and the daemon finishes its current task before exiting, avoiding interrupted mid-partition operations.</p>
+
+<p class="text-gray-300 leading-relaxed">The supporting heartbeat table allows external monitoring systems to detect a dead lifecycle daemon:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+CREATE TABLE lifecycle.daemon_heartbeat (
+    daemon_id       TEXT PRIMARY KEY,
+    heartbeat_at    TIMESTAMPTZ NOT NULL
+);
+
+-- Alert query: daemon dead if heartbeat older than 5 minutes
+SELECT
+    daemon_id,
+    heartbeat_at,
+    EXTRACT(EPOCH FROM NOW() - heartbeat_at) / 60 AS minutes_since_heartbeat
+FROM lifecycle.daemon_heartbeat
+WHERE heartbeat_at &lt; NOW() - INTERVAL '5 minutes';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A Prometheus alert rule consuming this query via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> fires a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LifecycleDaemonDead</code> alert if any daemon has missed more than three heartbeats, paging the on-call engineer before a retention violation window opens.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Lifecycle Audit Reporting and Dashboarding</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous lifecycle system that does not expose its activity in human-readable form is a black box that auditors and compliance teams cannot trust. The audit layer produces two categories of output: <strong class="text-white">operational reports</strong> (what did the system do, what is its current state) and <strong class="text-white">compliance reports</strong> (provable evidence that policies were enforced).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — monthly lifecycle activity summary:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE FUNCTION lifecycle.monthly_activity_report(
+    p_year  INTEGER,
+    p_month INTEGER
+)
+RETURNS TABLE (
+    table_name          TEXT,
+    partitions_archived INTEGER,
+    bytes_archived      BIGINT,
+    partitions_dropped  INTEGER,
+    rows_anonymized     BIGINT,
+    compliance_events   INTEGER,
+    critical_violations INTEGER
+)
+LANGUAGE sql
+STABLE
+AS $$
+    WITH date_range AS (
+        SELECT
+            make_date(p_year, p_month, 1)::timestamptz            AS period_start,
+            (make_date(p_year, p_month, 1) + INTERVAL '1 month')::timestamptz AS period_end
+    ),
+    archival_summary AS (
+        SELECT
+            al.table_name,
+            COUNT(*)                         AS partitions_archived,
+            0::BIGINT                        AS bytes_archived  -- extend with size tracking
+        FROM lifecycle.archival_log al, date_range dr
+        WHERE al.archived_at BETWEEN dr.period_start AND dr.period_end
+          AND al.status = 'completed'
+        GROUP BY al.table_name
+    ),
+    anonymization_summary AS (
+        SELECT
+            ca.table_name,
+            SUM(ca.row_count)               AS rows_anonymized
+        FROM lifecycle.compliance_attestation ca, date_range dr
+        WHERE ca.performed_at BETWEEN dr.period_start AND dr.period_end
+          AND ca.operation = 'anonymize_before_archive'
+        GROUP BY ca.table_name
+    ),
+    event_summary AS (
+        SELECT
+            ce.table_name,
+            COUNT(*)                                             AS compliance_events,
+            COUNT(*) FILTER (WHERE ce.severity = 'critical')    AS critical_violations
+        FROM lifecycle.compliance_event ce, date_range dr
+        WHERE ce.detected_at BETWEEN dr.period_start AND dr.period_end
+        GROUP BY ce.table_name
+    )
+    SELECT
+        COALESCE(ar.table_name, anon.table_name, ev.table_name) AS table_name,
+        COALESCE(ar.partitions_archived, 0)  AS partitions_archived,
+        COALESCE(ar.bytes_archived, 0)       AS bytes_archived,
+        0                                    AS partitions_dropped,
+        COALESCE(anon.rows_anonymized, 0)    AS rows_anonymized,
+        COALESCE(ev.compliance_events, 0)    AS compliance_events,
+        COALESCE(ev.critical_violations, 0)  AS critical_violations
+    FROM archival_summary ar
+    FULL OUTER JOIN anonymization_summary anon ON anon.table_name = ar.table_name
+    FULL OUTER JOIN event_summary         ev   ON ev.table_name   = COALESCE(ar.table_name, anon.table_name)
+    ORDER BY 1;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — equivalent report as a stored procedure:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER PROCEDURE lifecycle.MonthlyActivityReport
+    @Year  INT,
+    @Month INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @PeriodStart DATETIMEOFFSET = DATETIMEOFFSETFROMPARTS(@Year, @Month, 1, 0, 0, 0, 0, 0, 0, 7);
+    DECLARE @PeriodEnd   DATETIMEOFFSET = DATEADD(MONTH, 1, @PeriodStart);
+
+    WITH ArchivalSummary AS (
+        SELECT
+            TableName,
+            COUNT(*)       AS PartitionsArchived
+        FROM lifecycle.ArchivalLog
+        WHERE ArchivedAt &gt;= @PeriodStart
+          AND ArchivedAt  &lt; @PeriodEnd
+          AND Status      = 'completed'
+        GROUP BY TableName
+    ),
+    AnonymizationSummary AS (
+        SELECT
+            TableName,
+            SUM(RowCount)  AS RowsAnonymized
+        FROM lifecycle.ComplianceAttestation
+        WHERE PerformedAt &gt;= @PeriodStart
+          AND PerformedAt  &lt; @PeriodEnd
+          AND Operation    = 'anonymize_before_archive'
+        GROUP BY TableName
+    ),
+    EventSummary AS (
+        SELECT
+            TableName,
+            COUNT(*)                                             AS ComplianceEvents,
+            SUM(CASE WHEN Severity = 'critical' THEN 1 ELSE 0 END) AS CriticalViolations
+        FROM lifecycle.ComplianceEvent
+        WHERE DetectedAt &gt;= @PeriodStart
+          AND DetectedAt  &lt; @PeriodEnd
+        GROUP BY TableName
+    )
+    SELECT
+        COALESCE(ar.TableName, anon.TableName, ev.TableName)    AS TableName,
+        COALESCE(ar.PartitionsArchived, 0)                      AS PartitionsArchived,
+        COALESCE(anon.RowsAnonymized, 0)                        AS RowsAnonymized,
+        COALESCE(ev.ComplianceEvents, 0)                        AS ComplianceEvents,
+        COALESCE(ev.CriticalViolations, 0)                      AS CriticalViolations
+    FROM ArchivalSummary ar
+    FULL OUTER JOIN AnonymizationSummary anon ON anon.TableName = ar.TableName
+    FULL OUTER JOIN EventSummary         ev   ON ev.TableName   = COALESCE(ar.TableName, anon.TableName)
+    ORDER BY 1;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These reports feed directly into Grafana dashboards via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> query collector or a custom SQL Server datasource plugin. The standard operational dashboard has five panels: partitions per lifecycle stage (stacked bar, rolling 30 days), bytes archived per day (time series), retention violation count by severity (gauge), anonymization operations per table (heat map), and daemon heartbeat status (single-stat green/red). When the compliance team needs to produce evidence for an audit, they run the monthly report and the attestation query for the specific date range, export as PDF, and attach to the audit file.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Edge Cases: Hotspots, Late Arrivals, and Policy Conflicts</h3>
+
+<p class="text-gray-300 leading-relaxed">A production lifecycle system encounters data that does not behave according to policy assumptions. Three edge cases require explicit handling.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Late-arriving data</strong> — a partition classified as "cold" (no reads, no writes) suddenly receives an INSERT for a row with a historical timestamp. The autonomous system must detect this and re-heat the partition before any archival or compression operation begins. The detection mechanism uses a logical replication slot or table trigger that updates a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_write_at</code> column in the partition inventory:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: trigger to update last-write timestamp on any partition write
+CREATE OR REPLACE FUNCTION lifecycle.update_last_write()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE lifecycle.partition_write_log
+    SET last_write_at = NOW()
+    WHERE schema_name = TG_TABLE_SCHEMA
+      AND table_name  = TG_TABLE_NAME;
+    RETURN NEW;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The archival engine checks <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_write_at</code> before processing any partition and skips any partition written to within the past 24 hours, regardless of its classified lifecycle stage.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy conflicts</strong> — two policies accidentally match the same table (a data class policy and a table-specific override). The system resolves conflicts by preferring the more restrictive retention floor and the shorter retention ceiling, recording the conflict in the audit log:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: detect policy conflicts
+SELECT
+    schema_name,
+    table_name,
+    COUNT(*) AS policy_count,
+    MIN(retain_min_days)    AS effective_min,
+    MIN(retain_max_days)    AS effective_max,
+    ARRAY_AGG(policy_id)    AS conflicting_policies
+FROM lifecycle.policy
+WHERE enabled = TRUE
+GROUP BY schema_name, table_name
+HAVING COUNT(*) &gt; 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Access pattern hotspots</strong> — a table classified as "warm" suddenly shows a ten-fold increase in read access (a batch analytics job scanning historical data). The autonomous system should detect this via the temperature snapshot and temporarily suppress any compression or archival operations until the access pattern normalizes. The temperature log's 14-day rolling window naturally handles this: a sudden spike in scans over the window will exclude the partition from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compression_candidates</code> view without any special-case code.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Policy as a first-class schema object** removes lifecycle logic from ad hoc scripts and centralizes it into a contract that the automation reads at runtime; a single UPDATE to the policy table propagates to all downstream lifecycle decisions at the next evaluation cycle.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partition-aligned lifecycle operations** are the mechanical prerequisite for autonomous data management at scale — atomic detach/attach and switch operations on complete time-range segments avoid expensive row-by-row processing and allow the system to tier, compress, or delete entire data segments with minimal locking impact on the hot data layer.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Compliance attestation records are not optional metadata** — they are the auditable proof that regulatory obligations were satisfied at the exact moment of archival or deletion, and the checksum-plus-timestamp pattern ensures the attestation cannot be trivially backdated without database-level access that itself would be logged.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The IO headroom gate and late-arrival detection** prevent the lifecycle engine from becoming a production incident: the archival engine defers all heavy operations when the database is under storage pressure, and any partition that receives a write is held back from compression or archival for a configurable cooling window regardless of its classified lifecycle stage.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The orchestration daemon's event-driven escalation path** — `pg_notify` on PostgreSQL, SQL Agent alerts on SQL Server — means critical retention violations surface within seconds rather than waiting for the next scheduled evaluation window, giving operations teams time to respond before a regulatory deadline is breached.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
