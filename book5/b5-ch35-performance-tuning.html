@@ -6,6 +6,10 @@
   <title>Chapter 35: Query Performance Tuning on Managed Services — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 35: Query Performance Tuning on Managed Services. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -92,7 +96,7 @@ aws logs start-query \
   --performance-insights-retention-period 731 \
   --apply-immediately</code></pre>
 
-<p class="text-gray-300 leading-relaxed">Performance Insights retains 7 days free; 731 days costs roughly $0.02 per vCPU per hour. For a db.r6g.4xlarge (16 vCPUs), extended retention costs around $77/month — budget for it on any production instance.</p>
+<p class="text-gray-300 leading-relaxed">Performance Insights retains 7 days free; extending retention up to the 731-day maximum incurs an additional charge billed per vCPU-hour, which scales with both instance size and how far back you extend the window. Check current AWS pricing for your region before enabling extended retention fleet-wide — on a large multi-vCPU instance it becomes a meaningful recurring line item.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Database</strong></p>
 
@@ -409,10 +413,605 @@ for metric_list in response['MetricList']:
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `LWLock:buffer_content` — High-concurrency UPDATE hot spots (counter tables, queue tables)</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `Client:ClientRead` — Network latency between application and database; often a VPC placement issue or RDS Proxy connection overhead</li>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Top wait event<br/>from Performance Insights] --> B{Wait type}
+    B -->|IO:DataFileRead| C[Buffer pool miss:<br/>add index or increase cache]
+    B -->|Lock:relation| D[Blocking DDL/long transaction:<br/>fix concurrency, not indexes]
+    B -->|LWLock:buffer_content| E[Hot-row contention:<br/>redesign counter/queue pattern]
+    B -->|Client:ClientRead| F[Network/app-side latency:<br/>check VPC placement, proxy overhead]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Let the dominant wait event categorize the problem before choosing a remedy — an index fix does nothing for a lock-contention problem.*</p>
+
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: sys.dm_os_wait_stats and Extended Events</strong></p>
 
 <p class="text-gray-300 leading-relaxed">On Azure SQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> is available with some restrictions — the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SQLTRACE_*</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBMIRROR_*</code> wait types are filtered out as they're internal to the platform. For real-time wait analysis, Extended Events replace SQL Trace (Profiler is unsupported on Azure SQL):</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a lightweight Extended Events session to capture query waits
+CREATE EVENT SESSION [prod_wait_analysis] ON DATABASE
+ADD EVENT sqlserver.sql_statement_completed (
+    ACTION (
+        sqlserver.sql_text,
+        sqlserver.query_hash,
+        sqlserver.database_name,
+        sqlserver.username
+    )
+    WHERE (
+        duration &gt; 500000  -- 500ms in microseconds
+        AND sqlserver.database_name = N'ProdDB'
+    )
+),
+ADD EVENT sqlos.wait_info (
+    ACTION (sqlserver.sql_text, sqlserver.query_hash)
+    WHERE (
+        duration &gt; 100000   -- 100ms wait
+        AND opcode = 1      -- end of wait only
+    )
+)
+ADD TARGET package0.ring_buffer (SET max_memory = 51200)
+WITH (
+    MAX_DISPATCH_LATENCY = 5 SECONDS,
+    TRACK_CAUSALITY = ON
+);
+
+ALTER EVENT SESSION [prod_wait_analysis] ON DATABASE STATE = START;
+
+-- Read the ring buffer results
+SELECT
+    event_data.value('(@name)', 'nvarchar(128)') AS event_name,
+    event_data.value('(action[@name="sql_text"]/value)[1]', 'nvarchar(max)') AS sql_text,
+    event_data.value('(data[@name="wait_type"]/text)[1]', 'nvarchar(128)') AS wait_type,
+    event_data.value('(data[@name="duration"]/value)[1]', 'bigint') / 1000 AS duration_ms
+FROM (
+    SELECT CAST(target_data AS XML) AS target_data_xml
+    FROM sys.dm_xe_database_sessions s
+    JOIN sys.dm_xe_database_session_targets t ON s.address = t.event_session_address
+    WHERE s.name = 'prod_wait_analysis'
+      AND t.target_name = 'ring_buffer'
+) AS ring_buffer_data
+CROSS APPLY target_data_xml.nodes('//RingBufferTarget/event') AS XEventData(event_data)
+ORDER BY duration_ms DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cloud SQL PostgreSQL: pg_stat_activity for Live Session Analysis</strong></p>
+
+<p class="text-gray-300 leading-relaxed">On Cloud SQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> is available with the same columns as on-premises PostgreSQL. Because you cannot attach a debugger or strace to a backend process, this view — combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_locks</code> — is your primary tool for live session and blocking investigation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find blocking chains on Cloud SQL (works identically on RDS Aurora)
+WITH RECURSIVE lock_tree AS (
+    -- Base: sessions that are waiting for a lock
+    SELECT
+        blocked.pid AS blocked_pid,
+        blocked.query AS blocked_query,
+        blocked.wait_event_type,
+        blocked.wait_event,
+        blocked.state,
+        blocking.pid AS blocking_pid,
+        blocking.query AS blocking_query,
+        blocking.query_start AS blocking_started,
+        now() - blocking.query_start AS blocking_duration,
+        1 AS depth
+    FROM pg_stat_activity blocked
+    JOIN pg_locks blocked_locks
+        ON blocked.pid = blocked_locks.pid
+        AND NOT blocked_locks.granted
+    JOIN pg_locks blocking_locks
+        ON blocking_locks.locktype = blocked_locks.locktype
+        AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+        AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
+        AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
+        AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
+        AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
+        AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
+        AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
+        AND blocking_locks.granted
+        AND blocking_locks.pid != blocked_locks.pid
+    JOIN pg_stat_activity blocking
+        ON blocking.pid = blocking_locks.pid
+
+    UNION ALL
+
+    -- Recursive: find sessions blocking the already-identified blockers
+    SELECT
+        lt.blocked_pid,
+        lt.blocked_query,
+        lt.wait_event_type,
+        lt.wait_event,
+        lt.state,
+        blocking.pid AS blocking_pid,
+        blocking.query AS blocking_query,
+        blocking.query_start AS blocking_started,
+        now() - blocking.query_start AS blocking_duration,
+        lt.depth + 1
+    FROM lock_tree lt
+    JOIN pg_locks blocked_locks ON lt.blocking_pid = blocked_locks.pid AND NOT blocked_locks.granted
+    JOIN pg_locks blocking_locks
+        ON blocking_locks.locktype = blocked_locks.locktype
+        AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
+        AND blocking_locks.granted
+        AND blocking_locks.pid != blocked_locks.pid
+    JOIN pg_stat_activity blocking ON blocking.pid = blocking_locks.pid
+    WHERE lt.depth &lt; 5
+)
+SELECT
+    depth,
+    blocked_pid,
+    LEFT(blocked_query, 80) AS blocked_query_snippet,
+    wait_event_type || ':' || wait_event AS wait,
+    blocking_pid,
+    LEFT(blocking_query, 80) AS blocking_query_snippet,
+    blocking_duration
+FROM lock_tree
+ORDER BY depth, blocking_duration DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.5 Parameter Tuning on Managed Services</h3>
+
+<p class="text-gray-300 leading-relaxed">On self-managed PostgreSQL or SQL Server, you tuned memory allocations, parallelism settings, and I/O behavior through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> and had full control over the restart cycle. On managed services, parameters are set through the platform's parameter system, some changes require a restart (making them high-impact in production), and some parameters are immutable — the platform controls them.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS PostgreSQL: Tunable vs. Platform-Controlled Parameters</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The most performance-relevant parameters you can tune on RDS PostgreSQL:</p>
+
+<p class="text-gray-300 leading-relaxed">| Parameter | Default | Tuning Direction | Restart Required |</p>
+<p class="text-gray-300 leading-relaxed">|-----------|---------|------------------|------------------|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> | 25% of RAM | Increase to 25-40% RAM | Yes |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> | 4MB | Increase carefully per session | No |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code> | 64MB | Increase for faster VACUUM/index builds | No |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> | 4GB | Set to ~75% of total RAM | No |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">random_page_cost</code> | 4.0 | Lower to 1.1-1.5 for SSD/Aurora | No |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_workers_per_gather</code> | 2 | Tune based on vCPU count | No |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code> | 0.9 | Keep at 0.9 | No |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers</code> | auto | Usually auto is fine | Yes |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor</code> | 0.2 | Lower to 0.01-0.05 for large tables | No |</p>
+
+<p class="text-gray-300 leading-relaxed">Parameters RDS does not expose (they are controlled by the platform):</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `wal_level` — Fixed at `logical` on Aurora, `replica` on RDS standard</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `max_wal_size` and `min_wal_size` — Platform-managed</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `archive_mode` / `archive_command` — Managed by AWS for automated backups</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `fsync`, `full_page_writes` — Always enabled; platform guarantees these for durability</li>
+
+<p class="text-gray-300 leading-relaxed">A common misconfiguration on RDS is leaving <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> at its default 4MB on an instance with 64GB RAM running analytics queries. The result is excessive temp file spills. The right approach is not to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> globally high — that multiplies by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> and exhausts RAM — but to set it per session or per role for analytics workloads:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Set work_mem for an analytics role without changing the global default
+ALTER ROLE analytics_user SET work_mem = '256MB';
+
+-- Or set it for the current session only when running a known expensive query
+SET work_mem = '128MB';
+EXPLAIN (ANALYZE, BUFFERS) SELECT ... FROM large_aggregation_query;
+RESET work_mem;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The session-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> approach is particularly useful when you're tuning a specific batch job that runs under a dedicated database user — it doesn't affect OLTP connections using the same instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Aurora-Specific: cluster-level vs. instance-level parameter groups</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Aurora uses two layers of parameter groups: the DB cluster parameter group (applies to the whole cluster, controls parameters like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds.force_ssl</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_preload_libraries</code>) and the DB instance parameter group (applies to a specific instance, controls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, etc.). Mistakes happen when engineers apply changes to the wrong level. Adding <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_preload_libraries</code> at the instance level has no effect on Aurora — it must be in the cluster parameter group because the extension is loaded at cluster startup, not per instance.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Correct: add pg_stat_statements to the cluster parameter group
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name prod-aurora-cluster-params \
+  --parameters \
+    "ParameterName=shared_preload_libraries,ParameterValue=pg_stat_statements,ApplyMethod=pending-reboot"
+
+# Check which parameter group is attached to the cluster vs instance
+aws rds describe-db-clusters \
+  --db-cluster-identifier prod-aurora-cluster \
+  --query "DBClusters[0].DBClusterParameterGroup"
+
+aws rds describe-db-instances \
+  --db-instance-identifier prod-aurora-cluster-instance-1 \
+  --query "DBInstances[0].DBParameterGroups"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: Resource Governance and DTU/vCore Limits</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Database manages memory, CPU, and I/O through its resource governance layer. In the DTU model, all resources are bundled. In the vCore model, you have more visibility: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_user_db_resource_governance</code> shows the effective limits applied to your database:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- View effective resource limits for the current Azure SQL database
+SELECT
+    database_id,
+    logical_database_guid,
+    max_cpu,
+    max_db_memory_mb,
+    max_log_rate_mbps,
+    max_workers,
+    max_sessions,
+    max_instance_max_db_memory_mb
+FROM sys.dm_user_db_resource_governance;
+
+-- Check current resource consumption against limits
+SELECT
+    avg_cpu_percent,
+    avg_data_io_percent,
+    avg_log_write_percent,
+    avg_memory_usage_percent,
+    max_worker_percent,
+    max_session_percent
+FROM sys.dm_db_resource_stats
+ORDER BY end_time DESC
+OFFSET 0 ROWS FETCH NEXT 30 ROWS ONLY;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_log_write_percent</code> is consistently near 100%, log write throughput is the bottleneck. The fix is not to tune a parameter — you cannot increase the log rate limit without changing service tier. This is the key difference from on-premises: some bottlenecks on Azure SQL are resolved only by scaling up or out, not by configuration.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud SQL: Flags and Connection Limits</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cloud SQL exposes PostgreSQL parameters as database flags. The flag naming matches PostgreSQL parameter names exactly. The most impactful flags for tuning on Cloud SQL:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Apply a tuning set for a high-concurrency OLTP workload on Cloud SQL
+gcloud sql instances patch prod-cloudsql-pg \
+  --database-flags \
+    shared_buffers=8GB,\
+    effective_cache_size=24GB,\
+    work_mem=16MB,\
+    maintenance_work_mem=2GB,\
+    random_page_cost=1.1,\
+    effective_io_concurrency=200,\
+    max_parallel_workers_per_gather=4,\
+    max_parallel_workers=8,\
+    autovacuum_max_workers=5,\
+    autovacuum_vacuum_scale_factor=0.02,\
+    autovacuum_analyze_scale_factor=0.01,\
+    log_autovacuum_min_duration=250,\
+    checkpoint_completion_target=0.9,\
+    wal_compression=on
+
+# Note: shared_buffers requires an instance restart on Cloud SQL
+# Cloud SQL will restart the instance automatically when static flags change</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Cloud SQL does not allow <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> above a service-tier-specific ceiling. If your application requires more than the allowed maximum, you must use Cloud SQL Auth Proxy with connection pooling (PgBouncer or the built-in pgconnection_pool) rather than setting a higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> on the instance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.6 Query Rewrites and Application-Level Optimizations</h3>
+
+<p class="text-gray-300 leading-relaxed">After index tuning, statistics refresh, and parameter adjustments, some queries still perform poorly because the query structure itself is inefficient for the access pattern. These rewrites are platform-agnostic in logic but have platform-specific considerations in execution.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">N+1 Patterns Detected Through pg_stat_statements</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The N+1 problem — issuing one query per row from a parent result set — produces a distinctive signature in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>: a parameterized query with very high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">calls</code> count relative to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_time</code>, where the per-call time is low but the total time is large. This pattern is invisible in slow query logs because each individual call is fast.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify N+1 candidates in pg_stat_statements
+SELECT
+    LEFT(query, 100) AS query_snippet,
+    calls,
+    mean_exec_time,
+    total_exec_time,
+    rows / calls AS avg_rows_per_call
+FROM pg_stat_statements
+WHERE calls &gt; 10000
+  AND mean_exec_time &lt; 5   -- Fast individually (&lt; 5ms)
+  AND total_exec_time &gt; 60000  -- But expensive in aggregate (&gt; 60 seconds total)
+ORDER BY total_exec_time DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The fix is a query rewrite at the application layer — replace the loop with a single query using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE id = ANY($1)</code> with an array parameter, or with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">JOIN</code>. The PostgreSQL rewrite is straightforward:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Before: N+1 pattern (application issues one query per order)
+SELECT * FROM order_items WHERE order_id = $1;
+-- (called 50,000 times in a reporting window)
+
+-- After: single query with array unnesting
+SELECT
+    oi.*,
+    o.customer_id,
+    o.order_date
+FROM order_items oi
+JOIN orders o ON oi.order_id = o.order_id
+WHERE oi.order_id = ANY($1::bigint[]);
+-- $1 is passed as an array of all order_ids needed</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The equivalent fix in SQL Server uses a table-valued parameter or a JSON array to pass multiple IDs in a single round trip:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: replace N+1 with a single query using JSON input
+-- Before: called once per order_id
+SELECT * FROM OrderItems WHERE OrderId = @order_id;
+
+-- After: pass the full set as JSON
+CREATE OR ALTER PROCEDURE dbo.GetOrderItemsBatch
+    @order_ids NVARCHAR(MAX)  -- JSON array: [1001, 1002, 1003]
+AS
+BEGIN
+    SELECT
+        oi.*,
+        o.CustomerId,
+        o.OrderDate
+    FROM OrderItems oi
+    JOIN Orders o ON oi.OrderId = o.OrderId
+    WHERE oi.OrderId IN (
+        SELECT value FROM OPENJSON(@order_ids) WITH (value BIGINT '$')
+    );
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pagination Anti-Patterns</strong></p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OFFSET/LIMIT</code> (PostgreSQL) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OFFSET/FETCH</code> (SQL Server) performance degrades as the offset grows because the database must scan and discard all rows before the offset position. On large tables with deep pagination, this becomes a full table scan disguised as a pagination query. Use keyset pagination instead:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: OFFSET-based pagination (slow for large offsets)
+SELECT order_id, customer_id, order_date, total
+FROM orders
+ORDER BY order_date DESC, order_id DESC
+OFFSET 50000 LIMIT 20;
+
+-- PostgreSQL: Keyset pagination (constant time regardless of page depth)
+-- Client passes the last seen (order_date, order_id) from the previous page
+SELECT order_id, customer_id, order_date, total
+FROM orders
+WHERE (order_date, order_id) &lt; ($last_order_date, $last_order_id)
+ORDER BY order_date DESC, order_id DESC
+LIMIT 20;
+
+-- Requires a composite index to be efficient:
+CREATE INDEX idx_orders_date_id ON orders (order_date DESC, order_id DESC);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: OFFSET/FETCH (slow for large page numbers)
+SELECT OrderId, CustomerId, OrderDate, Total
+FROM Orders
+ORDER BY OrderDate DESC, OrderId DESC
+OFFSET 50000 ROWS FETCH NEXT 20 ROWS ONLY;
+
+-- SQL Server: Keyset pagination
+SELECT OrderId, CustomerId, OrderDate, Total
+FROM Orders
+WHERE OrderDate &lt; @last_order_date
+   OR (OrderDate = @last_order_date AND OrderId &lt; @last_order_id)
+ORDER BY OrderDate DESC, OrderId DESC
+OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY;
+
+-- Supporting index:
+CREATE INDEX IX_Orders_Date_Id ON Orders (OrderDate DESC, OrderId DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Covering Indexes for High-Frequency Lookup Patterns</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A covering index — one that includes all columns referenced in a query — eliminates the heap/table fetch entirely. On PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INCLUDE</code> clause adds non-key columns to the index leaf pages. On SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INCLUDE</code> on a nonclustered index does the same:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: covering index with INCLUDE for a common customer lookup
+CREATE INDEX CONCURRENTLY idx_orders_customer_covering
+ON orders (customer_id, order_date DESC)
+INCLUDE (status, total_amount, order_id);
+
+-- Query that can be satisfied entirely from the index:
+SELECT order_id, order_date, status, total_amount
+FROM orders
+WHERE customer_id = $1
+  AND order_date &gt;= NOW() - INTERVAL '90 days'
+ORDER BY order_date DESC
+LIMIT 50;
+-- EXPLAIN will show "Index Only Scan" — no heap access</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: covering nonclustered index with INCLUDE
+CREATE NONCLUSTERED INDEX IX_Orders_Customer_Date_Covering
+ON Orders (CustomerId, OrderDate DESC)
+INCLUDE (Status, TotalAmount, OrderId);
+
+-- The same query pattern uses the index without a Key Lookup:
+SELECT OrderId, OrderDate, Status, TotalAmount
+FROM Orders
+WHERE CustomerId = @customer_id
+  AND OrderDate &gt;= DATEADD(DAY, -90, GETDATE())
+ORDER BY OrderDate DESC;
+-- SSMS plan should show Index Seek without Key Lookup</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">35.7 Monitoring Query Performance Over Time</h3>
+
+<p class="text-gray-300 leading-relaxed">One-time tuning sessions fix the immediate problem. Production systems need continuous monitoring to catch regressions before users report them. Cloud managed services provide the infrastructure for this; you provide the alerting thresholds and response playbooks.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Automated Plan Regression Detection on Azure SQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Query Store's Automatic Plan Correction detects when a plan regresses (execution time degrades beyond a threshold compared to the previous plan) and forces the last known good plan automatically. You can configure the aggressiveness:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable Automatic Plan Correction in Azure SQL
+ALTER DATABASE [ProdDB]
+SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = ON);
+
+-- Check the history of automatic corrections
+SELECT
+    qsq.query_id,
+    qsqt.query_sql_text,
+    dra.reason,
+    dra.score,
+    dra.state_transition_reason,
+    JSON_VALUE(dra.details, '$.implementationDetails.script') AS correction_script
+FROM sys.dm_db_tuning_recommendations dra
+JOIN sys.query_store_query qsq ON CAST(JSON_VALUE(dra.details, '$.queryId') AS BIGINT) = qsq.query_id
+JOIN sys.query_store_query_text qsqt ON qsq.query_text_id = qsqt.query_text_id
+WHERE dra.type = 'FORCE_LAST_GOOD_PLAN'
+ORDER BY dra.score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS: CloudWatch Alarms for Query Performance Metrics</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Set CloudWatch alarms on the database-level metrics that correlate with query performance degradation. The most reliable leading indicators are <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadLatency</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WriteLatency</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DiskQueueDepth</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBLoad</code> (via Performance Insights):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create a CloudWatch alarm for high database load (&gt;= instance vCPU count indicates saturation)
+VCPU_COUNT=16  # for db.r6g.4xlarge
+
+aws cloudwatch put-metric-alarm \
+  --alarm-name "prod-db-high-load" \
+  --alarm-description "DB load exceeds vCPU count - query saturation likely" \
+  --metric-name DBLoad \
+  --namespace AWS/RDS \
+  --statistic Average \
+  --period 300 \
+  --evaluation-periods 3 \
+  --threshold $VCPU_COUNT \
+  --comparison-operator GreaterThanOrEqualToThreshold \
+  --dimensions Name=DBInstanceIdentifier,Value=prod-db-01 \
+  --alarm-actions arn:aws:sns:us-east-1:123456789012:db-oncall-alerts \
+  --ok-actions arn:aws:sns:us-east-1:123456789012:db-oncall-alerts \
+  --treat-missing-data notBreaching
+
+# Alarm on read latency &gt; 20ms average over 5 minutes
+aws cloudwatch put-metric-alarm \
+  --alarm-name "prod-db-high-read-latency" \
+  --alarm-description "Read latency elevated - check for missing indexes or table scans" \
+  --metric-name ReadLatency \
+  --namespace AWS/RDS \
+  --statistic Average \
+  --period 300 \
+  --evaluation-periods 2 \
+  --threshold 0.020 \
+  --comparison-operator GreaterThanThreshold \
+  --dimensions Name=DBInstanceIdentifier,Value=prod-db-01 \
+  --alarm-actions arn:aws:sns:us-east-1:123456789012:db-oncall-alerts</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Building a Query Performance Baseline Table</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The most durable monitoring approach is a scheduled job that snapshots <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> (PostgreSQL) or Query Store aggregates (SQL Server) into a history table. This lets you compare current performance against any historical baseline, detect gradual regressions over days or weeks, and tie performance changes to deployment events.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: create a baseline snapshot table
+CREATE TABLE query_performance_snapshots (
+    snapshot_time        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    queryid              BIGINT NOT NULL,
+    query_text           TEXT,
+    calls                BIGINT,
+    total_exec_time_ms   DOUBLE PRECISION,
+    mean_exec_time_ms    DOUBLE PRECISION,
+    stddev_exec_time_ms  DOUBLE PRECISION,
+    rows                 BIGINT,
+    shared_blks_hit      BIGINT,
+    shared_blks_read     BIGINT,
+    temp_blks_written    BIGINT,
+    PRIMARY KEY (snapshot_time, queryid)
+) PARTITION BY RANGE (snapshot_time);
+
+CREATE TABLE query_performance_snapshots_2024_q4
+PARTITION OF query_performance_snapshots
+FOR VALUES FROM ('2024-10-01') TO ('2025-01-01');
+
+-- Snapshot procedure (run via pg_cron or an external scheduler)
+INSERT INTO query_performance_snapshots (
+    queryid, query_text, calls, total_exec_time_ms,
+    mean_exec_time_ms, stddev_exec_time_ms, rows,
+    shared_blks_hit, shared_blks_read, temp_blks_written
+)
+SELECT
+    queryid,
+    LEFT(query, 1000),
+    calls,
+    total_exec_time,
+    mean_exec_time,
+    stddev_exec_time,
+    rows,
+    shared_blks_hit,
+    shared_blks_read,
+    temp_blks_written
+FROM pg_stat_statements
+WHERE calls &gt; 10
+ON CONFLICT (snapshot_time, queryid) DO UPDATE
+    SET calls = EXCLUDED.calls,
+        total_exec_time_ms = EXCLUDED.total_exec_time_ms,
+        mean_exec_time_ms = EXCLUDED.mean_exec_time_ms;
+
+-- Compare current performance vs. 7-day baseline
+WITH baseline AS (
+    SELECT
+        queryid,
+        AVG(mean_exec_time_ms) AS baseline_mean_ms,
+        AVG(calls) AS baseline_calls_per_snapshot
+    FROM query_performance_snapshots
+    WHERE snapshot_time BETWEEN NOW() - INTERVAL '8 days'
+                             AND NOW() - INTERVAL '1 day'
+    GROUP BY queryid
+),
+current AS (
+    SELECT
+        queryid,
+        mean_exec_time AS current_mean_ms,
+        calls AS current_calls
+    FROM pg_stat_statements
+)
+SELECT
+    c.queryid,
+    ROUND(c.current_mean_ms::NUMERIC, 2) AS current_mean_ms,
+    ROUND(b.baseline_mean_ms::NUMERIC, 2) AS baseline_mean_ms,
+    ROUND((c.current_mean_ms / NULLIF(b.baseline_mean_ms, 0) - 1) * 100, 1) AS pct_change,
+    LEFT(ps.query, 120) AS query_snippet
+FROM current c
+JOIN baseline b ON c.queryid = b.queryid
+JOIN pg_stat_statements ps ON c.queryid = ps.queryid
+WHERE c.current_mean_ms &gt; b.baseline_mean_ms * 1.5  -- 50% regression threshold
+  AND c.current_calls &gt; 100
+ORDER BY pct_change DESC
+LIMIT 20;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: snapshot Query Store runtime stats for regression detection
+CREATE TABLE dbo.QueryPerfSnapshots (
+    SnapshotTime         DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    QueryId              BIGINT NOT NULL,
+    PlanId               BIGINT NOT NULL,
+    QuerySqlText         NVARCHAR(MAX),
+    CountExecutions      BIGINT,
+    AvgDurationMs        FLOAT,
+    AvgCpuMs             FLOAT,
+    AvgLogicalIoReads    FLOAT,
+    AvgRowcount          FLOAT,
+    CONSTRAINT PK_QueryPerfSnapshots PRIMARY KEY (SnapshotTime, QueryId, PlanId)
+);
+
+-- Populate the snapshot (schedule via SQL Agent job)
+INSERT INTO dbo.QueryPerfSnapshots (
+    QueryId, PlanId, QuerySqlText, CountExecutions,
+    AvgDurationMs, AvgCpuMs, AvgLogicalIoReads, AvgRowcount
+)
+SELECT
+    q.query_id,
+    p.plan_id,
+    qt.query_sql_text,
+    rs.count_executions,
+    rs.avg_duration / 1000.0,
+    rs.avg_cpu_time / 1000.0,
+    rs.avg_logical_io_reads,
+    rs.avg_rowcount
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+JOIN sys.query_store_runtime_stats_interval rsi ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+WHERE rsi.start_time &gt;= DATEADD(MINUTE, -15, SYSUTCDATETIME());
+
+-- Regression detection query
+WITH Baseline AS (
+    SELECT
+        QueryId,
+        AVG(AvgDurationMs) AS BaselineDurationMs
+    FROM dbo.QueryPerfSnapshots
+    WHERE SnapshotTime BETWEEN DATEADD(DAY, -8, SYSUTCDATETIME())
+                           AND DATEADD(DAY, -1, SYSUTCDATETIME())
+    GROUP BY QueryId
+),
+Current AS (
+    SELECT
+        QueryId,
+        AVG(AvgDurationMs) AS CurrentDurationMs,
+        MAX(QuerySqlText) AS QuerySqlText
+    FROM dbo.QueryPerfSnapshots
+    WHERE SnapshotTime &gt;= DATEADD(HOUR, -1, SYSUTCDATETIME())
+    GROUP BY QueryId
+)
+SELECT TOP 20
+    c.QueryId,
+    ROUND(c.CurrentDurationMs, 2) AS CurrentDurationMs,
+    ROUND(b.BaselineDurationMs, 2) AS BaselineDurationMs,
+    ROUND((c.CurrentDurationMs / NULLIF(b.BaselineDurationMs, 0) - 1) * 100, 1) AS PctChange,
+    LEFT(c.QuerySqlText, 150) AS QuerySnippet
+FROM Current c
+JOIN Baseline b ON c.QueryId = b.QueryId
+WHERE c.CurrentDurationMs &gt; b.BaselineDurationMs * 1.5
+ORDER BY PctChange DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Slow query identification on managed services routes through cloud-native log sinks** — CloudWatch Logs Insights on AWS, Query Store on Azure SQL, and Cloud Logging on GCP — rather than direct filesystem access. Master the log query syntax for your platform before a production incident forces you to learn it under pressure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Execution plans on managed PostgreSQL require Aurora-aware interpretation**: Aurora's distributed storage layer changes the effective cost of sequential scans versus index scans compared to what the planner's default cost model assumes. Set `random_page_cost` to reflect SSD-backed storage (1.1–1.5) and validate that plan choices align with observed I/O behavior through Performance Insights wait events.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parameter tuning scope matters as much as the parameter value itself**: on Aurora, `shared_preload_libraries` must be set in the cluster parameter group or the change has no effect; on Azure SQL, hitting a resource governor ceiling (log write rate, worker threads) requires a service tier change rather than a configuration adjustment. Know which constraints are tunable and which require scaling.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Wait event analysis is the fastest path from symptom to root cause**: a query running slowly due to `Lock:relation` waits needs concurrency fixes, not index changes. A query slow due to `IO:DataFileRead` needs better cache usage or a covering index. Let the wait event categorize the problem before choosing the remedy.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Continuous regression detection requires owning the baseline data yourself**: cloud platforms surface current performance well but make week-over-week comparison difficult without a history table. Scheduling periodic snapshots of `pg_stat_statements` or Query Store aggregates into a dedicated history table gives you a durable record that survives instance restarts, failovers, and statistics resets — and lets you correlate deployment events with the performance changes they cause.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
