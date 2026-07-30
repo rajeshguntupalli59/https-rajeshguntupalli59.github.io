@@ -6,6 +6,10 @@
   <title>Chapter 32: Autonomous PostgreSQL Systems — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 32: Autonomous PostgreSQL Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -361,6 +365,362 @@ ORDER BY pss.total_exec_time DESC
 LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Missing index recommendations from Query Store and DMVs
+SELECT TOP 20
+    migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans)
+        AS improvement_measure,
+    mid.statement AS table_name,
+    mid.equality_columns,
+    mid.inequality_columns,
+    mid.included_columns,
+    migs.user_seeks,
+    migs.user_scans,
+    migs.last_user_seek,
+    ROUND(migs.avg_total_user_cost, 2) AS avg_query_cost,
+    ROUND(migs.avg_user_impact, 2) AS avg_impact_pct,
+    'CREATE INDEX IX_auto_' +
+        REPLACE(REPLACE(mid.statement, '[', ''), ']', '') +
+        '_' + CONVERT(varchar, mig.index_handle) AS suggested_index_ddl
+FROM sys.dm_db_missing_index_groups mig
+JOIN sys.dm_db_missing_index_group_stats migs ON mig.index_group_handle = migs.group_handle
+JOIN sys.dm_db_missing_index_details mid ON mig.index_handle = mid.index_handle
+WHERE migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) &gt; 1000
+ORDER BY improvement_measure DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Unused index detection is more straightforward — PostgreSQL tracks index scans, tuple reads, and tuple fetches per index since the last statistics reset. Any index with zero scans since the last reset (which should cover at least one full week of representative workload) is a candidate for elimination:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify unused and low-value indexes
+SELECT
+    schemaname,
+    tablename,
+    indexname,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    pg_size_pretty(pg_relation_size(indrelid)) AS table_size,
+    CASE
+        WHEN idx_scan = 0 THEN 'UNUSED'
+        WHEN idx_scan &lt; 10 AND pg_relation_size(indexrelid) &gt; 10485760 THEN 'LOW_VALUE'
+        ELSE 'ACTIVE'
+    END AS status
+FROM pg_stat_user_indexes
+JOIN pg_index USING (indexrelid)
+WHERE NOT indisprimary
+  AND NOT indisunique
+ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Unused indexes in SQL Server
+SELECT
+    OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
+    OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name,
+    i.type_desc,
+    ISNULL(us.user_seeks, 0) AS user_seeks,
+    ISNULL(us.user_scans, 0) AS user_scans,
+    ISNULL(us.user_lookups, 0) AS user_lookups,
+    ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) AS total_reads,
+    ISNULL(us.user_updates, 0) AS user_updates,
+    ps.used_page_count * 8 / 1024 AS index_size_mb
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats us
+    ON i.object_id = us.object_id
+    AND i.index_id = us.index_id
+    AND us.database_id = DB_ID()
+JOIN sys.dm_db_partition_stats ps
+    ON i.object_id = ps.object_id
+    AND i.index_id = ps.index_id
+WHERE i.type_desc NOT IN ('HEAP', 'CLUSTERED')
+  AND i.is_primary_key = 0
+  AND i.is_unique_constraint = 0
+  AND ISNULL(us.user_seeks + us.user_scans + us.user_lookups, 0) &lt; 10
+  AND ps.used_page_count * 8 / 1024 &gt; 10
+ORDER BY user_updates DESC, index_size_mb DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomous index manager never drops an index immediately. The workflow follows a three-phase safety protocol:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 1 — Marking.</strong> The index is renamed with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_autonomous_drop_candidate_YYYYMMDD</code> suffix. This change is visible to the DBA team, is logged, and does not affect query execution.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 2 — Observation.</strong> The system waits for a configurable dwell period — typically 7 to 14 days — while monitoring whether any query plan in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> shows a regression in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mean_exec_time</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_exec_time</code>. If a regression is detected that correlates temporally with the marking, the index is automatically unmarked and restored to its original name, and the incident is recorded.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 3 — Removal.</strong> After the dwell period with no regression, the index is dropped during a low-traffic window. The DDL is preserved in the audit log so it can be recreated manually if needed.</p>
+
+<p class="text-gray-300 leading-relaxed">For duplicate index detection — where two indexes cover the same leading columns — the system queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_index</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_attribute</code> to compare column lists:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect duplicate and prefix-duplicate indexes in PostgreSQL
+WITH index_columns AS (
+    SELECT
+        i.indrelid::regclass AS table_name,
+        c.relname AS index_name,
+        i.indisunique,
+        i.indisprimary,
+        array_agg(a.attname ORDER BY pos.ord) AS columns
+    FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_class t ON t.oid = i.indrelid
+    JOIN LATERAL unnest(i.indkey) WITH ORDINALITY AS pos(attnum, ord) ON TRUE
+    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = pos.attnum
+    WHERE t.relkind = 'r'
+      AND NOT i.indisprimary
+    GROUP BY i.indrelid, c.relname, i.indisunique, i.indisprimary
+),
+duplicates AS (
+    SELECT
+        a.table_name,
+        a.index_name AS index_a,
+        b.index_name AS index_b,
+        a.columns AS columns_a,
+        b.columns AS columns_b
+    FROM index_columns a
+    JOIN index_columns b
+        ON a.table_name = b.table_name
+        AND a.index_name &lt; b.index_name
+        AND (
+            a.columns = b.columns
+            OR a.columns[1:array_length(b.columns, 1)] = b.columns
+            OR b.columns[1:array_length(a.columns, 1)] = a.columns
+        )
+)
+SELECT * FROM duplicates ORDER BY table_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When duplicates are found, the system keeps the more selective index (or the one with more recent scan activity) and queues the other for the three-phase elimination workflow described above.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Query Plan Stability and Autonomous Plan Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Query plan regression is one of the most disruptive events in a production PostgreSQL environment. A statistics refresh, a new index, an autovacuum run on a recently modified table, or a PostgreSQL minor version upgrade can all cause the planner to choose a different execution plan — one that may be dramatically slower than the previous one. An autonomous system needs to detect plan regressions as they occur and respond before they cascade into user-visible latency.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL does not natively support plan freezing (SQL Server's Query Store plan forcing is the closest analog), but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> provides a mechanism to inject planner hints at query execution time, effectively overriding the optimizer's decisions. The autonomous plan manager uses this as a corrective tool, not a permanent configuration: when a regression is detected, a hint is applied; when the underlying statistics issue is resolved (by a targeted <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code>), the hint is removed and the system verifies the planner chooses the correct plan natively.</p>
+
+<p class="text-gray-300 leading-relaxed">The regression detection logic operates on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, comparing rolling average execution times against a historical baseline:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional
+import psycopg2
+
+@dataclass
+class QueryBaseline:
+    queryid: int
+    query_fingerprint: str
+    baseline_mean_ms: float
+    baseline_stddev_ms: float
+    recorded_at: datetime
+
+REGRESSION_THRESHOLD_MULTIPLIER = 3.0  # flag if mean &gt; 3x baseline
+
+def detect_plan_regressions(conn_str: str, baselines: list[QueryBaseline]) -&gt; list[dict]:
+    conn = psycopg2.connect(conn_str)
+    cur = conn.cursor()
+    regressions = []
+
+    for baseline in baselines:
+        cur.execute("""
+            SELECT
+                mean_exec_time,
+                stddev_exec_time,
+                calls
+            FROM pg_stat_statements
+            WHERE queryid = %s
+        """, (baseline.queryid,))
+        row = cur.fetchone()
+        if row is None:
+            continue
+        current_mean, current_stddev, calls = row
+        if calls &lt; 50:
+            continue  # insufficient sample
+        threshold = baseline.baseline_mean_ms * REGRESSION_THRESHOLD_MULTIPLIER
+        if current_mean &gt; threshold:
+            regressions.append({
+                "queryid": baseline.queryid,
+                "baseline_mean_ms": baseline.baseline_mean_ms,
+                "current_mean_ms": current_mean,
+                "degradation_factor": round(current_mean / baseline.baseline_mean_ms, 2),
+                "calls": calls,
+            })
+
+    cur.close()
+    conn.close()
+    return regressions</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When a regression is detected, the autonomous system performs three immediate actions:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Targeted ANALYZE.</strong> Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> on the tables involved in the regressed query's most recently observed plan. Fresh statistics frequently resolve planner regressions caused by stale row-count estimates.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Plan capture.</strong> Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN (FORMAT JSON)</code> to capture the current plan and compare it structurally to the last known good plan stored in the baseline catalog. If the plan structure has changed (for example, a nested loop replaced a hash join), the change is recorded as the probable cause.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Hint injection.</strong> If the targeted ANALYZE does not resolve the regression within two evaluation cycles (typically 10 minutes), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> is used to enforce the last-known-good join order and scan method. The hint is stored in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hint_plan.hints</code> management table that the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> extension reads at parse time.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL (pg_hint_plan table insertion):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Inject a stabilizing hint for a regressed query
+INSERT INTO hint_plan.hints (norm_query_string, application_name, hints)
+VALUES (
+    'SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.status = $1',
+    '',  -- apply to all application connections
+    'HashJoin(o c) SeqScan(o) IndexScan(c)'
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server (Query Store plan forcing — native capability):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Force a specific plan in SQL Server Query Store
+USE app_database;
+
+-- Find the last known good plan for a query
+SELECT
+    qsq.query_id,
+    qsp.plan_id,
+    qsp.last_execution_time,
+    qsp.avg_duration / 1000.0 AS avg_duration_ms,
+    qsp.count_executions
+FROM sys.query_store_query qsq
+JOIN sys.query_store_plan qsp ON qsq.query_id = qsp.query_id
+JOIN sys.query_store_runtime_stats qsrs ON qsp.plan_id = qsrs.plan_id
+WHERE qsq.query_hash = 0x &lt;your_query_hash&gt;
+ORDER BY qsp.last_execution_time DESC;
+
+-- Force the last known good plan
+EXEC sys.sp_query_store_force_plan
+    @query_id = &lt;query_id&gt;,
+    @plan_id = &lt;last_known_good_plan_id&gt;;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomous plan manager maintains a plan stability catalog — a table recording every queryid, its baseline execution profile, the last forced hint (if any), and the timestamp of the last regression event. This catalog is the input to a weekly plan health report that surfaces queries that have required intervention, allowing the DBA team to address root causes (missing statistics targets, poor histogram column coverage, correlation statistics) rather than relying on hints indefinitely.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous Control Plane: Event Loop, Audit, and Human Escalation</h3>
+
+<p class="text-gray-300 leading-relaxed">All of the autonomous behaviors described in the preceding sections — topology management, configuration tuning, vacuum remediation, connection routing, index management, plan stability enforcement — must be coordinated through a unified control plane. Without coordination, autonomous subsystems can conflict: the connection pool scaler may increase pool size at the same moment the configuration tuner is reducing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, for example. The control plane is the arbitration layer that prevents such conflicts, enforces action budgets, and determines when autonomy must give way to human judgment.</p>
+
+<p class="text-gray-300 leading-relaxed">The control plane architecture has five components:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">The Observation Bus.</strong> A continuous stream of metric events ingested from Prometheus, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_*</code> views, Patroni API, pgBouncer admin, and OS-level metrics (CPU, memory, I/O wait). Events are normalized into a common schema and written to a time-series buffer.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">The Rule Engine.</strong> A set of declarative rules — encoded as YAML or in a domain-specific policy language — that map observation patterns to candidate actions. Rules are versioned and auditable.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">The Action Queue.</strong> A prioritized queue of candidate actions. Before any action is dequeued and executed, it is evaluated for conflicts against currently executing actions, checked against the relevant budget (failover budget, vacuum budget, DDL budget), and logged with a pre-execution fingerprint.</p>
+
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">The Executor.</strong> The component that actually runs actions: calling Patroni APIs, issuing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM</code>, invoking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_repack</code>, updating pgBouncer configuration, inserting into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hint_plan.hints</code>. The executor is the only component with write access to the database infrastructure.</p>
+
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">The Escalation Manager.</strong> When budgets are exhausted, when actions fail, when contradictory signals make autonomous decision-making unsafe, or when a pre-defined confidence threshold is not met, the escalation manager creates an incident in the team's alerting system (PagerDuty, Opsgenie, or equivalent) with a structured context payload that tells the on-call engineer exactly what the system observed, what it tried, and why it stopped.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Observation Bus\nPrometheus, pg_stat_*, Patroni, pgBouncer, OS metrics] --> B[Rule Engine\nversioned policy]
+    B --> C[Action Queue\nconflict + budget checks]
+    C --> D[Executor\nPatroni API, ALTER SYSTEM, pg_repack, pgBouncer, hint_plan.hints]
+    D --> E[(Audit Log)]
+    C -->|Budget exhausted / low confidence| F[Escalation Manager]
+    F --> G[PagerDuty / Opsgenie Incident]
+    H[(Inhibit Table)] -.blocks.-> D</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The five-component control plane: every candidate action passes through budget and conflict checks before execution, and the inhibit table can halt the executor at any time regardless of what the rule engine proposes.*</p>
+
+<p class="text-gray-300 leading-relaxed">The escalation context payload is important enough to design carefully. An on-call engineer receiving an alert at 02:00 needs to be able to understand the system's reasoning within 30 seconds:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
+  "incident_id": "auto-20240315-0214-0032",
+  "severity": "P2",
+  "component": "vacuum_controller",
+  "cluster": "prod-pg-cluster-1",
+  "summary": "Transaction ID age approaching safety threshold on table public.events",
+  "observations": {
+    "table": "public.events",
+    "age_datfrozenxid": 1420000000,
+    "age_threshold_for_escalation": 1500000000,
+    "last_vacuum_freeze": "2024-02-28T04:12:00Z",
+    "autovacuum_running": false,
+    "estimated_time_to_threshold_hours": 18
+  },
+  "actions_taken": [
+    {
+      "action": "set_autovacuum_freeze_max_age",
+      "parameter": "autovacuum_freeze_max_age",
+      "new_value": "500000000",
+      "timestamp": "2024-03-15T02:10:00Z",
+      "result": "success"
+    },
+    {
+      "action": "trigger_manual_vacuum_freeze",
+      "table": "public.events",
+      "timestamp": "2024-03-15T02:11:00Z",
+      "result": "failed",
+      "error": "autovacuum launcher not responding"
+    }
+  ],
+  "recommended_action": "Manually execute VACUUM FREEZE public.events from a psql session. Verify autovacuum launcher process is alive.",
+  "runbook_url": "https://internal-wiki/runbooks/txid-wraparound-response"
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This structured escalation context means the on-call engineer arrives at the problem with full situational awareness. They do not need to diagnose what the system already diagnosed — they need to take the specific action that the system could not safely take autonomously.</p>
+
+<p class="text-gray-300 leading-relaxed">The audit log is equally critical. Every action taken by the autonomous system — whether successful or not — is written to an append-only audit table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous action audit log schema
+CREATE TABLE autonomous_actions (
+    action_id       BIGSERIAL PRIMARY KEY,
+    action_time     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    component       TEXT NOT NULL,
+    cluster_name    TEXT NOT NULL,
+    action_type     TEXT NOT NULL,
+    target_object   TEXT,
+    parameters      JSONB,
+    pre_state       JSONB,
+    post_state      JSONB,
+    result          TEXT NOT NULL CHECK (result IN ('success', 'failed', 'skipped', 'escalated')),
+    error_detail    TEXT,
+    triggered_by    TEXT NOT NULL  -- 'rule:vacuum_critical', 'rule:config_drift', etc.
+);
+
+CREATE INDEX ON autonomous_actions (action_time DESC);
+CREATE INDEX ON autonomous_actions (component, action_time DESC);
+CREATE INDEX ON autonomous_actions (cluster_name, result, action_time DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This table serves two purposes beyond auditability: it is the input to the budget enforcement calculation (counting actions of each type within a rolling window), and it feeds the weekly operational review that should be part of every team running an autonomous system. That review asks not only "what did the system fix?" but "what should the system have fixed but didn't, and why?"</p>
+
+<p class="text-gray-300 leading-relaxed">The question of human override is non-negotiable. Every autonomous action type must have a corresponding inhibit mechanism: a flag in a control table, a Patroni tag, a pgBouncer PAUSE command, or an environment variable read at action evaluation time. When an operator sets an inhibit flag, the relevant subsystem stops acting autonomously and escalates all decisions immediately. This is the emergency brake, and it must be reliable, fast, and well-documented.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous control inhibit table
+CREATE TABLE autonomous_inhibits (
+    inhibit_id      SERIAL PRIMARY KEY,
+    component       TEXT NOT NULL,   -- 'vacuum_controller', 'topology_manager', 'ALL'
+    cluster_name    TEXT NOT NULL,
+    inhibited_by    TEXT NOT NULL,
+    inhibit_reason  TEXT NOT NULL,
+    inhibit_start   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    inhibit_until   TIMESTAMPTZ,     -- NULL means indefinite
+    released_at     TIMESTAMPTZ
+);
+
+-- Check function used by all autonomous components before taking action
+CREATE OR REPLACE FUNCTION is_autonomous_action_inhibited(
+    p_component TEXT,
+    p_cluster   TEXT
+) RETURNS BOOLEAN AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM autonomous_inhibits
+        WHERE (component = p_component OR component = 'ALL')
+          AND cluster_name = p_cluster
+          AND released_at IS NULL
+          AND (inhibit_until IS NULL OR inhibit_until &gt; now())
+    );
+$$ LANGUAGE sql STABLE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Every autonomous component calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_autonomous_action_inhibited()</code> before executing any action. If it returns true, the action is logged with result <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">skipped</code> and the escalation manager is notified. This single check is the integration point between human judgment and automated execution — simple, auditable, and reliable under all conditions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous topology management requires policy-driven failover**, not timeout-based failover. Evaluating replication lag, synchronous commit state, and WAL streaming continuity before promoting a replica prevents the data loss and split-brain scenarios that naive automation produces. Failover budgets — maximum automated promotions within a rolling window — prevent cascading failures from spiraling beyond recovery.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Self-tuning configuration requires bounded autonomy with workload fingerprinting.** `ALTER SYSTEM` allows parameter changes that survive restart without touching managed configuration baselines, but every parameter must be bounded by policy — memory fractions, CPU counts, and connection limits — that the automation enforces without exception. Configuration drift detection closes the loop, ensuring that actual runtime values converge on declared policy rather than drifting silently.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vacuum management operates on two tiers: reactive remediation and proactive per-table tuning.** The reactive tier responds to accumulated dead tuples and bloat; the proactive tier adjusts `autovacuum_vacuum_scale_factor` and cost delay parameters per table based on observed write velocity, preventing problems before they require intervention. Transaction ID wraparound monitoring with tiered alert thresholds ensures this failure mode is addressed with days of runway rather than minutes.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index management in an autonomous system follows a three-phase safety protocol**: mark, observe, remove. Immediate index drops — even for provably unused indexes — carry operational risk. The dwell period with regression monitoring converts a high-risk manual operation into a low-risk automated one. Duplicate index detection and the missing index signal from `pg_stat_statements` combined with execution plan analysis complete the index lifecycle management loop.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The autonomous control plane is the architecture that makes individual autonomous subsystems safe to operate together.** The observation bus, rule engine, action queue, executor, and escalation manager form a coherent decision-making system. The audit log and inhibit mechanism are not optional add-ons — they are the foundation of operator trust in the system. Autonomy earns its place in production by making human intervention the exception and by being completely transparent about every decision it makes.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
