@@ -6,6 +6,10 @@
   <title>Chapter 31: Multi-Modal Search: Text and Image Together — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 31: Multi-Modal Search: Text and Image Together. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -50,6 +54,15 @@
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">CLIP and Its Descendants</strong></p>
 
 <p class="text-gray-300 leading-relaxed">OpenAI's CLIP (Contrastive Language-Image Pre-training, 2021) established the practical template. CLIP trains a text encoder and an image encoder jointly using contrastive loss — during training, the model pulls matching image-text pairs together while pushing non-matching pairs apart. The result is two encoders that produce vectors in the same 512- or 768-dimensional space.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A["Text: 'red running shoes'"] --> B[Text encoder]
+    C[Image: shoe photo] --> D[Image encoder]
+    B --> E[(Shared CLIP<br/>vector space)]
+    D --> E
+    E --> F[Cosine similarity<br/>ranks both against<br/>each other]
+    style E fill:#c8e6c9</pre></div>
+<p class="text-gray-300 leading-relaxed">*Text and image encoders trained jointly land vectors in the same coordinate system — this is what makes cross-modal retrieval possible.*</p>
 
 <p class="text-gray-300 leading-relaxed">For production use, the relevant CLIP derivatives include:</p>
 
@@ -408,6 +421,794 @@ async def ingest_products(
 
 <p class="text-gray-300 leading-relaxed">The simplest multi-modal query: a user types text, you retrieve images whose CLIP image embeddings are closest to the CLIP text embedding of the query. The entire "magic" is that the CLIP encoder maps both to the same space.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Multi-modal query patterns using Qdrant named vectors
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    SearchRequest, NamedVector, Filter,
+    FieldCondition, MatchValue, MatchAny
+)
+from sentence_transformers import SentenceTransformer
+from PIL import Image
+import base64
+import io
+from typing import Optional
+
+model = SentenceTransformer("clip-ViT-B-32")
+client = QdrantClient(url="http://localhost:6333")
+COLLECTION = "products_multimodal"
+
+def text_to_image_search(
+    query_text: str,
+    category_filter: Optional[str] = None,
+    top_k: int = 20
+) -&gt; list[dict]:
+    """
+    Query: text string → retrieve closest images.
+    Classic cross-modal retrieval.
+    """
+    query_vector = model.encode(
+        query_text,
+        normalize_embeddings=True
+    ).tolist()
+
+    search_filter = None
+    if category_filter:
+        search_filter = Filter(
+            must=[
+                FieldCondition(key="category", match=MatchValue(value=category_filter)),
+                FieldCondition(key="has_image", match=MatchValue(value=True))
+            ]
+        )
+
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=NamedVector(name="image", vector=query_vector),  # text → image space
+        query_filter=search_filter,
+        limit=top_k,
+        with_payload=True,
+        score_threshold=0.25  # CLIP cosine scores below 0.25 are typically noise
+    )
+
+    return [
+        {
+            "product_id": r.payload["product_id"],
+            "name": r.payload["name"],
+            "score": r.score,
+            "has_image": r.payload.get("has_image", False)
+        }
+        for r in results
+    ]
+
+def image_to_image_search(
+    query_image_path: str,
+    top_k: int = 20,
+    exclude_product_id: Optional[str] = None
+) -&gt; list[dict]:
+    """
+    Query: image → retrieve visually similar items.
+    'Shop the look' / visual similarity pattern.
+    """
+    img = Image.open(query_image_path).convert("RGB")
+    query_vector = model.encode(img, normalize_embeddings=True).tolist()
+
+    search_filter = None
+    if exclude_product_id:
+        # Exclude the query item itself from results
+        search_filter = Filter(
+            must_not=[
+                FieldCondition(key="product_id", match=MatchValue(value=exclude_product_id))
+            ]
+        )
+
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=NamedVector(name="image", vector=query_vector),
+        query_filter=search_filter,
+        limit=top_k,
+        with_payload=True
+    )
+    return [{"product_id": r.payload["product_id"], "name": r.payload["name"], "score": r.score}
+            for r in results]
+
+def combined_text_image_search(
+    query_text: str,
+    query_image_path: str,
+    text_weight: float = 0.4,
+    image_weight: float = 0.6,
+    top_k: int = 20
+) -&gt; list[dict]:
+    """
+    Fused query: BOTH a text query AND a reference image.
+    Use case: 'Find shoes like [image] but with [text description]'.
+
+    Fusion strategy: weighted average of text and image query vectors.
+    This works because both live in the same CLIP space.
+    """
+    import numpy as np
+
+    text_vector = model.encode(query_text, normalize_embeddings=True)
+
+    img = Image.open(query_image_path).convert("RGB")
+    image_vector = model.encode(img, normalize_embeddings=True)
+
+    # Weighted combination — still in the shared CLIP space
+    fused_vector = text_weight * text_vector + image_weight * image_vector
+
+    # Re-normalize after combination
+    fused_norm = np.linalg.norm(fused_vector)
+    if fused_norm &gt; 0:
+        fused_vector = fused_vector / fused_norm
+
+    # Query the image index with the fused vector
+    # (could also query the text index — depends on what you indexed)
+    results = client.search(
+        collection_name=COLLECTION,
+        query_vector=NamedVector(name="image", vector=fused_vector.tolist()),
+        limit=top_k,
+        with_payload=True,
+        score_threshold=0.20
+    )
+
+    return [
+        {
+            "product_id": r.payload["product_id"],
+            "name": r.payload["name"],
+            "score": r.score,
+            "query_mode": "fused_text_image"
+        }
+        for r in results
+    ]
+
+def late_fusion_search(
+    query_text: str,
+    query_image_path: str,
+    text_weight: float = 0.5,
+    image_weight: float = 0.5,
+    candidate_pool: int = 100,
+    top_k: int = 20
+) -&gt; list[dict]:
+    """
+    Late fusion: run two separate searches, then combine scores.
+    More expensive but allows independent index tuning per modality.
+    Use when text and image are in DIFFERENT embedding spaces.
+    """
+    import numpy as np
+
+    # Search 1: text vector → text index
+    text_vector = model.encode(query_text,normalize_embeddings=True).tolist()
+
+    text_results = client.search(
+        collection_name=COLLECTION,
+        query_vector=NamedVector(name="text", vector=text_vector),
+        limit=candidate_pool,
+        with_payload=True,
+        score_threshold=0.15
+    )
+
+    # Search 2: image vector → image index
+    img = Image.open(query_image_path).convert("RGB")
+    image_vector = model.encode(img, normalize_embeddings=True).tolist()
+
+    image_results = client.search(
+        collection_name=COLLECTION,
+        query_vector=NamedVector(name="image", vector=image_vector),
+        limit=candidate_pool,
+        with_payload=True,
+        score_threshold=0.15
+    )
+
+    # Merge scores by product_id
+    score_map: dict[str, dict] = {}
+    for r in text_results:
+        pid = r.payload["product_id"]
+        score_map[pid] = {
+            "product_id": pid,
+            "name": r.payload["name"],
+            "text_score": r.score,
+            "image_score": 0.0,
+            "payload": r.payload
+        }
+
+    for r in image_results:
+        pid = r.payload["product_id"]
+        if pid in score_map:
+            score_map[pid]["image_score"] = r.score
+        else:
+            score_map[pid] = {
+                "product_id": pid,
+                "name": r.payload["name"],
+                "text_score": 0.0,
+                "image_score": r.score,
+                "payload": r.payload
+            }
+
+    # Weighted combined score
+    fused = []
+    for pid, data in score_map.items():
+        combined = text_weight * data["text_score"] + image_weight * data["image_score"]
+        fused.append({
+            "product_id": pid,
+            "name": data["name"],
+            "combined_score": combined,
+            "text_score": data["text_score"],
+            "image_score": data["image_score"]
+        })
+
+    fused.sort(key=lambda x: x["combined_score"], reverse=True)
+    return fused[:top_k]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The late fusion pattern deserves a closer look, because it is the right choice whenever text and image embeddings come from *different* models with *different* dimensionalities. When you have a 1536-dimension OpenAI text embedding alongside a 512-dimension CLIP image embedding, you cannot average them — the vector spaces are unrelated. Late fusion avoids that requirement: each modality gets its own search against its own index, and scores are combined numerically after the fact. The cost is two round-trips to the database and a merge step in application memory.</p>
+
+<p class="text-gray-300 leading-relaxed">Early fusion (the weighted average in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">combined_text_image_search</code>) only works when both modalities are encoded by the same model family into the same shared space. CLIP's design makes this possible; most other combinations do not.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Multi-Modal Search in pgvector: The SQL Perspective</h3>
+
+<p class="text-gray-300 leading-relaxed">For teams operating in PostgreSQL with pgvector, the fusion logic moves into SQL rather than application code. This has advantages for teams that want to keep retrieval logic auditable and version-controlled as migrations.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Late fusion multi-modal search using two CTEs
+
+-- Assumes:
+--   product_text_embeddings (product_id, embedding VECTOR(1536))
+--   product_image_embeddings (product_id, embedding VECTOR(512))
+-- Each has its own HNSW index.
+
+-- Parameters passed as session variables or substituted by the application:
+--   :text_query_vector   — 1536-dim OpenAI embedding of the query string
+--   :image_query_vector  — 512-dim CLIP embedding of the reference image
+--   :text_weight         — e.g. 0.5
+--   :image_weight        — e.g. 0.5
+--   :candidate_k         — e.g. 100
+--   :top_k               — e.g. 20
+
+WITH text_candidates AS (
+    SELECT
+        product_id,
+        1 - (embedding &lt;=&gt; :text_query_vector::VECTOR(1536)) AS text_score
+    FROM product_text_embeddings
+    ORDER BY embedding &lt;=&gt; :text_query_vector::VECTOR(1536)
+    LIMIT :candidate_k
+),
+image_candidates AS (
+    SELECT
+        product_id,
+        1 - (embedding &lt;=&gt; :image_query_vector::VECTOR(512)) AS image_score
+    FROM product_image_embeddings
+    ORDER BY embedding &lt;=&gt; :image_query_vector::VECTOR(512)
+    LIMIT :candidate_k
+),
+fused AS (
+    SELECT
+        COALESCE(t.product_id, i.product_id) AS product_id,
+        COALESCE(t.text_score, 0.0)  * :text_weight
+            + COALESCE(i.image_score, 0.0) * :image_weight  AS combined_score,
+        COALESCE(t.text_score, 0.0)  AS text_score,
+        COALESCE(i.image_score, 0.0) AS image_score
+    FROM text_candidates t
+    FULL OUTER JOIN image_candidates i USING (product_id)
+)
+SELECT
+    f.product_id,
+    p.name,
+    p.category,
+    p.price,
+    f.combined_score,
+    f.text_score,
+    f.image_score
+FROM fused f
+JOIN products p ON p.id = f.product_id
+ORDER BY f.combined_score DESC
+LIMIT :top_k;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
+-- SQL Server does not have a native vector type in older versions;
+-- assuming the vector extension or a FLOAT column workaround is not available,
+-- the pattern below uses SQL Server 2025+ vector type (VECTOR) where supported,
+-- or a stored-proc approach calling an external scoring service.
+-- For teams on SQL Server 2022 and below, the recommended path is to perform
+-- the HNSW search outside SQL Server and use SQL Server only for the metadata JOIN.
+
+-- SQL Server 2025+ with native VECTOR type:
+WITH text_candidates AS (
+    SELECT TOP (:candidate_k)
+        product_id,
+        1.0 - VECTOR_DISTANCE('cosine', embedding, CAST(:text_query_vector AS VECTOR(1536)))
+            AS text_score
+    FROM product_text_embeddings
+    ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(:text_query_vector AS VECTOR(1536)))
+),
+image_candidates AS (
+    SELECT TOP (:candidate_k)
+        product_id,
+        1.0 - VECTOR_DISTANCE('cosine', embedding, CAST(:image_query_vector AS VECTOR(512)))
+            AS image_score
+    FROM product_image_embeddings
+    ORDER BY VECTOR_DISTANCE('cosine', embedding, CAST(:image_query_vector AS VECTOR(512)))
+),
+fused AS (
+    SELECT
+        COALESCE(t.product_id, i.product_id) AS product_id,
+        COALESCE(t.text_score, 0.0) * :text_weight
+            + COALESCE(i.image_score, 0.0) * :image_weight  AS combined_score,
+        COALESCE(t.text_score, 0.0)  AS text_score,
+        COALESCE(i.image_score, 0.0) AS image_score
+    FROM text_candidates t
+    FULL OUTER JOIN image_candidates i ON t.product_id = i.product_id
+)
+SELECT TOP (:top_k)
+    f.product_id,
+    p.name,
+    p.category,
+    p.price,
+    f.combined_score,
+    f.text_score,
+    f.image_score
+FROM fused f
+JOIN products p ON p.id = f.product_id
+ORDER BY f.combined_score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A subtlety in both queries: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FULL OUTER JOIN</code> between <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text_candidates</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">image_candidates</code> is deliberate. Products that appear in only one result set still participate in the final ranking, with a zero score contribution from the missing modality. This prevents the fusion from arbitrarily excluding products that have strong text relevance but weak image relevance or vice versa. Whether that behavior is correct depends on your use case — if you require *both* modalities to have non-trivial signal, replace the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FULL OUTER JOIN</code> with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INNER JOIN</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Score Normalization Before Fusion</h3>
+
+<p class="text-gray-300 leading-relaxed">A common mistake in late fusion implementations is combining raw cosine similarity scores across modalities without considering their distributions. Different models produce scores with different statistical properties: a cosine similarity of 0.7 in a text embedding space does not mean the same "closeness" as 0.7 in a CLIP image space. CLIP image-to-image similarities tend to cluster in a narrower range than text-to-text similarities because image features are more visually concrete.</p>
+
+<p class="text-gray-300 leading-relaxed">The solution is score normalization within each modality's result set before combining. The two standard approaches:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Min-Max normalization</strong>: Scale each modality's scores to [0, 1] relative to the candidate pool.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def normalize_scores_minmax(scores: list[float]) -&gt; list[float]:
+    if not scores:
+        return scores
+    min_s, max_s = min(scores), max(scores)
+    if max_s == min_s:
+        return [1.0] * len(scores)
+    return [(s - min_s) / (max_s - min_s) for s in scores]
+
+def late_fusion_with_normalization(
+    text_results: list,  # [(product_id, name, score), ...]
+    image_results: list,
+    text_weight: float = 0.5,
+    image_weight: float = 0.5,
+    top_k: int = 20
+) -&gt; list[dict]:
+    import numpy as np
+
+    text_scores_raw  = [r.score for r in text_results]
+    image_scores_raw = [r.score for r in image_results]
+
+    text_scores_norm  = normalize_scores_minmax(text_scores_raw)
+    image_scores_norm = normalize_scores_minmax(image_scores_raw)
+
+    score_map: dict[str, dict] = {}
+    for r, norm_score in zip(text_results, text_scores_norm):
+        pid = r.payload["product_id"]
+        score_map[pid] = {"name": r.payload["name"], "text_score": norm_score, "image_score": 0.0}
+
+    for r, norm_score in zip(image_results, image_scores_norm):
+        pid = r.payload["product_id"]
+        if pid in score_map:
+            score_map[pid]["image_score"] = norm_score
+        else:
+            score_map[pid] = {"name": r.payload["name"], "text_score": 0.0, "image_score": norm_score}
+
+    fused = [
+        {
+            "product_id": pid,
+            "name": data["name"],
+            "combined_score": text_weight * data["text_score"] + image_weight * data["image_score"],
+            "text_score": data["text_score"],
+            "image_score": data["image_score"]
+        }
+        for pid, data in score_map.items()
+    ]
+    fused.sort(key=lambda x: x["combined_score"], reverse=True)
+    return fused[:top_k]</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Reciprocal Rank Fusion (RRF)</strong>: An alternative that is rank-based rather than score-based, and therefore inherently distribution-agnostic.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def reciprocal_rank_fusion(
+    text_results: list,
+    image_results: list,
+    k: int = 60,  # RRF smoothing constant; 60 is the standard default
+    top_n: int = 20
+) -&gt; list[dict]:
+    """
+    Combine two ranked lists using RRF.
+    RRF score = sum over each list of: 1 / (rank_in_list + k)
+    """
+    rrf_scores: dict[str, float] = {}
+    payload_store: dict[str, dict] = {}
+
+    for rank, r in enumerate(text_results, start=1):
+        pid = r.payload["product_id"]
+        rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rank + k)
+        payload_store[pid] = r.payload
+
+    for rank, r in enumerate(image_results, start=1):
+        pid = r.payload["product_id"]
+        rrf_scores[pid] = rrf_scores.get(pid, 0.0) + 1.0 / (rank + k)
+        if pid not in payload_store:
+            payload_store[pid] = r.payload
+
+    ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_n]
+
+    return [
+        {
+            "product_id": pid,
+            "name": payload_store[pid]["name"],
+            "rrf_score": score
+        }
+        for pid, score in ranked
+    ]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">RRF has a practical advantage in production: it is robust to outlier scores and does not require you to tune normalization ranges as your corpus grows. The tradeoff is that you lose the interpretable per-modality score breakdown — you cannot easily tell whether a result ranked highly because of text signal, image signal, or both.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Queries Without an Image</h3>
+
+<p class="text-gray-300 leading-relaxed">In real deployments, most users will provide text queries most of the time. The multi-modal system must degrade gracefully when only one modality is present, rather than treating a missing image as an error.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
+
+class QueryModality(Enum):
+    TEXT_ONLY   = "text_only"
+    IMAGE_ONLY  = "image_only"
+    BOTH        = "both"
+
+@dataclass
+class MultiModalQuery:
+    text: Optional[str]
+    image_path: Optional[str]
+    category_filter: Optional[str] = None
+    text_weight: float = 0.5
+    image_weight: float = 0.5
+    top_k: int = 20
+
+    @property
+    def modality(self) -&gt; QueryModality:
+        if self.text and self.image_path:
+            return QueryModality.BOTH
+        elif self.text:
+            return QueryModality.TEXT_ONLY
+        elif self.image_path:
+            return QueryModality.IMAGE_ONLY
+        raise ValueError("Query must have at least one of text or image_path")
+
+def route_multimodal_query(
+    query: MultiModalQuery,
+    model: SentenceTransformer,
+    client: QdrantClient
+) -&gt; list[dict]:
+    """
+    Route query to the appropriate search strategy based on what inputs are available.
+    """
+    modality = query.modality
+
+    if modality == QueryModality.TEXT_ONLY:
+        # Standard vector search on text index; optionally also hit image index
+        # for cross-modal retrieval (user typed, wants images back)
+        return text_to_image_search(
+            query_text=query.text,
+            category_filter=query.category_filter,
+            top_k=query.top_k
+        )
+
+    elif modality == QueryModality.IMAGE_ONLY:
+        return image_to_image_search(
+            query_image_path=query.image_path,
+            top_k=query.top_k
+        )
+
+    else:  # BOTH
+        # Decide between early fusion and late fusion based on modality compatibility
+        # (For CLIP, early fusion is fine; generalize with late fusion if needed)
+        text_results = client.search(
+            collection_name=COLLECTION,
+            query_vector=NamedVector(
+                name="text",
+                vector=model.encode(query.text, normalize_embeddings=True).tolist()
+            ),
+            limit=query.top_k * 3,
+            with_payload=True
+        )
+        from PIL import Image as PILImage
+        img = PILImage.open(query.image_path).convert("RGB")
+        image_results = client.search(
+            collection_name=COLLECTION,
+            query_vector=NamedVector(
+                name="image",
+                vector=model.encode(img, normalize_embeddings=True).tolist()
+            ),
+            limit=query.top_k * 3,
+            with_payload=True
+        )
+
+        return reciprocal_rank_fusion(
+            text_results=text_results,
+            image_results=image_results,
+            top_n=query.top_k
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The routing logic here is deliberately simple — three branches, no machine learning. In a production system you might introduce a fourth branch: a <strong class="text-white">zero-shot re-ranker</strong> that scores the top-K candidates from the fused list against the original text query using a cross-encoder model. That adds latency (typically 50–150 ms for a list of 100 candidates on CPU) but improves precision significantly, especially for ambiguous queries where the bi-encoder CLIP search is unreliable.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Pinecone: Multi-Modal with Namespaces and Metadata Filtering</h3>
+
+<p class="text-gray-300 leading-relaxed">Pinecone's architecture does not have native named vector support in the same way Qdrant does. The production pattern for multi-modal search in Pinecone uses <strong class="text-white">namespaces</strong> to separate modalities within a single index, combined with metadata filtering.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Multi-modal pattern in Pinecone using namespaces
+# Pinecone indexes are fixed-dimension; CLIP ViT-B/32 = 512
+
+from pinecone import Pinecone, ServerlessSpec
+from sentence_transformers import SentenceTransformer
+from PIL import Image
+import numpy as np
+from typing import Optional
+
+pc = Pinecone(api_key="YOUR_PINECONE_API_KEY")
+model = SentenceTransformer("clip-ViT-B-32")
+
+INDEX_NAME   = "products-multimodal"
+TEXT_NS      = "text"   # namespace for text embeddings
+IMAGE_NS     = "image"  # namespace for image embeddings
+VECTOR_DIM   = 512
+
+def create_pinecone_index():
+    if INDEX_NAME not in [i.name for i in pc.list_indexes()]:
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=VECTOR_DIM,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1")
+        )
+
+def upsert_product(
+    product_id: str,
+    name: str,
+    description: str,
+    category: str,
+    price: float,
+    image_path: Optional[str] = None
+):
+    index = pc.Index(INDEX_NAME)
+
+    # Upsert text embedding
+    text_vector = model.encode(
+        f"{name}. {description}", normalize_embeddings=True
+    ).tolist()
+
+    index.upsert(
+        vectors=[{
+            "id": f"{product_id}",
+            "values": text_vector,
+            "metadata": {
+                "product_id": product_id,
+                "name": name,
+                "category": category,
+                "price": price,
+                "modality": "text"
+            }
+        }],
+        namespace=TEXT_NS
+    )
+
+    # Upsert image embedding if image is available
+    if image_path:
+        img = Image.open(image_path).convert("RGB")
+        image_vector = model.encode(img, normalize_embeddings=True).tolist()
+
+        index.upsert(
+            vectors=[{
+                "id": f"{product_id}",
+                "values": image_vector,
+                "metadata": {
+                    "product_id": product_id,
+                    "name": name,
+                    "category": category,
+                    "price": price,
+                    "modality": "image"
+                }
+            }],
+            namespace=IMAGE_NS
+        )
+
+def multimodal_query_pinecone(
+    query_text: Optional[str],
+    query_image_path: Optional[str],
+    category_filter: Optional[str] = None,
+    top_k: int = 20,
+    text_weight: float = 0.5,
+    image_weight: float = 0.5
+) -&gt; list[dict]:
+    index = pc.Index(INDEX_NAME)
+
+    metadata_filter = {}
+    if category_filter:
+        metadata_filter = {"category": {"$eq": category_filter}}
+
+    results_text   = []
+    results_image  = []
+
+    if query_text:
+        text_vector = model.encode(query_text, normalize_embeddings=True).tolist()
+        resp = index.query(
+            namespace=IMAGE_NS,           # text query → image namespace (cross-modal)
+            vector=text_vector,
+            top_k=top_k * 3,
+            filter=metadata_filter if metadata_filter else None,
+            include_metadata=True
+        )
+        results_text = resp.matches
+
+    if query_image_path:
+        img = Image.open(query_image_path).convert("RGB")
+        image_vector = model.encode(img, normalize_embeddings=True).tolist()
+        resp = index.query(
+            namespace=IMAGE_NS,
+            vector=image_vector,
+            top_k=top_k * 3,
+            filter=metadata_filter if metadata_filter else None,
+            include_metadata=True
+        )
+        results_image = resp.matches
+
+    if results_text and results_image:
+        return reciprocal_rank_fusion_pinecone(results_text, results_image, top_n=top_k)
+    elif results_text:
+        return [{"product_id": m.metadata["product_id"], "name": m.metadata["name"], "score": m.score}
+                for m in results_text[:top_k]]
+    elif results_image:
+        return [{"product_id": m.metadata["product_id"], "name": m.metadata["name"], "score": m.score}
+                for m in results_image[:top_k]]
+    return []
+
+def reciprocal_rank_fusion_pinecone(
+    text_matches,
+    image_matches,
+    k: int = 60,
+    top_n: int = 20
+) -&gt; list[dict]:
+    rrf: dict[str, float] = {}
+    meta: dict[str, dict]  = {}
+
+    for rank, m in enumerate(text_matches, start=1):
+        pid = m.metadata["product_id"]
+        rrf[pid] = rrf.get(pid, 0.0) + 1.0 / (rank + k)
+        meta[pid] = m.metadata
+
+    for rank, m in enumerate(image_matches, start=1):
+        pid = m.metadata["product_id"]
+        rrf[pid] = rrf.get(pid, 0.0) + 1.0 / (rank + k)
+        if pid not in meta:
+            meta[pid] = m.metadata
+
+    ranked = sorted(rrf.items(), key=lambda x: x[1], reverse=True)[:top_n]
+    return [{"product_id": pid, "name": meta[pid]["name"], "rrf_score": score}
+            for pid, score in ranked]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One limitation of the Pinecone namespace approach: namespaces share the same dimension. Since CLIP text and image encoders produce the same dimension by design, this is not a constraint for CLIP-based systems. If your architecture mixes CLIP images (512-d) with a different text embedding model (1536-d), you would need two separate Pinecone indexes rather than two namespaces.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Production Considerations: Latency, Cost, and Quality Tradeoffs</h3>
+
+<p class="text-gray-300 leading-relaxed">Multi-modal search introduces compound latency: you are now encoding queries with a vision model in addition to a text model, and potentially issuing two database queries instead of one. Understanding where time is spent guides optimization.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embedding latency</strong> is typically the largest contributor. CLIP ViT-B/32 runs at roughly 5–15 ms per image on a modern CPU with batch size 1, and under 2 ms per text query. On GPU, image embedding drops below 2 ms. If your deployment is CPU-only, consider:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Caching embeddings for repeated reference images (user uploads the same product photo repeatedly)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Quantizing the CLIP model with INT8 to reduce inference time at marginal quality cost</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Using a lighter CLIP variant (ViT-S/32) for latency-critical paths and a heavier model for offline indexing</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index scan latency</strong> scales with collection size and HNSW parameters. A practical rule: keep <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> (the HNSW search parameter at query time) at 2–4× your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_k</code>. For <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_k=20</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef=64</code> is a reasonable starting point. Increasing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef</code> improves recall at the cost of latency — profile this against your SLA.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quality measurement</strong> for multi-modal search requires a labeled evaluation set with both modalities. The standard metric is Recall@K: for a set of known-relevant items, what fraction appear in the top-K results? Building this dataset means collecting (query text, reference image, known-relevant product IDs) triples — time-consuming but necessary before tuning fusion weights.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cost management</strong> in cloud-hosted vector databases (Pinecone, Weaviate Cloud) is driven by stored vector count and query volume. Multi-modal doubles your vector count per document when storing separate text and image embeddings. If cost is a constraint, consider:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Storing only image embeddings and using the CLIP text encoder at query time for cross-modal retrieval (text query → image index). This halves storage at the cost of losing text-to-text retrieval as a fallback.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Tiering: use a smaller vector dimension (256-d via PCA projection of CLIP) for the first-pass ANN search, then re-score top candidates with the full 512-d embedding.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">A Complete End-to-End Example: Fashion Visual Search</h3>
+
+<p class="text-gray-300 leading-relaxed">To bring the patterns together, consider a fashion retail application that supports three query types: "type a description," "upload a photo," and "type a description while holding a photo." The following shows the complete server-side handler.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Fashion visual search: end-to-end query handler
+# FastAPI endpoint integrating all multi-modal patterns
+
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+import tempfile, os, shutil
+from typing import Optional
+from sentence_transformers import SentenceTransformer
+from qdrant_client import QdrantClient
+from qdrant_client.models import NamedVector, Filter, FieldCondition, MatchValue
+
+app = FastAPI(title="Fashion Visual Search API")
+
+# Initialize at startup — avoid re-loading per request
+_model: Optional[SentenceTransformer] = None
+_qdrant: Optional[QdrantClient] = None
+
+@app.on_event("startup")
+async def startup():
+    global _model, _qdrant
+    _model  = SentenceTransformer("clip-ViT-B-32")
+    _qdrant = QdrantClient(url=os.getenv("QDRANT_URL", "http://localhost:6333"))
+
+@app.post("/search")
+async def search(
+    query_text: Optional[str]       = Form(None),
+    category:   Optional[str]       = Form(None),
+    top_k:      int                 = Form(20),
+    text_weight: float              = Form(0.4),
+    image_weight: float             = Form(0.6),
+    image:      Optional[UploadFile] = File(None)
+):
+    if not query_text and not image:
+        raise HTTPException(status_code=400, detail="Provide at least query_text or an image.")
+
+    # Persist uploaded image to temp file for PIL
+    tmp_image_path = None
+    if image:
+        suffix = os.path.splitext(image.filename)[-1] or ".jpg"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            shutil.copyfileobj(image.file, tmp)
+            tmp_image_path = tmp.name
+
+    try:
+        q = MultiModalQuery(
+            text=query_text,
+            image_path=tmp_image_path,
+            category_filter=category,
+            text_weight=text_weight,
+            image_weight=image_weight,
+            top_k=top_k
+        )
+        results = route_multimodal_query(q, _model, _qdrant)
+        return JSONResponse(content={"results": results, "modality": q.modality.value})
+
+    finally:
+        if tmp_image_path and os.path.exists(tmp_image_path):
+            os.unlink(tmp_image_path)  # always clean up temp files
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "model": "clip-ViT-B-32"}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The FastAPI handler deliberately isolates temp-file cleanup in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finally</code> block — a failure during embedding or Qdrant search must not leave orphaned image files filling the server's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/tmp</code> directory. In a container environment, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/tmp</code> is often an in-memory tmpfs with limited capacity.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Shared embedding spaces** are the foundation of multi-modal search. CLIP-family models encode text and images into the same vector space, enabling cross-modal queries where a text string can retrieve images and vice versa without any additional translation layer.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage architecture choices** — single table with modality column, separate tables per modality, or database-native multi-modal collections (Weaviate) — each carry different tradeoffs for indexing flexibility, update independence, and operational complexity. Choose based on whether text and image pipelines change at the same rate.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Early fusion** (averaging query vectors) works only when text and image embeddings share the same model and dimensionality. **Late fusion** (two searches, score combination) is the safe default when embedding models differ, and RRF is the most robust score combination method because it is rank-based and distribution-agnostic.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Score normalization before combining modality scores** is not optional in production. Raw cosine similarities from different models have different statistical distributions; combining them without normalization biases fusion toward whichever modality happens to produce larger raw values.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Graceful degradation** — routing single-modality queries through the appropriate index without treating a missing image or text as an error — is required for any system that faces real user traffic. Wrap modality detection in an explicit routing layer so that adding new query types later does not require restructuring the retrieval core.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
