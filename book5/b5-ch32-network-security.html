@@ -6,6 +6,10 @@
   <title>Chapter 32: VPC, Private Endpoints, and Network Security — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 32: VPC, Private Endpoints, and Network Security. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -282,6 +286,15 @@ gcloud dns record-sets create prod-postgres.internal.example.com. \
 
 <p class="text-gray-300 leading-relaxed">Test DNS resolution from every network segment that needs database access, not just from one representative host.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Application tier<br/>private subnet] -->|Security group reference,<br/>not CIDR| B[Private endpoint /<br/>PrivateLink ENI]
+    B -->|Private IP, resolved via<br/>private DNS zone| C[Database instance<br/>private subnet]
+    D[Public internet] -.->|No route,<br/>no public IP| C
+    A -.->|DNS query for<br/>db hostname| E[Private DNS zone<br/>linked to VNet/VPC]
+    E -->|Resolves to<br/>private IP| B</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Traffic never leaves the VPC/VNet: the private DNS zone is what keeps applications from silently falling back to the public endpoint.*</p>
+
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">32.3 Security Groups, Firewall Rules, and the Principle of Least Privilege</h3>
@@ -487,7 +500,699 @@ az network vnet peering show \
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.5 IAM</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.5 IAM Authentication vs. Network Authentication: Combining Database and Network Security</h3>
+
+<p class="text-gray-300 leading-relaxed">Network controls limit which machines can attempt a connection. Database authentication controls which identities succeed when they do. Production security requires both layers, and the cloud adds a third layer: cloud IAM integration with the database authentication system itself.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS IAM Database Authentication</strong></p>
+
+<p class="text-gray-300 leading-relaxed">RDS and Aurora support IAM authentication as an alternative to password-based logins. Instead of storing a password, the application generates a short-lived authentication token using its AWS IAM identity (an IAM role). The token is valid for 15 minutes and is generated locally using AWS credentials — it never requires a call to an external auth service at connection time, only for token generation.</p>
+
+<p class="text-gray-300 leading-relaxed">The workflow:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Create a database user mapped to IAM</p>
+<p class="text-gray-300 leading-relaxed">2. Grant the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_iam</code> role (Aurora PostgreSQL) or equivalent</p>
+<p class="text-gray-300 leading-relaxed">3. Application uses its EC2 instance profile or ECS task role to generate the token</p>
+<p class="text-gray-300 leading-relaxed">4. Application connects with the token as the password</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL on RDS/Aurora: create IAM-authenticated user
+-- Run this as the master user
+CREATE USER app_service WITH LOGIN;
+GRANT rds_iam TO app_service;
+
+-- Verify the IAM role association
+SELECT rolname, rolsuper, rolinherit
+FROM pg_roles
+WHERE rolname IN ('rds_iam', 'app_service');</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server on RDS: IAM auth uses Windows authentication via Active Directory
+-- or certificate-based auth — IAM token auth is PostgreSQL/MySQL-specific
+-- For SQL Server, use AD integration instead:
+CREATE LOGIN [DOMAIN\app-service-account] FROM WINDOWS;
+CREATE USER [DOMAIN\app-service-account] FOR LOGIN [DOMAIN\app-service-account];
+ALTER ROLE db_datareader ADD MEMBER [DOMAIN\app-service-account];</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Generating the token from application code (Python example pattern):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import psycopg2
+
+def get_rds_auth_token(host, port, db_user, region):
+    """Generate a short-lived IAM auth token for RDS."""
+    client = boto3.client('rds', region_name=region)
+    token = client.generate_db_auth_token(
+        DBHostname=host,
+        Port=port,
+        DBUsername=db_user,
+        Region=region
+    )
+    return token
+
+def connect_with_iam_auth():
+    host = "prod-postgres-01.cluster-xyz.us-east-1.rds.amazonaws.com"
+    port = 5432
+    db_user = "app_service"
+    region = "us-east-1"
+
+    token = get_rds_auth_token(host, port, db_user, region)
+
+    conn = psycopg2.connect(
+        host=host,
+        port=port,
+        database="appdb",
+        user=db_user,
+        password=token,
+        sslmode="verify-full",
+        sslrootcert="/etc/ssl/certs/rds-ca-bundle.pem"
+    )
+    return conn</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sslmode="verify-full"</code> — IAM authentication requires SSL. Without it, the token cannot be validated. This is a hard requirement, not a suggestion, and it means you must distribute the RDS CA certificate bundle to your application hosts.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS IAM Auth: Performance Considerations</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Token generation makes an API call to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds.amazonaws.com</code>. If your application opens many short-lived connections (poor connection pooling, Lambda without RDS Proxy), this adds latency. The solution: use RDS Proxy with IAM auth. The proxy handles token generation and maintains a persistent connection pool. Applications authenticate to the proxy using IAM, and the proxy handles the database connection:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create RDS Proxy with IAM authentication
+aws rds create-db-proxy \
+  --db-proxy-name prod-postgres-proxy \
+  --engine-family POSTGRESQL \
+  --auth '[{
+    "AuthScheme": "SECRETS",
+    "SecretArn": "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/postgres/credentials",
+    "IAMAuth": "REQUIRED"
+  }]' \
+  --role-arn arn:aws:iam::123456789012:role/RDSProxyRole \
+  --vpc-subnet-ids subnet-0a1b2c3d4e5f67890 subnet-0f9e8d7c6b5a43210 \
+  --vpc-security-group-ids sg-rdsproxy-sg-id \
+  --require-tls
+
+# Register the RDS cluster with the proxy
+aws rds register-db-proxy-targets \
+  --db-proxy-name prod-postgres-proxy \
+  --db-cluster-identifiers prod-aurora-cluster</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL and Azure Active Directory Authentication</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL supports three authentication modes: SQL authentication (username/password stored in the database), Azure AD authentication (identities managed by Azure AD), and mixed mode. In production, enforce Azure AD-only:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Set Azure AD admin on SQL Server — this enables AAD auth
+az sql server ad-admin create \
+  --server prod-sql-server \
+  --resource-group prod-rg \
+  --display-name "DBA-Team" \
+  --object-id $(az ad group show --group "DBA-Team" --query id -o tsv)
+
+# Disable SQL (password-based) authentication — Azure AD only
+az sql server update \
+  --name prod-sql-server \
+  --resource-group prod-rg \
+  --set administratorLogin="" \
+  --minimal-tls-version 1.2</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Creating contained database users mapped to Azure AD identities (managed identities for applications):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL: create user for a managed identity (application service principal)
+-- Run as Azure AD admin
+CREATE USER [my-app-managed-identity] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datareader ADD MEMBER [my-app-managed-identity];
+ALTER ROLE db_datawriter ADD MEMBER [my-app-managed-identity];
+
+-- For a service principal (app registration):
+CREATE USER [my-app-registration] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datareader ADD MEMBER [my-app-registration];
+
+-- Verify contained users
+SELECT name, type_desc, authentication_type_desc
+FROM sys.database_principals
+WHERE type IN ('E', 'X')  -- E=external user, X=external group
+ORDER BY name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP Cloud SQL and IAM Database Authentication</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cloud SQL PostgreSQL supports IAM database authentication where the Google Cloud IAM identity (service account) maps to a PostgreSQL role:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable IAM database authentication on Cloud SQL instance
+gcloud sql instances patch prod-postgres-instance \
+  --project=my-project \
+  --database-flags=cloudsql.iam_authentication=on
+
+# Add IAM service account as a Cloud SQL user
+gcloud sql users create app-service@my-project.iam.gserviceaccount.com \
+  --instance=prod-postgres-instance \
+  --project=my-project \
+  --type=CLOUD_IAM_SERVICE_ACCOUNT</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Cloud SQL PostgreSQL: the IAM user is created automatically when added via gcloud
+-- Grant appropriate privileges
+GRANT CONNECT ON DATABASE appdb TO "app-service@my-project.iam";
+GRANT USAGE ON SCHEMA public TO "app-service@my-project.iam";
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public
+  TO "app-service@my-project.iam";
+
+-- For future tables:
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES
+  TO "app-service@my-project.iam";
+
+-- Verify the IAM user in pg_roles
+SELECT rolname, rolcanlogin
+FROM pg_roles
+WHERE rolname LIKE '%iam%' OR rolname LIKE '%gserviceaccount%';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.6 TLS Enforcement and Certificate Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Network isolation prevents unwanted access. TLS encryption protects the data in transit from eavesdropping on the connections that are allowed. For managed cloud databases, you should be enforcing TLS everywhere and verifying certificates, not just encrypting.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enforcing TLS on AWS RDS</strong></p>
+
+<p class="text-gray-300 leading-relaxed">RDS PostgreSQL and MySQL use parameter group settings to enforce SSL. Without enforcement, clients can connect unencrypted even when SSL is available:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create a parameter group that enforces SSL for PostgreSQL
+aws rds create-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name prod-postgres-enforced-ssl \
+  --db-parameter-group-family aurora-postgresql15 \
+  --description "Forces all connections to use SSL"
+
+# Set rds.force_ssl = 1 (1 = reject non-SSL connections)
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name prod-postgres-enforced-ssl \
+  --parameters ParameterName=rds.force_ssl,ParameterValue=1,ApplyMethod=immediate
+
+# Apply to your cluster
+aws rds modify-db-cluster \
+  --db-cluster-identifier prod-aurora-cluster \
+  --db-cluster-parameter-group-name prod-postgres-enforced-ssl \
+  --apply-immediately</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: verify SSL is required — check current connections
+SELECT pid, usename, application_name, client_addr, ssl, ssl_version, ssl_cipher
+FROM pg_stat_ssl
+JOIN pg_stat_activity USING (pid)
+WHERE backend_type = 'client backend'
+ORDER BY ssl, client_addr;
+
+-- SQL Server on RDS: check SSL/TLS for existing connections
+SELECT session_id, encrypt_option, net_transport, auth_scheme
+FROM sys.dm_exec_connections
+ORDER BY encrypt_option;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Certificate Verification: The Difference Between Encryption and Security</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Using SSL without certificate verification protects against passive eavesdropping but not against man-in-the-middle attacks. Applications should verify the server certificate using the RDS Certificate Authority bundle. AWS periodically rotates CA certificates (the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds-ca-rsa2048-g1</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds-ca-rsa4096-g1</code> rotation is an example), and failing to update the CA bundle in applications causes connection failures:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Download current RDS CA bundle
+curl -o /etc/ssl/certs/global-bundle.pem \
+  https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem
+
+# Verify what CA your RDS instance is currently using
+aws rds describe-db-instances \
+  --db-instance-identifier prod-postgres-01 \
+  --query 'DBInstances[0].CACertificateIdentifier'
+
+# Check when the certificate expires
+aws rds describe-certificates \
+  --certificate-identifier rds-ca-rsa2048-g1 \
+  --query 'Certificates[0].{ValidTill:ValidTill,CustomerOverride:CustomerOverride}'
+
+# List all available CA certificates
+aws rds describe-certificates \
+  --query 'Certificates[*].{ID:CertificateIdentifier,ValidFrom:ValidFrom,ValidTill:ValidTill}' \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Azure SQL, the DigiCert root CA is used. The connection string must include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Encrypt=True;TrustServerCertificate=False;</code> — if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TrustServerCertificate=True</code>, certificate verification is bypassed, which is acceptable only in development:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Correct production Azure SQL connection string (ADO.NET style)
+Server=tcp:prod-sql-server.database.windows.net,1433;
+Initial Catalog=appdb;
+Authentication=Active Directory Managed Identity;
+Encrypt=True;
+TrustServerCertificate=False;
+Connection Timeout=30;
+
+# Incorrect — TrustServerCertificate=True means no cert verification
+Server=tcp:prod-sql-server.database.windows.net,1433;
+Initial Catalog=appdb;
+User ID=sqladmin;Password=...;
+Encrypt=True;
+TrustServerCertificate=True;  # DO NOT USE IN PRODUCTION</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Minimum TLS Version Enforcement</strong></p>
+
+<p class="text-gray-300 leading-relaxed">TLS 1.0 and 1.1 have known vulnerabilities. Enforce TLS 1.2 as the minimum everywhere:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># AWS RDS: enforce minimum TLS via parameter group
+# For PostgreSQL, this is controlled by ssl_min_protocol_version
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name prod-postgres-enforced-ssl \
+  --parameters ParameterName=ssl_min_protocol_version,ParameterValue=TLSv1.2,ApplyMethod=immediate
+
+# Azure SQL: set minimum TLS version at server level
+az sql server update \
+  --name prod-sql-server \
+  --resource-group prod-rg \
+  --minimal-tls-version 1.2
+
+# GCP Cloud SQL: set minimum TLS version
+gcloud sql instances patch prod-postgres-instance \
+  --project=my-project \
+  --database-flags=ssl_min_protocol_version=TLSv1.2</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.7 Auditing Network Access and Detecting Anomalies</h3>
+
+<p class="text-gray-300 leading-relaxed">Configuration is not complete without visibility. You need logs showing who connected from where, and alerts when connection patterns deviate from baseline.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS VPC Flow Logs for Database Traffic</strong></p>
+
+<p class="text-gray-300 leading-relaxed">VPC Flow Logs capture connection-level metadata (source IP, destination IP, port, protocol, accept/reject) for all traffic in your VPC. Enabling them on the database subnets gives you a full record of connection attempts:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable VPC Flow Logs on database subnets, sending to CloudWatch Logs
+aws ec2 create-flow-logs \
+  --resource-type Subnet \
+  --resource-ids subnet-0a1b2c3d4e5f67890 subnet-0f9e8d7c6b5a43210 \
+  --traffic-type ALL \
+  --log-destination-type cloud-watch-logs \
+  --log-group-name /vpc/database-subnet-flow-logs \
+  --deliver-logs-permission-arn arn:aws:iam::123456789012:role/VPCFlowLogsRole \
+  --log-format '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}'
+
+# Query flow logs in CloudWatch Insights for rejected connections to PostgreSQL port
+# This reveals port-scanning or misconfigured application connectivity
+# (CloudWatch Insights query — run in the console or via CLI)</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># CloudWatch Logs Insights query: rejected connections to port 5432
+fields @timestamp, srcaddr, dstaddr, srcport, dstport, action
+| filter dstport = 5432 and action = "REJECT"
+| stats count(*) as attempts by srcaddr
+| sort attempts desc
+| limit 20</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS Enhanced Monitoring and Connection Tracking</strong></p>
+
+<p class="text-gray-300 leading-relaxed">RDS Enhanced Monitoring, distinct from standard CloudWatch metrics, runs a monitoring agent inside the RDS instance and provides per-process metrics at 1-second granularity. For connection tracking, the CloudWatch metric <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RDS.DBConnections</code> provides aggregate counts. For per-client connection tracking, use the PostgreSQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> view:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: connection audit — active connections by client IP and user
+SELECT
+    client_addr,
+    usename,
+    application_name,
+    state,
+    COUNT(*) AS connection_count,
+    MAX(EXTRACT(EPOCH FROM (NOW() - state_change))) AS max_idle_seconds
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY client_addr, usename, application_name, state
+ORDER BY connection_count DESC;
+
+-- Identify connections from unexpected source addresses
+-- Baseline: connections should come only from known application server IPs
+SELECT DISTINCT client_addr, usename
+FROM pg_stat_activity
+WHERE client_addr NOT IN (
+    '10.0.1.10',   -- app server 1
+    '10.0.1.11',   -- app server 2
+    '10.0.2.5'     -- batch processing host
+)
+AND backend_type = 'client backend';</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: audit active connections by login and application
+SELECT
+    login_name,
+    host_name,
+    program_name,
+    client_net_address,
+    COUNT(*) AS session_count,
+    SUM(CASE WHEN status = 'sleeping' THEN 1 ELSE 0 END) AS idle_sessions
+FROM sys.dm_exec_sessions s
+JOIN sys.dm_exec_connections c ON s.session_id = c.session_id
+WHERE s.is_user_process = 1
+GROUP BY login_name, host_name, program_name, client_net_address
+ORDER BY session_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL Auditing</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL has a built-in auditing feature that logs connection events, query executions, and schema changes to Azure Blob Storage, Log Analytics, or Event Hub. Enable it at the server level to cover all databases:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable Azure SQL auditing to Log Analytics workspace
+az sql server audit-policy update \
+  --server prod-sql-server \
+  --resource-group prod-rg \
+  --state Enabled \
+  --log-analytics-target-state Enabled \
+  --log-analytics-workspace-resource-id \
+    /subscriptions/{sub-id}/resourceGroups/prod-rg/providers/Microsoft.OperationalInsights/workspaces/prod-law
+
+# Enable Advanced Threat Protection — detects anomalous connection patterns,
+# SQL injection attempts, and access from unusual locations
+az sql server threat-policy update \
+  --server prod-sql-server \
+  --resource-group prod-rg \
+  --state Enabled \
+  --storage-account prod-audit-storage \
+  --email-addresses dba-team@company.com security@company.com \
+  --email-account-admins Enabled</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Querying Azure SQL audit logs from Log Analytics:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// KQL: Failed login attempts to Azure SQL in the last 24 hours
+AzureDiagnostics
+| where ResourceType == "SERVERS/DATABASES"
+| where Category == "SQLSecurityAuditEvents"
+| where action_name_s == "LOGIN FAILED"
+| where TimeGenerated &gt; ago(24h)
+| summarize FailedAttempts = count() by client_ip_s, server_instance_name_s, succeeded_s
+| order by FailedAttempts desc
+
+// KQL: Connections from unexpected IP ranges
+AzureDiagnostics
+| where Category == "SQLSecurityAuditEvents"
+| where action_name_s == "LOGIN SUCCEEDED"
+| where client_ip_s !startswith "10.0."   // adjust to your private CIDR
+| project TimeGenerated, client_ip_s, server_principal_name_s, database_principal_name_s
+| order by TimeGenerated desc</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.8 Network Security Automation and Infrastructure as Code</h3>
+
+<p class="text-gray-300 leading-relaxed">Manual security group changes are how security incidents happen. Every network configuration change affecting database access should go through code review, be tracked in version control, and be deployed through CI/CD. This section covers the patterns for automating network security configuration.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting Security Group Drift</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Configuration drift — when the live environment diverges from what Terraform (or CloudFormation) defines — is the silent enemy of security posture. Terraform plan run against an existing environment will show drift:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Run terraform plan to detect any manual changes made outside Terraform
+# Output showing changes = drift that needs investigation
+cd infrastructure/network
+terraform plan -out=plan.out
+
+# For a more targeted audit, use AWS Config rules
+# This rule checks that RDS instances are not publicly accessible
+aws configservice get-compliance-details-by-config-rule \
+  --config-rule-name rds-instance-public-access-check \
+  --compliance-types NON_COMPLIANT \
+  --query 'EvaluationResults[*].{ResourceId:EvaluationResultIdentifier.EvaluationResultQualifier.ResourceId,Annotation:Annotation}'</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS Config Rules for Database Network Security</strong></p>
+
+<p class="text-gray-300 leading-relaxed">AWS Config provides managed rules that continuously evaluate your RDS configuration against defined security policies:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable key Config rules for database network security
+# These rules run continuously and flag non-compliant resources
+
+# Rule 1: RDS must not be publicly accessible
+aws configservice put-config-rule \
+  --config-rule '{
+    "ConfigRuleName": "rds-instance-public-access-check",
+    "Source": {
+      "Owner": "AWS",
+      "SourceIdentifier": "RDS_INSTANCE_PUBLIC_ACCESS_CHECK"
+    },
+    "Scope": {
+      "ComplianceResourceTypes": ["AWS::RDS::DBInstance"]
+    }
+  }'
+
+# Rule 2: RDS instances must be in a VPC
+aws configservice put-config-rule \
+  --config-rule '{
+    "ConfigRuleName": "rds-instance-deployment-in-vpc",
+    "Source": {
+      "Owner": "AWS",
+      "SourceIdentifier": "RDS_IN_BACKUP_PLAN"
+    }
+  }'
+
+# Rule 3: No security group should allow unrestricted inbound access
+aws configservice put-config-rule \
+  --config-rule '{
+    "ConfigRuleName": "restricted-common-ports",
+    "Source": {
+      "Owner": "AWS",
+      "SourceIdentifier": "RESTRICTED_INCOMING_TRAFFIC"
+    },
+    "InputParameters": "{\"blockedPort1\": \"5432\", \"blockedPort2\": \"1433\", \"blockedPort3\": \"3306\"}"
+  }'</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Automated Remediation for Security Violations</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Detecting a violation is valuable. Automatically remediating it is better for low-risk, high-confidence rules. For an RDS instance found to have <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PubliclyAccessible: true</code>, you can configure AWS Config to invoke a Lambda that immediately corrects it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Lambda function: auto-remediate RDS public accessibility violations
+import boto3
+import json
+
+def lambda_handler(event, context):
+    """
+    Triggered by AWS Config when an RDS instance is found publicly accessible.
+    Immediately sets PubliclyAccessible=False and logs the action.
+    """
+    config_item = event.get('configurationItem', {})
+    resource_id = config_item.get('resourceId')
+    resource_type = config_item.get('resourceType')
+
+    if resource_type != 'AWS::RDS::DBInstance':
+        return {'statusCode': 200, 'body': 'Not an RDS instance, skipping'}
+
+    rds = boto3.client('rds')
+
+    # Check current state before modifying
+    response = rds.describe_db_instances(DBInstanceIdentifier=resource_id)
+    instance = response['DBInstances'][0]
+
+    if not instance['PubliclyAccessible']:
+        return {'statusCode': 200, 'body': f'{resource_id} already not publicly accessible'}
+
+    # Remediate: disable public accessibility
+    rds.modify_db_instance(
+        DBInstanceIdentifier=resource_id,
+        PubliclyAccessible=False,
+        ApplyImmediately=True
+    )
+
+    # Log to CloudWatch for audit trail
+    print(json.dumps({
+        'action': 'remediated_public_rds',
+        'instance_id': resource_id,
+        'previous_state': 'PubliclyAccessible=True',
+        'new_state': 'PubliclyAccessible=False',
+        'triggered_by': 'AWS Config auto-remediation'
+    }))
+
+    return {
+        'statusCode': 200,
+        'body': f'Successfully remediated {resource_id}: PubliclyAccessible set to False'
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Terraform Security Group Policy as Code</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For teams using Terraform across multiple environments, a shared module that enforces security group structure prevents permissive rules from being introduced:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># modules/database-security-group/main.tf
+# Reusable module that enforces correct database security group structure
+
+variable "vpc_id" {
+  description = "VPC ID where the database security group will be created"
+  type        = string
+}
+
+variable "allowed_security_group_ids" {
+  description = "List of security group IDs allowed to connect to the database"
+  type        = list(string)
+}
+
+variable "database_port" {
+  description = "Database port (5432 for PostgreSQL, 1433 for SQL Server)"
+  type        = number
+  validation {
+    condition     = contains([5432, 1433, 3306, 5439], var.database_port)
+    error_message = "Database port must be a known database port (5432, 1433, 3306, 5439)."
+  }
+}
+
+variable "environment" {
+  type = string
+}
+
+resource "aws_security_group" "database" {
+  name        = "${var.environment}-database-sg"
+  description = "Database security group — managed by Terraform, do not modify manually"
+  vpc_id      = var.vpc_id
+
+  # No ingress from CIDR ranges — only from specific security groups
+  dynamic "ingress" {
+    for_each = var.allowed_security_group_ids
+    content {
+      description     = "Database access from approved security group"
+      from_port       = var.database_port
+      to_port         = var.database_port
+      protocol        = "tcp"
+      security_groups = [ingress.value]
+    }
+  }
+
+  # Egress: minimal — only what the database actually needs outbound
+  # RDS needs HTTPS outbound for IAM auth token validation and enhanced monitoring
+  egress {
+    description = "HTTPS for IAM auth and AWS APIs"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  lifecycle {
+    # Prevent accidental deletion of the security group
+    prevent_destroy = true
+  }
+
+  tags = {
+    Name        = "${var.environment}-database-sg"
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    Security    = "database-tier"
+  }
+}
+
+output "security_group_id" {
+  value       = aws_security_group.database.id
+  description = "Security group ID for the database tier"
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">32.9 Common Misconfigurations and How to Find Them</h3>
+
+<p class="text-gray-300 leading-relaxed">The security incidents that affect cloud databases almost never involve a sophisticated zero-day exploit. They result from misconfigurations that are entirely preventable. Here is a systematic checklist for auditing your database network security.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Audit Checklist</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Database network security audit script — AWS
+# Run this periodically or as part of a CI/CD security gate
+
+echo "=== RDS Network Security Audit ==="
+echo ""
+
+echo "--- Checking for publicly accessible RDS instances ---"
+aws rds describe-db-instances \
+  --query 'DBInstances[?PubliclyAccessible==`true`].{ID:DBInstanceIdentifier,Engine:Engine,PubliclyAccessible:PubliclyAccessible}' \
+  --output table
+
+echo ""
+echo "--- Checking for RDS instances NOT in a VPC ---"
+aws rds describe-db-instances \
+  --query 'DBInstances[?DBSubnetGroup==null].{ID:DBInstanceIdentifier,Engine:Engine}' \
+  --output table
+
+echo ""
+echo "--- Checking for security groups with 0.0.0.0/0 on database ports ---"
+for port in 5432 1433 3306 5439 27017; do
+  echo "Port $port:"
+  aws ec2 describe-security-groups \
+    --filters "Name=ip-permission.from-port,Values=$port" \
+              "Name=ip-permission.to-port,Values=$port" \
+              "Name=ip-permission.cidr,Values=0.0.0.0/0" \
+    --query 'SecurityGroups[*].{ID:GroupId,Name:GroupName,VPC:VpcId}' \
+    --output table
+done
+
+echo ""
+echo "--- Checking RDS parameter groups for SSL enforcement ---"
+aws rds describe-db-cluster-parameter-groups \
+  --query 'DBClusterParameterGroups[*].DBClusterParameterGroupName' \
+  --output text | tr '\t' '\n' | while read pgname; do
+    ssl_setting=$(aws rds describe-db-cluster-parameters \
+      --db-cluster-parameter-group-name "$pgname" \
+      --query "Parameters[?ParameterName=='rds.force_ssl'].ParameterValue" \
+      --output text)
+    echo "Parameter group: $pgname | rds.force_ssl = ${ssl_setting:-not_set}"
+done
+
+echo ""
+echo "--- Checking for RDS snapshots that are publicly accessible ---"
+aws rds describe-db-snapshots \
+  --query 'DBSnapshots[?Attribute==`restore` && contains(AttributeValues, `all`)].{ID:DBSnapshotIdentifier,Instance:DBInstanceIdentifier}' \
+  --output table 2&gt;/dev/null || \
+  aws rds describe-db-snapshots \
+    --include-shared \
+    --query 'DBSnapshots[?SnapshotType==`public`].{ID:DBSnapshotIdentifier,Instance:DBInstanceIdentifier}' \
+    --output table
+
+echo ""
+echo "=== Audit complete ==="</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Publicly Accessible Snapshots</strong></p>
+
+<p class="text-gray-300 leading-relaxed">One of the highest-severity misconfigurations that is easy to miss: RDS snapshots can be made public, allowing anyone with an AWS account to copy and restore them. This has been the source of several well-documented data exposures. The audit script above checks for this, but the explicit remediation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Find and remediate public RDS snapshots
+aws rds describe-db-snapshots \
+  --snapshot-type public \
+  --query 'DBSnapshots[*].DBSnapshotIdentifier' \
+  --output text | tr '\t' '\n' | while read snapshot_id; do
+    echo "Revoking public access from snapshot: $snapshot_id"
+    aws rds modify-db-snapshot-attribute \
+      --db-snapshot-identifier "$snapshot_id" \
+      --attribute-name restore \
+      --values-to-remove all
+done</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The "Allow Azure Services" Trap</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Already mentioned in section 32.3, but worth repeating because it appears in so many production Azure SQL deployments: the "Allow access to Azure services" toggle in the Azure SQL firewall adds a rule from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.0.0.0</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.0.0.0</code> that permits any traffic from Azure datacenters. This is often added during initial setup to make connectivity easy, then forgotten. Audit for it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Audit Azure SQL firewall rules — look for the overly permissive rule
+az sql server firewall-rule list \
+  --server prod-sql-server \
+  --resource-group prod-rg \
+  --query "[?startIpAddress=='0.0.0.0' || endIpAddress=='255.255.255.255'].{Name:name,Start:startIpAddress,End:endIpAddress}" \
+  --output table
+
+# If you see "AllowAllWindowsAzureIps" or 0.0.0.0/255.255.255.255 entries, remove them
+az sql server firewall-rule list \
+  --server prod-sql-server \
+  --resource-group prod-rg \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS Subnet Group in Public Subnets</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A subnet group can be created with public subnets (subnets with a route to an internet gateway). If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PubliclyAccessible</code> is also set to true, the database gets a public IP. Audit for subnet groups containing public subnets:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Check if subnets in DB subnet groups have routes to internet gateway
+# First, get all subnet IDs used by DB subnet groups
+aws rds describe-db-subnet-groups \
+  --query 'DBSubnetGroups[*].Subnets[*].SubnetIdentifier' \
+  --output text | tr '\t' '\n' | sort -u | while read subnet_id; do
+    # Check if subnet has a route to an internet gateway (0.0.0.0/0 -&gt; igw-*)
+    igw_route=$(aws ec2 describe-route-tables \
+      --filters "Name=association.subnet-id,Values=$subnet_id" \
+      --query "RouteTables[*].Routes[?GatewayId!=null && starts_with(GatewayId,'igw-')].GatewayId" \
+      --output text)
+
+    if [ -n "$igw_route" ]; then
+      echo "WARNING: Subnet $subnet_id has route to Internet Gateway: $igw_route"
+      echo "  This subnet should NOT be used for database instances"
+    fi
+done</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Network isolation is the first line of defense**: Place all managed database instances in private subnets with no route to an internet gateway, use security groups chained by reference rather than CIDR range, and explicitly audit for `PubliclyAccessible: true` and public snapshot exposure on a scheduled basis — these misconfigurations are the most common source of cloud database exposure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Private endpoints require correct DNS to be effective**: Configuring an Azure Private Endpoint, AWS VPC endpoint, or GCP Private Service Connect attachment does nothing for hosts whose DNS resolver does not consult the private DNS zone. Verify name resolution from every network segment — application servers, Lambda functions, containers, and on-premises hosts connected via VPN or Direct Connect — not just from a single representative host.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cloud IAM authentication combines network and identity security**: AWS IAM auth tokens, Azure AD managed identity logins, and GCP Cloud SQL IAM authentication eliminate long-lived passwords from application configurations. Pairing IAM auth with RDS Proxy or Azure AD-only mode removes the credential rotation problem entirely and makes the cloud IAM audit trail your authoritative record of who connected and when.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **TLS enforcement means both encryption and certificate verification**: Setting `rds.force_ssl=1` or `Encrypt=True` encrypts the wire but does not prevent a man-in-the-middle attack if the application uses `TrustServerCertificate=True` or skips `sslmode=verify-full`. Distribute CA bundles to application hosts, pin to a minimum TLS version of 1.2 at the server level across all three clouds, and track CA certificate expiration dates in your change calendar.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate detection and remediation of network drift**: Manual security group changes and portal-level firewall modifications that bypass Terraform are how production security posture silently degrades. Use AWS Config managed rules, Azure Policy, or GCP Organization Policies to continuously evaluate compliance, pipe violations into your alerting system, and — for high-confidence rules like RDS public accessibility — trigger automated remediation so the window between misconfiguration and correction is measured in minutes rather than audit cycles.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
