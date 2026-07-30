@@ -6,6 +6,10 @@
   <title>Chapter 12: Multi-Tenant Vector Storage in PostgreSQL — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 12: Multi-Tenant Vector Storage in PostgreSQL. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -52,6 +56,21 @@
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema-Level Isolation</strong> gives each tenant their own schema within a single PostgreSQL database. Each schema contains its own <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embeddings</code> table and its own HNSW index. This sidesteps the index contamination problem entirely — each tenant's index is built only over their own data. The cost is operational complexity: adding a tenant means executing DDL, managing schema-scoped connections, and ensuring your migration tooling handles hundreds or thousands of schemas without timing out. At roughly 500–1,000 schemas, operational overhead becomes a real concern; beyond 5,000 schemas, PostgreSQL's catalog can become a performance bottleneck during connection and query planning.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Database-Level Isolation</strong> gives each tenant a separate PostgreSQL database. This provides the strongest isolation — separate connection pools, separate WAL streams, separate backup targets — but multiplies your operational surface area by the number of tenants. It's appropriate for enterprise SaaS where each customer is a large organization with their own compliance requirements, not for consumer applications with thousands of small tenants.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    subgraph RL["Row-level"]
+        RLT[(Single table<br/>tenant_id column<br/>one shared HNSW index)]
+    end
+    subgraph SL["Schema-level"]
+        SA[(Schema: tenant A<br/>own table + index)]
+        SB[(Schema: tenant B<br/>own table + index)]
+    end
+    subgraph DL["Database-level"]
+        DA[(Database: tenant A)]
+        DB[(Database: tenant B)]
+    end</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Isolation strength increases left to right; so does per-tenant operational overhead.*</p>
 
 <p class="text-gray-300 leading-relaxed">The decision matrix looks like this in practice:</p>
 
@@ -446,6 +465,584 @@ psql "$DATABASE_URL" -c "
 
 <p class="text-gray-300 leading-relaxed">For automated index lifecycle management at scale, wrap this in a Python job that reads from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_index_health</code> view and prioritizes rebuilds:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import psycopg2
+from psycopg2 import sql
+import logging
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class TenantIndexStatus:
+    schema_name: str
+    live_rows: int
+    dead_pct: float
+    last_analyze: datetime | None
+    status: str
+
+def get_stale_tenant_indexes(conn) -&gt; list[TenantIndexStatus]:
+    """Return tenants requiring index maintenance, ordered by urgency."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                schemaname,
+                live_rows,
+                dead_pct,
+                last_analyze,
+                CASE
+                    WHEN dead_pct &gt; 25 THEN 'REBUILD_URGENT'
+                    WHEN last_analyze &lt; NOW() - INTERVAL '7 days'
+                         AND live_rows &gt; 10000 THEN 'REBUILD_SCHEDULED'
+                    ELSE 'OK'
+                END AS status
+            FROM public.tenant_index_health
+            WHERE dead_pct &gt; 10
+               OR last_analyze &lt; NOW() - INTERVAL '7 days'
+            ORDER BY
+                CASE WHEN dead_pct &gt; 25 THEN 0 ELSE 1 END,
+                dead_pct DESC
+        """)
+        rows = cur.fetchall()
+
+    return [
+        TenantIndexStatus(
+            schema_name=r[0],
+            live_rows=r[1],
+            dead_pct=float(r[2] or 0),
+            last_analyze=r[3],
+            status=r[4]
+        )
+        for r in rows
+        if r[4] != 'OK'
+    ]
+
+def rebuild_tenant_index(conn, schema_name: str) -&gt; bool:
+    """
+    Rebuild the vector index for a tenant schema.
+    Returns True on success, False on failure.
+    REINDEX CONCURRENTLY cannot run inside a transaction — use autocommit.
+    """
+    original_autocommit = conn.autocommit
+    conn.autocommit = True
+
+    try:
+        index_name = f"embeddings_ivfflat_{schema_name}"
+        full_index = f"{schema_name}.{index_name}"
+
+        with conn.cursor() as cur:
+            logger.info(f"Starting concurrent reindex for {schema_name}")
+            cur.execute(
+                sql.SQL("REINDEX INDEXCONCURRENTLY {}").format(
+                    sql.Identifier(schema_name, index_name)
+                )
+            )
+            cur.execute(
+                sql.SQL("ANALYZE {}.embeddings").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+
+        logger.info(f"Reindex complete for {schema_name}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Reindex failed for {schema_name}: {e}")
+        return False
+
+    finally:
+        conn.autocommit = original_autocommit
+
+def run_index_maintenance(dsn: str, max_rebuilds_per_run: int = 10):
+    """
+    Top-level maintenance job. Call from a cron job or scheduled task.
+    Processes the most urgent tenants first, capped at max_rebuilds_per_run
+    to bound wall-clock time.
+    """
+    conn = psycopg2.connect(dsn)
+    try:
+        stale = get_stale_tenant_indexes(conn)
+        logger.info(f"Found {len(stale)} tenants needing index maintenance")
+
+        rebuilt = 0
+        for tenant in stale[:max_rebuilds_per_run]:
+            success = rebuild_tenant_index(conn, tenant.schema_name)
+            if success:
+                rebuilt += 1
+            else:
+                logger.warning(
+                    f"Skipping remaining tenants after failure at {tenant.schema_name}"
+                )
+                break
+
+        logger.info(f"Index maintenance complete: {rebuilt}/{len(stale)} tenants rebuilt")
+    finally:
+        conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Changing embedding models</strong>: When you migrate from one embedding model to another (e.g., from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code> at 1536 dimensions to a newer model at a different dimensionality), the vector column type changes. This is a disruptive migration. The safest approach is a shadow column strategy:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Phase 1: Add new embedding column alongside the old one
+ALTER TABLE {schema}.embeddings
+    ADD COLUMN embedding_v2 vector(3072);   -- new model dimensionality
+
+-- Phase 2: Backfill new embeddings in batches (done by your migration job)
+-- Phase 3: Create new index on embedding_v2
+CREATE INDEX CONCURRENTLY embeddings_hnsw_v2_{schema}
+    ON {schema}.embeddings
+    USING hnsw (embedding_v2 vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Phase 4: Once backfill complete, swap queries to use embedding_v2
+-- Phase 5: Drop old column and old index
+-- ALTER TABLE {schema}.embeddings DROP COLUMN embedding;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The shadow column approach lets you serve queries from the old index while the new one is being built, with zero downtime.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.5 Cross-Tenant Query Routing</h3>
+
+<p class="text-gray-300 leading-relaxed">Most SaaS applications need to perform cross-tenant operations at some point: admin dashboards that aggregate stats across all tenants, internal search that spans the entire document corpus, or anomaly detection that compares embedding distributions across customers.</p>
+
+<p class="text-gray-300 leading-relaxed">Cross-tenant queries in a schema-per-tenant system require either dynamic SQL that unions across schemas or a separate denormalized table. The dynamic SQL approach is more flexible but has query planning overhead for large tenant counts.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def cross_tenant_search(
+    conn,
+    query_embedding: list[float],
+    tenant_ids: list[str],
+    top_k_per_tenant: int = 5,
+    final_top_k: int = 20
+) -&gt; list[dict]:
+    """
+    Federated vector search across multiple tenants.
+    Executes one query per tenant schema and merges results client-side.
+
+    For admin/internal use only — never expose this to tenant-scoped
+    application paths. Performance scales linearly with tenant count.
+    """
+    embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+    results = []
+
+    with conn.cursor() as cur:
+        for tenant_id in tenant_ids:
+            schema_name = sanitize_schema_name(tenant_id)
+            try:
+                cur.execute(
+                    sql.SQL("""
+                        SELECT
+                            %s AS tenant_id,
+                            doc_id,
+                            content,
+                            1 - (embedding &lt;=&gt; %s::vector) AS score
+                        FROM {schema}.embeddings
+                        ORDER BY embedding &lt;=&gt; %s::vector
+                        LIMIT %s
+                    """).format(schema=sql.Identifier(schema_name)),
+                    (tenant_id, embedding_str, embedding_str, top_k_per_tenant)
+                )
+                rows = cur.fetchall()
+                results.extend({
+                    "tenant_id": r[0],
+                    "doc_id": r[1],
+                    "content": r[2],
+                    "score": float(r[3])
+                } for r in rows)
+            except psycopg2.errors.InvalidSchemaName:
+                logger.warning(f"Schema not found for tenant {tenant_id}, skipping")
+                continue
+
+    # Merge and re-rank by score
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:final_top_k]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For larger cross-tenant operations, a materialized summary table avoids the per-schema fan-out:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Materialized cross-tenant view for admin analytics
+-- Populated by a background job, not a live view
+CREATE TABLE public.cross_tenant_embeddings_summary (
+    tenant_id       UUID NOT NULL,
+    schema_name     TEXT NOT NULL,
+    doc_id          TEXT NOT NULL,
+    embedding       vector(1536),
+    created_at      TIMESTAMPTZ,
+    synced_at       TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (tenant_id, doc_id)
+);
+
+CREATE INDEX idx_cross_tenant_hnsw
+    ON public.cross_tenant_embeddings_summary
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Query across all tenants with a single vector search
+SELECT
+    tenant_id,
+    doc_id,
+    1 - (embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector) AS score
+FROM public.cross_tenant_embeddings_summary
+ORDER BY embedding &lt;=&gt; '[0.1, 0.2, ...]'::vector
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The summary table trades freshness for query speed. Your sync job needs to handle inserts, updates, and deletes from all tenant schemas, which is non-trivial at scale. Logical replication or a change-data-capture pipeline (e.g., Debezium) is the production-grade approach.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.6 Tenant-Aware Connection Pooling</h3>
+
+<p class="text-gray-300 leading-relaxed">Connection management is where schema-per-tenant architectures most commonly fail in production. The core tension: PgBouncer in transaction-mode pooling (the recommended mode for high-concurrency applications) does not support <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET search_path</code> persisting across transactions because connections are returned to the pool after each transaction. Session-mode pooling preserves settings but reduces effective concurrency because a connection is pinned to one application session.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical solution is to use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET LOCAL</code> within a transaction, or to explicitly set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">search_path</code> as part of every query batch. The code pattern in Section 12.3 already does this. Here's the infrastructure configuration to pair with it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># pgbouncer.ini
+[pgbouncer]
+pool_mode = transaction
+max_client_conn = 5000
+default_pool_size = 25
+min_pool_size = 5
+reserve_pool_size = 5
+reserve_pool_timeout = 3
+server_reset_query = DISCARD ALL
+server_check_query = SELECT 1
+server_check_delay = 30
+ignore_startup_parameters = extra_float_digits
+
+# Application database
+[myapp_db]
+host = 127.0.0.1
+port = 5432
+dbname = myapp
+pool_size = 25</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">server_reset_query = DISCARD ALL</code> ensures that any session-level settings left by previous transactions are cleared when a server connection is returned to the pool. This is your safety net against schema leakage.</p>
+
+<p class="text-gray-300 leading-relaxed">On the application side, always pair your schema-setting code with explicit transaction management:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Correct pattern: SET LOCAL inside explicit transaction
+# SET LOCAL is reverted automatically at transaction end
+def safe_tenant_query(pool, tenant_id: str, query_sql: str, params: tuple):
+    schema_name = sanitize_schema_name(tenant_id)
+    conn = pool.getconn()
+    try:
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute(
+                sql.SQL("SET LOCAL search_path TO {}, public").format(
+                    sql.Identifier(schema_name)
+                )
+            )
+            cur.execute(query_sql, params)
+            result = cur.fetchall()
+        conn.commit()
+        return result
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.autocommit = True
+        pool.putconn(conn)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For async workloads using asyncpg or SQLAlchemy async:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python (asyncpg)
+import asyncpg
+
+async def async_tenant_search(
+    pool: asyncpg.Pool,
+    tenant_id: str,
+    query_embedding: list[float],
+    top_k: int = 10
+) -&gt; list[asyncpg.Record]:
+    schema_name = sanitize_schema_name(tenant_id)
+    embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                f"SET LOCAL search_path TO {asyncpg.utils._quote_ident(schema_name)}, public"
+            )
+            return await conn.fetch("""
+                SELECT
+                    doc_id,
+                    content,
+                    1 - (embedding &lt;=&gt; $1::vector) AS score
+                FROM embeddings
+                ORDER BY embedding &lt;=&gt; $1::vector
+                LIMIT $2
+            """, embedding_str, top_k)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note: asyncpg's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_quote_ident</code> is an internal utility. In production, implement your own identifier quoting or use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">f'"{schema_name}"'</code> after validating the schema name against your known-safe naming scheme.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.7 Scaling Considerations and Performance Cliffs</h3>
+
+<p class="text-gray-300 leading-relaxed">As tenant count and per-tenant data volume grow, several performance cliffs appear that aren't obvious from small-scale testing.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL catalog contention</strong>: The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_class</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_attribute</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_index</code> system catalogs are shared across the entire instance. When you have 3,000 tenant schemas each with 10 tables and 5 indexes, you have 15,000 entries in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_class</code> and 75,000 in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_index</code>. Connection startup and query planning read these catalogs, and the catalog can become a hot read path at scale. Monitor with:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Catalog table bloat and access frequency
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    seq_scan,
+    idx_scan
+FROM pg_stat_sys_tables
+WHERE relname IN ('pg_class', 'pg_attribute', 'pg_index', 'pg_namespace')
+ORDER BY seq_scan DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If you see high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">seq_scan</code> counts on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_class</code>, you're hitting catalog contention. The mitigation is reducing schema count (consolidate small tenants to row-level partitioning) or sharding across PostgreSQL instances.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Memory pressure from concurrent index builds</strong>: HNSW index construction is memory-intensive. Each concurrent <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX</code> operation can consume <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">maintenance_work_mem</code>. With 50 tenants being provisioned simultaneously, you can exhaust available memory on the database server. Serialize index builds or cap concurrent DDL operations:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import asyncio
+
+async def provision_tenants_with_concurrency_limit(
+    tenant_ids: list[str],
+    dsn: str,
+    max_concurrent: int = 5
+):
+    """Provision tenant schemas with bounded DDL concurrency."""
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def provision_one(tenant_id: str):
+        async with semaphore:
+            # Each task gets its own connection to avoid transaction interference
+            conn = await asyncpg.connect(dsn)
+            try:
+                await async_provision_tenant(conn, tenant_id)
+            finally:
+                await conn.close()
+
+    await asyncio.gather(*[provision_one(tid) for tid in tenant_ids])</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">IVFFlat <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> misconfiguration</strong>: The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code> parameter must be set when the index is created and cannot be changed without dropping and recreating the index. A tenant provisioned with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists = 100</code> when it had 10,000 rows will have severely degraded recall once it grows to 1,000,000 rows (where <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists = ~1000</code> would be appropriate). The automated index health check from Section 12.4 should flag this. Add a check:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Detect tenants whose IVFFlat list count is under-provisioned
+-- relative to current row count
+SELECT
+    h.schemaname,
+    h.live_rows,
+    (ix.reloptions::text)                          AS index_options,
+    ROUND(SQRT(h.live_rows))                       AS recommended_lists,
+    -- Extract the actual lists value from index options
+    (
+        SELECT val::int
+        FROM unnest(ix.reloptions) AS opt(val_text)
+        CROSS JOIN LATERAL (SELECT val_text) AS t(val)
+        WHERE val LIKE 'lists=%'
+        LIMIT 1
+    )                                               AS current_lists
+FROM public.tenant_index_health h
+JOIN pg_indexes pi
+    ON pi.schemaname = h.schemaname
+    AND pi.tablename = 'embeddings'
+    AND pi.indexdef LIKE '%ivfflat%'
+JOIN pg_class ix
+    ON ix.relname = pi.indexname
+WHERE h.live_rows &gt; 0
+ORDER BY h.live_rows DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Vacuum and autovacuum across many schemas</strong>: pgvector tables accumulate dead tuples like any other heap. With 1,000 schemas each doing moderate write activity, autovacuum workers can be spread thin. Increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_max_workers</code> and tune per-table autovacuum thresholds for high-churn tenant tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Aggressive autovacuum settings for high-write tenant embedding tables
+-- Apply after provisioning for tenants with expected high write volume
+ALTER TABLE {schema}.embeddings SET (
+    autovacuum_vacuum_scale_factor = 0.01,  -- Vacuum after 1% of rows are dead
+    autovacuum_analyze_scale_factor = 0.005, -- Analyze after 0.5% of rows change
+    autovacuum_vacuum_cost_delay = 2         -- ms; reduce I/O throttling for these tables
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.8 A Complete Working Example</h3>
+
+<p class="text-gray-300 leading-relaxed">To tie together the patterns from this chapter, here is a minimal but production-representative multi-tenant vector store with FastAPI, asyncpg, and pgvector:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# main.py — FastAPI multi-tenant vector store
+from fastapi import FastAPI, HTTPException, Header
+from pydantic import BaseModel
+import asyncpg
+import os
+import logging
+from contextlib import asynccontextmanager
+from openai import AsyncOpenAI
+
+logger = logging.getLogger(__name__)
+openai_client = AsyncOpenAI()
+
+# ---------------------------------------------------------------------------
+# Application lifecycle
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    app.state.pool = await asyncpg.create_pool(
+        dsn=os.environ["DATABASE_URL"],
+        min_size=5,
+        max_size=20,
+        command_timeout=30
+    )
+    yield
+    await app.state.pool.close()
+
+app = FastAPI(lifespan=lifespan)
+
+# ---------------------------------------------------------------------------
+# Schema helpers (repeated from earlier sections, included for completeness)
+# ---------------------------------------------------------------------------
+
+def sanitize_schema_name(tenant_id: str) -&gt; str:
+    safe = tenant_id.replace("-", "_")
+    return f"t_{safe}"
+
+def quote_ident(name: str) -&gt; str:
+    """Minimal safe quoting for schema names we control."""
+    if not all(c.isalnum() or c == '_' for c in name):
+        raise ValueError(f"Unsafe identifier: {name}")
+    return f'"{name}"'
+
+PROVISION_DDL = """
+    CREATE SCHEMA IF NOT EXISTS {schema};
+    CREATE TABLE IF NOT EXISTS {schema}.embeddings (
+        id         BIGSERIAL PRIMARY KEY,
+        doc_id     TEXT NOT NULL UNIQUE,
+        content    TEXT NOT NULL,
+        embedding  vector(1536),
+        metadata   JSONB DEFAULT '{{}}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS embeddings_hnsw
+        ON {schema}.embeddings
+        USING hnsw (embedding vector_cosine_ops)
+        WITH (m = 16, ef_construction = 64);
+"""
+
+async def ensure_tenant_schema(pool: asyncpg.Pool, tenant_id: str):
+    schema = sanitize_schema_name(tenant_id)
+    ddl = PROVISION_DDL.format(schema=quote_ident(schema))
+    async with pool.acquire() as conn:
+        await conn.execute(ddl)
+
+# ---------------------------------------------------------------------------
+# Embedding helper
+# ---------------------------------------------------------------------------
+
+async def get_embedding(text: str) -&gt; list[float]:
+    response = await openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text
+    )
+    return response.data[0].embedding
+
+# ---------------------------------------------------------------------------
+# API models
+# ---------------------------------------------------------------------------
+
+class UpsertRequest(BaseModel):
+    doc_id: str
+    content: str
+    metadata: dict = {}
+
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 10
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+@app.post("/tenants/{tenant_id}/provision")
+async def provision_tenant(tenant_id: str):
+    await ensure_tenant_schema(app.state.pool, tenant_id)
+    return {"status": "ok", "tenant_id": tenant_id}
+
+@app.post("/tenants/{tenant_id}/documents")
+async def upsert_document(tenant_id: str, req: UpsertRequest):
+    schema = sanitize_schema_name(tenant_id)
+    schema_q = quote_ident(schema)
+    embedding = await get_embedding(req.content)
+    embedding_str = "[" + ",".join(str(x) for x in embedding) + "]"
+
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                f"SET LOCAL search_path TO {schema_q}, public"
+            )
+            await conn.execute("""
+                INSERT INTO embeddings (doc_id, content, embedding, metadata)
+                VALUES ($1, $2, $3::vector, $4)
+                ON CONFLICT (doc_id) DO UPDATE
+                    SET content   = EXCLUDED.content,
+                        embedding = EXCLUDED.embedding,
+                        metadata  = EXCLUDED.metadata
+            """, req.doc_id, req.content, embedding_str,
+                req.metadata)
+
+    return {"status": "ok", "doc_id": req.doc_id}
+
+@app.post("/tenants/{tenant_id}/search")
+async def search_documents(tenant_id: str, req: SearchRequest):
+    schema = sanitize_schema_name(tenant_id)
+    schema_q = quote_ident(schema)
+    query_embedding = await get_embedding(req.query)
+    embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+
+    async with app.state.pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                f"SET LOCAL search_path TO {schema_q}, public"
+            )
+            rows = await conn.fetch("""
+                SELECT
+                    doc_id,
+                    content,
+                    metadata,
+                    1 - (embedding &lt;=&gt; $1::vector) AS score
+                FROM embeddings
+                ORDER BY embedding &lt;=&gt; $1::vector
+                LIMIT $2
+            """, embedding_str, req.top_k)
+
+    return [
+        {
+            "doc_id": r["doc_id"],
+            "content": r["content"],
+            "metadata": dict(r["metadata"]),
+            "score": float(r["score"])
+        }
+        for r in rows
+    ]
+
+@app.delete("/tenants/{tenant_id}")
+async def deprovision_tenant(tenant_id: str):
+    schema = sanitize_schema_name(tenant_id)
+    schema_q = quote_ident(schema)
+    async with app.state.pool.acquire() as conn:
+        await conn.execute(f"DROP SCHEMA IF EXISTS {schema_q} CASCADE")
+    return {"status": "ok", "tenant_id": tenant_id}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This example is intentionally minimal — it has no authentication, no rate limiting, and no observability instrumentation. In a real deployment you would add all three. The patterns for schema provisioning, search_path scoping, and connection management are production-ready as written.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Row-level isolation** is simple to implement but breaks down when tenant sizes diverge significantly, because HNSW and IVFFlat indexes scan the full table before applying tenant filters. Partial indexes per tenant extend row-level isolation but are operationally viable only for your largest few tenants.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Schema-per-tenant isolation** is the production default for most SaaS vector workloads. Each tenant gets its own index built only over their data, eliminating the filter post-scan problem. The cost is DDL automation complexity and PostgreSQL catalog pressure above roughly 3,000–5,000 schemas.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index lifecycle management** requires active monitoring: IVFFlat `lists` parameters become under-provisioned as tenants grow, dead tuple accumulation degrades recall, and embedding model changes require a zero-downtime shadow-column migration strategy.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connection pool configuration** is as important as the data model. Use `SET LOCAL search_path` within explicit transactions to scope queries to tenant schemas, and configure `DISCARD ALL` as the PgBouncer server reset query to prevent cross-tenant schema leakage.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cross-tenant operations** — admin search, analytics, anomaly detection — require either a fan-out query that iterates tenant schemas or a separately maintained materialized summary table with its own HNSW index. The fan-out approach scales linearly with tenant count; the summary table trades freshness for constant-time queries.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
