@@ -6,6 +6,10 @@
   <title>Chapter 33: Database Migration to Cloud: Practical Runbook — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 33: Database Migration to Cloud: Practical Runbook. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -455,6 +459,784 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">Azure DMS for SQL Managed Instance uses SQL Server transaction log shipping combined with log replay service to achieve minimal downtime:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create Azure DMS instance
+az dms create \
+  --name prod-migration-dms \
+  --resource-group rg-migration \
+  --location eastus \
+  --sku-name Premium_4vCores \
+  --subnet /subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-networking/providers/Microsoft.Network/virtualNetworks/migration-vnet/subnets/dms-subnet
+
+# Create the source connection info
+SOURCE_CONNECTION='{
+  "serverName": "onprem-sql.internal",
+  "port": 1433,
+  "authentication": "SqlAuthentication",
+  "userName": "migration_user",
+  "password": "'${SOURCE_PASSWORD}'"
+}'
+
+# Create migration project
+az dms project create \
+  --name sql-to-mi-project \
+  --resource-group rg-migration \
+  --service-name prod-migration-dms \
+  --source-platform SQL \
+  --target-platform SQLMI \
+  --location eastus
+
+# Create the migration task
+# For SQL MI online migration, DMS uses log shipping via Azure Blob Storage
+az dms task create \
+  --database-options-json '[{
+    "name": "ProdDB",
+    "targetDatabaseName": "ProdDB",
+    "backupFileShare": {
+      "path": "\\\\onprem-fileserver\\sqlbackups",
+      "userName": "backup_user",
+      "password": "'${BACKUP_SHARE_PASSWORD}'"
+    },
+    "selectedTables": null,
+    "makeSourceDbReadOnly": false
+  }]' \
+  --name online-migration-task \
+  --project-name sql-to-mi-project \
+  --resource-group rg-migration \
+  --service-name prod-migration-dms \
+  --source-connection-json "${SOURCE_CONNECTION}" \
+  --target-connection-json '{
+    "serverName": "${MI_FQDN}",
+    "port": 1433,
+    "authentication": "SqlAuthentication",
+    "userName": "mi_admin",
+    "password": "'${TARGET_PASSWORD}'"
+  }' \
+  --task-type OnlineMigration</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Prepare the Source SQL Server for Online Migration</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Online migration to SQL MI requires full recovery model and a recent full backup. These are baseline requirements, but there are additional source-side preparations that prevent mid-migration failures:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run on source SQL Server: pre-migration preparation
+
+-- 1. Verify databases are in FULL recovery model
+SELECT name, recovery_model_desc
+FROM sys.databases
+WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb')
+ORDER BY name;
+
+-- Fix any databases not in FULL recovery
+-- ALTER DATABASE [ProdDB] SET RECOVERY FULL;
+
+-- 2. Check for deprecated features that DMA flagged
+-- Text/NText/Image columns -- must be aware of migration behavior
+SELECT
+    t.name AS table_name,
+    c.name AS column_name,
+    ty.name AS data_type
+FROM sys.columns c
+JOIN sys.tables t ON c.object_id = t.object_id
+JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+WHERE ty.name IN ('text', 'ntext', 'image')
+  AND t.is_ms_shipped = 0
+ORDER BY t.name, c.name;
+
+-- 3. Find linked servers that will break after migration
+SELECT
+    name AS linked_server_name,
+    product,
+    provider,
+    data_source,
+    is_remote_login_enabled,
+    modify_date
+FROM sys.servers
+WHERE is_linked = 1
+ORDER BY name;
+
+-- 4. Identify SQL Agent jobs and their schedules
+SELECT
+    j.name AS job_name,
+    j.enabled,
+    j.description,
+    c.name AS category,
+    l.name AS owner,
+    j.date_modified
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.syscategories c ON j.category_id = c.category_id
+JOIN sys.syslogins l ON j.owner_sid = l.sid
+ORDER BY j.name;
+
+-- 5. Check current log backup chain — DMS needs an unbroken chain
+-- If log backups have gaps, you need a new full backup
+EXEC sp_helpdb 'ProdDB';
+
+-- 6. Identify certificates and asymmetric keys (TDE, encrypted objects)
+SELECT
+    name,
+    certificate_id,
+    pvt_key_encryption_type_desc,
+    is_active_for_begin_dialog
+FROM sys.certificates
+WHERE database_id = DB_ID('ProdDB');
+
+-- If TDE is enabled, export the certificate BEFORE migration
+-- Failure to do this means the database cannot be restored on MI
+-- BACKUP CERTIFICATE TDECert
+-- TO FILE = '\\backup-server\certs\TDECert.cer'
+-- WITH PRIVATE KEY (
+--     FILE = '\\backup-server\certs\TDECert_key.pvk',
+--     ENCRYPTION BY PASSWORD = 'cert_export_password'
+-- );</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitor Azure DMS Migration Progress</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Poll migration task status
+watch_migration() {
+    local RESOURCE_GROUP="rg-migration"
+    local SERVICE="prod-migration-dms"
+    local PROJECT="sql-to-mi-project"
+    local TASK="online-migration-task"
+
+    while true; do
+        STATUS=$(az dms task show \
+            --resource-group "${RESOURCE_GROUP}" \
+            --service-name "${SERVICE}" \
+            --project-name "${PROJECT}" \
+            --name "${TASK}" \
+            --expand output \
+            --query "output[0].migrationState" \
+            --output tsv 2&gt;/dev/null)
+
+        LAG=$(az dms task show \
+            --resource-group "${RESOURCE_GROUP}" \
+            --service-name "${SERVICE}" \
+            --project-name "${PROJECT}" \
+            --name "${TASK}" \
+            --expand output \
+            --query "output[0].databaseSummary.ProdDB.cdcLatency" \
+            --output tsv 2&gt;/dev/null)
+
+        echo "[$(date '+%H:%M:%S')] State: ${STATUS} | CDC Lag: ${LAG}s"
+
+        if [[ "${STATUS}" == "ReadyForCutover" ]]; then
+            echo "&gt;&gt;&gt; MIGRATION IS READY FOR CUTOVER &lt;&lt;&lt;"
+            break
+        fi
+
+        sleep 30
+    done
+}
+
+watch_migration
+
+# Initiate cutover when ready
+az dms task cutover \
+    --resource-group rg-migration \
+    --service-name prod-migration-dms \
+    --project-name sql-to-mi-project \
+    --name online-migration-task \
+    --object-name ProdDB</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.4 GCP Database Migration Service</h3>
+
+<p class="text-gray-300 leading-relaxed">Google Cloud's Database Migration Service (DMS) is the youngest of the three major cloud DMS offerings. It supports PostgreSQL-to-Cloud SQL PostgreSQL, MySQL-to-Cloud SQL MySQL, and PostgreSQL/Oracle-to-AlloyDB migrations. Its setup model differs from AWS and Azure DMS in one important way: connectivity to the source is managed through a *connection profile*, and you can route traffic through a reverse-SSH tunnel, VPN, or VPC peering — which is particularly useful when your source environment does not permit inbound connections from the cloud.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Create a GCP DMS Migration Job via gcloud</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Set project and region
+gcloud config set project your-project-id
+REGION="us-central1"
+SOURCE_IP="10.0.1.50"   # On-prem PostgreSQL IP, reachable via Cloud VPN or Interconnect
+
+# 1. Create the source connection profile
+# --password with no value will prompt interactively — use Secret Manager in CI/CD
+gcloud database-migration connection-profiles create postgresql \
+  --region="${REGION}" \
+  --connection-profile-id="onprem-pg-source" \
+  --host="${SOURCE_IP}" \
+  --port=5432 \
+  --username="migration_user" \
+  --password \
+  --database-service="postgres" \
+  --display-name="On-Prem PostgreSQL Source"
+
+# 2. Create the destination connection profile (Cloud SQL instance)
+gcloud database-migration connection-profiles create cloudsql \
+  --region="${REGION}" \
+  --connection-profile-id="cloudsql-pg-target" \
+  --cloudsql-instance-id="prod-cloudsql-pg" \
+  --display-name="Cloud SQL PostgreSQL Target"
+
+# 3. Create the migration job (continuous / minimal downtime)
+gcloud database-migration migration-jobs create \
+  --region="${REGION}" \
+  --migration-job-id="prod-pg-migration" \
+  --source="onprem-pg-source" \
+  --destination="cloudsql-pg-target" \
+  --type=CONTINUOUS \
+  --display-name="Production PostgreSQL Migration" \
+  --dump-path="gs://your-migration-bucket/pg-dump/"
+  # --dump-path is for initial seeding from a Cloud Storage dump;
+  # omit to let DMS perform the initial dump automatically
+
+# 4. Verify connectivity before starting
+gcloud database-migration migration-jobs verify \
+  --region="${REGION}" \
+  --migration-job-id="prod-pg-migration"
+
+# Expected output includes per-check pass/fail — fix any FAIL before proceeding
+# Common failures: firewall rules blocking DMS egress IPs, wal_level not set to logical,
+# replication user lacks REPLICATION privilege
+
+# 5. Start the migration
+gcloud database-migration migration-jobs start \
+  --region="${REGION}" \
+  --migration-job-id="prod-pg-migration"
+
+# 6. Monitor status
+gcloud database-migration migration-jobs describe \
+  --region="${REGION}" \
+  --migration-job-id="prod-pg-migration" \
+  --format="yaml(state, phase, error, duration)"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP DMS Source PostgreSQL Requirements</strong></p>
+
+<p class="text-gray-300 leading-relaxed">GCP DMS uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pglogical</code> extension internally. The requirements mirror AWS DMS but with slightly different parameter names:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On source PostgreSQL for GCP DMS:
+
+-- Required parameter settings (edit postgresql.conf or use ALTER SYSTEM)
+ALTER SYSTEM SET wal_level = 'logical';
+ALTER SYSTEM SET max_replication_slots = 10;
+ALTER SYSTEM SET max_wal_senders = 10;
+ALTER SYSTEM SET wal_sender_timeout = 0;  -- Prevent timeout during large transactions
+
+-- GCP DMS requires the pglogical extension
+CREATE EXTENSION IF NOT EXISTS pglogical;
+
+-- Create migration user with required privileges
+CREATE USER gcp_dms_user WITH REPLICATION LOGIN PASSWORD 'strong_password';
+GRANT CONNECT ON DATABASE prod_db TO gcp_dms_user;
+
+-- pglogical requires the user to have superuser OR specific privileges:
+-- On managed sources (like RDS), use rds_superuser grant if applicable
+-- On self-managed: grant superuser, OR grant these specific privileges:
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO gcp_dms_user;
+GRANT SELECT ON ALL SEQUENCES IN SCHEMA public TO gcp_dms_user;
+GRANT USAGE ON SCHEMA public TO gcp_dms_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO gcp_dms_user;
+
+-- pglogical also needs SELECT on pg_catalog system tables — superuser handles this
+-- For non-superuser, grant replication role privilege:
+GRANT pg_read_all_data TO gcp_dms_user;  -- PostgreSQL 14+
+
+-- Verify pg_hba.conf allows replication connections from DMS egress IPs
+-- Add to pg_hba.conf:
+-- host replication gcp_dms_user 34.0.0.0/8 md5   -- GCP DMS IP range (verify current range)
+-- host all        gcp_dms_user 34.0.0.0/8 md5</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP DMS: Promote to Standalone (Cutover)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When the migration job reaches <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CDC_RUNNING</code> phase and replication lag is near zero, you promote the Cloud SQL instance from replica to standalone:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Monitor lag before promoting
+watch_gcp_migration() {
+    while true; do
+        gcloud database-migration migration-jobs describe \
+            --region=us-central1 \
+            --migration-job-id="prod-pg-migration" \
+            --format="table(state,phase,duration,error.message)" 2&gt;/dev/null
+
+        # Also check CDC lag via Cloud SQL metrics
+        gcloud monitoring metrics list \
+            --filter="metric.type=cloudsql.googleapis.com/database/replication/replica_lag" \
+            2&gt;/dev/null | head -20
+
+        sleep 30
+    done
+}
+
+# Promote when lag is consistently &lt; 5 seconds and during your cutover window
+gcloud database-migration migration-jobs promote \
+    --region=us-central1 \
+    --migration-job-id="prod-pg-migration"
+
+# After promotion, Cloud SQL is no longer a replica — it accepts writes
+# This is the point of no return for the replication stream</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.5 Cutover Runbook: The Final 60 Minutes</h3>
+
+<p class="text-gray-300 leading-relaxed">The migration tools handle data movement. Cutover is where you transition application traffic. A poorly executed cutover causes data loss or extended downtime even when the underlying migration was perfect. This section is a scripted runbook — execute each step in order, with named owners and time checkpoints.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pre-Cutover Checklist (T-48 hours)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>[ ] All blocking DMA/SCT issues resolved and tested on target
+[ ] Application connection strings tested against target database (read-only smoke test)
+[ ] DNS TTLs reduced to 60 seconds (they were at 300+ before — change 48h ahead)
+[ ] Backup taken of source database within 24h of cutover
+[ ] Rollback plan documented and tested (see section 33.6)
+[ ] Monitoring alerts configured on target instance (CPU, connections, replication lag)
+[ ] On-call rotation confirmed with names and phone numbers
+[ ] Schema change freeze in effect on source (no DDL until post-cutover)
+[ ] Sequence values audited — sync script ready to execute
+[ ] All DMS/migration job metrics reviewed: no errors, lag &lt; 10 seconds</code></pre>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[1. Verify replication<br/>lag under 5s] --> B[2. Enable app<br/>maintenance mode]
+    B --> C[3. Confirm source<br/>quiesced, no writes]
+    C --> D[4. Synchronize<br/>sequences]
+    D --> E[5. Validate row<br/>counts match]
+    E --> F[6. Stop DMS<br/>replication task]
+    F --> G[7. Update DNS to<br/>target endpoint]
+    G --> H[8. Restore app traffic,<br/>run smoke tests]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Each step gates the next — this is also the sequence a rollback must unwind if smoke tests fail within the first hour.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cutover Execution (T-0)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# cutover.sh — Execute with two DBAs present: one driving, one verifying
+# Time each step and log to a shared document in real time
+
+set -euo pipefail
+LOGFILE="/tmp/cutover-$(date +%Y%m%d-%H%M).log"
+exec &gt; &gt;(tee -a "${LOGFILE}") 2&gt;&1
+
+log_step() {
+    echo ""
+    echo "=========================================="
+    echo "[$(date '+%H:%M:%S')] STEP: $1"
+    echo "=========================================="
+}
+
+#--- STEP 1: Final validation of replication lag ---#
+log_step "1. Verify replication lag &lt; 5 seconds"
+
+# For AWS DMS:
+aws dms describe-replication-tasks \
+    --filters Name=replication-task-id,Values=prod-full-load-cdc \
+    --query 'ReplicationTasks[0].{Status:Status,CDCLatencyTarget:CDCLatencyTarget,CDCLatencySource:CDCLatencySource}' \
+    --output table
+
+# For GCP DMS:
+# gcloud database-migration migration-jobs describe --region=us-central1 --migration-job-id="prod-pg-migration"
+
+echo "Confirm lag is acceptable before proceeding. Press ENTER to continue or Ctrl+C to abort."
+read -r
+
+#--- STEP 2: Put application in maintenance mode ---#
+log_step "2. Enable maintenance mode on application"
+# This is application-specific — examples:
+# - Set load balancer target group to maintenance page
+# - Toggle feature flag in config service
+# - Scale down application pods to 0
+#   kubectl scale deployment app-deployment --replicas=0 -n production
+
+echo "Application maintenance mode enabled. Confirm no new writes to source. Press ENTER."
+read -r
+
+#--- STEP 3: Verify zero active write transactions on source ---#
+log_step "3. Confirm source is quiesced (no active writes)"
+
+# PostgreSQL source
+psql -h "${SOURCE_HOST}" -U dba_user -d prod_db -c "
+SELECT count(*) AS active_write_transactions
+FROM pg_stat_activity
+WHERE state = 'active'
+  AND query !~ '^(SELECT|SHOW|EXPLAIN|--)'
+  AND backend_type = 'client backend'
+  AND pid != pg_backend_pid();
+"
+
+# SQL Server source
+# sqlcmd -S "${SOURCE_SQL_HOST}" -U dba_user -Q "
+# SELECT COUNT(*) AS active_write_spids
+# FROM sys.dm_exec_sessions s
+# JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+# WHERE r.command NOT IN ('SELECT', 'BACKUP DATABASE', 'BACKUP LOG')
+#   AND s.database_id = DB_ID('ProdDB')
+#   AND s.is_user_process = 1;
+# "
+
+echo "Source quiesced. Press ENTER to proceed with sequence sync."
+read -r
+
+#--- STEP 4: Synchronize sequences ---#
+log_step "4. Synchronize sequences on target"
+
+# Generate and execute sequence sync (PostgreSQL targets)
+psql -h "${SOURCE_HOST}" -U dba_user -d prod_db -t -A -c "
+SELECT 'SELECT setval(''' || schemaname || '.' || sequencename ||
+       ''', COALESCE((SELECT MAX(' || quote_ident(a.attname) ||
+       ') FROM ' || schemaname || '.' || tablename || '), 1), true);'
+FROM pg_sequences s
+JOIN pg_class c ON c.relname = s.sequencename
+JOIN pg_depend d ON d.objid = c.oid
+JOIN pg_class ct ON d.refobjid = ct.oid
+JOIN pg_attribute a ON a.attrelid = ct.oid AND a.attnum = d.refobjsubid
+JOIN pg_tables t ON t.tablename = ct.relname AND t.schemaname = s.schemaname
+WHERE s.schemaname NOT IN ('pg_catalog', 'information_schema');
+" &gt; /tmp/sequence_sync.sql
+
+echo "Generated sequence sync SQL. Review /tmp/sequence_sync.sql then press ENTER."
+cat /tmp/sequence_sync.sql
+read -r
+
+psql -h "${TARGET_HOST}" -U target_dba_user -d prod_db -f /tmp/sequence_sync.sql
+echo "Sequences synchronized."
+
+#--- STEP 5: Row count validation ---#
+log_step "5. Validate row counts source vs target"
+
+validate_counts() {
+    local HOST=$1
+    local LABEL=$2
+    psql -h "${HOST}" -U dba_user -d prod_db -t -A -c "
+    SELECT tablename || '|' || n_live_tup
+    FROM pg_stat_user_tables
+    ORDER BY tablename;
+    " &gt; "/tmp/counts_${LABEL}.txt"
+}
+
+validate_counts "${SOURCE_HOST}" "source"
+validate_counts "${TARGET_HOST}" "target"
+
+DIFF_COUNT=$(diff /tmp/counts_source.txt /tmp/counts_target.txt | grep -c "^[&lt;&gt;]" || true)
+if [[ "${DIFF_COUNT}" -gt 0 ]]; then
+    echo "WARNING: Row count differences detected:"
+    diff /tmp/counts_source.txt /tmp/counts_target.txt
+    echo "Investigate before proceeding. Press ENTER to continue anyway or Ctrl+C to abort."
+    read -r
+else
+    echo "Row counts match. Proceeding."
+fi
+
+#--- STEP 6: Stop DMS task ---#
+log_step "6. Stop DMS replication task"
+
+# AWS DMS:
+aws dms stop-replication-task \
+    --replication-task-arn "${DMS_TASK_ARN}"
+
+echo "Waiting for DMS task to stop..."
+aws dms wait replication-task-stopped \
+    --filters "Name=replication-task-arn,Values=${DMS_TASK_ARN}"
+
+echo "DMS task stopped."
+
+#--- STEP 7: Update DNS / connection strings ---#
+log_step "7. Update application DNS to point to target"
+
+# Update Route 53 (AWS example)
+aws route53 change-resource-record-sets \
+    --hosted-zone-id "${HOSTED_ZONE_ID}" \
+    --change-batch '{
+        "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "db.internal.example.com",
+                "Type": "CNAME",
+                "TTL": 60,
+                "ResourceRecords": [{"Value": "'"${AURORA_ENDPOINT}"'"}]
+            }
+        }]
+    }'
+
+echo "DNS updated. TTL is 60s — wait 90 seconds for propagation."
+sleep 90
+
+#--- STEP 8: Restore application traffic ---#
+log_step "8. Restore application traffic"
+
+# Scale application back up / disable maintenance mode
+# kubectl scale deployment app-deployment --replicas=4 -n production
+
+echo "Application traffic restored. Begin smoke testing."</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Post-Cutover Smoke Tests</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run on target immediately after traffic restoration
+-- These queries confirm application behavior is correct
+
+-- PostgreSQL target: verify active connections coming in
+SELECT
+    client_addr,
+    usename,
+    application_name,
+    state,
+    count(*) AS connection_count
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+  AND datname = current_database()
+GROUP BY client_addr, usename, application_name, state
+ORDER BY connection_count DESC
+LIMIT 20;
+
+-- Verify no long-running idle transactions (application connection pool issue)
+SELECT
+    pid,
+    usename,
+    application_name,
+    state,
+    now() - xact_start AS transaction_age,
+    left(query, 100) AS query_snippet
+FROM pg_stat_activity
+WHERE state IN ('idle in transaction', 'idle in transaction (aborted)')
+  AND xact_start &lt; now() - interval '60 seconds';
+
+-- SQL Server target: equivalent connection validation
+-- SELECT
+--     s.session_id,
+--     s.login_name,
+--     s.program_name,
+--     s.status,
+--     r.command,
+--     r.wait_type,
+--     s.last_request_start_time
+-- FROM sys.dm_exec_sessions s
+-- LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+-- WHERE s.is_user_process = 1
+--   AND s.database_id = DB_ID('ProdDB')
+-- ORDER BY s.last_request_start_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.6 Rollback Plan</h3>
+
+<p class="text-gray-300 leading-relaxed">Every cutover runbook needs a tested rollback path. The time to design the rollback is not during an incident at 3 AM — it is before you start the migration. The rollback strategy depends on your migration type.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Rollback for DMS-Based Migrations (PostgreSQL)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If you detect data corruption or application failures within the first hour after cutover, you can roll back by directing traffic back at the source — but only if the source was not taken offline or made read-only.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># ROLLBACK PROCEDURE — Execute only if smoke tests fail within 1 hour of cutover
+# This window closes when you decommission the source or disable writes to it
+
+log_step "ROLLBACK: Redirecting traffic to source database"
+
+# 1. Put application in maintenance mode again
+# kubectl scale deployment app-deployment --replicas=0 -n production
+
+# 2. Revert DNS to source
+aws route53 change-resource-record-sets \
+    --hosted-zone-id "${HOSTED_ZONE_ID}" \
+    --change-batch '{
+        "Changes": [{
+            "Action": "UPSERT",
+            "ResourceRecordSet": {
+                "Name": "db.internal.example.com",
+                "Type": "CNAME",
+                "TTL": 60,
+                "ResourceRecords": [{"Value": "'"${SOURCE_HOST}"'"}]
+            }
+        }]
+    }'
+
+echo "DNS reverted to source. Waiting 90s for propagation."
+sleep 90
+
+# 3. Restore application traffic
+# kubectl scale deployment app-deployment --replicas=4 -n production
+
+echo "ROLLBACK COMPLETE. Applications are writing to source again."
+echo "Assess target failures before rescheduling migration."</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Important rollback constraint</strong>: once you stop the DMS task and allow writes to the target, the replication stream is broken. If you discover a problem after writes have occurred on the target, you cannot roll back cleanly without accepting data loss. This is why the cutover window (Step 2 through Step 8 in the cutover script) must be executed quickly — typically under 15 minutes for most workloads — and smoke tests must be decisive.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server migrations to Azure SQL Managed Instance, Azure DMS keeps the migration task in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadyForCutover</code> state, and you have not yet invoked the cutover command. In this state, you can abandon the migration task without any impact to the source. Once you issue the cutover command, the commitment is final.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.7 Post-Migration Optimization</h3>
+
+<p class="text-gray-300 leading-relaxed">The database has landed in cloud. The application is running. The work is not done. Cloud databases expose different performance characteristics than on-premises ones: network-attached storage introduces latency patterns you did not see on direct-attached SAN, the managed service's shared infrastructure imposes IOPS limits that vary by instance class, and the optimizer's statistics may not yet reflect production query patterns.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Rebuild Statistics and Indexes on Target</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL (Aurora / Cloud SQL): rebuild statistics after full load
+-- DMS full load does not run ANALYZE; statistics are stale
+
+-- Run ANALYZE on all user tables immediately after migration
+DO $$
+DECLARE
+    tbl RECORD;
+BEGIN
+    FOR tbl IN
+        SELECT schemaname, tablename
+        FROM pg_tables
+        WHERE schemaname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+    LOOP
+        EXECUTE format('ANALYZE %I.%I', tbl.schemaname, tbl.tablename);
+        RAISE NOTICE 'Analyzed: %.%', tbl.schemaname, tbl.tablename;
+    END LOOP;
+END $$;
+
+-- For large tables, run ANALYZE with a progress check
+-- Aurora/RDS exposes pg_stat_progress_analyze (PostgreSQL 13+)
+SELECT
+    phase,
+    sample_blks_total,
+    sample_blks_scanned,
+    ext_stats_total,
+    ext_stats_computed,
+    child_tables_total,
+    child_tables_done
+FROM pg_stat_progress_analyze;
+
+-- Check for bloated indexes from the full load process
+-- DMS loads data in bulk; indexes may have high dead-tuple ratios
+SELECT
+    schemaname,
+    tablename,
+    indexname,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+JOIN pg_index USING (indexrelid)
+WHERE idx_scan = 0  -- Indexes never used since migration
+  AND NOT indisprimary
+  AND NOT indisunique
+ORDER BY pg_relation_size(indexrelid) DESC
+LIMIT 20;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server (Azure SQL MI / Azure SQL Database): post-migration statistics
+-- Rebuild statistics after full load (equivalent operation)
+
+-- Update all statistics with full scan
+EXEC sp_updatestats;
+
+-- For a more thorough rebuild on a specific database:
+USE ProdDB;
+
+DECLARE @sql NVARCHAR(MAX) = N'';
+SELECT @sql += N'UPDATE STATISTICS ' + QUOTENAME(SCHEMA_NAME(t.schema_id))
+    + N'.' + QUOTENAME(t.name) + N' WITH FULLSCAN;' + CHAR(10)
+FROM sys.tables t
+WHERE t.is_ms_shipped = 0;
+
+-- Review before executing
+PRINT @sql;
+-- EXEC sp_executesql @sql;  -- Uncomment to execute
+
+-- Identify indexes with high fragmentation post-migration
+SELECT
+    DB_NAME() AS database_name,
+    OBJECT_NAME(ips.object_id) AS table_name,
+    i.name AS index_name,
+    ips.index_type_desc,
+    ROUND(ips.avg_fragmentation_in_percent, 2) AS fragmentation_pct,
+    ips.page_count,
+    ips.record_count
+FROM sys.dm_db_index_physical_stats(
+    DB_ID(), NULL, NULL, NULL, 'LIMITED'
+) ips
+JOIN sys.indexes i
+    ON ips.object_id = i.object_id
+    AND ips.index_id = i.index_id
+WHERE ips.avg_fragmentation_in_percent &gt; 30
+  AND ips.page_count &gt; 1000
+ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Verify Query Plan Stability</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The first week after migration is when query plan regressions appear. Queries that ran well on the source may receive poor plans on the target due to different optimizer defaults, missing statistics, or engine version differences.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: enable pg_stat_statements to catch slow queries post-migration
+-- Confirm extension is installed (it should be on RDS/Aurora/Cloud SQL)
+SELECT * FROM pg_available_extensions WHERE name = 'pg_stat_statements';
+
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Top 20 slowest queries by mean execution time since migration
+SELECT
+    round(mean_exec_time::numeric, 2) AS mean_ms,
+    round(total_exec_time::numeric, 2) AS total_ms,
+    calls,
+    round((stddev_exec_time / NULLIF(mean_exec_time, 0) * 100)::numeric, 1) AS variability_pct,
+    rows / NULLIF(calls, 0) AS avg_rows,
+    left(query, 120) AS query_snippet
+FROM pg_stat_statements
+WHERE userid = (SELECT oid FROM pg_roles WHERE rolname = current_user)
+   OR userid IN (SELECT oid FROM pg_roles WHERE rolname != 'rdsadmin')
+ORDER BY mean_exec_time DESC
+LIMIT 20;
+
+-- Reset stats baseline after initial stabilization (24-48h post-migration)
+-- SELECT pg_stat_statements_reset();</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: use Query Store to compare plans before and after migration
+-- Query Store should be enabled on Azure SQL by default
+
+-- Check Query Store is active
+SELECT name, is_query_store_on
+FROM sys.databases
+WHERE name = 'ProdDB';
+
+-- Find queries with high variance in execution time (plan instability)
+SELECT TOP 20
+    q.query_id,
+    qt.query_sql_text,
+    rs.count_executions,
+    ROUND(rs.avg_duration / 1000.0, 2) AS avg_duration_ms,
+    ROUND(rs.max_duration / 1000.0, 2) AS max_duration_ms,
+    ROUND(rs.stdev_duration / 1000.0, 2) AS stdev_duration_ms,
+    rs.avg_logical_io_reads
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+JOIN sys.query_store_runtime_stats_interval rsi
+    ON rs.runtime_stats_interval_id = rsi.runtime_stats_interval_id
+WHERE rsi.start_time &gt; DATEADD(HOUR, -24, GETUTCDATE())
+ORDER BY rs.stdev_duration DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Right-Size the Instance After One Week</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cloud instances provisioned for migration are often over-provisioned. After one week of production traffic, review actual utilization and downsize if appropriate:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># AWS: check RDS instance utilization via CloudWatch
+aws cloudwatch get-metric-statistics \
+    --namespace AWS/RDS \
+    --metric-name CPUUtilization \
+    --dimensions Name=DBInstanceIdentifier,Value=prod-aurora-instance \
+    --start-time $(date -d '7 days ago' --iso-8601=seconds) \
+    --end-time $(date --iso-8601=seconds) \
+    --period 3600 \
+    --statistics Average Maximum \
+    --query 'sort_by(Datapoints, &Timestamp)[*].{Time:Timestamp,Avg:Average,Max:Maximum}' \
+    --output table
+
+# Azure: check SQL MI CPU over 7 days
+az monitor metrics list \
+    --resource "/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/rg-prod/providers/Microsoft.Sql/managedInstances/prod-sql-mi" \
+    --metric "avg_cpu_percent" \
+    --interval PT1H \
+    --start-time $(date -d '7 days ago' --iso-8601=seconds) \
+    --end-time $(date --iso-8601=seconds) \
+    --output table
+
+# GCP: check Cloud SQL CPU utilization
+gcloud monitoring metrics list \
+    --filter="metric.type=cloudsql.googleapis.com/database/cpu/utilization" \
+    2&gt;/dev/null
+
+# Or use the Metrics Explorer in GCP Console for visual review</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Assessment before tooling**: run SCT and DMA against every source database before touching a migration tool — blocking incompatibilities discovered during execution cost ten times more to fix than the same issues discovered during assessment.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **DMS does not migrate everything**: sequences, SQL Agent jobs, linked servers, certificates for TDE, and DDL changes during CDC are outside the replication stream; each requires a separate manual migration step baked into the cutover runbook.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cutover speed determines rollback viability**: the longer your cutover window stays open, the more writes accumulate on the target and the harder it becomes to roll back cleanly; practice the cutover steps in a staging environment until they execute consistently in under 15 minutes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Statistics are stale immediately after full load**: DMS bulk load bypasses autovacuum and statistics collection; run `ANALYZE` (PostgreSQL) or `UPDATE STATISTICS` (SQL Server) as the first post-migration step before allowing application traffic, or query plans will be based on empty histograms.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Right-size after one week, not before**: provisioning decisions made before migration are guesses; only after one week of real production traffic on the target instance do CloudWatch, Azure Monitor, and Cloud Monitoring metrics provide the utilization data needed to make a defensible downsize decision without risking performance regression.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
