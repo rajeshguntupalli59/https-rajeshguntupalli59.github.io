@@ -6,6 +6,10 @@
   <title>Chapter 22: Autonomous Patch Management — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 22: Autonomous Patch Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -247,6 +251,17 @@ if __name__ == "__main__":
 <p class="text-gray-300 leading-relaxed">| 2 | Production canary (1 cluster) | 48 hours | All Ring 1 metrics + replication lag < 500ms |</p>
 <p class="text-gray-300 leading-relaxed">| 3 | Production batch (25% per wave) | 72 hours per wave | SLA metrics within tolerance |</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    R0[Ring 0: Dev/test<br/>2h dwell] -->|pass| R1[Ring 1: Staging 10%<br/>24h dwell]
+    R1 -->|pass| R2[Ring 2: Prod canary<br/>48h dwell]
+    R2 -->|pass| R3[Ring 3: Prod batch 25%/wave<br/>72h per wave]
+    R3 -->|pass| Done[Fully deployed]
+    R0 -->|fail| RB0[Rollback ring 0 + escalate]
+    R1 -->|fail| RB1[Rollback ring 1 + escalate]
+    R2 -->|fail| RB2[Rollback ring 2 + escalate]
+    R3 -->|fail| RB3[Rollback ring 3 + escalate]</pre></div>
+<p class="text-gray-300 leading-relaxed">*A failing ring halts propagation entirely — later rings never see a patch that hasn't earned trust from every ring before it.*</p>
+
 <p class="text-gray-300 leading-relaxed">The orchestrator is responsible for advancing or halting rings. It does not ask for human confirmation to advance; it only escalates when a ring fails validation. The core orchestration loop:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from enum import Enum
@@ -470,7 +485,579 @@ $$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Soft triggers</strong> — rollback if condition persists beyond hysteresis window (30 minutes):</p>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Query latency P99 elevated > 20% above pre-patch baseline</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Lock wait events per second > 2×</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Lock wait events per second > 2×pre-patch baseline</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Buffer hit ratio drops > 5 percentage points below pre-patch baseline</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> TempDB allocation failures per minute > 0 (SQL Server specific)</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Informational triggers</strong> — logged, escalated to human, no automatic rollback:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> New query plan regressions detected (via `pg_stat_statements` diff or Query Store)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Checkpoint duration increase > 50%</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autovacuum bloat increase in tracked tables</li>
+
+<p class="text-gray-300 leading-relaxed">The distinction between hard and soft triggers is intentional. Hard triggers represent conditions where continued operation is objectively unsafe — the database is either crashing, disconnecting clients, or losing replication. Soft triggers represent degradation that could be transient (a batch job, a sudden traffic spike) and need the hysteresis window to distinguish noise from signal.</p>
+
+<p class="text-gray-300 leading-relaxed">The rollback state machine tracks which tier of trigger fired and records it in the patch audit log:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+class TriggerType(Enum):
+    HARD  = "hard"
+    SOFT  = "soft"
+    NONE  = "none"
+
+@dataclass
+class RollbackDecision:
+    trigger_type:   TriggerType
+    trigger_reason: str
+    fired_at:       datetime
+    should_rollback: bool
+    escalate_human: bool
+
+@dataclass
+class SoftTriggerState:
+    condition:    str
+    first_seen:   datetime
+    last_seen:    datetime
+    breach_count: int = 0
+    HYSTERESIS_MINUTES: int = 30
+
+    def is_sustained(self) -&gt; bool:
+        duration = (self.last_seen - self.first_seen).total_seconds() / 60
+        return duration &gt;= self.HYSTERESIS_MINUTES
+
+class RollbackEvaluator:
+    def __init__(self, metrics_client, baseline: dict):
+        self.metrics  = metrics_client
+        self.baseline = baseline
+        self._soft_states: dict[str, SoftTriggerState] = {}
+
+    def evaluate(self, cluster_id: str) -&gt; RollbackDecision:
+        m = self.metrics.fetch(cluster_id)
+
+        # --- Hard trigger evaluation ---
+        if m.get("process_crash_detected"):
+            return RollbackDecision(
+                trigger_type    = TriggerType.HARD,
+                trigger_reason  = "PostgreSQL process crash detected",
+                fired_at        = datetime.utcnow(),
+                should_rollback = True,
+                escalate_human  = True,
+            )
+
+        if m.get("connection_rejection_rate", 0) &gt; 0.05:
+            return RollbackDecision(
+                trigger_type    = TriggerType.HARD,
+                trigger_reason  = f"Connection rejection rate {m['connection_rejection_rate']:.1%}",
+                fired_at        = datetime.utcnow(),
+                should_rollback = True,
+                escalate_human  = True,
+            )
+
+        replication_lag_growth = m.get("replication_lag_growth_rate_seconds_per_minute", 0)
+        if replication_lag_growth &gt; 0 and m.get("minutes_since_patch", 0) &gt; 10:
+            return RollbackDecision(
+                trigger_type    = TriggerType.HARD,
+                trigger_reason  = "Replication lag growing monotonically post-patch",
+                fired_at        = datetime.utcnow(),
+                should_rollback = True,
+                escalate_human  = True,
+            )
+
+        # --- Soft trigger evaluation ---
+        latency_baseline = self.baseline.get("p99_latency_ms", 0)
+        current_latency  = m.get("p99_latency_ms", 0)
+        if latency_baseline &gt; 0 and current_latency &gt; latency_baseline * 1.20:
+            decision = self._evaluate_soft(
+                "latency_elevation",
+                f"P99 latency {current_latency:.0f}ms vs baseline {latency_baseline:.0f}ms"
+            )
+            if decision:
+                return decision
+
+        lock_baseline = self.baseline.get("lock_waits_per_second", 0)
+        current_locks = m.get("lock_waits_per_second", 0)
+        if lock_baseline &gt; 0 and current_locks &gt; lock_baseline * 2:
+            decision = self._evaluate_soft(
+                "lock_wait_elevation",
+                f"Lock waits {current_locks:.1f}/s vs baseline {lock_baseline:.1f}/s"
+            )
+            if decision:
+                return decision
+
+        # Clear any soft states that have recovered
+        self._clear_recovered_states(m)
+
+        return RollbackDecision(
+            trigger_type    = TriggerType.NONE,
+            trigger_reason  = "All metrics within tolerance",
+            fired_at        = datetime.utcnow(),
+            should_rollback = False,
+            escalate_human  = False,
+        )
+
+    def _evaluate_soft(self, condition_key: str, reason: str) -&gt; Optional[RollbackDecision]:
+        now = datetime.utcnow()
+        if condition_key not in self._soft_states:
+            self._soft_states[condition_key] = SoftTriggerState(
+                condition  = reason,
+                first_seen = now,
+                last_seen  = now,
+            )
+        else:
+            state = self._soft_states[condition_key]
+            state.last_seen   = now
+            state.breach_count += 1
+            if state.is_sustained():
+                return RollbackDecision(
+                    trigger_type    = TriggerType.SOFT,
+                    trigger_reason  = f"Sustained 30m: {reason}",
+                    fired_at        = now,
+                    should_rollback = True,
+                    escalate_human  = True,
+                )
+        return None
+
+    def _clear_recovered_states(self, metrics: dict):
+        """Remove soft trigger states for conditions that have self-resolved."""
+        latency_ok = (
+            metrics.get("p99_latency_ms", 0)
+            &lt;= self.baseline.get("p99_latency_ms", 0) * 1.20
+        )
+        if latency_ok and "latency_elevation" in self._soft_states:
+            del self._soft_states["latency_elevation"]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once a rollback decision is made, the rollback executor must verify its own success. A rollback that silently fails is indistinguishable from a patch that was never rolled back. The verification sequence:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def execute_rollback_with_verification(cluster_id: str, patch_id: str,
+                                       patcher, metrics_client,
+                                       baseline: dict) -&gt; bool:
+    """
+    Returns True if rollback succeeded and cluster returned to healthy baseline.
+    Returns False if rollback itself failed — escalates immediately.
+    """
+    import logging, time
+
+    logging.warning(f"Initiating rollback: cluster={cluster_id}, patch={patch_id}")
+
+    try:
+        patcher.rollback(cluster_id, patch_id)
+    except Exception as exc:
+        logging.error(f"Rollback execution error on {cluster_id}: {exc}")
+        # Escalate immediately — this is a tier-1 incident
+        escalate_incident(
+            cluster_id = cluster_id,
+            severity   = "P1",
+            message    = f"Patch rollback FAILED on {cluster_id}: {exc}",
+        )
+        return False
+
+    # Wait for service to stabilize after rollback
+    time.sleep(60)
+
+    # Verify the binary actually reverted
+    current_version = patcher.get_version(cluster_id)
+    expected_version = patcher.pre_patch_version(cluster_id, patch_id)
+    if current_version != expected_version:
+        logging.error(
+            f"Version mismatch post-rollback: got {current_version}, "
+            f"expected {expected_version}"
+        )
+        escalate_incident(
+            cluster_id = cluster_id,
+            severity   = "P1",
+            message    = (
+                f"Rollback version verification failed: {cluster_id} "
+                f"still running {current_version}"
+            ),
+        )
+        return False
+
+    # Verify metric recovery — wait up to 10 minutes
+    for attempt in range(20):
+        m = metrics_client.fetch(cluster_id)
+        latency_ok = (
+            m.get("p99_latency_ms", 0)
+            &lt;= baseline.get("p99_latency_ms", 0) * 1.10
+        )
+        error_rate_ok = m.get("connection_rejection_rate", 0) &lt; 0.01
+        replication_ok = m.get("replication_lag_growth_rate_seconds_per_minute", 0) &lt;= 0
+
+        if latency_ok and error_rate_ok and replication_ok:
+            logging.info(f"Rollback verified successfully for {cluster_id}")
+            return True
+
+        time.sleep(30)
+
+    # Metrics did not recover in 10 minutes even after rollback
+    escalate_incident(
+        cluster_id = cluster_id,
+        severity   = "P1",
+        message    = (
+            f"Post-rollback metric recovery failed on {cluster_id}. "
+            f"Manual intervention required."
+        ),
+    )
+    return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The distinction between a failed rollback and a slow recovery is time-bounded: ten minutes is sufficient for a PostgreSQL cluster to re-establish streaming replication and drain in-flight queries after a binary revert. If the cluster is still degraded at that point, the issue is not the patch reversal but something deeper — possibly a catalog corruption, a config file inconsistency, or an infrastructure-layer failure — and human judgment is genuinely needed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.6 Patch Audit Trails and Compliance Reporting</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous systems that operate without human approval at each step face a higher evidentiary standard than manual processes. When an auditor asks "who approved patching this cluster at 2 AM?" the answer "the policy authorized it and the orchestrator executed autonomously" must be substantiated by a complete, tamper-evident record of every decision, every trigger condition evaluated, and every action taken.</p>
+
+<p class="text-gray-300 leading-relaxed">The patch audit log is append-only by design. On PostgreSQL, this is enforced using row-level security combined with a privilege structure that grants INSERT but never UPDATE or DELETE to the patch agent role:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE patch_audit_log (
+    log_id          BIGSERIAL       PRIMARY KEY,
+    event_time      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    patch_id        TEXT            NOT NULL,
+    cluster_id      TEXT            NOT NULL,
+    ring_id         INT,
+    event_type      TEXT            NOT NULL,
+    -- e.g. 'ring_started', 'patch_applied', 'validation_passed',
+    --      'trigger_fired', 'rollback_initiated', 'rollback_verified'
+    trigger_type    TEXT,
+    trigger_reason  TEXT,
+    actor           TEXT            NOT NULL DEFAULT current_user,
+    metrics_snapshot JSONB,
+    outcome         TEXT,
+    notes           TEXT
+);
+
+-- Enforce append-only: grant INSERT, revoke UPDATE/DELETE from agent role
+GRANT INSERT ON patch_audit_log TO patch_agent;
+REVOKE UPDATE, DELETE ON patch_audit_log FROM patch_agent;
+
+-- Optionally use a publication for logical replication to a
+-- separate compliance sink that the patch system itself cannot reach
+CREATE PUBLICATION patch_audit_pub FOR TABLE patch_audit_log;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.PatchAuditLog (
+    LogId            BIGINT IDENTITY(1,1) PRIMARY KEY,
+    EventTime        DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    PatchId          NVARCHAR(100) NOT NULL,
+    ClusterId        NVARCHAR(200) NOT NULL,
+    RingId           INT,
+    EventType        NVARCHAR(100) NOT NULL,
+    TriggerType      NVARCHAR(50),
+    TriggerReason    NVARCHAR(MAX),
+    Actor            NVARCHAR(200) NOT NULL DEFAULT SYSTEM_USER,
+    MetricsSnapshot  NVARCHAR(MAX),  -- JSON stored as NVARCHAR for SQL Server 2016 compat
+    Outcome          NVARCHAR(100),
+    Notes            NVARCHAR(MAX)
+);
+
+-- Deny UPDATE and DELETE to the patch agent login
+DENY UPDATE ON dbo.PatchAuditLog TO patch_agent_login;
+DENY DELETE ON dbo.PatchAuditLog TO patch_agent_login;
+
+-- Create a DDL trigger to prevent table alterations by non-sysadmin principals
+CREATE TRIGGER PreventAuditTableAlter
+ON DATABASE
+FOR ALTER_TABLE, DROP_TABLE
+AS
+BEGIN
+    DECLARE @EventData XML = EVENTDATA();
+    IF @EventData.value('(/EVENT_INSTANCE/ObjectName)[1]', 'NVARCHAR(200)')
+           = 'PatchAuditLog'
+       AND IS_SRVROLEMEMBER('sysadmin') = 0
+    BEGIN
+        RAISERROR('Modifications to PatchAuditLog are not permitted.', 16, 1);
+        ROLLBACK;
+    END
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Compliance reports query the audit log to produce evidence artifacts. A typical SOC 2 or PCI-DSS audit requires demonstrating that patches were applied within the required timeframe of CVE publication and that a complete approval chain exists. The autonomous model satisfies this by making the policy itself the auditable artifact:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Patch SLA compliance report
+-- Shows CVEs published in the last quarter and whether they were patched within tier SLA
+SELECT
+    pc.cve_id,
+    pc.priority_score,
+    CASE
+        WHEN pc.priority_score &gt;= 80 THEN 'Tier 1 (24h)'
+        WHEN pc.priority_score &gt;= 50 THEN 'Tier 2 (7d)'
+        ELSE                              'Tier 3 (next upgrade)'
+    END                                                   AS tier,
+    pc.published_at,
+    MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
+                                                          AS first_applied_at,
+    EXTRACT(EPOCH FROM (
+        MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
+        - pc.published_at
+    )) / 3600                                             AS hours_to_first_patch,
+    CASE
+        WHEN pc.priority_score &gt;= 80
+         AND EXTRACT(EPOCH FROM (
+               MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
+               - pc.published_at)) / 3600 &lt;= 24
+         THEN 'COMPLIANT'
+        WHEN pc.priority_score &gt;= 50
+         AND EXTRACT(EPOCH FROM (
+               MIN(pal.event_time) FILTER (WHERE pal.event_type = 'patch_applied')
+               - pc.published_at)) / 3600 &lt;= 168
+         THEN 'COMPLIANT'
+        WHEN pc.priority_score &lt; 50
+         THEN 'TIER3_DEFERRED'
+        ELSE 'NON_COMPLIANT'
+    END                                                   AS sla_status
+FROM patch_catalog pc
+LEFT JOIN patch_audit_log pal
+       ON pal.patch_id = pc.cve_id
+WHERE pc.published_at &gt;= NOW() - INTERVAL '90 days'
+GROUP BY pc.cve_id, pc.priority_score, pc.published_at
+ORDER BY pc.priority_score DESC, pc.published_at DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SELECT
+    pc.CveId,
+    pc.PriorityScore,
+    CASE
+        WHEN pc.PriorityScore &gt;= 80 THEN 'Tier 1 (24h)'
+        WHEN pc.PriorityScore &gt;= 50 THEN 'Tier 2 (7d)'
+        ELSE                              'Tier 3 (next upgrade)'
+    END                                                AS Tier,
+    pc.PublishedAt,
+    MIN(CASE WHEN pal.EventType = 'patch_applied'
+             THEN pal.EventTime END)                   AS FirstAppliedAt,
+    DATEDIFF(HOUR, pc.PublishedAt,
+        MIN(CASE WHEN pal.EventType = 'patch_applied'
+                 THEN pal.EventTime END))              AS HoursToFirstPatch,
+    CASE
+        WHEN pc.PriorityScore &gt;= 80
+         AND DATEDIFF(HOUR, pc.PublishedAt,
+               MIN(CASE WHEN pal.EventType = 'patch_applied'
+                        THEN pal.EventTime END)) &lt;= 24
+         THEN 'COMPLIANT'
+        WHEN pc.PriorityScore &gt;= 50
+         AND DATEDIFF(HOUR, pc.PublishedAt,
+               MIN(CASE WHEN pal.EventType = 'patch_applied'
+                        THEN pal.EventTime END)) &lt;= 168
+         THEN 'COMPLIANT'
+        WHEN pc.PriorityScore &lt; 50
+         THEN 'TIER3_DEFERRED'
+        ELSE 'NON_COMPLIANT'
+    END                                                AS SlaStatus
+FROM dbo.PatchCatalog pc
+LEFT JOIN dbo.PatchAuditLog pal
+       ON pal.PatchId = pc.CveId
+WHERE pc.PublishedAt &gt;= DATEADD(DAY, -90, SYSUTCDATETIME())
+GROUP BY pc.CveId, pc.PriorityScore, pc.PublishedAt
+ORDER BY pc.PriorityScore DESC, pc.PublishedAt DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond the compliance report, the audit log surfaces operational metrics that feed continuous improvement of the patch policy itself. Rollback rates per patch tier, average dwell time before ring advancement, frequency of soft-trigger false positives — all of these are computable from the log and should be reviewed quarterly to tighten or relax thresholds as the fleet matures.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.7 Integrating with Change Management Systems: Autonomous Tickets Without Human Approval</h3>
+
+<p class="text-gray-300 leading-relaxed">The autonomous patch pipeline does not operate in a vacuum. Most regulated environments require that every production change be associated with a change record — a ticket in ServiceNow, Jira, or a similar system. The key architectural decision is whether a human must approve that ticket before the patch executes, or whether the ticket is created and auto-approved by policy for patches that meet defined criteria.</p>
+
+<p class="text-gray-300 leading-relaxed">For Tier 1 patches (CVSS-equivalent score ≥ 80, 24-hour SLA), requiring human approval before patching begins is incompatible with the SLA. The system must be authorized to auto-approve via policy and to create the change record as an artifact of what it did, not as a gate to get permission. This requires a formal "pre-authorized change" category in the change management system — a concept that most ITSM platforms support but that must be explicitly negotiated with the change advisory board.</p>
+
+<p class="text-gray-300 leading-relaxed">The integration with ServiceNow's REST API demonstrates the pattern:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import httpx
+import json
+from datetime import datetime
+
+SNOW_BASE = "https://your-instance.service-now.com/api/now"
+SNOW_AUTH = ("automation_user", "secret")
+
+def create_patch_change_record(
+    patch_id: str,
+    cve_ids: list[str],
+    tier: int,
+    affected_clusters: list[str],
+    planned_start: datetime,
+    planned_end: datetime,
+) -&gt; str:
+    """
+    Creates a ServiceNow change request.
+    Tier 1 patches are submitted as pre-authorized (change_type=standard).
+    Tier 2 and 3 submit as normal changes and await CAB approval.
+    Returns the change request sys_id.
+    """
+    change_type = "standard" if tier == 1 else "normal"
+    approval    = "pre_approved" if tier == 1 else "requested"
+
+    payload = {
+        "short_description": f"Autonomous DB Patch: {', '.join(cve_ids)}",
+        "description": (
+            f"Automated patch deployment initiated by ADE patch orchestrator.\n"
+            f"Patch ID: {patch_id}\n"
+            f"CVEs addressed: {', '.join(cve_ids)}\n"
+            f"Tier: {tier}\n"
+            f"Affected clusters: {', '.join(affected_clusters)}\n"
+            f"Planned window: {planned_start.isoformat()} – {planned_end.isoformat()}"
+        ),
+        "type":             change_type,
+        "approval":         approval,
+        "category":         "Database",
+        "risk":             "low" if tier == 1 else "moderate",
+        "impact":           "2",   # Medium impact
+        "planned_start_date": planned_start.isoformat(),
+        "planned_end_date":   planned_end.isoformat(),
+        "u_automation_driven": "true",   # Custom field for audit filtering
+    }
+
+    resp = httpx.post(
+        f"{SNOW_BASE}/table/change_request",
+        auth   = SNOW_AUTH,
+        json   = payload,
+        headers = {"Content-Type": "application/json"},
+    )
+    resp.raise_for_status()
+    sys_id = resp.json()["result"]["sys_id"]
+    return sys_id
+
+def close_patch_change_record(sys_id: str, outcome: str, notes: str):
+    """Closes the change record with actual outcome after patch completes."""
+    close_code = "successful" if outcome == "completed" else "unsuccessful"
+    httpx.patch(
+        f"{SNOW_BASE}/table/change_request/{sys_id}",
+        auth  = SNOW_AUTH,
+        json  = {
+            "state":      "closed",
+            "close_code": close_code,
+            "close_notes": notes,
+        },
+        headers = {"Content-Type": "application/json"},
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">u_automation_driven</code> custom field is load-bearing for compliance: it allows auditors to filter all autonomously-executed changes and review them as a category, rather than having to distinguish them from manually-executed changes by description text. The change management team gets a clean report of every autonomous action, and the CAB can tune the pre-authorized change criteria based on observed outcomes.</p>
+
+<p class="text-gray-300 leading-relaxed">For Tier 2 changes that do require CAB approval, the orchestrator submits the ticket and then polls for approval state before proceeding:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def wait_for_cab_approval(sys_id: str, timeout_hours: int = 72) -&gt; bool:
+    """
+    Polls the change record until approved or timeout.
+    Returns True if approved, False if rejected or timed out.
+    """
+    import time
+    deadline = time.time() + (timeout_hours * 3600)
+
+    while time.time() &lt; deadline:
+        resp = httpx.get(
+            f"{SNOW_BASE}/table/change_request/{sys_id}"
+            "?sysparm_fields=approval,state",
+            auth = SNOW_AUTH,
+        )
+        record = resp.json()["result"]
+        if record["approval"] == "approved":
+            return True
+        if record["approval"] in ("rejected", "cancelled"):
+            return False
+        time.sleep(300)  # Poll every 5 minutes
+
+    return False  # Timed out — treat as blocked, not rejected</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A timeout is treated differently from a rejection: a timed-out approval means the CAB did not act within the window, which may itself be an SLA violation on the ITSM side. The orchestrator logs this separately and notifies both the DBA team and the ITSM administrators, rather than silently dropping the patch.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.8 Testing the Patch Pipeline: Chaos Injection and Dry-Run Mode</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous patch pipeline that has never been exercised under failure conditions will fail unpredictably when it encounters one in production. The patch pipeline requires its own test regime: scheduled dry runs that walk the full orchestration path without applying any package changes, and chaos injection tests that deliberately trigger rollback conditions to verify the rollback path executes correctly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dry-run mode</strong> is toggled by a single flag threaded through the orchestrator. In dry-run mode, every action that would cause a side effect is replaced by a logged simulation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>class DryRunPatcher:
+    """Drop-in replacement for the real patcher during dry-run execution."""
+
+    def __init__(self, real_patcher):
+        self._real = real_patcher
+
+    def apply(self, cluster_id: str, patch_id: str):
+        import logging
+        version_before = self._real.get_version(cluster_id)
+        logging.info(
+            f"[DRY-RUN] Would apply {patch_id} to {cluster_id} "
+            f"(currently {version_before})"
+        )
+
+    def rollback(self, cluster_id: str, patch_id: str):
+        import logging
+        logging.info(f"[DRY-RUN] Would rollback {patch_id} on {cluster_id}")
+
+    def get_version(self, cluster_id: str) -&gt; str:
+        return self._real.get_version(cluster_id)
+
+    def pre_patch_version(self, cluster_id: str, patch_id: str) -&gt; str:
+        return self._real.pre_patch_version(cluster_id, patch_id)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Dry-run mode exercises the full decision logic, the ServiceNow ticket creation (in a non-production SNOW instance), the metrics evaluation, and the ring advancement logic — but touches no database binaries. It should be run weekly in a staging environment against the current patch backlog to verify the pipeline remains functional.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chaos injection</strong> goes further: it deliberately injects failing conditions into the metrics stream to verify that the rollback evaluator fires correctly and that rollback execution completes within the expected time budget. A chaos test scenario for the hard-trigger path:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>class ChaosMetricsClient:
+    """
+    Wraps a real metrics client and injects synthetic failures
+    at a specified time offset after patch application.
+    """
+    def __init__(self, real_client, chaos_scenario: dict):
+        self._real    = real_client
+        self._scenario = chaos_scenario
+        self._patch_applied_at = None
+
+    def mark_patch_applied(self):
+        from datetime import datetime
+        self._patch_applied_at = datetime.utcnow()
+
+    def fetch(self, cluster_id: str) -&gt; dict:
+        from datetime import datetime
+        real_metrics = self._real.fetch(cluster_id)
+
+        if self._patch_applied_at is None:
+            return real_metrics
+
+        elapsed = (datetime.utcnow() - self._patch_applied_at).total_seconds()
+        inject_after = self._scenario.get("inject_after_seconds", 120)
+
+        if elapsed &gt;= inject_after:
+            for key, value in self._scenario.get("inject_metrics", {}).items():
+                real_metrics[key] = value
+
+        return real_metrics
+
+# Example chaos scenario: inject a crash-loop signal 2 minutes after patch
+crash_loop_scenario = {
+    "inject_after_seconds": 120,
+    "inject_metrics": {
+        "process_crash_detected": True,
+    },
+}
+
+# Example chaos scenario: inject sustained latency elevation
+latency_scenario = {
+    "inject_after_seconds": 60,
+    "inject_metrics": {
+        "p99_latency_ms": 4500,  # Well above any reasonable baseline
+    },
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Chaos tests run in a dedicated test environment on a monthly cadence and their results are recorded in the audit log under <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">event_type = 'chaos_test'</code>. A chaos test that does not trigger the expected rollback within the specified time budget is treated as a pipeline defect and blocks the next production patch cycle until resolved. This is the test-as-gate model: the autonomous system must continuously prove its own safety mechanisms work before it is trusted to act autonomously in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Patch priority scoring combines CVSS base score, exploit probability (EPSS), and local fleet exposure** — treating all CVEs as equal severity leads to alert fatigue and delays action on genuinely dangerous vulnerabilities while wasting resources on theoretical ones.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The ring rollout model gates fleet-wide propagation on dwell-time validation** — no ring advances until the previous ring has operated within defined SLI tolerances for the full dwell period, converting patch deployment from a single high-risk event into a series of validated, low-radius steps.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Rollback triggers are stratified into hard triggers (immediate, no override) and soft triggers (hysteresis-gated)** — this distinction prevents transient load spikes from causing unnecessary rollbacks while ensuring genuinely dangerous post-patch conditions receive an immediate response without waiting for human review.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Append-only audit logs with privilege-enforced write restrictions provide the evidentiary foundation** for autonomous operation in regulated environments — the policy itself becomes the auditable approval artifact, replacing per-change human sign-off with documented, machine-verifiable policy adherence.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Dry-run mode and monthly chaos injection tests verify the rollback path remains functional** — an untested autonomous rollback is operationally equivalent to no rollback at all, and the patch pipeline must treat its own safety mechanisms as first-class test subjects with gate conditions that block production use when tests fail.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
