@@ -6,6 +6,10 @@
   <title>Chapter 15: Pinecone: Architecture, Indexing, and Namespaces — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 15: Pinecone: Architecture, Indexing, and Namespaces. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -428,7 +432,7 @@ print(f"Active namespaces: {active_namespaces}")</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">When Namespaces Are Not Enough</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Namespaces provide logical isolation but share physical resources. For strict compliance requirements (GDPR right-to-erasure with audit proof, HIPAA physical data isolation), namespaces within a shared index are generally insufficient. In those cases, use <strong class="text-white">separate indexes per tenant</strong>, accepting the higher cost. A single-tenant index on a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">p1.x1</code> pod costs roughly $70/month per tenant on current Pinecone pricing—viable for enterprise SaaS models but prohibitive for consumer-scale applications.</p>
+<p class="text-gray-300 leading-relaxed">Namespaces provide logical isolation but share physical resources. For strict compliance requirements (GDPR right-to-erasure with audit proof, HIPAA physical data isolation), namespaces within a shared index are generally insufficient. In those cases, use <strong class="text-white">separate indexes per tenant</strong>, accepting the higher cost. A single-tenant index on a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">p1.x1</code> pod has a cost per tenant that varies by Pinecone's current pricing model—viable for enterprise SaaS but may be prohibitive for consumer-scale applications. Verify current costs with Pinecone's pricing documentation.</p>
 
 <p class="text-gray-300 leading-relaxed">The namespace vs. separate-index decision follows the same logic as shared vs. dedicated database servers for tenant isolation in traditional SaaS architectures.</p>
 
@@ -440,6 +444,640 @@ print(f"Active namespaces: {active_namespaces}")</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Index Statistics and Health Monitoring</strong></p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Comprehensive index monitoring — suitable for integration into Datadog, 
+# CloudWatch custom metrics, or a Prometheus exporter
+
+from pinecone import Pinecone
+import time
+
+pc = Pinecone(api_key="YOUR_API_KEY")
+index = pc.Index("document-embeddings-pods")
+
+def collect_index_metrics(index_name: str) -&gt; dict:
+    """
+    Collect key operational metrics from a Pinecone index.
+    Call this on a schedule (e.g., every 60 seconds) and push to your monitoring system.
+    """
+    pc_client = Pinecone(api_key="YOUR_API_KEY")
+    idx = pc_client.Index(index_name)
+    
+    # describe_index_stats returns vector count and namespace breakdown
+    stats = idx.describe_index_stats()
+    
+    # describe_index returns pod config, status, and replicas
+    index_config = pc_client.describe_index(index_name)
+    
+    total_vectors = stats.get("total_vector_count", 0)
+    dimension = stats.get("dimension", 0)
+    
+    # Capacity utilization — critical for pod-based indexes
+    # p1.x1 holds ~1M vectors; x2 = ~2M, x4 = ~4M, x8 = ~8M
+    pod_type = index_config.spec.pod.pod_type if hasattr(index_config.spec, 'pod') else "serverless"
+    pods = index_config.spec.pod.pods if hasattr(index_config.spec, 'pod') else None
+    replicas = index_config.spec.pod.replicas if hasattr(index_config.spec, 'pod') else None
+
+    namespace_stats = {
+        ns: data["vector_count"]
+        for ns, data in stats.get("namespaces", {}).items()
+    }
+
+    return {
+        "index_name": index_name,
+        "total_vectors": total_vectors,
+        "dimension": dimension,
+        "pod_type": pod_type,
+        "pods": pods,
+        "replicas": replicas,
+        "namespace_vector_counts": namespace_stats,
+        "collected_at": time.time()
+    }
+
+
+def estimate_capacity_utilization(metrics: dict) -&gt; float:
+    """
+    Estimate percentage of pod capacity consumed.
+    Useful for alerting before you hit ResourceExhausted errors.
+    Capacity estimates are approximate — refer to Pinecone documentation
+    for current per-pod limits.
+    """
+    pod_type = metrics.get("pod_type", "")
+    pods = metrics.get("pods", 1) or 1
+    total_vectors = metrics.get("total_vectors", 0)
+
+    # Approximate per-pod capacities by pod family
+    # These change as Pinecone updates infrastructure — treat as guidelines
+    per_pod_capacity = {
+        "p1": 1_000_000,
+        "p2": 1_000_000,
+        "s1": 5_000_000,
+    }
+
+    pod_family = pod_type.split(".")[0] if pod_type else "p1"
+    base_capacity = per_pod_capacity.get(pod_family, 1_000_000)
+
+    # x2, x4, x8 multipliers double/quadruple capacity
+    multiplier = 1
+    if "." in pod_type:
+        suffix = pod_type.split(".")[1]  # e.g., "x2"
+        if suffix.startswith("x"):
+            try:
+                multiplier = int(suffix[1:])
+            except ValueError:
+                multiplier = 1
+
+    total_capacity = base_capacity * multiplier * pods
+    return (total_vectors / total_capacity) * 100 if total_capacity &gt; 0 else 0.0
+
+
+# Example usage
+metrics = collect_index_metrics("document-embeddings-pods")
+utilization = estimate_capacity_utilization(metrics)
+
+print(f"Index: {metrics['index_name']}")
+print(f"Vectors: {metrics['total_vectors']:,}")
+print(f"Pod type: {metrics['pod_type']}, Pods: {metrics['pods']}, Replicas: {metrics['replicas']}")
+print(f"Estimated capacity utilization: {utilization:.1f}%")
+
+if utilization &gt; 80:
+    print("WARNING: Index approaching capacity. Plan pod upgrade or horizontal expansion.")
+elif utilization &gt; 95:
+    print("CRITICAL: Index near capacity. Upserts will fail with ResourceExhausted.")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Latency Measurement Patterns</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone does not expose p99 query latency directly through its Python client—that telemetry lives in your own instrumentation. Wrap every query call with a timing decorator and feed the results into your observability stack.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import time
+import statistics
+from functools import wraps
+from collections import deque
+
+# Simple sliding-window latency tracker
+class LatencyTracker:
+    def __init__(self, window_size: int = 1000):
+        self.latencies = deque(maxlen=window_size)
+
+    def record(self, latency_ms: float):
+        self.latencies.append(latency_ms)
+
+    def percentile(self, p: float) -&gt; float:
+        if not self.latencies:
+            return 0.0
+        sorted_latencies = sorted(self.latencies)
+        idx = int(len(sorted_latencies) * p / 100)
+        return sorted_latencies[min(idx, len(sorted_latencies) - 1)]
+
+    def report(self) -&gt; dict:
+        if not self.latencies:
+            return {}
+        return {
+            "p50_ms": self.percentile(50),
+            "p95_ms": self.percentile(95),
+            "p99_ms": self.percentile(99),
+            "mean_ms": statistics.mean(self.latencies),
+            "sample_count": len(self.latencies),
+        }
+
+
+query_latency = LatencyTracker(window_size=500)
+
+
+def timed_query(index, vector, top_k, namespace, **kwargs):
+    """
+    Execute a Pinecone query and record wall-clock latency.
+    Use this wrapper everywhere instead of calling index.query() directly.
+    """
+    start = time.perf_counter()
+    result = index.query(
+        vector=vector,
+        top_k=top_k,
+        namespace=namespace,
+        **kwargs
+    )
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    query_latency.record(elapsed_ms)
+    return result
+
+
+# After a load test or production traffic window:
+print("Query latency report:", query_latency.report())</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Common Failure Modes and Mitigations</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Failure Mode | Cause | Mitigation |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ResourceExhausted</code> on upsert | Index at pod capacity | Upgrade pod size or add pods before hitting 90% |</p>
+<p class="text-gray-300 leading-relaxed">| Fewer results than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_k</code> | Metadata filter too selective | Increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_k</code>; consider namespace isolation |</p>
+<p class="text-gray-300 leading-relaxed">| Stale vectors after upsert | Pinecone indexes asynchronously | Add read-your-writes wait loop; see below |</p>
+<p class="text-gray-300 leading-relaxed">| High p99 latency spikes | Replica saturation | Add replicas; or switch to pod type with better cache behavior |</p>
+<p class="text-gray-300 leading-relaxed">| 400 on dimension mismatch | Embedding model changed | Validate vector dimensions before every upsert batch |</p>
+<p class="text-gray-300 leading-relaxed">| Timeout on large batch upsert | Request body exceeds 2MB | Limit batch to 100 vectors; reduce metadata payload size |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Read-Your-Writes Consistency</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone is eventually consistent on write paths. An upsert call that returns success does not guarantee the vector is immediately queryable. For workflows that require confirming vector availability after upsert—such as in integration tests or post-ingest verification jobs—poll <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">describe_index_stats</code> until the vector count increments, or use a small polling loop on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fetch</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Wait for a vector to become queryable after upsert
+def wait_for_vector(index, vector_id: str, namespace: str, 
+                    timeout_seconds: int = 30, poll_interval: float = 0.5):
+    """
+    Poll until a vector with the given ID is fetchable.
+    Useful in tests and post-ingest verification pipelines.
+    Not recommended for hot paths — adds latency.
+    """
+    deadline = time.time() + timeout_seconds
+    while time.time() &lt; deadline:
+        result = index.fetch(ids=[vector_id], namespace=namespace)
+        if vector_id in result.get("vectors", {}):
+            return True
+        time.sleep(poll_interval)
+    raise TimeoutError(
+        f"Vector '{vector_id}' not visible in namespace '{namespace}' "
+        f"after {timeout_seconds}s"
+    )
+
+
+# Usage: after upserting a critical document, verify before proceeding
+index.upsert(
+    vectors=[{"id": "critical-doc-001", "values": get_embedding("important text"), "metadata": {}}],
+    namespace="production"
+)
+wait_for_vector(index, "critical-doc-001", "production")
+print("Vector confirmed queryable.")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scaling Playbook: When to Take Each Action</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Database professionals expect a capacity scaling decision matrix. Here is the equivalent for Pinecone pod-based indexes:</p>
+
+<p class="text-gray-300 leading-relaxed">| Observed Symptom | Diagnosis | Action |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ResourceExhausted</code> on upsert | Pod storage full | Scale pod size (x1 → x2 → x4) or add pods |</p>
+<p class="text-gray-300 leading-relaxed">| Rising p99 query latency | Replica throughput saturated | Add replicas |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_k</code> results consistently short | Filter selectivity < 10% | Increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">top_k</code> or move to namespaces |</p>
+<p class="text-gray-300 leading-relaxed">| Upsert throughput degrading | Saturating pod write path | Increase batch concurrency or pod count |</p>
+<p class="text-gray-300 leading-relaxed">| Cold start latency spikes (serverless) | Object storage fetch on cold data | Migrate hot data to pod-based index |</p>
+<p class="text-gray-300 leading-relaxed">| High cost with low query rate | Over-provisioned pods | Migrate to serverless for cost reduction |</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.6 Advanced Patterns: Hybrid Search and Re-Ranking</h3>
+
+<p class="text-gray-300 leading-relaxed">Pinecone's core operation is approximate nearest neighbor search over dense vectors. However, most production retrieval systems need more than raw ANN scores—they need the ability to blend keyword relevance with semantic similarity, and to re-rank initial retrieval results with a more expensive model before returning the final set.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Sparse-Dense Hybrid Search</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone supports <strong class="text-white">sparse-dense hybrid search</strong> on pod-based indexes using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dotproduct</code> metric. Sparse vectors represent keyword or BM25-style term-frequency signals; dense vectors represent semantic embeddings. Combining them lets you retrieve results that are both keyword-relevant and semantically similar—the same goal that Elasticsearch's Reciprocal Rank Fusion (RRF) achieves at the query rewrite layer.</p>
+
+<p class="text-gray-300 leading-relaxed">The architecture requires generating both a dense embedding and a sparse vector for each document at index time, then combining them at query time with an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha</code> weighting parameter.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Sparse-dense hybrid search
+# Requires: pod-based index with dotproduct metric and sparse vector support
+
+from pinecone import Pinecone
+from pinecone_text.sparse import BM25Encoder
+import openai
+
+pc = Pinecone(api_key="YOUR_API_KEY")
+
+# Create an index that supports sparse vectors
+# Note: hybrid search requires dotproduct metric and pod-based index
+pc.create_index(
+    name="hybrid-search-index",
+    dimension=1536,
+    metric="dotproduct",
+    spec=PodSpec(
+        environment="us-east1-gcp",
+        pod_type="p1.x1",
+        pods=1
+    )
+)
+
+index = pc.Index("hybrid-search-index")
+openai_client = openai.OpenAI(api_key="YOUR_OPENAI_KEY")
+
+# BM25 encoder — fit on your document corpus for accurate IDF weights
+# In production, fit once on the full corpus, serialize, and reuse
+bm25 = BM25Encoder()
+
+documents = [
+    "PostgreSQL VACUUM reclaims storage from dead tuples created by updates and deletes.",
+    "Index bloat in PostgreSQL accumulates when autovacuum cannot keep pace with write load.",
+    "BM25 is a term frequency ranking function used in full-text search systems.",
+]
+
+# Fit BM25 on corpus (computes IDF weights)
+bm25.fit(documents)
+
+# Encode sparse vectors for each document
+sparse_doc_vectors = bm25.encode_documents(documents)
+
+# Encode dense vectors for each document
+dense_response = openai_client.embeddings.create(
+    input=documents,
+    model="text-embedding-3-small"
+)
+dense_doc_vectors = [item.embedding for item in dense_response.data]
+
+# Upsert hybrid vectors
+hybrid_vectors = []
+for i, (dense, sparse) in enumerate(zip(dense_doc_vectors, sparse_doc_vectors)):
+    hybrid_vectors.append({
+        "id": f"hybrid-doc-{i:03d}",
+        "values": dense,
+        "sparse_values": {
+            "indices": sparse["indices"],
+            "values": sparse["values"]
+        },
+        "metadata": {"text": documents[i]}
+    })
+
+index.upsert(vectors=hybrid_vectors, namespace="hybrid")
+
+# Hybrid query with alpha blending
+# alpha = 1.0 → pure dense search
+# alpha = 0.0 → pure sparse (keyword) search
+# alpha = 0.5 → equal blend
+
+def hybrid_query(query_text: str, alpha: float = 0.7, top_k: int = 5):
+    """
+    Execute a hybrid sparse-dense query.
+    alpha controls the balance: higher = more semantic, lower = more keyword.
+    """
+    # Encode query as both dense and sparse
+    dense_query = openai_client.embeddings.create(
+        input=[query_text],
+        model="text-embedding-3-small"
+    ).data[0].embedding
+
+    sparse_query = bm25.encode_queries(query_text)
+
+    # Scale sparse and dense components by alpha
+    def scale_sparse(sparse_vec, scale: float):
+        return {
+            "indices": sparse_vec["indices"],
+            "values": [v * scale for v in sparse_vec["values"]]
+        }
+
+    def scale_dense(dense_vec, scale: float):
+        return [v * scale for v in dense_vec]
+
+    results = index.query(
+        vector=scale_dense(dense_query, alpha),
+        sparse_vector=scale_sparse(sparse_query, 1 - alpha),
+        top_k=top_k,
+        namespace="hybrid",
+        include_metadata=True
+    )
+    return results["matches"]
+
+
+# Compare pure semantic vs. hybrid results
+print("=== Pure Semantic Search (alpha=1.0) ===")
+semantic_results = hybrid_query("dead rows storage reclamation", alpha=1.0)
+for r in semantic_results:
+    print(f"  {r['id']}: {r['score']:.4f} — {r['metadata']['text'][:60]}...")
+
+print("\n=== Hybrid Search (alpha=0.7, 30% BM25) ===")
+hybrid_results = hybrid_query("dead rows storage reclamation", alpha=0.7)
+for r in hybrid_results:
+    print(f"  {r['id']}: {r['score']:.4f} — {r['metadata']['text'][:60]}...")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Re-Ranking with a Cross-Encoder</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Approximate nearest neighbor retrieval returns a candidate set quickly, but ANN scores are coarse signals. Cross-encoder re-ranking runs a more expensive model over the (query, candidate) pairs to produce precise relevance scores. The pattern is always two-stage:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Retrieval</strong> (fast, approximate): Pinecone returns top-100 candidates.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Re-ranking</strong> (slower, precise): Cross-encoder scores each candidate; return top-10.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Two-stage retrieval and cross-encoder re-ranking
+
+from sentence_transformers import CrossEncoder
+from pinecone import Pinecone
+import openai
+
+pc = Pinecone(api_key="YOUR_API_KEY")
+index = pc.Index("document-embeddings-serverless")
+openai_client = openai.OpenAI(api_key="YOUR_OPENAI_KEY")
+
+# Cross-encoder from sentence-transformers — runs locally
+# ms-marco-MiniLM-L-6-v2 is a well-validated choice for passage reranking
+cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+
+def two_stage_retrieval(
+    query: str,
+    namespace: str,
+    retrieve_k: int = 50,
+    rerank_top_k: int = 5
+) -&gt; list[dict]:
+    """
+    Stage 1: Retrieve retrieve_k candidates from Pinecone using ANN.
+    Stage 2: Re-rank with cross-encoder and return rerank_top_k results.
+
+    retrieve_k should be at least 5–10× rerank_top_k to give the 
+    cross-encoder enough candidates to work with.
+    """
+    # Stage 1: ANN retrieval
+    query_embedding = openai_client.embeddings.create(
+        input=[query],
+        model="text-embedding-3-small"
+    ).data[0].embedding
+
+    ann_results = index.query(
+        vector=query_embedding,
+        top_k=retrieve_k,
+        namespace=namespace,
+        include_metadata=True
+    )
+
+    candidates = ann_results["matches"]
+    if not candidates:
+        return []
+
+    # Stage 2: Cross-encoder re-ranking
+    # Cross-encoder expects (query, passage) pairs
+    # Requires document text to be stored in metadata or fetched from primary DB
+    pairs = [
+        (query, candidate["metadata"].get("text", ""))
+        for candidate in candidates
+    ]
+
+    # Predict returns a score per pair — higher is more relevant
+    rerank_scores = cross_encoder.predict(pairs)
+
+    # Attach rerank scores and sort descending
+    for candidate, score in zip(candidates, rerank_scores):
+        candidate["rerank_score"] = float(score)
+
+    reranked = sorted(candidates, key=lambda x: x["rerank_score"], reverse=True)
+    return reranked[:rerank_top_k]
+
+
+# Example usage
+query = "How does PostgreSQL reclaim space from deleted rows?"
+final_results = two_stage_retrieval(
+    query=query,
+    namespace="production",
+    retrieve_k=20,
+    rerank_top_k=3
+)
+
+print(f"Query: {query}\n")
+print("Re-ranked results:")
+for i, result in enumerate(final_results, 1):
+    print(f"  {i}. [{result['rerank_score']:.3f}] {result['id']}: "
+          f"{result['metadata'].get('text', '')[:80]}...")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The cross-encoder step runs in the application tier—it has no dependency on Pinecone and can be parallelized. For latency-sensitive applications, run the cross-encoder inference on GPU or use a hosted re-ranking API (Cohere's Rerank API provides this as a managed service) rather than the CPU-bound local model.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.7 Integrating Pinecone with Your Data Stack</h3>
+
+<p class="text-gray-300 leading-relaxed">Pinecone does not exist in isolation. In production architectures, it sits alongside a primary relational database, an event streaming layer, and an embedding generation service. Getting the integration topology right determines whether your vector search layer stays consistent with the rest of your data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Canonical Integration Topology</strong></p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    App[Application]
+    PG[(PostgreSQL / Primary DB<br/>source of truth for text + metadata)]
+    CDC[CDC / Event Stream]
+    Embed[Embedding Service<br/>OpenAI / Cohere / self-hosted]
+    Pine[(Pinecone Index<br/>vector storage, ANN search)]
+    Query[Pinecone ANN Query]
+    Fetch[Fetch full docs from PostgreSQL by returned IDs]
+    Result[Return to application / LLM context]
+
+    App --> PG
+    PG --> CDC
+    CDC --> Embed
+    Embed --> Pine
+    App --> Query
+    Query --> Fetch
+    Fetch --> Result
+    Pine -.-> Query
+    PG -.-> Fetch</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Write path (left): PostgreSQL changes flow through CDC into the embedding service and land in Pinecone. Read path (right): the application queries Pinecone for nearest-neighbor IDs, then fetches authoritative text from PostgreSQL.*</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern is clear: Pinecone stores vectors and returns IDs. PostgreSQL stores authoritative text and structured data. Your application joins the two at query time using the IDs Pinecone returns. Never treat Pinecone's metadata as the sole copy of document content.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Keeping Pinecone Synchronized with PostgreSQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The most common production headache with Pinecone is index drift: records updated or deleted in PostgreSQL that still exist (stale) in Pinecone. Address this with one of three patterns, in order of reliability:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 1: Transactional outbox with CDC</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Write changes to an outbox table in PostgreSQL in the same transaction as the business record change. A downstream consumer (Debezium, pglogical, or a custom pg_notify listener) reads the outbox and triggers re-embedding + Pinecone upsert. Deletes in PostgreSQL produce a tombstone event that triggers <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index.delete()</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Outbox table for Pinecone sync events
+CREATE TABLE pinecone_sync_queue (
+    id              BIGSERIAL PRIMARY KEY,
+    operation       TEXT NOT NULL,         -- 'upsert' or 'delete'
+    document_id     TEXT NOT NULL,
+    namespace       TEXT NOT NULL DEFAULT 'default',
+    payload         JSONB,                 -- document text and metadata for upsert
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    processed_at    TIMESTAMPTZ
+);
+
+CREATE INDEX idx_pinecone_sync_unprocessed 
+    ON pinecone_sync_queue (created_at) 
+    WHERE processed_at IS NULL;
+
+-- Trigger function: queue a Pinecone sync event on document change
+CREATE OR REPLACE FUNCTION queue_pinecone_sync()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        INSERT INTO pinecone_sync_queue (operation, document_id, namespace)
+        VALUES ('delete', OLD.id::TEXT, 'production');
+        RETURN OLD;
+    ELSE
+        INSERT INTO pinecone_sync_queue (operation, document_id, namespace, payload)
+        VALUES (
+            'upsert',
+            NEW.id::TEXT,
+            'production',
+            jsonb_build_object(
+                'text', NEW.content,
+                'metadata', jsonb_build_object(
+                    'category', NEW.category,
+                    'created_at', NEW.created_at,
+                    'doc_type', NEW.doc_type
+                )
+            )
+        );
+        RETURN NEW;
+    END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach trigger to document table
+CREATE TRIGGER trg_queue_pinecone_sync
+AFTER INSERT OR UPDATE OR DELETE ON documents
+FOR EACH ROW EXECUTE FUNCTION queue_pinecone_sync();</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Outbox consumer — runs as a background worker or scheduled job
+
+import time
+import psycopg2
+from pinecone import Pinecone
+import openai
+
+pc = Pinecone(api_key="YOUR_API_KEY")
+index = pc.Index("document-embeddings-serverless")
+openai_client = openai.OpenAI(api_key="YOUR_OPENAI_KEY")
+
+def process_sync_queue(pg_conn, batch_size: int = 50):
+    """
+    Fetch unprocessed events from the outbox, execute Pinecone operations,
+    then mark events as processed. Runs in a polling loop.
+    """
+    with pg_conn.cursor() as cur:
+        # Fetch a batch of unprocessed events, lock them to avoid double-processing
+        cur.execute("""
+            SELECT id, operation, document_id, namespace, payload
+            FROM pinecone_sync_queue
+            WHERE processed_at IS NULL
+            ORDER BY created_at
+            LIMIT %s
+            FOR UPDATE SKIP LOCKED
+        """, (batch_size,))
+
+        events = cur.fetchall()
+        if not events:
+            return 0
+
+        upsert_batch = []
+        delete_ids_by_namespace = {}
+
+        for event_id, operation, document_id, namespace, payload in events:
+            if operation == 'delete':
+                delete_ids_by_namespace.setdefault(namespace, []).append(document_id)
+
+            elif operation == 'upsert' and payload:
+                text = payload.get("text", "")
+                metadata = payload.get("metadata", {})
+
+                # Generate embedding for the document
+                embedding = openai_client.embeddings.create(
+                    input=[text],
+                    model="text-embedding-3-small"
+                ).data[0].embedding
+
+                upsert_batch.append({
+                    "id": document_id,
+                    "values": embedding,
+                    "metadata": {**metadata, "text": text},
+                    "_namespace": namespace  # Store namespace for grouping
+                })
+
+        # Execute upserts grouped by namespace
+        upserts_by_ns = {}
+        for vec in upsert_batch:
+            ns = vec.pop("_namespace")
+            upserts_by_ns.setdefault(ns, []).append(vec)
+
+        for ns, vectors in upserts_by_ns.items():
+            index.upsert(vectors=vectors, namespace=ns)
+
+        # Execute deletes grouped by namespace
+        for ns, ids in delete_ids_by_namespace.items():
+            index.delete(ids=ids, namespace=ns)
+
+        # Mark events as processed
+        processed_ids = [e[0] for e in events]
+        cur.execute("""
+            UPDATE pinecone_sync_queue
+            SET processed_at = NOW()
+            WHERE id = ANY(%s)
+        """, (processed_ids,))
+
+        pg_conn.commit()
+        return len(events)
+
+
+# Polling loop — in production, deploy as a dedicated service with retry logic
+pg_conn = psycopg2.connect("postgresql://user:password@host:5432/dbname")
+
+while True:
+    processed = process_sync_queue(pg_conn, batch_size=50)
+    if processed == 0:
+        time.sleep(2)  # Back off when queue is empty
+    else:
+        print(f"Processed {processed} sync events")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 2: Application-layer dual write</strong></p>
+
+<p class="text-gray-300 leading-relaxed">On every create/update/delete operation in your application, write to PostgreSQL first, then synchronously upsert/delete from Pinecone. Simpler than the outbox pattern but introduces a failure mode: if the Pinecone call fails after the PostgreSQL commit, your systems diverge. Acceptable for low-stakes applications; not recommended for any dataset where consistency matters.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 3: Periodic full re-index</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For datasets that change infrequently—large document corpora where new versions are published in batches—a nightly full re-index is often the most operationally straightforward approach. Export all documents from PostgreSQL, batch-embed them, and upsert into Pinecone. Stale data exists for at most one index cycle, which is acceptable for many knowledge base applications.</p>
+
+<p class="text-gray-300 leading-relaxed">The three patterns represent the classic reliability vs. complexity tradeoff: outbox CDC is the most reliable but operationally heaviest; full re-index is the simplest but least timely.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pinecone's capacity model maps to familiar infrastructure concepts**: pods correspond to storage units (analogous to tablespace capacity), replicas correspond to read scaling (analogous to read replicas), and shards provide horizontal partitioning. Understanding which lever to pull—pods for storage, replicas for throughput—prevents the common mistake of adding replicas when you've hit a storage limit.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Namespaces provide logical tenant isolation enforced at the query layer**, not at the storage hardware layer. They are the right choice for multi-tenant applications where data privacy between tenants is required at the application level, but not a substitute for separate indexes when regulatory compliance demands physical data isolation (HIPAA, GDPR right-to-erasure audit trails).</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Metadata filtering operates post-ANN, not pre-ANN**, which means highly selective filters on large indexes return fewer results than `top_k` requests. The practical threshold is that filters should match at least 10–20% of the index to produce reliable result sets. For cardinality-based isolation below that threshold, namespace separation is more reliable than metadata filtering.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Serverless and pod-based indexes represent fundamentally different tradeoff profiles**: serverless eliminates capacity provisioning overhead and is cost-efficient for bursty or moderate workloads, but trades away the predictable low-latency (single-digit millisecond p50) that pod-based indexes deliver. Choose based on your application's latency SLA, not on index size alone.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Keeping Pinecone synchronized with your primary database requires an explicit consistency strategy**. The transactional outbox pattern—queuing sync events in PostgreSQL within the same transaction as business record changes—is the most robust approach. Application-layer dual writes are simpler but introduce a divergence window on partial failures, and periodic full re-indexing is appropriate only when data freshness requirements allow for batch-cycle latency.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
