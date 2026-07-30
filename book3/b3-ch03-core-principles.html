@@ -6,6 +6,10 @@
   <title>Chapter 3: Core Principles of Autonomous Database Systems — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 3: Core Principles of Autonomous Database Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -414,6 +418,90 @@ ORDER BY score DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This contract is enforced programmatically. The autonomous engine's action dispatcher validates every proposed action against the safety contract before execution:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># safety_contract.py — action dispatcher with autonomous safety validation
+
+from enum import Enum
+from typing import Callable, Optional
+import logging
+
+class ApprovalLevel(Enum):
+    AUTONOMOUS = "autonomous"
+    REQUIRES_APPROVAL = "requires_approval"
+    PROHIBITED = "prohibited"
+
+class SafetyContract:
+    def __init__(self, contract_definition: dict, approval_callback: Optional[Callable] = None):
+        self.contract = contract_definition
+        self.approval_callback = approval_callback
+        self.audit_log = []
+
+    def evaluate(self, action_type: str, context: dict) -&gt; ApprovalLevel:
+        rule = self.contract.get(action_type)
+        if rule is None:
+            # Unknown actions default to prohibited — fail closed
+            return ApprovalLevel.PROHIBITED
+
+        level = rule["default"]
+
+        # Apply context overrides
+        for condition, override_level in rule.get("conditions", []):
+            if condition(context):
+                level = override_level
+                break
+
+        return ApprovalLevel(level)
+
+    def dispatch(self, action_type: str, action_fn: Callable, context: dict) -&gt; bool:
+        level = self.evaluate(action_type, context)
+
+        self.audit_log.append({
+            "action": action_type,
+            "context": context,
+            "approval_level": level.value
+        })
+
+        if level == ApprovalLevel.AUTONOMOUS:
+            logging.info(f"[AUTONOMOUS] Executing {action_type} | context={context}")
+            action_fn(context)
+            return True
+
+        elif level == ApprovalLevel.REQUIRES_APPROVAL:
+            logging.info(f"[APPROVAL REQUIRED] {action_type} | context={context}")
+            if self.approval_callback and self.approval_callback(action_type, context):
+                action_fn(context)
+                logging.info(f"[APPROVED] Executing {action_type} | context={context}")
+                return True
+            logging.warning(f"[NOT APPROVED] {action_type} | context={context}")
+            return False
+
+        else:  # PROHIBITED
+            logging.error(f"[PROHIBITED] Refusing to execute {action_type} | context={context}")
+            return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">evaluate</code> method's fail-closed default — unknown action types default to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PROHIBITED</code> — is the single most important line in the contract. As the system encounters new action types over time (new tooling, new extensions, new failure modes), the safe default is always to require human review rather than assume autonomy is appropriate. This is the same posture Tier 3 classification takes in a taxonomy-based safety model: silence in the specification means "ask a human," never "proceed."</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    O[Observe<br/>context-enriched telemetry] --> D[Decide<br/>policy engine evaluates signals]
+    D --> G{Safety Contract<br/>evaluate action_type}
+    G -->|Autonomous| A[Act: execute directly]
+    G -->|Requires Approval| H[Notify + wait for approval]
+    G -->|Prohibited / unknown| X[Refuse + log — fail closed]
+    H -->|approved| A
+    H -->|denied or timeout| X
+    A --> O</pre></div>
+<p class="text-gray-300 leading-relaxed">*The Observe-Decide-Act loop as gated by the autonomous safety contract: every action is classified before it executes, and unknown action types default to prohibited rather than permitted.*</p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous safety contract, the taxonomy of autonomous actions, and the governance gate are three names for the same underlying discipline: autonomy is not a binary switch, it is a graduated, auditable, and reversible boundary that the engineering team defines explicitly rather than discovers by incident.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Every autonomous database system is built on the Observe–Decide–Act loop, and the quality of the system is bounded by the weakest of the three phases — rich observation with a shallow decision layer produces a system that reacts fast to the wrong things.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Self-configuration requires the system to know which operational parameters can change immediately, which require a reload, and which require a restart — and to queue changes accordingly, with every change recorded as an idempotent, reversible, auditable event.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Self-healing is broader than automatic failover: a complete implementation covers process crashes, runaway queries, connection exhaustion, and storage saturation, and it periodically verifies its own recovery paths through controlled testing rather than assuming they still work.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Self-optimization tools like `hypopg` for PostgreSQL and Query Store automatic tuning for SQL Server let the system evaluate the impact of a change — an index, a forced plan — before committing to it, which is what separates autonomous optimization from blind automation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The autonomous safety contract is the governing artifact of the entire system: a versioned, code-enforced specification of what the system may do alone, what needs human approval, and what is permanently off-limits, with unknown actions defaulting to prohibited rather than permitted.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
