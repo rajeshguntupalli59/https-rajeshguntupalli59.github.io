@@ -6,6 +6,10 @@
   <title>Chapter 8: Creating and Storing Embeddings in PostgreSQL — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 8: Creating and Storing Embeddings in PostgreSQL. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -489,8 +493,486 @@ SET ivfflat.probes = 100;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The query pattern for semantic search in a RAG pipeline has three stages: embed the user query, find nearest neighbors, join to retrieve context. Each stage has production considerations that aren't visible in tutorial examples.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    D[Document] --> CH[Chunk<br/>256-512 tokens]
+    CH --> EMB[Embedding API<br/>OpenAI / local model]
+    EMB --> ST[(document_chunks<br/>vector column)]
+    ST --> IDX[HNSW index]
+    Q[User query] --> EMBQ[Embed query]
+    EMBQ --> IDX
+    IDX --> RES[Top-K chunks]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The write path (chunk, embed, store, index) and the read path (embed query, search index) share the same embedding model — that's what makes the vectors comparable.*</p>
+
 <p class="text-gray-300 leading-relaxed">The query below represents a full production pattern: embedding generation, nearest neighbor retrieval with metadata filters, and result hydration in a single round-trip using a parameterized query:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import psycopg2
+import psycopg2.extras
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+DB_DSN = os.environ.get("DATABASE_URL", "postgresql://postgres:password@localhost:5432/vectordb")
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+RETRIEVAL_LIMIT = 10       # retrieve top-10, re-rank to top-5 before sending to LLM
+SIMILARITY_THRESHOLD = 0.3  # cosine distance; 0 = identical, 2 = opposite
+
+
+def embed_query_openai(query: str) -&gt; list[float]:
+    response = client.embeddings.create(model=EMBEDDING_MODEL, input=[query])
+    return response.data[0].embedding
+
+
+def retrieve_chunks(
+    query: str,
+    document_ids: list[int] | None = None,
+    limit: int = RETRIEVAL_LIMIT,
+) -&gt; list[dict]:
+    """
+    Retrieve the most semantically similar chunks for a query, optionally filtered by document IDs.
+    Returns results ordered by cosine similarity (ascending distance = descending similarity).
+    """
+    query_embedding = embed_query_openai(query)
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Build the filter clause dynamically
+            filter_clause = "WHERE dc.embedding IS NOT NULL"
+            params: list = [query_embedding, SIMILARITY_THRESHOLD]
+
+            if document_ids:
+                filter_clause += " AND dc.document_id = ANY(%s)"
+                params.append(document_ids)
+
+            params.append(limit)
+
+            cur.execute(
+                f"""
+                SELECT
+                    dc.id                AS chunk_id,
+                    dc.document_id,
+                    dc.chunk_index,
+                    dc.chunk_text,
+                    dc.token_count,
+                    d.title              AS document_title,
+                    d.source_url,
+                    dc.embedding &lt;=&gt; %s::vector  AS cosine_distance,
+                    1 - (dc.embedding &lt;=&gt; %s::vector) AS cosine_similarity
+                FROM document_chunks dc
+                JOIN documents d ON d.id = dc.document_id
+                {filter_clause}
+                ORDER BY dc.embedding &lt;=&gt; %s::vector
+                LIMIT %s
+                """,
+                [query_embedding, query_embedding, *params[2:]],
+            )
+            results = cur.fetchall()
+    finally:
+        conn.close()
+
+    # Post-filter: discard results below similarity threshold
+    return [
+        dict(r) for r in results
+        if r["cosine_distance"] &lt;= SIMILARITY_THRESHOLD * 2
+    ]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">There is a subtle parameter duplication in that query: the embedding vector appears twice in the SELECT list (once for the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cosine_distance</code> alias, once for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cosine_similarity</code>) and again in the ORDER BY. PostgreSQL does not evaluate the expression three times against the index; the planner recognizes the repeated expression and the ORDER BY drives index access. However, passing the embedding as a bind parameter three times is unavoidable in parameterized queries—you cannot reference a positional parameter by name in standard PostgreSQL parameter syntax. A cleaner approach uses a CTE to bind the embedding once:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def retrieve_chunks_cte(
+    query: str,
+    document_ids: list[int] | None = None,
+    limit: int = RETRIEVAL_LIMIT,
+) -&gt; list[dict]:
+    """
+    Same retrieval logic, but binds the query embedding exactly once via a CTE.
+    Cleaner parameter management for complex queries.
+    """
+    query_embedding = embed_query_openai(query)
+
+    conn = psycopg2.connect(DB_DSN)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            filter_clause = "WHERE dc.embedding IS NOT NULL"
+            params: list = [query_embedding]
+
+            if document_ids:
+                filter_clause += " AND dc.document_id = ANY(%s)"
+                params.append(document_ids)
+
+            params.append(limit)
+
+            cur.execute(
+                f"""
+                WITH query_vec AS (
+                    SELECT %s::vector AS vec
+                )
+                SELECT
+                    dc.id                              AS chunk_id,
+                    dc.document_id,
+                    dc.chunk_index,
+                    dc.chunk_text,
+                    dc.token_count,
+                    d.title                            AS document_title,
+                    d.source_url,
+                    dc.embedding &lt;=&gt; qv.vec            AS cosine_distance,
+                    1 - (dc.embedding &lt;=&gt; qv.vec)      AS cosine_similarity
+                FROM document_chunks dc
+                JOIN documents d ON d.id = dc.document_id
+                CROSS JOIN query_vec qv
+                {filter_clause}
+                ORDER BY dc.embedding &lt;=&gt; qv.vec
+                LIMIT %s
+                """,
+                params,
+            )
+            results = cur.fetchall()
+    finally:
+        conn.close()
+
+    return [dict(r) for r in results]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The CTE version passes the embedding once. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CROSS JOIN query_vec qv</code> adds zero overhead—the CTE materializes a single row, and PostgreSQL folds it into the scan. This pattern becomes especially valuable when the vector participates in multiple distance expressions within the same query, such as hybrid scoring that weights cosine distance against a BM25-style text rank.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Filtered Vector Search and the Pre-Filter Problem</p>
+
+<p class="text-gray-300 leading-relaxed">The most common performance trap in production pgvector deployments is combining WHERE clause filters with ORDER BY distance. Consider this query:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Naive: filter by document_id, then find nearest neighbors
+-- The HNSW index searches the full graph first, then filters — this is POST-filtering
+-- If document_id = 42 contains only 0.5% of rows, recall collapses
+
+SELECT dc.chunk_text, dc.embedding &lt;=&gt; '[...]'::vector AS dist
+FROM document_chunks dc
+WHERE dc.document_id = 42
+ORDER BY dist
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When PostgreSQL evaluates this query, the planner has two options. If the HNSW index is used, it performs approximate nearest neighbor search across the entire table and then applies the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_id = 42</code> filter to the candidates returned from the index. If the filtered set is a small fraction of the total table, the index may return fewer than 10 usable results even with a large candidate pool. This is called the <strong class="text-white">post-filter problem</strong>.</p>
+
+<p class="text-gray-300 leading-relaxed">The alternative is a sequential scan: PostgreSQL ignores the HNSW index, scans only the rows matching <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_id = 42</code> (using the B-tree index on that column), computes exact distances, and sorts. For highly selective filters—when the filtered set contains thousands to tens of thousands of rows—the sequential scan often produces better results with lower latency than the HNSW post-filter approach.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical strategy is to force this tradeoff explicitly by understanding your data distribution:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Check how many chunks exist per document to understand filter selectivity
+SELECT
+    document_id,
+    COUNT(*) AS chunk_count,
+    COUNT(*) * 100.0 / SUM(COUNT(*)) OVER () AS pct_of_total
+FROM document_chunks
+GROUP BY document_id
+ORDER BY chunk_count DESC
+LIMIT 20;
+
+-- For small filtered sets (&lt; ~10,000 rows), disable HNSW and use exact search
+-- This forces the planner to scan the filtered rows exactly
+SET enable_indexscan = off;   -- disables index scans including HNSW
+SELECT dc.chunk_text, dc.embedding &lt;=&gt; '[...]'::vector AS dist
+FROM document_chunks dc
+WHERE dc.document_id = 42
+ORDER BY dist
+LIMIT 10;
+RESET enable_indexscan;
+
+-- Better long-term solution: partition the table by a high-cardinality filter column
+-- or use a partial HNSW index per logical partition (e.g., per tenant in SaaS)
+
+-- Partial index for a specific document (useful if one document is queried very frequently)
+CREATE INDEX CONCURRENTLY idx_chunks_doc42_hnsw
+ON document_chunks
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64)
+WHERE document_id = 42;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For multi-tenant SaaS applications where queries are always scoped to a single tenant, building one partial HNSW index per tenant is the cleanest solution when tenant data sizes are large enough to warrant it. For smaller tenants, exact search over their filtered rows is faster than any approximate index.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Hybrid Search: Combining Vector Similarity with Full-Text Search</p>
+
+<p class="text-gray-300 leading-relaxed">Pure vector search misses exact keyword matches. A query for "PostgreSQL 16 logical replication slot" may semantically match a document about replication in general while missing a document that uses those exact terms in a different context. Hybrid search combines cosine similarity with PostgreSQL's built-in full-text search to capture both signals.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Add a full-text search column to the chunks table
+ALTER TABLE document_chunks
+ADD COLUMN ts_chunk TSVECTOR
+    GENERATED ALWAYS AS (to_tsvector('english', chunk_text)) STORED;
+
+CREATE INDEX ON document_chunks USING GIN (ts_chunk);
+
+-- Hybrid search: combine BM25 rank with cosine similarity
+-- Reciprocal Rank Fusion (RRF) is a parameter-free fusion method
+-- rrf_score = 1 / (k + rank), with k = 60 being the standard value
+
+WITH query_vec AS (
+    SELECT '[...]'::vector AS vec  -- substitute actual query embedding
+),
+query_text AS (
+    SELECT to_tsquery('english', 'postgresql & replication & slot') AS tsq
+),
+vector_ranked AS (
+    SELECT
+        dc.id,
+        dc.chunk_text,
+        dc.document_id,
+        ROW_NUMBER() OVER (ORDER BY dc.embedding &lt;=&gt; qv.vec) AS vector_rank
+    FROM document_chunks dc
+    CROSS JOIN query_vec qv
+    WHERE dc.embedding IS NOT NULL
+    ORDER BY dc.embedding &lt;=&gt; qv.vec
+    LIMIT 60   -- retrieve top-60 from each signal, fuse to top-10
+),
+text_ranked AS (
+    SELECT
+        dc.id,
+        ts_rank_cd(dc.ts_chunk, qt.tsq) AS text_score,
+        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(dc.ts_chunk, qt.tsq) DESC) AS text_rank
+    FROM document_chunks dc
+    CROSS JOIN query_text qt
+    WHERE dc.ts_chunk @@ qt.tsq
+    ORDER BY text_score DESC
+    LIMIT 60
+),
+fused AS (
+    SELECT
+        COALESCE(vr.id, tr.id)                        AS chunk_id,
+        COALESCE(1.0 / (60 + vr.vector_rank), 0)
+            + COALESCE(1.0 / (60 + tr.text_rank), 0)  AS rrf_score
+    FROM vector_ranked vr
+    FULL OUTER JOIN text_ranked tr ON tr.id = vr.id
+)
+SELECT
+    f.chunk_id,
+    dc.chunk_text,
+    d.title AS document_title,
+    f.rrf_score
+FROM fused f
+JOIN document_chunks dc ON dc.id = f.chunk_id
+JOIN documents d ON d.id = dc.document_id
+ORDER BY f.rrf_score DESC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Reciprocal Rank Fusion is favored in production because it requires no tuning: the constant <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">k = 60</code> dampens the impact of extreme ranks and is robust to score scale differences between the two signals. Alternatives like linear combination (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">alpha * cosine_score + (1 - alpha) * bm25_score</code>) require careful per-dataset calibration.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.6 Schema Evolution and Model Migration</h3>
+
+<p class="text-gray-300 leading-relaxed">Embedding models improve over time. When OpenAI released <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> as a replacement for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-ada-002</code>, the new model outperformed its predecessor while costing less. Any production system that embeds documents must have a migration path for re-embedding with a new model.</p>
+
+<p class="text-gray-300 leading-relaxed">The naive approach—dropping the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding</code> column and re-running—has zero downtime resilience. Applications querying during the migration return no results or errors. The correct approach uses a multi-column shadow migration:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Step 1: Add a new column for the new model without touching the old one
+ALTER TABLE document_chunks
+ADD COLUMN embedding_v2 vector(1536);   -- adjust dimensions if model differs
+
+-- Step 2: Add a migration-tracking index
+CREATE INDEX ON document_chunks (id) WHERE embedding_v2 IS NULL;
+
+-- Step 3: Run the backfill in the background (Python job iterates this query)
+-- Application continues using embedding column during this window
+
+-- Step 4: After backfill completes, verify coverage
+SELECT
+    COUNT(*) FILTER (WHERE embedding IS NOT NULL)    AS old_embedded,
+    COUNT(*) FILTER (WHERE embedding_v2 IS NOT NULL) AS new_embedded,
+    COUNT(*)                                          AS total
+FROM document_chunks;
+
+-- Step 5: Switch application queries to use embedding_v2
+-- This is a code deploy, not a schema change
+
+-- Step 6: Build the production HNSW index on embedding_v2
+CREATE INDEX CONCURRENTLY idx_chunks_embedding_v2_hnsw
+ON document_chunks
+USING hnsw (embedding_v2 vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Step 7: After the index is live and application is using embedding_v2,
+-- drop the old column and its index
+DROP INDEX CONCURRENTLY idx_chunks_embedding_hnsw;
+ALTER TABLE document_chunks DROP COLUMN embedding;
+
+-- Step 8: Rename for clarity
+ALTER TABLE document_chunks RENAME COLUMN embedding_v2 TO embedding;
+ALTER INDEX idx_chunks_embedding_v2_hnsw RENAME TO idx_chunks_embedding_hnsw;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This approach is explicit and reversible. At any point during the backfill, the old index is live and queries work. The application code switch at step 5 is instantaneous and rollback-safe—you simply revert the code deploy.</p>
+
+<p class="text-gray-300 leading-relaxed">For systems with strict schema change policies, a separate migration table avoids column proliferation when migrating through multiple model versions:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- Separate table to hold embeddings by model version
+-- Allows multiple embedding versions to coexist without schema changes
+CREATE TABLE chunk_embeddings (
+    chunk_id    BIGINT NOT NULL REFERENCES document_chunks(id) ON DELETE CASCADE,
+    model_name  TEXT NOT NULL,
+    dimensions  INT NOT NULL,
+    embedding   vector(1536),  -- must match maximum expected dimensions
+    embedded_at TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (chunk_id, model_name)
+);
+
+CREATE INDEX CONCURRENTLY idx_chunk_embeddings_hnsw
+ON chunk_embeddings
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64)
+WHERE model_name = 'text-embedding-3-small';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The separate-table design has a cost: every similarity query requires a JOIN. For high-QPS applications, the join overhead is measurable. The tradeoff is flexibility during migration versus query performance during steady state. Most teams start with the single-column approach and add the separation only when managing three or more model versions simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.7 Operational Monitoring and Maintenance</h3>
+
+<p class="text-gray-300 leading-relaxed">Running vectors in production adds two monitoring concerns that don't exist in purely relational schemas: index health and embedding pipeline throughput.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Index Bloat and VACUUM</p>
+
+<p class="text-gray-300 leading-relaxed">HNSW indexes in pgvector do not support in-place deletion of dead vectors from the graph. When rows are updated or deleted, the corresponding nodes in the HNSW graph become logically deleted but remain in the structure until a VACUUM operation cleans them. High update rates on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding</code> column—typical during initial backfills or model migrations—can create significant bloat. Monitor with:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+
+-- Check for dead tuples and bloat in the chunks table
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    ROUND(n_dead_tup * 100.0 / NULLIF(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+    last_vacuum,
+    last_autovacuum,
+    last_analyze
+FROM pg_stat_user_tables
+WHERE relname = 'document_chunks';
+
+-- If dead_pct is high after a migration, run a manual VACUUM ANALYZE
+VACUUM ANALYZE document_chunks;
+
+-- For autovacuum tuning on embedding-heavy tables:
+-- Lower the threshold so autovacuum triggers more frequently
+ALTER TABLE document_chunks SET (
+    autovacuum_vacuum_scale_factor = 0.01,  -- trigger at 1% dead tuples
+    autovacuum_analyze_scale_factor = 0.01
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Embedding Pipeline Monitoring</p>
+
+<p class="text-gray-300 leading-relaxed">Track these metrics in your application observability stack:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — instrumentation pattern for embedding pipelines
+
+import time
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class EmbeddingPipelineMetrics:
+    chunks_processed: int = 0
+    chunks_failed: int = 0
+    api_calls: int = 0
+    total_tokens: int = 0
+    total_latency_ms: float = 0.0
+    start_time: datetime = field(default_factory=datetime.utcnow)
+
+    def record_batch(
+        self,
+        batch_size: int,
+        token_count: int,
+        latency_ms: float,
+        success: bool = True,
+    ) -&gt; None:
+        self.api_calls += 1
+        self.total_latency_ms += latency_ms
+        if success:
+            self.chunks_processed += batch_size
+            self.total_tokens += token_count
+        else:
+            self.chunks_failed += batch_size
+
+    def report(self) -&gt; dict:
+        elapsed = (datetime.utcnow() - self.start_time).total_seconds()
+        return {
+            "chunks_processed": self.chunks_processed,
+            "chunks_failed": self.chunks_failed,
+            "api_calls": self.api_calls,
+            "total_tokens": self.total_tokens,
+            "avg_latency_ms": self.total_latency_ms / max(self.api_calls, 1),
+            "throughput_chunks_per_sec": self.chunks_processed / max(elapsed, 1),
+            "elapsed_seconds": elapsed,
+        }
+
+
+def get_embedding_pipeline_lag(conn) -&gt; dict:
+    """
+    Returns metrics on how many chunks are waiting to be embedded.
+    Run this as a scheduled job and emit to your metrics system.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE embedding IS NULL)     AS pending,
+                COUNT(*) FILTER (WHERE embedding IS NOT NULL) AS embedded,
+                COUNT(*)                                       AS total,
+                MIN(created_at) FILTER (WHERE embedding IS NULL) AS oldest_pending
+            FROM document_chunks
+            """
+        )
+        row = cur.fetchone()
+        return {
+            "pending_chunks": row[0],
+            "embedded_chunks": row[1],
+            "total_chunks": row[2],
+            "oldest_pending_at": row[3].isoformat() if row[3] else None,
+        }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Tracking <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">oldest_pending_at</code> is more operationally useful than raw count. A backlog of 50,000 chunks is acceptable if they arrived in the last hour; the same number is alarming if the oldest chunk is 12 hours old, indicating a pipeline stall.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Query Latency Baselines</p>
+
+<p class="text-gray-300 leading-relaxed">Establish query latency baselines before going to production and re-measure after each schema change or index rebuild:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+
+-- Baseline: latency for a nearest-neighbor search at various table sizes
+-- Run EXPLAIN ANALYZE multiple times and take median
+
+-- Warm the cache first
+SELECT COUNT(*) FROM document_chunks;
+
+-- Measure query with HNSW at default ef_search
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT id, chunk_text, embedding &lt;=&gt; '[...]'::vector AS dist
+FROM document_chunks
+ORDER BY dist
+LIMIT 10;
+
+-- Verify index usage: look for "Index Scan using idx_chunks_embedding_hnsw"
+-- in the EXPLAIN output. If you see "Seq Scan", the planner chose sequential scan
+-- because the table is small or statistics are stale — run ANALYZE first.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embeddings are fixed-size float arrays stored in `vector(n)` columns.** For OpenAI `text-embedding-3-small`, that is 1,536 dimensions consuming 6 KB per row. Separate the documents table from a chunks table to handle token limits and improve retrieval precision.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Batch your API calls and handle rate limits with exponential backoff.** The OpenAI embeddings endpoint supports up to 2,048 inputs per request; 100–500 per batch is a practical production target. Use `ON CONFLICT DO UPDATE` to make the pipeline idempotent.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose the HNSW index for append-heavy workloads and IVFFlat when you need lower memory overhead with acceptable recall.** Tune `ef_search` at query time to balance recall against latency without rebuilding the index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Filtered vector search requires explicit strategy.** The post-filter problem means HNSW recall collapses for highly selective WHERE clauses. Use partial indexes for frequently filtered subsets, or allow the planner to fall back to exact sequential scan for small filtered sets.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Model migration follows a shadow-column pattern.** Add a new embedding column, backfill in the background, switch application code to use the new column, build the new index, then drop the old column. This keeps queries functional at every step and makes the cutover instantaneous and rollback-safe.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
