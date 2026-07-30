@@ -6,6 +6,10 @@
   <title>Chapter 28: Integrating Autonomous Systems with DevOps — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 28: Integrating Autonomous Systems with DevOps. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -406,6 +410,16 @@ spec:
 
 <p class="text-gray-300 leading-relaxed">An autonomous system that acts without feedback is opaque. The ADE standard requires that every autonomous decision be visible in three places simultaneously: the observability stack (Prometheus/Grafana), the GitOps repository (as a configuration commit or PR), and the incident management system (PagerDuty or equivalent). This trinity of feedback is what makes autonomous behavior trustworthy at the organizational level.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Autonomous action executes] --> B[autonomous_action_log]
+    B --> C[Prometheus metrics<br/>counters + histograms]
+    B --> D[GitOps PR<br/>if parameter has IaC baseline]
+    B --> E[PagerDuty event<br/>if gated/anomalous]
+    C --> F[SRE dashboards]
+    D --> G[Platform engineers<br/>review + merge/close]
+    E --> H[On-call triage]</pre></div>
+<p class="text-gray-300 leading-relaxed">*One action, three audiences: the same <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_action_log</code> row feeds dashboards, a reviewable Git diff, and an incident event — no channel is optional.*</p>
+
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Observability feedback:</strong> Every autonomous action emits structured metrics. A Prometheus custom collector exposes these as labeled counters and histograms:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># autonomous_metrics_exporter.py
@@ -472,6 +486,385 @@ while True:
 
 <p class="text-gray-300 leading-relaxed">The autonomous agent uses the GitHub API (or GitLab equivalent) to create a commit whenever it changes a parameter that has an IaC baseline:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># gitops_feedback.py
+import requests
+import base64
+import json
+import os
+
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+REPO = "myorg/db-platform-config"
+
+def commit_autonomous_config_change(parameter: str, old_value: str, new_value: str,
+                                     reason: str, action_id: int):
+    """
+    Write autonomous configuration change back into the GitOps repo as a PR.
+    This makes the autonomous action visible, auditable, and revertible via Git.
+    """
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json"
+    }
+
+    # Read current file
+    file_path = "config/postgres/autonomous-runtime.json"
+    get_resp = requests.get(
+        f"https://api.github.com/repos/{REPO}/contents/{file_path}",
+        headers=headers
+    ).json()
+
+    current_content = json.loads(base64.b64decode(get_resp["content"]))
+    current_content["parameters"][parameter] = {
+        "value": new_value,
+        "autonomous_action_id": action_id,
+        "reason": reason,
+        "previous_value": old_value
+    }
+
+    new_content_b64 = base64.b64encode(
+        json.dumps(current_content, indent=2).encode()
+    ).decode()
+
+    branch = f"autonomous/action-{action_id}"
+
+    # Create branch
+    ref_resp = requests.get(
+        f"https://api.github.com/repos/{REPO}/git/ref/heads/main",
+        headers=headers
+    ).json()
+    main_sha = ref_resp["object"]["sha"]
+
+    requests.post(
+        f"https://api.github.com/repos/{REPO}/git/refs",
+        headers=headers,
+        json={"ref": f"refs/heads/{branch}", "sha": main_sha}
+    )
+
+    # Commit updated file to branch
+    requests.put(
+        f"https://api.github.com/repos/{REPO}/contents/{file_path}",
+        headers=headers,
+        json={
+            "message": f"autonomous: {parameter} changed from {old_value} to {new_value} [action-{action_id}]",
+            "content": new_content_b64,
+            "sha": get_resp["sha"],
+            "branch": branch
+        }
+    )
+
+    # Open pull request
+    pr_resp = requests.post(
+        f"https://api.github.com/repos/{REPO}/pulls",
+        headers=headers,
+        json={
+            "title": f"[Autonomous] {parameter}: {old_value} → {new_value}",
+            "head": branch,
+            "base": "main",
+            "body": (
+                f"**Autonomous configuration change**\n\n"
+                f"- **Parameter:** `{parameter}`\n"
+                f"- **Old value:** `{old_value}`\n"
+                f"- **New value:** `{new_value}`\n"
+                f"- **Reason:** {reason}\n"
+                f"- **Action ID:** {action_id}\n\n"
+                f"This PR was opened automatically by the database autonomy layer. "
+                f"Merge to record the change in IaC baseline, or close to flag for review."
+            )
+        }
+    ).json()
+
+    print(f"[GitOps] PR opened: {pr_resp['html_url']}")
+    return pr_resp["html_url"]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern gives operators a natural review surface. A PR opened by the autonomous agent carries a full audit trail: what changed, why, which action ID traces back to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_action_log</code>, and what the previous value was. Merging the PR updates the IaC baseline so Terraform no longer sees drift. Closing without merging flags the change as needing human review. The Git history becomes a secondary audit log of every autonomous structural decision.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Incident management feedback:</strong> For gated actions that cannot proceed, and for any autonomous action that results in an anomalous outcome, the autonomous layer fires a structured event to the incident management system:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># incident_feedback.py
+import requests
+import os
+
+PAGERDUTY_ROUTING_KEY = os.environ["PD_ROUTING_KEY"]
+
+def fire_autonomous_event(action_type: str, zone: str, outcome: str,
+                           action_id: int, details: dict, severity: str = "info"):
+    """
+    Sends a PagerDuty Events API v2 event for every non-trivial autonomous decision.
+    severity: 'info' for successful actions, 'warning' for blocked/queued, 'error' for failures.
+    """
+    payload = {
+        "routing_key": PAGERDUTY_ROUTING_KEY,
+        "event_action": "trigger" if severity in ("warning", "error") else "acknowledge",
+        "dedup_key": f"autonomous-db-{action_id}",
+        "payload": {
+            "summary": f"[AutonomousDB] {action_type} ({zone}) — {outcome}",
+            "severity": severity,
+            "source": "autonomous-database-engine",
+            "custom_details": {
+                "action_id": action_id,
+                "action_type": action_type,
+                "zone": zone,
+                "outcome": outcome,
+                **details
+            }
+        }
+    }
+
+    resp = requests.post(
+        "https://events.pagerduty.com/v2/enqueue",
+        json=payload,
+        timeout=5
+    )
+    resp.raise_for_status()
+    return resp.json()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The three feedback channels — metrics, GitOps PRs, and incident events — give a complete picture to three distinct audiences: the SRE team watching dashboards, the platform engineers reviewing configuration history, and the on-call engineer triaging alerts. Autonomous behavior stops being a black box and becomes a first-class participant in the team's operational processes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Rollback Architecture: Making Every Autonomous Decision Reversible</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomy without reversibility is recklessness dressed as intelligence. Every autonomous action must have a defined rollback path, and the rollback must be executable without human reconstruction of what the system did. This means the rollback SQL or rollback operator patch is generated and stored before the action executes, not after.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_action_log</code> tables defined earlier carry a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rollback_sql</code> column for exactly this reason. For parameter changes, the rollback is trivially the prior value. For structural changes — index creation, partition additions, replica configuration changes — the rollback requires more care.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Stored procedure executed by the rollback daemon
+CREATE OR REPLACE PROCEDURE execute_autonomous_rollback(p_action_id BIGINT)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_rollback_sql  TEXT;
+    v_zone          TEXT;
+    v_executed_at   TIMESTAMPTZ;
+    v_action_type   TEXT;
+BEGIN
+    SELECT rollback_sql, zone, executed_at, action_type
+    INTO v_rollback_sql, v_zone, v_executed_at, v_action_type
+    FROM autonomous_action_log
+    WHERE action_id = p_action_id;
+
+    IF v_rollback_sql IS NULL THEN
+        RAISE EXCEPTION 'No rollback SQL recorded for action_id=%', p_action_id;
+    END IF;
+
+    IF v_executed_at IS NULL THEN
+        RAISE EXCEPTION 'Action % has not been executed — nothing to roll back', p_action_id;
+    END IF;
+
+    -- Execute rollback
+    EXECUTE v_rollback_sql;
+
+    -- Record the rollback in the log
+    UPDATE autonomous_action_log
+    SET outcome        = 'rolled_back',
+        conflict_detected = TRUE
+    WHERE action_id = p_action_id;
+
+    -- Insert a companion rollback record for full traceability
+    INSERT INTO autonomous_action_log
+        (action_type, zone, initiated_at, executed_at, outcome, rollback_sql)
+    VALUES
+        ('rollback_of_' || v_action_type, v_zone,
+         now(), now(),
+         'rollback_executed',
+         '-- rollback of action_id ' || p_action_id);
+
+    RAISE NOTICE 'Rollback of action % completed.', p_action_id;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server rollback procedure
+CREATE OR ALTER PROCEDURE dbo.ExecuteAutonomousRollback
+    @ActionId BIGINT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @RollbackSQL  NVARCHAR(MAX);
+    DECLARE @Zone         NVARCHAR(50);
+    DECLARE @ExecutedAt   DATETIMEOFFSET;
+    DECLARE @ActionType   NVARCHAR(200);
+
+    SELECT
+        @RollbackSQL = RollbackSQL,
+        @Zone        = Zone,
+        @ExecutedAt  = ExecutedAt,
+        @ActionType  = ActionType
+    FROM dbo.AutonomousActionLog
+    WHERE ActionId = @ActionId;
+
+    IF @RollbackSQL IS NULL
+        THROW 50001, 'No rollback SQL recorded for this ActionId.', 1;
+
+    IF @ExecutedAt IS NULL
+        THROW 50002, 'Action has not been executed — nothing to roll back.', 1;
+
+    -- Execute the rollback
+    EXEC sp_executesql @RollbackSQL;
+
+    -- Mark original action as rolled back
+    UPDATE dbo.AutonomousActionLog
+    SET Outcome = 'rolled_back', ConflictDetected = 1
+    WHERE ActionId = @ActionId;
+
+    -- Companion rollback record
+    INSERT INTO dbo.AutonomousActionLog
+        (ActionType, Zone, InitiatedAt, ExecutedAt, Outcome, RollbackSQL)
+    VALUES
+        ('rollback_of_' + @ActionType, @Zone,
+         SYSDATETIMEOFFSET(), SYSDATETIMEOFFSET(),
+         'rollback_executed',
+         N'-- rollback of action_id ' + CAST(@ActionId AS NVARCHAR(20)));
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For index operations — where rollback means dropping a just-created index or recreating a dropped one — the rollback SQL is generated before execution and stored atomically with the action log record:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Before creating an autonomous index, generate and store rollback SQL
+DO $$
+DECLARE
+    v_action_id BIGINT;
+    v_index_name TEXT := 'idx_orders_customer_autonomous_20240115';
+    v_rollback   TEXT;
+BEGIN
+    -- Generate rollback BEFORE acting
+    v_rollback := format('DROP INDEX CONCURRENTLY IF EXISTS %I', v_index_name);
+
+    INSERT INTO autonomous_action_log
+        (action_type, zone, initiated_at, rollback_sql)
+    VALUES
+        ('index_creation_replica', 'fully_autonomous', now(), v_rollback)
+    RETURNING action_id INTO v_action_id;
+
+    -- Now act
+    EXECUTE format(
+        'CREATE INDEX CONCURRENTLY %I ON orders (customer_id, created_at DESC)',
+        v_index_name
+    );
+
+    UPDATE autonomous_action_log
+    SET executed_at = now(), outcome = 'success'
+    WHERE action_id = v_action_id;
+
+    RAISE NOTICE 'Index created. Rollback stored for action_id=%', v_action_id;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The rollback store is not just a safety net — it becomes the foundation for automated regression detection. If the autonomous system's observability layer detects that a recent action correlated with a performance degradation (query latency increased after index creation, for example, due to increased planner overhead on writes), the rollback daemon can be triggered automatically within the evaluation window, executing the stored rollback SQL without human involvement.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Multi-Environment Promotion: Autonomous Behavior Across Dev, Staging, and Production</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous system behavior should not be identical across all environments. In development, the autonomy contract should be maximally permissive — let the system try everything, including gated actions, to build a behavioral record. In staging, gated actions require approval but coordinated-autonomous actions execute freely. In production, the full contract applies.</p>
+
+<p class="text-gray-300 leading-relaxed">Environment-specific autonomy profiles are managed through the same GitOps repository, with Helm values or Kustomize overlays controlling which profile is active:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># config/autonomy/values-dev.yaml
+autonomy_profile: aggressive
+gated_actions_require_approval: false
+deployment_window_enforcement: false
+rollback_evaluation_window_minutes: 5
+max_autonomous_actions_per_hour: 100
+
+# config/autonomy/values-staging.yaml
+autonomy_profile: standard
+gated_actions_require_approval: true
+deployment_window_enforcement: true
+rollback_evaluation_window_minutes: 15
+max_autonomous_actions_per_hour: 30
+
+# config/autonomy/values-production.yaml
+autonomy_profile: conservative
+gated_actions_require_approval: true
+deployment_window_enforcement: true
+rollback_evaluation_window_minutes: 60
+max_autonomous_actions_per_hour: 10
+change_freeze_calendar: "pagerduty_schedule_id_xyz"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">change_freeze_calendar</code> field in the production profile integrates the autonomous system with the organization's change management calendar. Before any gated or coordinated-autonomous action in production, the agent queries the PagerDuty schedule (or ServiceNow, or OpsGenie) to confirm there is no active change freeze. This single integration prevents autonomous systems from violating change management policies that exist for regulatory or contractual reasons.</p>
+
+<p class="text-gray-300 leading-relaxed">When a behavioral pattern learned in dev or staging is ready to promote to production — for example, a new autonomous tuning rule that proved effective in staging — the promotion follows the same GitOps PR workflow as any other configuration change. The PR includes evidence: a summary of actions taken in staging, their outcomes, and the performance delta observed. Human reviewers approve the promotion with full context rather than blindly enabling new autonomous behavior in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Security Boundaries: Least-Privilege Autonomous Agents</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous database agents require credentials to act — and credentials are the primary attack surface if an autonomous system is compromised. The architecture must enforce least-privilege at every layer.</p>
+
+<p class="text-gray-300 leading-relaxed">Each autonomous agent role should have exactly the permissions required for its specific action set and nothing more. The vacuum optimization agent needs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_signal_backend</code> and the ability to alter autovacuum storage parameters; it does not need <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SUPERUSER</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATEDB</code>, or access to application schema tables.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Least-privilege role for the vacuum optimization agent
+CREATE ROLE autonomous_vacuum_agent LOGIN PASSWORD 'rotated-by-vault';
+
+-- Only what it needs
+GRANT pg_signal_backend TO autonomous_vacuum_agent;
+GRANT UPDATE ON TABLE autonomous_parameter_ownership TO autonomous_vacuum_agent;
+GRANT INSERT, UPDATE ON TABLE autonomous_action_log TO autonomous_vacuum_agent;
+
+-- Can read pg_stat_user_tables and pg_stat_bgwriter — nothing else
+GRANT pg_monitor TO autonomous_vacuum_agent;
+
+-- Explicit denial of application schema access
+REVOKE ALL ON SCHEMA public FROM autonomous_vacuum_agent;
+GRANT USAGE ON SCHEMA monitoring TO autonomous_vacuum_agent;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Least-privilege login for the index advisor agent
+CREATE LOGIN AutonomousIndexAgent WITH PASSWORD = 'ManagedByVault!1';
+CREATE USER AutonomousIndexAgent FOR LOGIN AutonomousIndexAgent;
+
+-- Specific permissions only
+GRANT ALTER ANY INDEX TO AutonomousIndexAgent;
+GRANT VIEW DATABASE STATE TO AutonomousIndexAgent;
+GRANT INSERT, UPDATE ON dbo.AutonomousActionLog TO AutonomousIndexAgent;
+GRANT INSERT, UPDATE ON dbo.AutonomousParameterOwnership TO AutonomousIndexAgent;
+
+-- Explicitly deny data access
+DENY SELECT ON SCHEMA::dbo TO AutonomousIndexAgent;
+GRANT SELECT ON dbo.AutonomousActionLog TO AutonomousIndexAgent;
+GRANT SELECT ON dbo.AutonomousParameterOwnership TO AutonomousIndexAgent;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Credentials for autonomous agents should never be static. Integration with HashiCorp Vault's database secrets engine, AWS IAM authentication for RDS, or Azure Managed Identity for Azure SQL means credentials are short-lived and automatically rotated. If an autonomous agent is compromised, its credential expires before a lateral movement attack can leverage it.</p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous action log itself should be protected against tampering. In PostgreSQL, this means the agent role can <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> and perform limited <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> (to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">executed_at</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">outcome</code>) but cannot <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code> or perform arbitrary <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code>. In SQL Server, row-level security or column-level permissions accomplish the same constraint. For high-assurance environments, the action log can be replicated to an immutable audit sink — an append-only S3 bucket with object lock, or Azure Immutable Blob Storage — where even a compromised database cannot alter the historical record.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability at the Integration Layer: What to Instrument</h3>
+
+<p class="text-gray-300 leading-relaxed">The integration layer between autonomous systems and DevOps tooling generates its own class of signals that must be monitored independently of the database's internal telemetry. These signals answer questions about the health of the integration itself, not just the database.</p>
+
+<p class="text-gray-300 leading-relaxed">Key metrics to instrument at the integration layer:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | Description | Alert Threshold |</p>
+<p class="text-gray-300 leading-relaxed">|--------|-------------|-----------------|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_deployment_conflicts_total</code> | Times an autonomous action was blocked by a deployment lock | > 10 in 1h suggests lock is too broad |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_terraform_drift_count</code> | Parameters where autonomous value diverges from IaC baseline | > 0 triggers ownership reconciliation |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_gated_queue_age_seconds</code> | Age of oldest unapproved gated action | > 3600s triggers escalation |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_gitops_pr_open_count</code> | Open PRs created by autonomous system | > 20 suggests review bandwidth issue |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_rollback_rate</code> | Fraction of autonomous actions that triggered rollback | > 5% triggers rule review |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_credential_rotation_lag_seconds</code> | Time since last agent credential rotation | > 86400s triggers rotation |</p>
+
+<p class="text-gray-300 leading-relaxed">These metrics are exported by the same Prometheus collector that tracks action outcomes, and they populate a dedicated "Autonomy Operations" dashboard in Grafana. The dashboard is owned by the platform engineering team, not the application teams — it surfaces the health of the autonomous system as infrastructure, not as application behavior.</p>
+
+<p class="text-gray-300 leading-relaxed">The single most important signal in this set is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_rollback_rate</code>. A system that is rolling back more than a small fraction of its own decisions is learning poorly or acting on bad signal. An elevated rollback rate is the early warning that the autonomous system's decision models need retraining, its action thresholds need adjustment, or its observability inputs are feeding it corrupted data. This metric should never be absent from a production autonomy deployment.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Define an explicit autonomy contract before writing integration code.** Classify every autonomous behavior into fully autonomous, coordinated autonomous, or gated zones, and store the contract as a versioned artifact in your GitOps repository. The contract is the foundation on which all pipeline integration is built.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Teach autonomous agents to read deployment state.** A lightweight deployment state bus — written by the CI/CD pipeline and read by autonomous agents — prevents autonomous actions from colliding with in-flight deployments. Agents should self-throttle during deploying and validating states without requiring tight coupling to the pipeline.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Use a configuration ownership registry to resolve IaC/autonomy drift.** Autonomous agents claim ownership of parameters they tune, and Terraform reads that registry before applying — skipping parameters currently managed by the autonomous layer. Ownership release conditions should be explicit and machine-readable.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **In Kubernetes environments, route all autonomous decisions through operator CRD patches.** Autonomous agents should never call `kubectl` directly or bypass the operator's reconciliation loop. Every autonomous action expressed as a CRD patch inherits Kubernetes API audit logging, admission controller validation, and the operator's own safety checks at no additional cost.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The rollback SQL must be generated and stored before the action executes, not after.** An autonomous system that cannot cleanly reverse its own decisions is not ready for production. Combined with an elevated rollback rate metric as a leading indicator of model degradation, pre-stored rollback SQL transforms autonomous reversibility from a manual recovery exercise into an automated feedback loop.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
