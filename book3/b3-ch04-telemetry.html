@@ -6,6 +6,10 @@
   <title>Chapter 4: Telemetry, Metrics, and Data Required for Autonomy — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 4: Telemetry, Metrics, and Data Required for Autonomy. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -281,6 +285,18 @@ receivers:
       - url: 'http://ade-controller:8080/api/v1/schedule-vacuum'
         send_resolved: true</code></pre>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    T[Resource / Engine / Workload / State Telemetry] --> E[postgres_exporter / sql_exporter]
+    E --> P[Prometheus TSDB]
+    P --> AM[Alertmanager]
+    AM -->|ReplicationLagHigh| F[autonomous-failover-handler]
+    AM -->|LongRunningQueryDetected| K[autonomous-query-killer]
+    AM -->|TableBloatHigh| V[autonomous-vacuum-scheduler]
+    F --> C[ADE Controller]
+    K --> C
+    V --> C</pre></div>
+<p class="text-gray-300 leading-relaxed">*The telemetry pipeline: four layers of raw signal flow through exporters into Prometheus, where Alertmanager routes classified alerts to webhook handlers instead of a pager.*</p>
+
 <p class="text-gray-300 leading-relaxed">The ADE controller at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">http://ade-controller:8080</code> is the autonomous decision engine — a service (covered in detail in Chapter 7) that receives webhook payloads from Alertmanager, validates the trigger conditions against a second source of truth, and executes the appropriate action. The double-check against a second source is non-negotiable: acting on a single metric signal without validation is how autonomous systems cause outages.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
@@ -323,7 +339,7 @@ lock_chains AS (
     FROM pg_stat_activity blocked
     JOIN pg_stat_activity blocking
         ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-    WHERE blocked.cardinality(pg_blocking_pids(blocked.pid)) &gt; 0
+    WHERE cardinality(pg_blocking_pids(blocked.pid)) &gt; 0
 )
 SELECT
     ws.wait_event_type,
@@ -410,7 +426,40 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">4.5 Contextual State Data: Topology, Schema, and Configuration Telemetry</h3>
 
-<p class="text-gray-300 leading-relaxed">Metrics about query performance and wait events are meaningless without context about the system's current topology and configuration state. An autonomous action that's perfectly correct for a primary with three healthy replicas may be catastrophically wrong during a failover event. The autonomous system must always know the current state of the world before acting — and that state includes cluster</p>
+<p class="text-gray-300 leading-relaxed">Metrics about query performance and wait events are meaningless without context about the system's current topology and configuration state. An autonomous action that's perfectly correct for a primary with three healthy replicas may be catastrophically wrong during a failover event. The autonomous system must always know the current state of the world before acting — and that state includes cluster topology, current role (primary or replica), schema version, and the effective value of every configuration parameter the decision logic depends on.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Topology and role snapshot, polled alongside performance telemetry
+SELECT
+    pg_is_in_recovery()                          AS is_replica,
+    CASE WHEN pg_is_in_recovery()
+         THEN pg_last_wal_replay_lsn()
+         ELSE pg_current_wal_lsn() END            AS current_lsn,
+    (SELECT count(*) FROM pg_stat_replication)    AS connected_replica_count,
+    current_setting('server_version_num')         AS server_version_num;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Availability Group role and replica-count snapshot
+SELECT
+    ars.role_desc,
+    (SELECT COUNT(*) FROM sys.dm_hadr_availability_replica_states) AS replica_state_rows,
+    SERVERPROPERTY('ProductVersion')              AS product_version
+FROM sys.dm_hadr_availability_replica_states ars
+WHERE ars.is_local = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Configuration state — the effective, running values of parameters like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max degree of parallelism</code> — must be polled from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_settings</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.configurations</code> rather than assumed from a config file, because a pending reload or an in-session override can make the file and the running state diverge. An autonomous system that reads <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> instead of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_settings</code> is reasoning about a state that may no longer be true.</p>
+
+<p class="text-gray-300 leading-relaxed">Schema version telemetry — tracking which migration has been applied, via a migrations table or a tool like Flyway or Sqitch — matters because an autonomous system evaluating whether to create an index or adjust a query plan needs to know it's looking at the schema it thinks it's looking at, not a version mid-migration. Combining topology, configuration, and schema-version telemetry with the performance and wait-event data from earlier sections gives the decision engine the complete picture it needs before it acts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous systems need telemetry across four layers — resource, engine-internal, workload, and state/topology — and each layer feeds a different class of decision; a system missing any one layer has a blind spot in its corresponding decision class.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `pg_stat_activity` and `pg_stat_statements` on PostgreSQL, and DMVs plus Query Store on SQL Server, are the primary machine-readable surfaces; snapshotting them on a schedule and computing deltas between snapshots is what turns cumulative counters into actionable rate-of-change signals.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Wait event data is the highest-signal category for autonomous diagnosis because it explains *why* a session is blocked, not just that resource utilization is elevated — and it maps directly to a bounded set of recommended actions per wait category.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Prometheus with custom exporter queries, and Alertmanager routed to webhook-driven action handlers rather than pagers, form a practical reference pipeline for turning raw telemetry into autonomous triggers — with a second-source validation step before any action executes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> No metric is safe to act on in isolation from topology and configuration context; the same signal can call for opposite actions depending on whether the target is a primary or a replica, or whether a schema migration is in flight.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

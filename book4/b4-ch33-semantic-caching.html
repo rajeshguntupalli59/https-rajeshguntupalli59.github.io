@@ -6,6 +6,10 @@
   <title>Chapter 33: Semantic Caching for LLM Applications — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 33: Semantic Caching for LLM Applications. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -48,6 +52,17 @@
 <p class="text-gray-300 leading-relaxed">Traditional application caches operate on exact key matching. You hash the input, look up the hash, return the value if it exists. This works well when inputs are programmatically generated and predictable—SQL query strings, API endpoint parameters, serialized data structures. It fails completely for natural language, where the same information need generates an infinite variety of phrasings.</p>
 
 <p class="text-gray-300 leading-relaxed">Semantic caching replaces the hash lookup with a vector similarity search. The cache stores (embedding, response) pairs. When a new query arrives, you embed it, search the cache for the nearest stored embedding, and if the similarity exceeds a threshold, return the cached response rather than hitting the LLM. The similarity threshold is the most operationally significant parameter in the entire system.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Incoming query] --> B[Embed query]
+    B --> C{Nearest cached<br/>embedding above<br/>threshold?}
+    C -->|Yes: cache hit| D[Return cached response]
+    C -->|No: cache miss| E[Call LLM]
+    E --> F[Store query embedding<br/>+ response in cache]
+    F --> G[Return fresh response]
+    style D fill:#c8e6c9
+    style E fill:#ffe0b2</pre></div>
+<p class="text-gray-300 leading-relaxed">*The similarity threshold at the decision point is the single most consequential tuning parameter — too low and wrong answers get served with confidence, too high and the cache never fires.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The threshold problem in database terms</strong></p>
 
@@ -614,6 +629,753 @@ for query in queries:
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">LlamaIndex with a custom semantic cache node postprocessor</strong></p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# LlamaIndex: semantic cache as a query-level postprocessor
+# This pattern caches full RAG query results, not just LLM calls
+# pip install llama-index llama-index-vector-stores-qdrant openai
+
+import time
+import hashlib
+from typing import Optional, List
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.core.schema import NodeWithScore, QueryBundle
+from llama_index.core.postprocessor.types import BaseNodePostprocessor
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.llms.openai import OpenAI
+
+# --- Simple in-process semantic cache for RAG responses ---
+# In production, replace the dict store with pgvector or Qdrant
+
+class RAGSemanticCache:
+    """
+    Caches full (query -&gt; RAG response) pairs using embedding similarity.
+    Stored in-memory here; swap _store for a persistent backend.
+    """
+
+    def __init__(
+        self,
+        embedding_model: OpenAIEmbedding,
+        threshold: float = 0.94,
+    ):
+        self.embedder = embedding_model
+        self.threshold = threshold
+        # List of (embedding: list[float], response: str)
+        self._store: list[tuple[list[float], str, str]] = []  # (embedding, query, response)
+
+    def _cosine_similarity(self, a: list[float], b: list[float]) -&gt; float:
+        import math
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
+    async def get(self, query: str) -&gt; Optional[dict]:
+        embedding = await self.embedder.aget_text_embedding(query)
+        best_sim = 0.0
+        best_entry = None
+        for stored_emb, stored_query, stored_response in self._store:
+            sim = self._cosine_similarity(embedding, stored_emb)
+            if sim &gt; best_sim:
+                best_sim = sim
+                best_entry = (stored_query, stored_response)
+        if best_entry and best_sim &gt;= self.threshold:
+            return {
+                "cached_query": best_entry[0],
+                "response": best_entry[1],
+                "similarity": best_sim,
+                "cache_hit": True,
+            }
+        return None
+
+    async def set(self, query: str, response: str) -&gt; None:
+        embedding = await self.embedder.aget_text_embedding(query)
+        self._store.append((embedding, query, response))
+
+
+class SemanticCachedQueryEngine:
+    """
+    Wraps a LlamaIndex query engine with a semantic response cache.
+    On cache hit, returns the cached response without touching the index.
+    """
+
+    def __init__(self, query_engine, cache: RAGSemanticCache):
+        self.engine = query_engine
+        self.cache = cache
+        self.stats = {"hits": 0, "misses": 0}
+
+    async def aquery(self, query_str: str) -&gt; dict:
+        # Check cache
+        cached = await self.cache.get(query_str)
+        if cached:
+            self.stats["hits"] += 1
+            return {
+                "response": cached["response"],
+                "cache_hit": True,
+                "similarity": cached["similarity"],
+                "cached_query": cached["cached_query"],
+            }
+
+        # Cache miss — run the full RAG pipeline
+        self.stats["misses"] += 1
+        t0 = time.perf_counter()
+        rag_response = await self.engine.aquery(query_str)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        response_text = str(rag_response)
+
+        # Store in cache
+        await self.cache.set(query_str, response_text)
+
+        return {
+            "response": response_text,
+            "cache_hit": False,
+            "rag_latency_ms": elapsed_ms,
+        }
+
+    def query(self, query_str: str) -&gt; dict:
+        import asyncio
+        return asyncio.get_event_loop().run_until_complete(self.aquery(query_str))
+
+
+# Wire it together
+async def build_cached_rag_engine(docs_path: str):
+    embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+    llm = OpenAI(model="gpt-4o", temperature=0)
+
+    Settings.embed_model = embed_model
+    Settings.llm = llm
+
+    documents = SimpleDirectoryReader(docs_path).load_data()
+    index = VectorStoreIndex.from_documents(documents)
+    base_engine = index.as_query_engine(similarity_top_k=4)
+
+    cache = RAGSemanticCache(embedding_model=embed_model, threshold=0.94)
+    cached_engine = SemanticCachedQueryEngine(base_engine, cache)
+    return cached_engine</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The right level to cache in a RAG pipeline</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A common design question: should the semantic cache sit in front of the LLM call, or in front of the entire RAG pipeline (retrieval + LLM)?</p>
+
+<p class="text-gray-300 leading-relaxed">| Cache placement | What is cached | When to use |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| LLM-only | LLM response for a given prompt (including retrieved context) | High prompt repetition, stable retrieval |</p>
+<p class="text-gray-300 leading-relaxed">| Full RAG (query → response) | Complete answer for a user query | When retrieval is also expensive (large corpus, many chunks) |</p>
+<p class="text-gray-300 leading-relaxed">| Retrieval-only | Retrieved document chunks for a query | Stable corpora, expensive vector search at scale |</p>
+
+<p class="text-gray-300 leading-relaxed">For most production systems, caching at the full RAG level (query → final answer) offers the best latency savings, since retrieval and LLM inference are both bypassed. The tradeoff is that the cached answer reflects the document state at the time of the original query—if documents are updated frequently, TTLs must be set accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.5 Cache Hit Rate Optimization</h3>
+
+<p class="text-gray-300 leading-relaxed">A semantic cache delivering a 20% hit rate is nearly useless. To reach the 50–80% hit rates that justify the infrastructure, you need deliberate optimization across four levers: query normalization, namespace segmentation, embedding model selection, and threshold tuning.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query normalization before embedding</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Small textual differences that don't affect meaning can scatter embeddings unnecessarily. Normalizing queries before embedding pushes semantically equivalent questions closer together in embedding space.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import re
+import unicodedata
+
+def normalize_query(text: str) -&gt; str:
+    """
+    Normalize a user query before embedding for cache lookup.
+    Reduces unnecessary cache misses from surface-form variation.
+    """
+    # Unicode normalize (handles fancy quotes, diacritics in English queries)
+    text = unicodedata.normalize("NFKC", text)
+
+    # Lowercase
+    text = text.lower()
+
+    # Collapse whitespace (tabs, newlines, multiple spaces)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Remove trailing punctuation that doesn't affect meaning
+    text = re.sub(r"[?.!,;:]+$", "", text).strip()
+
+    # Expand common contractions
+    contractions = {
+        "what's": "what is",
+        "i'm": "i am",
+        "can't": "cannot",
+        "don't": "do not",
+        "won't": "will not",
+        "how's": "how is",
+        "it's": "it is",
+        "that's": "that is",
+        "there's": "there is",
+        "i've": "i have",
+        "you've": "you have",
+        "we've": "we have",
+        "i'd": "i would",
+        "you'd": "you would",
+        "he'd": "he would",
+        "she'd": "she would",
+    }
+    for contraction, expansion in contractions.items():
+        text = re.sub(r"\b" + re.escape(contraction) + r"\b", expansion, text)
+
+    return text
+
+
+# Example — these should now embed closer together
+queries = [
+    "What's your return policy?",
+    "what is your return policy",
+    "What Is Your Return Policy?",
+    "what's your return policy?",
+]
+
+for q in queries:
+    print(repr(normalize_query(q)))
+# All output: 'what is your return policy'</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Namespace segmentation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A single cache namespace mixing product questions, support queries, and code generation requests will produce false positive hits—code generation questions semantically overlapping with English descriptions. Segmenting by namespace (which maps to a Qdrant collection filter or a Postgres <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE namespace = ...</code> predicate) keeps the search space focused and reduces false positives.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+NAMESPACE_MAP = {
+    "/support":         "support",
+    "/docs":            "documentation",
+    "/code-assistant":  "code_generation",
+    "/data-explorer":   "sql_generation",
+    "/api":             "api_default",
+}
+
+def route_to_namespace(request_path: str) -&gt; str:
+    for prefix, ns in NAMESPACE_MAP.items():
+        if request_path.startswith(prefix):
+            return ns
+    return "default"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Measuring hit rate and cache quality</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Hit rate per namespace over the last 24 hours
+SELECT
+    namespace,
+    COUNT(*) AS total_entries,
+    SUM(hit_count) AS total_hits,
+    AVG(hit_count) AS avg_hits_per_entry,
+    MAX(hit_count) AS max_hits_single_entry,
+    COUNT(*) FILTER (WHERE hit_count = 0) AS zero_hit_entries,
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE hit_count &gt; 0) / NULLIF(COUNT(*), 0),
+        1
+    ) AS pct_entries_ever_hit
+FROM semantic_cache
+WHERE created_at &gt; NOW() - INTERVAL '24 hours'
+GROUP BY namespace
+ORDER BY total_hits DESC;
+
+-- Top cached queries by hit count — useful for validating cache quality
+SELECT
+    query_text,
+    hit_count,
+    ROUND((1.0 - 0) * 100, 0) AS similarity_pct,  -- placeholder; join with access log for real similarity
+    created_at,
+    last_accessed,
+    expires_at
+FROM semantic_cache
+WHERE namespace = 'support'
+ORDER BY hit_count DESC
+LIMIT 20;
+
+-- Stale entries: created but never accessed and older than 6 hours
+-- (candidates for eviction to free index space)
+SELECT COUNT(*) AS stale_count
+FROM semantic_cache
+WHERE hit_count = 0
+  AND created_at &lt; NOW() - INTERVAL '6 hours';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Threshold sensitivity analysis</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Before deploying to production, run an offline analysis on a sample of logged queries to find the threshold that maximizes F1 score across your labeled evaluation set.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Offline threshold analysis
+# Requires: a list of (query_a, query_b, is_same_intent: bool) pairs
+
+import numpy as np
+from openai import OpenAI
+
+oai = OpenAI()
+
+def get_embedding(text: str) -&gt; np.ndarray:
+    response = oai.embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return np.array(response.data[0].embedding)
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -&gt; float:
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
+
+def analyze_thresholds(
+    eval_pairs: list[tuple[str, str, bool]],
+    thresholds: list[float] = None,
+) -&gt; list[dict]:
+    if thresholds is None:
+        thresholds = [round(t, 2) for t in np.arange(0.80, 1.00, 0.01)]
+
+    # Precompute similarities
+    similarities = []
+    labels = []
+    for q_a, q_b, same_intent in eval_pairs:
+        emb_a = get_embedding(q_a)
+        emb_b = get_embedding(q_b)
+        sim = cosine_similarity(emb_a, emb_b)
+        similarities.append(sim)
+        labels.append(same_intent)
+
+    similarities = np.array(similarities)
+    labels = np.array(labels)
+
+    results = []
+    for thresh in thresholds:
+        predictions = similarities &gt;= thresh
+        tp = int(np.sum(predictions & labels))
+        fp = int(np.sum(predictions & ~labels))
+        fn = int(np.sum(~predictions & labels))
+        tn = int(np.sum(~predictions & ~labels))
+
+        precision = tp / (tp + fp) if (tp + fp) &gt; 0 else 0.0
+        recall    = tp / (tp + fn) if (tp + fn) &gt; 0 else 0.0
+        f1        = (2 * precision * recall / (precision + recall)
+                     if (precision + recall) &gt; 0 else 0.0)
+
+        results.append({
+            "threshold": thresh,
+            "precision": round(precision, 4),
+            "recall":    round(recall, 4),
+            "f1":        round(f1, 4),
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        })
+
+    # Sort by F1 descending
+    results.sort(key=lambda r: r["f1"], reverse=True)
+    return results
+
+
+# Example eval set (in production, source this from human-labeled query logs)
+eval_pairs = [
+    ("What is your refund policy?",         "How do I get a refund?",           True),
+    ("What is your refund policy?",         "How do I cancel my subscription?",  False),
+    ("Show me my order history",            "List my past orders",               True),
+    ("Show me my order history",            "What is the return window?",        False),
+    ("How do I reset my password?",         "I forgot my password, help",        True),
+    ("How do I reset my password?",         "What are your business hours?",     False),
+]
+
+results = analyze_thresholds(eval_pairs)
+print(f"{'Threshold':&gt;10} {'Precision':&gt;10} {'Recall':&gt;8} {'F1':&gt;8}")
+print("-" * 42)
+for r in results[:10]:
+    print(
+        f"{r['threshold']:&gt;10.2f} "
+        f"{r['precision']:&gt;10.4f} "
+        f"{r['recall']:&gt;8.4f} "
+        f"{r['f1']:&gt;8.4f}"
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.6 Production Operations: Monitoring, Eviction, and Invalidation</h3>
+
+<p class="text-gray-300 leading-relaxed">A semantic cache that nobody monitors slowly drifts into a state where stale responses are served confidently. Production operation requires three ongoing concerns: monitoring cache quality, evicting dead weight, and invalidating entries when source data changes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring key metrics</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The following metrics should feed into your observability stack (Prometheus, Datadog, or equivalent):</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | Description | Alert threshold |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache_hit_rate</code> | Fraction of queries answered from cache | Alert if drops below baseline by >10pp |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache_miss_latency_p99</code> | P99 latency of LLM calls on cache miss | Baseline × 2 |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cache_hit_latency_p99</code> | P99 latency of cache lookups | >50ms warrants investigation |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stale_entry_fraction</code> | Entries past TTL still in index | >5% suggests purge job is lagging |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">false_positive_rate</code> | Cached responses rated incorrect by users | >2% warrants threshold increase |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">embedding_error_rate</code> | Embedding API failures | Any sustained failure |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tracking false positives with user feedback</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The most dangerous failure mode of a semantic cache is serving a cached answer that is wrong for the new query. Track this with a lightweight thumbs-down signal:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# FastAPI endpoint pattern for collecting cache quality feedback
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import psycopg
+
+app = FastAPI()
+
+class FeedbackPayload(BaseModel):
+    cache_entry_id: str
+    query: str
+    was_correct: bool
+    user_comment: str = ""
+
+@app.post("/feedback/cache")
+async def record_cache_feedback(payload: FeedbackPayload):
+    async with await psycopg.AsyncConnection.connect(DSN) as conn:
+        async with conn.cursor() as cur:
+            # Log the feedback
+            await cur.execute(
+                """
+                INSERT INTO cache_feedback
+                    (cache_entry_id, query_text, was_correct, user_comment, created_at)
+                VALUES (%s, %s, %s, %s, NOW())
+                """,
+                (
+                    payload.cache_entry_id,
+                    payload.query,
+                    payload.was_correct,
+                    payload.user_comment,
+                ),
+            )
+            # If negative feedback, optionally flag the entry for review
+            if not payload.was_correct:
+                await cur.execute(
+                    """
+                    UPDATE semantic_cache
+                    SET metadata = jsonb_set(
+                        COALESCE(metadata, '{}'),
+                        '{flagged}',
+                        'true'
+                    )
+                    WHERE id = %s::uuid
+                    """,
+                    (payload.cache_entry_id,),
+                )
+            await conn.commit()
+    return {"status": "recorded"}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Event-driven invalidation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When a source document changes—a policy page is updated, a product spec is revised—cached responses derived from that document should be invalidated. The pattern mirrors how CDN edge caches are purged: a content update event triggers a cache invalidation call.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Cache invalidation triggered by document update events
+# Integrates with any event bus (Kafka, SQS, Redis Streams, etc.)
+
+import asyncio
+import json
+from datetime import timezone, datetime
+
+async def handle_document_updated_event(event: dict, cache: PgvectorSemanticCache):
+    """
+    Called when a source document is updated.
+    Invalidates cached entries that reference that document.
+    event = {
+        "document_id": "doc_123",
+        "namespace": "support",
+        "updated_at": "2024-06-01T12:00:00Z",
+    }
+    """
+    doc_id = event["document_id"]
+    namespace = event.get("namespace", "default")
+
+    conn = await cache._get_conn()
+    async with conn.cursor() as cur:
+        # Delete entries in this namespace that reference the document
+        # (requires storing document_id in metadata at cache-write time)
+        await cur.execute(
+            """
+            DELETE FROM semantic_cache
+            WHERE namespace = %s
+              AND metadata-&gt;&gt;'source_document_id' = %s
+            RETURNING id
+            """,
+            (namespace, doc_id),
+        )
+        deleted_ids = await cur.fetchall()
+        await conn.commit()
+
+    print(
+        f"Invalidated {len(deleted_ids)} cache entries "
+        f"for document {doc_id} in namespace {namespace}"
+    )
+    return [str(row[0]) for row in deleted_ids]
+
+
+async def handle_namespace_flush_event(event: dict, cache: PgvectorSemanticCache):
+    """
+    Full namespace flush — used when a large batch of documents is updated,
+    making entry-level invalidation impractical.
+    """
+    namespace = event["namespace"]
+    conn = await cache._get_conn()
+    async with conn.cursor() as cur:
+        await cur.execute(
+            "DELETE FROM semantic_cache WHERE namespace = %s RETURNING id",
+            (namespace,),
+        )
+        count = len(await cur.fetchall())
+        await conn.commit()
+    print(f"Flushed {count} entries from namespace {namespace}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Eviction strategies</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Unlike memory-bounded caches like Redis, a Postgres-backed semantic cache grows without bound unless you actively evict entries. Three practical eviction strategies:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">TTL-based expiry</strong>: Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">expires_at</code> at write time and run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">purge_expired_cache()</code> as a scheduled job (pg_cron or an external scheduler). This is the minimum viable eviction strategy.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">LFU eviction on index size</strong>: When the table exceeds a row count threshold, delete the N entries with the lowest <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hit_count</code> that are also older than a minimum age. This keeps high-value entries and removes long-tail entries that never proved useful.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Namespace-scoped budgets</strong>: Assign a maximum row count per namespace. When a namespace exceeds its budget, evict the least recently used entries first.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- LFU eviction: remove the bottom 10% of entries by hit count
+-- when the table exceeds 500,000 rows
+
+DO $$
+DECLARE
+    v_total BIGINT;
+    v_evict_target BIGINT;
+BEGIN
+    SELECT COUNT(*) INTO v_total FROM semantic_cache;
+
+    IF v_total &gt; 500000 THEN
+        v_evict_target := v_total / 10;  -- evict 10%
+
+        DELETE FROM semantic_cache
+        WHERE id IN (
+            SELECT id FROM semantic_cache
+            WHERE created_at &lt; NOW() - INTERVAL '1 hour'  -- protect very new entries
+            ORDER BY hit_count ASC, last_accessed ASC
+            LIMIT v_evict_target
+        );
+
+        RAISE NOTICE 'Evicted % entries (total was %)', v_evict_target, v_total;
+    END IF;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.7 Semantic Caching for Agentic and Multi-Turn Workloads</h3>
+
+<p class="text-gray-300 leading-relaxed">Single-turn Q&A is the simplest semantic caching case. Agentic workloads—where an LLM reasons across multiple steps, invokes tools, and maintains conversation state—present two harder problems: what to cache and at what granularity.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Caching at the tool-call level</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In a ReAct-style agent, the expensive operations are typically not the reasoning steps themselves but tool calls: web searches, database queries, API calls, sub-agent invocations. Caching at the individual tool-call level rather than the full agent trajectory captures most of the value without the staleness risk of caching an entire multi-step reasoning chain.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Tool call semantic cache — wraps any tool function
+# Works with LangChain tools, LlamaIndex tools, or custom tool implementations
+
+import functools
+import asyncio
+from typing import Callable, Any
+
+def semantic_cache_tool(
+    cache: PgvectorSemanticCache,
+    namespace_prefix: str = "tool",
+):
+    """
+    Decorator that adds semantic caching to any async tool function.
+    The tool's input is serialized to a string for embedding.
+    """
+    def decorator(tool_fn: Callable) -&gt; Callable:
+        tool_namespace = f"{namespace_prefix}:{tool_fn.__name__}"
+
+        @functools.wraps(tool_fn)
+        async def wrapper(*args, **kwargs) -&gt; Any:
+            # Serialize inputs to a canonical query string
+            input_repr = f"{tool_fn.__name__}({args!r}, {kwargs!r})"
+            # Use a copy of the cache pointed at the tool's namespace
+            tool_cache = PgvectorSemanticCache(
+                dsn=cache.dsn,
+                openai_client=cache.oai,
+                namespace=tool_namespace,
+                threshold=cache.threshold,
+                ttl_seconds=cache.ttl_seconds,
+                embedding_model=cache.embedding_model,
+            )
+
+            cached = await tool_cache.get(input_repr)
+            if cached:
+                return cached["response"]
+
+            result = await tool_fn(*args, **kwargs)
+            await tool_cache.set(input_repr, str(result))
+            return result
+
+        return wrapper
+    return decorator
+
+
+# Usage with a database lookup tool
+@semantic_cache_tool(cache=some_cache, namespace_prefix="tool")
+async def lookup_customer_account(customer_id: str, fields: list[str]) -&gt; dict:
+    """Fetches customer account data from CRM API."""
+    # ... actual CRM API call ...
+    return {"customer_id": customer_id, "status": "active"}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Multi-turn conversation caching</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In multi-turn conversations, the relevant semantic unit is not a single utterance but the current question in context. A user asking "What about the return window?" as their third message has a different intent from the same string asked cold. Two strategies handle this:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Context-conditioned embedding</strong>: Concatenate the last N turns of conversation history with the current query before embedding. This captures context but reduces cache hit rate (each conversation history is unique).</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Semantic intent extraction</strong>: Use a fast, cheap LLM call to extract the standalone question from the conversation context ("User is asking: what is the return window for electronics?"), then cache on the extracted standalone question. The extraction step costs a small-model token call but dramatically improves cache reuse.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+async def extract_standalone_question(
+    conversation_history: list[dict],
+    current_query: str,
+    oai_client,
+) -&gt; str:
+    """
+    Condenses a multi-turn conversation into a standalone question
+    suitable for embedding and cache lookup.
+    Uses a cheap, fast model for this step.
+    """
+    if not conversation_history:
+        return current_query
+
+    history_text = "\n".join(
+        f"{m['role'].capitalize()}: {m['content']}"
+        for m in conversation_history[-4:]  # last 4 turns
+    )
+
+    prompt = f"""Given the following conversation, rewrite the final user question
+as a complete, standalone question that can be understood without the conversation context.
+Return only the rewritten question, nothing else.
+
+Conversation:
+{history_text}
+User: {current_query}
+
+Standalone question:"""
+
+    response = await oai_client.chat.completions.create(
+        model="gpt-4o-mini",  # fast, cheap model for extraction
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=100,
+        temperature=0,
+    )
+    return response.choices[0].message.content.strip()
+
+
+async def multi_turn_cached_response(
+    conversation_history: list[dict],
+    current_query: str,
+    cache: PgvectorSemanticCache,
+    llm_call_fn,
+    oai_client,
+) -&gt; dict:
+    standalone = await extract_standalone_question(
+        conversation_history, current_query, oai_client
+    )
+    result = await cache.get_or_generate(standalone, llm_call_fn)
+    result["standalone_query"] = standalone
+    return result</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">33.8 Failure Modes and Mitigations</h3>
+
+<p class="text-gray-300 leading-relaxed">A semantic cache introduces failure modes that conventional caches do not have. Understanding them prevents subtle production bugs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Embedding model version drift</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If the embedding model used to populate the cache differs from the model used at query time—because the model was upgraded—all existing cache entries become unsearchable. Cosine distances computed across model versions are meaningless. Always store the embedding model name with each cache entry and route lookups to only compare against entries produced by the same model. During a model migration, run both models in parallel, rebuild the cache with the new model under a new namespace, and cut over atomically.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Threshold creep</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Under pressure to improve hit rates, teams lower the threshold incrementally ("0.93 → 0.92 → 0.91…") without re-running precision/recall analysis. By the time false positives appear in user feedback, the threshold has drifted far from the safe operating range. Treat threshold changes as configuration changes requiring offline evaluation before deployment.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cold start</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A freshly deployed semantic cache has no entries. Under production traffic, the first N queries are all cache misses, and the cache fills gradually as the LLM handles them. For applications with predictable query distributions, pre-warm the cache at deployment time with the top-K queries from historical logs.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — cache pre-warming from historical query log
+async def prewarm_cache(
+    cache: PgvectorSemanticCache,
+    historical_queries: list[tuple[str, str]],  # (query, response) pairs
+    model: str = "gpt-4o",
+    batch_size: int = 50,
+) -&gt; int:
+    """
+    Pre-warm a semantic cache from a list of (query, response) pairs.
+    Returns the number of entries written.
+    """
+    written = 0
+    for i in range(0, len(historical_queries), batch_size):
+        batch = historical_queries[i : i + batch_size]
+        tasks = [
+            cache.set(query, response, model=model)
+            for query, response in batch
+        ]
+        await asyncio.gather(*tasks)
+        written += len(batch)
+        print(f"Pre-warmed {written}/{len(historical_queries)} entries")
+    return written</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cascade failure: embedding API unavailability</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When the embedding API is down, your semantic cache cannot compute embeddings and every request falls through to the LLM. Design the cache as a best-effort layer with a circuit breaker: if embedding calls fail consecutively, bypass the cache entirely rather than letting latency stack up.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import time
+
+class CircuitBreaker:
+    """
+    Simple circuit breaker for embedding API calls.
+    Opens after consecutive_failures failures,
+    retries after reset_timeout_seconds.
+    """
+    def __init__(self, consecutive_failures: int = 5, reset_timeout_seconds: float = 60.0):
+        self.threshold = consecutive_failures
+        self.reset_timeout = reset_timeout_seconds
+        self._failures = 0
+        self._opened_at: Optional[float] = None
+
+    @property
+    def is_open(self) -&gt; bool:
+        if self._opened_at is None:
+            return False
+        if time.monotonic() - self._opened_at &gt; self.reset_timeout:
+            # Half-open: allow one probe
+            return False
+        return True
+
+    def record_success(self):
+        self._failures = 0
+        self._opened_at = None
+
+    def record_failure(self):
+        self._failures += 1
+        if self._failures &gt;= self.threshold:
+            self._opened_at = time.monotonic()
+
+    async def call(self, fn, *args, **kwargs):
+        if self.is_open:
+            raise RuntimeError("Circuit breaker open — embedding API unavailable")
+        try:
+            result = await fn(*args, **kwargs)
+            self.record_success()
+            return result
+        except Exception as exc:
+            self.record_failure()
+            raise</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Semantic caching replaces exact-match hash lookups with vector similarity search**, allowing applications to serve cached LLM responses to queries that are phrased differently but mean the same thing—achieving latency reductions of two orders of magnitude on cache hits.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The similarity threshold is the single most operationally significant parameter**: too low and you serve wrong answers with confidence; too high and the cache never hits. Calibrate it with a labeled evaluation set and precision/recall analysis per query domain before deploying.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tiered architectures—a fast vector index for similarity lookup combined with a key-value store for response bodies—deliver the best latency profile**, with total cache hit latency typically under 15ms compared to multi-second LLM API calls.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Production semantic caches require active lifecycle management**: TTL-based expiry, LFU eviction when index size grows, event-driven invalidation when source documents change, and monitoring of false positive rates through user feedback signals.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Agentic and multi-turn workloads require adapted caching strategies**: cache at the tool-call level rather than the full agent trajectory, and use standalone-question extraction to normalize multi-turn context into cache-friendly canonical query forms before embedding.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -6,6 +6,10 @@
   <title>Chapter 35: Disaster Recovery for Vector Stores — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 35: Disaster Recovery for Vector Stores. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -539,6 +543,1337 @@ client.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">pgvector inherits PostgreSQL's streaming replication without modification. Vectors stored in heap tuples replicate through WAL exactly like any other data. However, HNSW indexes on replicas are kept in sync through WAL as well — you are not rebuilding them, you are streaming the physical changes. This is one of pgvector's strongest operational advantages.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Configure pgvector streaming replication
+# On primary: postgresql.conf
+
+cat &gt;&gt; /etc/postgresql/16/main/postgresql.conf &lt;&lt; 'EOF'
+# Replication settings for vector workloads
+wal_level = replica
+max_wal_senders = 5
+wal_keep_size = 2GB          # Vector operations generate large WAL entries
+# HNSW index updates can be 10-50x larger than row inserts
+# Increase wal_keep_size if replicas fall behind during bulk loads
+
+max_replication_slots = 5
+synchronous_commit = on      # Set to 'remote_write' if latency is unacceptable
+
+# Performance tuning for vector workloads with replication
+checkpoint_completion_target = 0.9
+max_wal_size = 4GB
+EOF
+
+# Create replication user
+psql -U postgres &lt;&lt; 'EOF'
+CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'strong_password_here';
+SELECT pg_create_physical_replication_slot('vector_replica_1');
+EOF
+
+# On replica: configure recovery
+cat &gt; /etc/postgresql/16/main/postgresql.conf &lt;&lt; 'EOF'
+hot_standby = on
+hot_standby_feedback = on    # Prevents query cancellation on replica during vacuum
+
+# Replica-specific tuning for vector similarity queries
+# Replicas can be dedicated to read-heavy vector search traffic
+max_parallel_workers_per_gather = 4
+hnsw.ef_search = 200         # Can tune independently on read replicas
+EOF
+
+cat &gt; /etc/postgresql/16/main/pg_hba.conf &lt;&lt; 'EOF'
+# Allow replication connections from primary
+host    replication     replicator    10.0.0.10/32    scram-sha-256
+EOF
+
+# Create recovery signal and connection config
+touch /var/lib/postgresql/16/main/standby.signal
+
+cat &gt; /var/lib/postgresql/16/main/postgresql.auto.conf &lt;&lt; 'EOF'
+primary_conninfo = 'host=10.0.0.10 port=5432 user=replicator password=strong_password_here application_name=vector_replica_1'
+primary_slot_name = 'vector_replica_1'
+EOF</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Monitor replication lag — critical for vector workloads during bulk loads
+-- Large HNSW index updates generate significant WAL; replicas can fall behind
+
+SELECT
+    client_addr,
+    application_name,
+    state,
+    sent_lsn,
+    write_lsn,
+    flush_lsn,
+    replay_lsn,
+    pg_size_pretty(pg_wal_lsn_diff(sent_lsn, replay_lsn)) AS replication_lag_bytes,
+    write_lag,
+    flush_lag,
+    replay_lag,
+    sync_state
+FROM pg_stat_replication
+ORDER BY replay_lag DESC NULLS LAST;
+
+-- Check if replica is usable for vector search
+-- A replica lagging more than your RPO threshold should be excluded from traffic
+SELECT
+    now() - pg_last_xact_replay_timestamp() AS replication_lag_time,
+    pg_is_in_recovery() AS is_replica,
+    pg_last_wal_receive_lsn() AS last_received,
+    pg_last_wal_replay_lsn() AS last_replayed,
+    pg_wal_lsn_diff(
+        pg_last_wal_receive_lsn(),
+        pg_last_wal_replay_lsn()
+    ) AS lag_bytes;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A common production pattern is to direct all embedding write operations (INSERT/UPDATE from the embedding pipeline) to the primary, while routing similarity search queries to one or more hot standbys. This requires your application connection pool or proxy (PgBouncer, HAProxy, pgpool-II) to distinguish read from write operations at the connection level.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Weaviate Multi-Node Replication</p>
+
+<p class="text-gray-300 leading-relaxed">Weaviate uses a distributed architecture where replication is configured per class (collection). The replication factor determines how many nodes hold a copy of each shard.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Weaviate: configure a collection with replication factor for HA
+
+import weaviate
+import weaviate.classes.config as wvc_config
+
+client = weaviate.connect_to_custom(
+    http_host="weaviate-node1.internal",
+    http_port=8080,
+    http_secure=False,
+    grpc_host="weaviate-node1.internal",
+    grpc_port=50051,
+    grpc_secure=False
+)
+
+# Create a collection with replication factor 3 (tolerates 1 node failure)
+# and quorum-based consistency
+client.collections.create(
+    name="DocumentEmbeddings",
+    vectorizer_config=wvc_config.Configure.Vectorizer.none(),
+    vector_index_config=wvc_config.Configure.VectorIndex.hnsw(
+        distance_metric=wvc_config.VectorDistances.COSINE,
+        ef_construction=128,
+        max_connections=16,
+        ef=64,
+        dynamic_ef_min=100,
+        dynamic_ef_max=500
+    ),
+    replication_config=wvc_config.Configure.replication(
+        factor=3,              # Store 3 copies across cluster nodes
+        async_enabled=False    # Synchronous replication for consistency
+    ),
+    properties=[
+        wvc_config.Property(name="document_id", data_type=wvc_config.DataType.TEXT),
+        wvc_config.Property(name="content_text", data_type=wvc_config.DataType.TEXT),
+        wvc_config.Property(name="chunk_index", data_type=wvc_config.DataType.INT),
+        wvc_config.Property(name="source_url", data_type=wvc_config.DataType.TEXT),
+        wvc_config.Property(name="embedding_model", data_type=wvc_config.DataType.TEXT),
+        wvc_config.Property(name="created_at", data_type=wvc_config.DataType.DATE),
+    ]
+)
+
+# Query with explicit consistency level
+# QUORUM requires majority of replicas to agree — protects against stale reads
+collection = client.collections.get("DocumentEmbeddings")
+
+results = collection.query.near_vector(
+    near_vector=[0.1] * 1536,
+    limit=10,
+    consistency_level=wvc_config.ConsistencyLevel.QUORUM
+)
+
+# For recovery validation after node failure:
+def check_cluster_health(client: weaviate.WeaviateClient) -&gt; dict:
+    """
+    Check node health across the Weaviate cluster.
+    Returns a dict identifying any nodes that are degraded or unreachable.
+    """
+    nodes = client.cluster.nodes(output="verbose")
+    health = {
+        "total_nodes": len(nodes),
+        "healthy_nodes": 0,
+        "degraded_nodes": [],
+        "total_objects": 0,
+        "shard_detail": []
+    }
+
+    for node in nodes:
+        node_healthy = node.status == "HEALTHY"
+        if node_healthy:
+            health["healthy_nodes"] += 1
+        else:
+            health["degraded_nodes"].append({
+                "name": node.name,
+                "status": node.status,
+                "version": node.version
+            })
+
+        for shard in (node.shards or []):
+            health["total_objects"] += shard.object_count
+            health["shard_detail"].append({
+                "node": node.name,
+                "collection": shard.collection,
+                "shard": shard.name,
+                "object_count": shard.object_count,
+                "vector_indexing_status": shard.vector_indexing_status
+            })
+
+    health["quorum_available"] = (
+        health["healthy_nodes"] &gt; health["total_nodes"] // 2
+    )
+
+    return health
+
+
+cluster_status = check_cluster_health(client)
+print(f"Cluster health: {cluster_status['healthy_nodes']}/{cluster_status['total_nodes']} nodes healthy")
+print(f"Quorum available: {cluster_status['quorum_available']}")
+if cluster_status["degraded_nodes"]:
+    print(f"Degraded nodes: {cluster_status['degraded_nodes']}")
+
+client.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key operational point with Weaviate replication: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">async_enabled=False</code> (synchronous replication) gives you the strongest consistency guarantee but increases write latency proportionally to the slowest replica. For write-heavy embedding pipelines, consider <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">async_enabled=True</code> during bulk loads and switch back to synchronous for production traffic. This is operationally similar to temporarily reducing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code> in PostgreSQL during bulk inserts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cross-Region Failover Runbook</h3>
+
+<p class="text-gray-300 leading-relaxed">The sections above establish backup and replication mechanics. This section assembles them into an actionable runbook for a full regional failover. The scenario: your primary region becomes unavailable. Your DR site in a secondary region must take over serving vector similarity queries within your RTO.</p>
+
+<p class="text-gray-300 leading-relaxed">The runbook below uses pgvector as the primary store (because its replication story is the most mature), with a Pinecone failover path shown in parallel for hybrid deployments where both are in use.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant Op as On-call operator
+    participant Rep as DR replica
+    participant DNS as DNS / load balancer
+    participant App as Application
+
+    Op->>Rep: Check replication lag
+    alt Lag exceeds tolerance
+        Rep-->>Op: Abort — manual review required
+    else Lag within tolerance
+        Op->>Rep: Promote replica to primary
+        Rep-->>Op: Promotion confirmed
+        Op->>DNS: Update record to DR primary IP
+        DNS-->>App: Traffic reconnects to DR primary
+        Op->>Rep: Run validation query suite
+        alt Validation fails
+            Rep-->>Op: Halt — do not open traffic
+        else Validation passes
+            Op->>App: Failover complete, traffic live
+            Op->>Rep: Begin re-establishing replication
+        end
+    end</pre></div>
+<p class="text-gray-300 leading-relaxed">*Every gate gives the operator a chance to abort rather than promote a lagging or unvalidated replica.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Cross-region failover orchestration
+# This script is designed to be run manually or by an on-call automation system
+# after a human has confirmed the primary region is unreachable.
+
+import psycopg2
+import subprocess
+import time
+import logging
+import json
+from datetime import datetime
+from typing import Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger("vector_dr_failover")
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Validate DR replica is caught up enough to promote
+# ---------------------------------------------------------------------------
+
+def check_replica_lag(
+    replica_dsn: str,
+    max_acceptable_lag_seconds: float = 30.0
+) -&gt; dict:
+    """
+    Connect to the DR replica and verify replication lag is within RTO tolerance.
+    Refuse promotion if lag exceeds threshold — stale vectors cause silent
+    search quality degradation, not obvious errors.
+    """
+    conn = psycopg2.connect(replica_dsn)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT
+            now() - pg_last_xact_replay_timestamp()    AS lag_time,
+            pg_last_wal_receive_lsn()                   AS last_received,
+            pg_last_wal_replay_lsn()                    AS last_replayed,
+            pg_is_in_recovery()                         AS is_standby
+    """)
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    lag_interval = row[0]
+    lag_seconds = lag_interval.total_seconds() if lag_interval else float("inf")
+
+    return {
+        "lag_seconds": lag_seconds,
+        "last_received_lsn": str(row[1]),
+        "last_replayed_lsn": str(row[2]),
+        "is_standby": row[3],
+        "within_tolerance": lag_seconds &lt;= max_acceptable_lag_seconds
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Promote PostgreSQL replica to primary
+# ---------------------------------------------------------------------------
+
+def promote_postgres_replica(
+    replica_host: str,
+    pg_ctl_path: str = "/usr/lib/postgresql/16/bin/pg_ctl",
+    data_dir: str = "/var/lib/postgresql/16/main"
+) -&gt; bool:
+    """
+    Promote the standby to a writable primary.
+    pg_promote() is available in PostgreSQL 12+; pg_ctl promote is the
+    older equivalent for automation from outside the database.
+    """
+    log.info(f"Promoting PostgreSQL replica at {replica_host}")
+
+    # Use pg_promote() from within the replica if we still have a connection
+    try:
+        conn = psycopg2.connect(
+            f"host={replica_host} dbname=postgres user=postgres"
+        )
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("SELECT pg_promote(wait =&gt; true, wait_seconds =&gt; 60)")
+        result = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+
+        if result:
+            log.info("pg_promote() succeeded — replica is now primary")
+            return True
+        else:
+            log.warning("pg_promote() returned false — may have timed out")
+            return False
+
+    except Exception as e:
+        log.error(f"pg_promote() failed: {e}. Attempting pg_ctl fallback.")
+
+    # Fallback: call pg_ctl promote via SSH if pg_promote() is unavailable
+    result = subprocess.run(
+        ["ssh", replica_host, f"sudo -u postgres {pg_ctl_path} promote -D {data_dir}"],
+        capture_output=True,
+        text=True,
+        timeout=120
+    )
+
+    if result.returncode == 0:
+        log.info("pg_ctl promote succeeded")
+        return True
+    else:
+        log.error(f"pg_ctl promote failed: {result.stderr}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Update DNS / load balancer to point to DR primary
+# ---------------------------------------------------------------------------
+
+def update_dns_record(
+    dns_name: str,
+    new_ip: str,
+    ttl: int = 30,
+    hosted_zone_id: str = None
+) -&gt; None:
+    """
+    Update Route 53 DNS record to point vector-db.internal to the promoted replica.
+    Applications reconnect automatically when their connection pool recycles.
+    Pre-condition: DNS TTL should already be set low (30–60s) in normal operation.
+    """
+    import boto3
+    r53 = boto3.client("route53")
+
+    change_batch = {
+        "Changes": [
+            {
+                "Action": "UPSERT",
+                "ResourceRecordSet": {
+                    "Name": dns_name,
+                    "Type": "A",
+                    "TTL": ttl,
+                    "ResourceRecords": [{"Value": new_ip}]
+                }
+            }
+        ]
+    }
+
+    response = r53.change_resource_record_sets(
+        HostedZoneId=hosted_zone_id,
+        ChangeBatch=change_batch
+    )
+
+    change_id = response["ChangeInfo"]["Id"]
+    log.info(f"DNS update submitted: {change_id} — {dns_name} -&gt; {new_ip}")
+
+    # Wait for DNS change to propagate
+    waiter = r53.get_waiter("resource_record_sets_changed")
+    waiter.wait(Id=change_id)
+    log.info("DNS change propagated")
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Post-failover validation of vector search quality
+# ---------------------------------------------------------------------------
+
+def validate_vector_search_post_failover(
+    new_primary_dsn: str,
+    test_queries: list,
+    min_results_per_query: int = 5
+) -&gt; dict:
+    """
+    Run a battery of known test queries against the promoted primary.
+    For each query, we verify:
+      1. Results are returned (index is queryable)
+      2. Result count meets minimum
+      3. Top result cosine distance is within expected range
+      
+    test_queries: list of dicts with keys 'query_vector' and 'expected_top_id'
+    """
+    conn = psycopg2.connect(new_primary_dsn)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    results_summary = {
+        "total_queries": len(test_queries),
+        "passed": 0,
+        "failed": 0,
+        "failures": []
+    }
+
+    for i, test in enumerate(test_queries):
+        query_vector = test["query_vector"]
+        expected_top_id = test.get("expected_top_id")
+        label = test.get("label", f"query_{i}")
+
+        cur.execute("""
+            SELECT
+                id,
+                document_id,
+                1 - (embedding &lt;=&gt; %s::vector) AS cosine_similarity
+            FROM document_embeddings
+            ORDER BY embedding &lt;=&gt; %s::vector
+            LIMIT %s
+        """, (query_vector, query_vector, min_results_per_query))
+
+        rows = cur.fetchall()
+        result_count = len(rows)
+
+        passed = result_count &gt;= min_results_per_query
+        top_id_match = True
+
+        if expected_top_id and rows:
+            top_id_match = str(rows[0][1]) == str(expected_top_id)
+            if not top_id_match:
+                log.warning(
+                    f"Query '{label}': expected top doc {expected_top_id}, "
+                    f"got {rows[0][1]} (similarity={rows[0][2]:.4f})"
+                )
+
+        if passed and top_id_match:
+            results_summary["passed"] += 1
+        else:
+            results_summary["failed"] += 1
+            results_summary["failures"].append({
+                "label": label,
+                "result_count": result_count,
+                "top_id_match": top_id_match
+            })
+
+    cur.close()
+    conn.close()
+
+    results_summary["all_passed"] = results_summary["failed"] == 0
+    return results_summary
+
+
+# ---------------------------------------------------------------------------
+# Main failover orchestration
+# ---------------------------------------------------------------------------
+
+def execute_failover(config: dict) -&gt; None:
+    """
+    Execute full cross-region failover for vector store infrastructure.
+    config keys:
+        replica_dsn, replica_host, primary_dns, dr_primary_ip,
+        hosted_zone_id, max_lag_seconds, test_queries
+    """
+    log.info("=" * 60)
+    log.info("VECTOR STORE FAILOVER INITIATED")
+    log.info(f"Time: {datetime.utcnow().isoformat()}Z")
+    log.info("=" * 60)
+
+    # Step 1: Check lag
+    lag_info = check_replica_lag(
+        config["replica_dsn"],
+        max_acceptable_lag_seconds=config.get("max_lag_seconds", 30)
+    )
+    log.info(f"Replica lag: {lag_info['lag_seconds']:.1f}s")
+
+    if not lag_info["within_tolerance"]:
+        log.error(
+            f"Replica lag ({lag_info['lag_seconds']:.1f}s) exceeds tolerance. "
+            "Manual review required before promotion."
+        )
+        raise RuntimeError("Replication lag too high for safe failover")
+
+    # Step 2: Promote replica
+    promoted = promote_postgres_replica(config["replica_host"])
+    if not promoted:
+        raise RuntimeError("Replica promotion failed — aborting failover")
+
+    # Brief pause for promotion to fully settle
+    time.sleep(5)
+
+    # Step 3: Update DNS
+    update_dns_record(
+        dns_name=config["primary_dns"],
+        new_ip=config["dr_primary_ip"],
+        hosted_zone_id=config["hosted_zone_id"]
+    )
+
+    # Step 4: Validate
+    log.info("Running post-failover validation queries...")
+    validation = validate_vector_search_post_failover(
+        new_primary_dsn=config["dr_primary_dsn"],
+        test_queries=config["test_queries"]
+    )
+
+    log.info(f"Validation: {validation['passed']}/{validation['total_queries']} passed")
+
+    if not validation["all_passed"]:
+        log.error(f"Validation failures: {json.dumps(validation['failures'], indent=2)}")
+        raise RuntimeError("Post-failover validation failed — manual investigation required")
+
+    log.info("Failover complete. Vector search is live on DR primary.")
+    log.info("Next step: begin re-establishing replication from DR primary to new standby.")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Recovery Point Objective and Recovery Time Objective Planning</h3>
+
+<p class="text-gray-300 leading-relaxed">RTO and RPO for vector stores have components that do not appear in relational DR planning:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RPO components for vector stores:</strong></p>
+<p class="text-gray-300 leading-relaxed">1. Source document RPO (how stale can your underlying content be?)</p>
+<p class="text-gray-300 leading-relaxed">2. Embedding pipeline RPO (how many documents processed after the last backup are un-embedded?)</p>
+<p class="text-gray-300 leading-relaxed">3. Vector index RPO (gap between last backup and failure)</p>
+
+<p class="text-gray-300 leading-relaxed">All three must align. If your source PostgreSQL database recovers to T-minus-2-hours, your vector store recovers to T-minus-6-hours, and your embedding pipeline queue was processing documents at the time of failure, you could have semantic gaps that are never automatically identified.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RTO components for vector stores:</strong></p>
+<p class="text-gray-300 leading-relaxed">1. Infrastructure recovery time (restore volume or index from backup)</p>
+<p class="text-gray-300 leading-relaxed">2. Index rebuild time (pgvector only — zero for managed services that persist the index)</p>
+<p class="text-gray-300 leading-relaxed">3. Catch-up embedding time (documents written between backup and failure that need to be re-embedded)</p>
+<p class="text-gray-300 leading-relaxed">4. Validation time (you cannot skip similarity query validation)</p>
+
+<p class="text-gray-300 leading-relaxed">Table 35.2 gives representative RTO estimates by platform and database size:</p>
+
+<p class="text-gray-300 leading-relaxed">| Platform | Vectors | Infrastructure Restore | Index Rebuild | Catch-up Embedding | Total RTO |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| pgvector | 5M × 1536-d | 15–30 min | 2–4 hours | Depends on gap | 3–5 hours |</p>
+<p class="text-gray-300 leading-relaxed">| pgvector | 50M × 1536-d | 45–90 min | 8–16 hours | Depends on gap | 10–18 hours |</p>
+<p class="text-gray-300 leading-relaxed">| Weaviate (self-hosted) | 10M | 20–40 min | Included in restore | Depends on gap | 30–90 min |</p>
+<p class="text-gray-300 leading-relaxed">| Pinecone (managed) | 10M | 30–60 min | Not applicable | Depends on gap | 45–90 min |</p>
+<p class="text-gray-300 leading-relaxed">| Qdrant (self-hosted) | 10M | 15–30 min | Included in restore | Depends on gap | 25–60 min |</p>
+
+<p class="text-gray-300 leading-relaxed">The pgvector index rebuild time is the most significant operational difference. For large deployments, this drives a strong architectural recommendation: maintain a hot standby rather than relying on backup-and-restore as your primary HA mechanism.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Estimate index rebuild time before starting a restore
+-- Run this on any machine with the same hardware profile as your DR target
+
+-- First, check current index build parameters
+SHOW max_parallel_maintenance_workers;
+SHOW maintenance_work_mem;
+
+-- Rough rebuild time estimation based on table size and vector dimensions
+-- These ratios are empirical and will vary by hardware
+WITH size_estimates AS (
+    SELECT
+        COUNT(*) AS row_count,
+        AVG(vector_dims(embedding)) AS avg_dims,
+        pg_total_relation_size('document_embeddings') AS total_bytes
+    FROM document_embeddings
+)
+SELECT
+    row_count,
+    avg_dims,
+    pg_size_pretty(total_bytes) AS table_size,
+    -- HNSW build is roughly O(n log n) — use a linear approximation for planning
+    -- Actual time depends heavily on ef_construction and m parameters
+    ROUND(row_count::numeric / 1000000 * 12) AS estimated_hnsw_minutes_low,
+    ROUND(row_count::numeric / 1000000 * 25) AS estimated_hnsw_minutes_high
+FROM size_estimates;
+
+-- After restore: rebuild HNSW index with maximum parallelism
+-- Run this in a maintenance window; it will block on heavy I/O
+SET maintenance_work_mem = '16GB';  -- Use as much RAM as you can spare
+SET max_parallel_maintenance_workers = 7;
+
+-- Drop old index if present (e.g., restored from pg_dump which included it)
+DROP INDEX CONCURRENTLY IF EXISTS idx_document_embeddings_hnsw;
+
+-- Rebuild with parameters tuned for recall vs. build time tradeoff
+CREATE INDEX idx_document_embeddings_hnsw
+    ON document_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+-- ef_construction=64 builds faster; increase to 128 for higher recall
+-- Monitor progress:
+SELECT
+    phase,
+    blocks_done,
+    blocks_total,
+    tuples_done,
+    tuples_total,
+    ROUND(100.0 * tuples_done / NULLIF(tuples_total, 0), 1) AS pct_complete
+FROM pg_stat_progress_create_index
+WHERE relid = 'document_embeddings'::regclass;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Re-Embedding Recovery Path</h3>
+
+<p class="text-gray-300 leading-relaxed">The most costly recovery scenario — one that has no equivalent in relational DR — is the case where you must regenerate all embeddings from source documents. This happens when:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Both the vector store and the source embedding cache are lost</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You change embedding models (not strictly a recovery scenario, but operationally identical)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The original embedding model is deprecated and results are no longer consistent with new queries</li>
+
+<p class="text-gray-300 leading-relaxed">This section builds a production-grade re-embedding pipeline with checkpointing, so that a failure mid-run does not force you to start from zero.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Re-embedding pipeline with checkpointing and rate-limit handling
+# Designed for recovery scenarios where you must regenerate all vectors from source text
+
+import asyncio
+import psycopg2
+import psycopg2.extras
+import openai
+import json
+import time
+import logging
+from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional
+
+log = logging.getLogger("reembedding_pipeline")
+
+@dataclass
+class ReembeddingCheckpoint:
+    """Persisted state for resuming a failed re-embedding job."""
+    job_id: str
+    started_at: str
+    last_processed_id: int
+    total_processed: int
+    total_errors: int
+    model: str
+    status: str  # "running", "completed", "failed"
+
+
+def load_or_create_checkpoint(
+    conn,
+    job_id: str,
+    model: str
+) -&gt; ReembeddingCheckpoint:
+    """Load existing checkpoint or create a new one."""
+    cur = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+    # Create checkpoint table if not exists
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reembedding_jobs (
+            job_id              TEXT PRIMARY KEY,
+            started_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_processed_id   BIGINT NOT NULL DEFAULT 0,
+            total_processed     BIGINT NOT NULL DEFAULT 0,
+            total_errors        BIGINT NOT NULL DEFAULT 0,
+            model               TEXT NOT NULL,
+            status              TEXT NOT NULL DEFAULT 'running',
+            updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    """)
+
+    cur.execute(
+        "SELECT * FROM reembedding_jobs WHERE job_id = %s",
+        (job_id,)
+    )
+    row = cur.fetchone()
+
+    if row:
+        log.info(
+            f"Resuming job {job_id} from ID {row['last_processed_id']} "
+            f"({row['total_processed']} already processed)"
+        )
+        return ReembeddingCheckpoint(
+            job_id=row["job_id"],
+            started_at=str(row["started_at"]),
+            last_processed_id=row["last_processed_id"],
+            total_processed=row["total_processed"],
+            total_errors=row["total_errors"],
+            model=row["model"],
+            status=row["status"]
+        )
+    else:
+        cur.execute("""
+            INSERT INTO reembedding_jobs (job_id, model, status)
+            VALUES (%s, %s, 'running')
+        """, (job_id, model))
+        conn.commit()
+        log.info(f"Created new re-embedding job: {job_id}")
+        return ReembeddingCheckpoint(
+            job_id=job_id,
+            started_at=datetime.utcnow().isoformat(),
+            last_processed_id=0,
+            total_processed=0,
+            total_errors=0,
+            model=model,
+            status="running"
+        )
+
+
+def save_checkpoint(conn, checkpoint: ReembeddingCheckpoint) -&gt; None:
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE reembedding_jobs SET
+            last_processed_id = %s,
+            total_processed   = %s,
+            total_errors      = %s,
+            status            = %s,
+            updated_at        = NOW()
+        WHERE job_id = %s
+    """, (
+        checkpoint.last_processed_id,
+        checkpoint.total_processed,
+        checkpoint.total_errors,
+        checkpoint.status,
+        checkpoint.job_id
+    ))
+    conn.commit()
+
+
+def run_reembedding_pipeline(
+    source_dsn: str,
+    target_dsn: str,
+    job_id: str,
+    model: str = "text-embedding-3-large",
+    batch_size: int = 100,
+    checkpoint_interval: int = 1000,
+    max_retries: int = 3
+) -&gt; ReembeddingCheckpoint:
+    """
+    Re-embed all documents from source table into target embeddings table.
+    
+    source_dsn: Connection to database with 'documents' table (source text)
+    target_dsn: Connection to database with 'document_embeddings' table (destination)
+    
+    The pipeline:
+    1. Loads documents in batches ordered by ID
+    2. Generates embeddings via OpenAI API (with retry logic)
+    3. Upserts into the embeddings table
+    4. Checkpoints progress every checkpoint_interval records
+    5. On resume, skips all records with ID &lt;= last_processed_id
+    """
+    oai = openai.OpenAI()
+
+    source_conn = psycopg2.connect(source_dsn)
+    target_conn = psycopg2.connect(target_dsn)
+    target_conn.autocommit = False
+
+    checkpoint = load_or_create_checkpoint(target_conn, job_id, model)
+
+    if checkpoint.status == "completed":
+        log.info(f"Job {job_id} is already complete. Exiting.")
+        return checkpoint
+
+    log.info(f"Starting re-embedding from document ID &gt; {checkpoint.last_processed_id}")
+
+    source_cur = source_conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+    target_cur = target_conn.cursor()
+
+    # Fetch total count for progress reporting
+    source_cur.execute(
+        "SELECT COUNT(*) FROM documents WHERE id &gt; %s",
+        (checkpoint.last_processed_id,)
+    )
+    remaining = source_cur.fetchone()[0]
+    log.info(f"Documents remaining to embed: {remaining:,}")
+
+    # Stream documents in ordered batches
+    source_cur.execute("""
+        SELECT id, content_text, metadata
+        FROM documents
+        WHERE id &gt; %s
+        ORDER BY id ASC
+    """, (checkpoint.last_processed_id,))
+
+    batch = []
+    processed_this_run = 0
+
+    while True:
+        rows = source_cur.fetchmany(batch_size)
+        if not rows:
+            break
+
+        # Build embedding request
+        texts = [row["content_text"] for row in rows]
+        doc_ids = [row["id"] for row in rows]
+        metadatas = [row["metadata"] for row in rows]
+
+        # Call embedding API with retry
+        embeddings = None
+        for attempt in range(max_retries):
+            try:
+                response = oai.embeddings.create(
+                    model=model,
+                    input=texts
+                )
+                embeddings = [item.embedding for item in response.data]
+                break
+            except openai.RateLimitError:
+                wait = 2 ** attempt * 5  # exponential backoff
+                log.warning(f"Rate limited. Waiting {wait}s before retry {attempt+1}")
+                time.sleep(wait)
+            except openai.APIError as e:
+                log.error(f"API error on attempt {attempt+1}: {e}")
+                if attempt == max_retries - 1:
+                    checkpoint.total_errors += len(rows)
+                    log.error(f"Skipping batch after {max_retries} failures")
+
+        if embeddings is None:
+            continue
+
+        # Upsert embeddings into target table
+        records = [
+            (
+                doc_ids[i],
+                0,  # chunk_index — 0 for whole-document embeddings
+                texts[i],
+                embeddings[i],
+                json.dumps(metadatas[i]) if metadatas[i] else "{}",
+                model
+            )
+            for i in range(len(rows))
+        ]
+
+        psycopg2.extras.execute_values(
+            target_cur,
+            """
+            INSERT INTO document_embeddings
+                (document_id, chunk_index, content_text, embedding, metadata, embedding_model)
+            VALUES %s
+            ON CONFLICT (document_id, chunk_index)
+            DO UPDATE SET
+                embedding       = EXCLUDED.embedding,
+                content_text    = EXCLUDED.content_text,
+                metadata        = EXCLUDED.metadata,
+                embedding_model = EXCLUDED.embedding_model,
+                updated_at      = NOW()
+            """,
+            records,
+            template="(%s, %s, %s, %s::vector, %s::jsonb, %s)"
+        )
+        target_conn.commit()
+
+        checkpoint.last_processed_id = doc_ids[-1]
+        checkpoint.total_processed += len(rows)
+        processed_this_run += len(rows)
+
+        # Periodic checkpoint save and progress log
+        if processed_this_run % checkpoint_interval == 0:
+            save_checkpoint(target_conn, checkpoint)
+            pct = 100 * checkpoint.total_processed / max(remaining, 1)
+            log.info(
+                f"Progress: {checkpoint.total_processed:,} processed "
+                f"({pct:.1f}%) | last_id={checkpoint.last_processed_id} "
+                f"| errors={checkpoint.total_errors}"
+            )
+
+    # Mark complete
+    checkpoint.status = "completed"
+    save_checkpoint(target_conn, checkpoint)
+
+    log.info(
+        f"Re-embedding complete. "
+        f"Total processed: {checkpoint.total_processed:,} | "
+        f"Errors: {checkpoint.total_errors}"
+    )
+
+    source_cur.close()
+    target_cur.close()
+    source_conn.close()
+    target_conn.close()
+
+    return checkpoint</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The checkpointing pattern here is the most important operational detail: every failure in a multi-hour re-embedding job that lacks checkpointing costs you the full restart. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">last_processed_id</code> persisted,a failure mid-run resumes from the last committed batch. At a batch size of 100 documents with checkpointing every 1,000 records, the maximum repeated work on resume is 1,000 documents — a few seconds of API calls, not hours.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Testing Your DR Plan</h3>
+
+<p class="text-gray-300 leading-relaxed">A DR plan that has never been tested is a hypothesis, not a safety net. Vector store DR introduces validation challenges that relational DR does not: after a successful restore, how do you know the similarity results are *correct*, not merely *present*?</p>
+
+<p class="text-gray-300 leading-relaxed">#### Defining Validation Test Cases</p>
+
+<p class="text-gray-300 leading-relaxed">Before any disaster occurs, record a set of known-good query pairs: a query vector and the expected top-k document IDs it should return. These become your DR validation corpus.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Create a table of DR validation test cases
+-- Populate this during normal operation, not during an incident
+
+CREATE TABLE IF NOT EXISTS dr_validation_queries (
+    test_id         SERIAL PRIMARY KEY,
+    label           TEXT NOT NULL,
+    description     TEXT,
+    query_vector    VECTOR(1536) NOT NULL,
+    expected_top_5  BIGINT[] NOT NULL,   -- document_ids in expected order
+    expected_max_distance FLOAT NOT NULL, -- cosine distance to top result under normal conditions
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_verified   TIMESTAMPTZ,
+    model_version   TEXT NOT NULL DEFAULT 'text-embedding-3-large'
+);
+
+-- Insert a validation case by capturing the current top result for a known query
+INSERT INTO dr_validation_queries
+    (label, description, query_vector, expected_top_5, expected_max_distance, model_version)
+SELECT
+    'python_tutorial_query',
+    'Search for Python programming tutorials — should always return the Python docs chunks',
+    query_emb.embedding,
+    ARRAY(
+        SELECT document_id FROM document_embeddings
+        ORDER BY embedding &lt;=&gt; query_emb.embedding
+        LIMIT 5
+    ),
+    (
+        SELECT MIN(embedding &lt;=&gt; query_emb.embedding)
+        FROM document_embeddings
+        ORDER BY embedding &lt;=&gt; query_emb.embedding
+        LIMIT 1
+    ),
+    'text-embedding-3-large'
+FROM (
+    -- In practice, this would be a pre-computed embedding for your test phrase
+    SELECT embedding FROM document_embeddings
+    WHERE content_text ILIKE '%introduction to python%'
+    LIMIT 1
+) AS query_emb;
+
+-- Run the full validation suite and return pass/fail per test
+WITH validation_results AS (
+    SELECT
+        dq.test_id,
+        dq.label,
+        dq.expected_top_5,
+        dq.expected_max_distance,
+        ARRAY(
+            SELECT document_id FROM document_embeddings
+            ORDER BY embedding &lt;=&gt; dq.query_vector
+            LIMIT 5
+        ) AS actual_top_5,
+        (
+            SELECT MIN(embedding &lt;=&gt; dq.query_vector)
+            FROM document_embeddings
+            ORDER BY embedding &lt;=&gt; dq.query_vector
+            LIMIT 1
+        ) AS actual_top_distance
+    FROM dr_validation_queries dq
+)
+SELECT
+    test_id,
+    label,
+    expected_top_5[1]              AS expected_top_id,
+    actual_top_5[1]                AS actual_top_id,
+    expected_top_5[1] = actual_top_5[1] AS top_id_matches,
+    ROUND(expected_max_distance::numeric, 4) AS expected_dist,
+    ROUND(actual_top_distance::numeric, 4)   AS actual_dist,
+    ABS(expected_max_distance - actual_top_distance) &lt; 0.01 AS distance_within_tolerance,
+    CASE
+        WHEN expected_top_5[1] = actual_top_5[1]
+         AND ABS(expected_max_distance - actual_top_distance) &lt; 0.01
+        THEN 'PASS'
+        ELSE 'FAIL'
+    END AS result
+FROM validation_results
+ORDER BY test_id;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The distance tolerance check (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">< 0.01</code>) is important: a restored index may produce slightly different distance values due to HNSW's approximate nature and how graph construction is seeded. An exact distance match is neither expected nor required. What matters is that the top result is the correct document and the distance is in the same range — not shifted by a magnitude that indicates a corrupt or mismatched index.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Running Scheduled DR Tests</p>
+
+<p class="text-gray-300 leading-relaxed">The most effective DR test schedule for vector stores is:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Weekly**: Restore a single collection or schema to an isolated test environment. Run validation queries. Tear down. This tests the restore path without touching production.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Monthly**: Full failover simulation — promote the replica, redirect a canary traffic percentage, run validation, failback. This tests the entire runbook including DNS switching.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Quarterly**: Re-embedding drill — take a random sample of 10,000 documents, re-generate embeddings, compare to production embeddings using cosine similarity to verify model consistency.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Scheduled DR test: restore validation environment and run test suite
+
+import subprocess
+import psycopg2
+import logging
+import json
+from datetime import datetime
+
+log = logging.getLogger("dr_test")
+
+
+def restore_test_environment(
+    backup_path: str,
+    test_db_name: str = "vector_dr_test",
+    pg_host: str = "localhost"
+) -&gt; bool:
+    """
+    Create an isolated test database from the latest backup.
+    Uses pg_restore for a custom-format dump, or psql for SQL dumps.
+    """
+    log.info(f"Restoring {backup_path} to {test_db_name}")
+
+    # Drop and recreate the test database
+    subprocess.run(
+        ["psql", "-h", pg_host, "-U", "postgres",
+         "-c", f"DROP DATABASE IF EXISTS {test_db_name}"],
+        check=True
+    )
+    subprocess.run(
+        ["psql", "-h", pg_host, "-U", "postgres",
+         "-c", f"CREATE DATABASE {test_db_name}"],
+        check=True
+    )
+
+    # Restore from backup file
+    result = subprocess.run(
+        ["pg_restore",
+         "-h", pg_host,
+         "-U", "postgres",
+         "-d", test_db_name,
+         "--no-owner",
+         "--no-acl",
+         "-j", "4",       # 4 parallel restore workers
+         backup_path],
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        log.error(f"pg_restore stderr: {result.stderr}")
+        return False
+
+    log.info(f"Restore to {test_db_name} complete")
+    return True
+
+
+def run_dr_validation_suite(
+    test_dsn: str,
+    validation_queries_path: str
+) -&gt; dict:
+    """
+    Load pre-recorded validation cases and run them against the test environment.
+    validation_queries_path: JSON file with list of {label, vector, expected_top_id}
+    """
+    with open(validation_queries_path) as f:
+        test_cases = json.load(f)
+
+    conn = psycopg2.connect(test_dsn)
+    conn.autocommit = True
+    cur = conn.cursor()
+
+    results = {
+        "run_at": datetime.utcnow().isoformat(),
+        "total": len(test_cases),
+        "passed": 0,
+        "failed": 0,
+        "details": []
+    }
+
+    for tc in test_cases:
+        label = tc["label"]
+        vector = tc["query_vector"]
+        expected_id = tc["expected_top_document_id"]
+
+        cur.execute("""
+            SELECT document_id, 1 - (embedding &lt;=&gt; %s::vector) AS similarity
+            FROM document_embeddings
+            ORDER BY embedding &lt;=&gt; %s::vector
+            LIMIT 1
+        """, (vector, vector))
+
+        row = cur.fetchone()
+        if row is None:
+            passed = False
+            detail = {"label": label, "pass": False, "reason": "no results returned"}
+        else:
+            actual_id, similarity = row
+            passed = str(actual_id) == str(expected_id)
+            detail = {
+                "label": label,
+                "pass": passed,
+                "expected_id": expected_id,
+                "actual_id": actual_id,
+                "similarity": round(float(similarity), 4)
+            }
+
+        results["details"].append(detail)
+        if passed:
+            results["passed"] += 1
+        else:
+            results["failed"] += 1
+            log.warning(f"FAIL: {label} — {detail}")
+
+    cur.close()
+    conn.close()
+
+    results["pass_rate"] = round(results["passed"] / max(results["total"], 1) * 100, 1)
+    log.info(
+        f"DR validation: {results['passed']}/{results['total']} passed "
+        f"({results['pass_rate']}%)"
+    )
+    return results
+
+
+def teardown_test_environment(
+    test_db_name: str = "vector_dr_test",
+    pg_host: str = "localhost"
+) -&gt; None:
+    """Remove the test database after validation."""
+    subprocess.run(
+        ["psql", "-h", pg_host, "-U", "postgres",
+         "-c", f"DROP DATABASE IF EXISTS {test_db_name}"],
+        check=True
+    )
+    log.info(f"Test environment {test_db_name} removed")
+
+
+def weekly_dr_test(config: dict) -&gt; dict:
+    """
+    Full DR test pipeline: restore, validate, teardown, report.
+    Designed to run from a scheduled job (cron, Airflow, etc.).
+    """
+    report = {
+        "test_date": datetime.utcnow().isoformat(),
+        "restore_ok": False,
+        "validation": None,
+        "overall_pass": False
+    }
+
+    try:
+        restored = restore_test_environment(
+            backup_path=config["latest_backup_path"],
+            test_db_name=config.get("test_db_name", "vector_dr_test"),
+            pg_host=config.get("pg_host", "localhost")
+        )
+        report["restore_ok"] = restored
+
+        if restored:
+            validation = run_dr_validation_suite(
+                test_dsn=config["test_dsn"],
+                validation_queries_path=config["validation_queries_path"]
+            )
+            report["validation"] = validation
+            report["overall_pass"] = (
+                restored and validation["pass_rate"] &gt;= config.get("min_pass_rate", 95.0)
+            )
+
+    finally:
+        teardown_test_environment(
+            test_db_name=config.get("test_db_name", "vector_dr_test"),
+            pg_host=config.get("pg_host", "localhost")
+        )
+
+    # Write report to file for audit trail
+    report_path = (
+        f"/var/log/dr_tests/vector_dr_{datetime.utcnow().strftime('%Y%m%d')}.json"
+    )
+    with open(report_path, "w") as f:
+        json.dump(report, f, indent=2, default=str)
+
+    log.info(f"DR test report written to {report_path}")
+    return report</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min_pass_rate</code> threshold of 95% acknowledges that HNSW is an approximate index: a small percentage of queries may return a slightly different result set after restore due to non-deterministic graph construction during index rebuild. A 100% pass rate requirement would produce false failures. Define your acceptable approximate search tolerance in advance and encode it here.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Synchronizing Vector Stores with Source Systems After Recovery</h3>
+
+<p class="text-gray-300 leading-relaxed">One scenario that is easy to overlook in DR planning is the case where the vector store recovers successfully but the source system recovers to a different point in time — or vice versa. This creates semantic drift: the vector index contains embeddings for documents that no longer exist in the source, or the source has documents that have never been embedded.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Post-recovery drift detection: find documents in source that lack embeddings
+-- Run this after any recovery event to identify re-embedding backlog
+
+WITH source_docs AS (
+    SELECT id, updated_at
+    FROM documents
+    WHERE deleted_at IS NULL
+),
+embedded_docs AS (
+    SELECT DISTINCT document_id, MAX(updated_at) AS last_embedded_at
+    FROM document_embeddings
+    GROUP BY document_id
+)
+SELECT
+    sd.id AS document_id,
+    sd.updated_at AS source_updated_at,
+    ed.last_embedded_at,
+    CASE
+        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
+        WHEN sd.updated_at &gt; ed.last_embedded_at + INTERVAL '5 minutes'
+             THEN 'STALE_EMBEDDING'
+        ELSE 'OK'
+    END AS drift_status
+FROM source_docs sd
+LEFT JOIN embedded_docs ed ON sd.id = ed.document_id
+WHERE
+    ed.document_id IS NULL
+    OR sd.updated_at &gt; ed.last_embedded_at + INTERVAL '5 minutes'
+ORDER BY sd.updated_at DESC;
+
+-- Count by drift category for an at-a-glance recovery health check
+WITH source_docs AS (
+    SELECT id, updated_at FROM documents WHERE deleted_at IS NULL
+),
+embedded_docs AS (
+    SELECT DISTINCT document_id, MAX(updated_at) AS last_embedded_at
+    FROM document_embeddings GROUP BY document_id
+)
+SELECT
+    CASE
+        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
+        WHEN sd.updated_at &gt; ed.last_embedded_at + INTERVAL '5 minutes'
+             THEN 'STALE_EMBEDDING'
+        ELSE 'OK'
+    END AS drift_status,
+    COUNT(*) AS document_count
+FROM source_docs sd
+LEFT JOIN embedded_docs ed ON sd.id = ed.document_id
+GROUP BY 1
+ORDER BY 2 DESC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent (using SQL Server with a vector extension or hybrid architecture
+-- where SQL Server is the source system and pgvector/external store holds embeddings)
+
+-- Post-recovery drift detection: documents in SQL Server source without embeddings
+WITH SourceDocs AS (
+    SELECT id, updated_at
+    FROM dbo.documents
+    WHERE deleted_at IS NULL
+),
+EmbeddedDocs AS (
+    SELECT document_id, MAX(updated_at) AS last_embedded_at
+    FROM dbo.embedding_sync_log          -- sync log maintained by embedding pipeline
+    GROUP BY document_id
+)
+SELECT
+    sd.id AS document_id,
+    sd.updated_at AS source_updated_at,
+    ed.last_embedded_at,
+    CASE
+        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
+        WHEN sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
+             THEN 'STALE_EMBEDDING'
+        ELSE 'OK'
+    END AS drift_status
+FROM SourceDocs sd
+LEFT JOIN EmbeddedDocs ed ON sd.id = ed.document_id
+WHERE
+    ed.document_id IS NULL
+    OR sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
+ORDER BY sd.updated_at DESC;
+
+-- Summary count
+WITH SourceDocs AS (
+    SELECT id, updated_at FROM dbo.documents WHERE deleted_at IS NULL
+),
+EmbeddedDocs AS (
+    SELECT document_id, MAX(updated_at) AS last_embedded_at
+    FROM dbo.embedding_sync_log
+    GROUP BY document_id
+)
+SELECT
+    CASE
+        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
+        WHEN sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
+             THEN 'STALE_EMBEDDING'
+        ELSE 'OK'
+    END AS drift_status,
+    COUNT(*) AS document_count
+FROM SourceDocs sd
+LEFT JOIN EmbeddedDocs ed ON sd.id = ed.document_id
+GROUP BY
+    CASE
+        WHEN ed.document_id IS NULL THEN 'MISSING_EMBEDDING'
+        WHEN sd.updated_at &gt; DATEADD(MINUTE, 5, ed.last_embedded_at)
+             THEN 'STALE_EMBEDDING'
+        ELSE 'OK'
+    END
+ORDER BY document_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">After drift detection, feed the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MISSING_EMBEDDING</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">STALE_EMBEDDING</code> document IDs back into the re-embedding pipeline shown in the previous section. The pipeline's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO UPDATE</code> upsert logic handles both new insertions and updates without special-casing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">DR Runbook Checklist</h3>
+
+<p class="text-gray-300 leading-relaxed">Operational runbooks should be concise enough to use under pressure. This is the condensed checklist version of everything in this chapter:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Before any failure (preparation):</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Backup schedule established with RPO clearly documented</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Backup restore tested within the last 30 days</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] DR validation query corpus populated and stored</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Replication lag monitoring alerts configured (alert at > 60s, page at > 300s)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] DNS TTL for vector store endpoint set to ≤ 60 seconds</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Index rebuild time estimated and incorporated into RTO SLA</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Re-embedding pipeline tested with checkpointing verified</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Source-to-vector-store sync watermark table in place</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">During failover:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Confirm primary region is unreachable (do not fail over on transient issues)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Check DR replica replication lag — do not promote if lag exceeds RTO tolerance</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Promote replica / restore from backup</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Update DNS / load balancer target</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Run validation query suite — do not open traffic until pass rate ≥ threshold</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Run drift detection query — quantify the re-embedding backlog</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Start re-embedding pipeline for drifted documents (background job)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Notify downstream teams of RPO impact (data as-of timestamp)</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">After failover:</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Establish new replication from DR primary to a new standby</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Schedule new backup immediately (failover cluster has no recent backup)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Document the incident timeline and actual RPO/RTO achieved</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> [ ] Update RTO estimates in Table 35.2 based on observed rebuild times</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embeddings are primary data, not cache.** The cost and time to regenerate a large vector corpus from source text makes vectors as recovery-critical as the transactional data they were derived from. Treat backup frequency and retention accordingly.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index rebuild is a hidden RTO multiplier for pgvector.** Unlike managed vector databases that persist HNSW indexes through restore, pgvector rebuilds indexes from heap data after restore. For datasets in the tens of millions of rows, this can extend RTO by 8–16 hours beyond infrastructure recovery time, making hot standby replication the preferred HA strategy at scale.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Synchronization with source systems is a first-class DR concern.** Because vector stores are derived from upstream content, a recovery plan that restores the vector index to a different point in time than the source database creates semantic drift — documents that exist in search results but not in the source, or source documents whose embeddings reflect outdated content. Post-recovery drift detection and targeted re-embedding are mandatory steps in any complete runbook.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Validation after restore must test similarity correctness, not just availability.** A restored vector index can return HTTP 200 and still produce incorrect results due to corrupt graph state, model mismatch, or partial restore. Pre-recording known-good query/result pairs and verifying them post-restore — with tolerance for HNSW's approximate nature — is the only reliable way to confirm a restore was successful.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Checkpointed re-embedding pipelines eliminate the catastrophic restart problem.** Multi-hour embedding regeneration jobs without checkpointing mean any failure requires starting from zero. Persisting a `last_processed_id` watermark after each committed batch caps the repeated work on resume to at most one checkpoint interval, turning a potentially day-long re-run into a recovery measured in minutes.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -6,6 +6,10 @@
   <title>Chapter 34: Access Control on Vector Data — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 34: Access Control on Vector Data. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -58,6 +62,18 @@
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Metadata exposure.</strong> Most vector databases store metadata payloads alongside embeddings. The embedding itself may be meaningless to an attacker, but the metadata often contains document titles, author IDs, timestamps, and excerpts. Access control that secures the embedding but exposes the payload is incomplete.</p>
 
 <p class="text-gray-300 leading-relaxed">The practical architecture for addressing these challenges combines three layers: storage-level isolation (namespaces and collections), query-time filtering (metadata predicates applied before returning results), and application-level enforcement (authorization checks before the vector query is even dispatched).</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Query request] --> B[Verified identity<br/>JWT / token]
+    B --> C[Storage-level isolation:<br/>namespace / collection / RLS]
+    C --> D[Query-time filtering:<br/>classification metadata predicate]
+    D --> E[Application-layer verification:<br/>defense-in-depth re-check]
+    E --> F[Audit log write]
+    F --> G[Results returned]
+    style C fill:#e3f2fd
+    style D fill:#e3f2fd
+    style E fill:#e3f2fd</pre></div>
+<p class="text-gray-300 leading-relaxed">*No single layer is sufficient alone — a misconfiguration in one is caught by the next.*</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -328,7 +344,7 @@ async def search_documents(
     results = query_for_tenant(tenant_id, query, top_k=top_k)
     return {"results": results, "tenant": tenant_id}</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate</strong> organizes data into classes (schema types) and supports multi-tenancy as a first-class feature. In Weaviate v1.17+, tenant isolation can be enabled at the class level, after which each tenant's data is stored in separate segments and queries must specify a tenant key:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate</strong> organizes data into classes (schema types) and supports multi-tenancy as a first-class feature. In modern Weaviate versions, tenant isolation can be enabled at the class level, after which each tenant's data is stored in separate segments and queries must specify a tenant key:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
 import weaviate
@@ -516,6 +532,539 @@ def authorized_search(
 <p class="text-gray-300 leading-relaxed">3. Injects the appropriate vector DB API key into the upstream request</p>
 <p class="text-gray-300 leading-relaxed">4. Logs the operation for audit</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Centralized credential and namespace management
+import boto3
+import json
+from dataclasses import dataclass
+from enum import Enum
+
+class VectorOperation(Enum):
+    READ = "read"
+    WRITE = "write"
+    DELETE = "delete"
+    ADMIN = "admin"
+
+@dataclass
+class VectorAccess:
+    tenant_namespace: str
+    permitted_operations: list[VectorOperation]
+    classification_ceiling: str  # maximum classification this credential can access
+
+class VectorAccessController:
+    """
+    Mediates all vector database access.
+    API keys are stored in AWS Secrets Manager.
+    Access decisions are driven by IAM role of the calling service.
+    """
+    
+    def __init__(self):
+        self.secrets_client = boto3.client("secretsmanager", region_name="us-east-1")
+        self._key_cache = {}
+    
+    def _get_pinecone_key(self, key_type: str = "app") -&gt; str:
+        """Retrieve Pinecone API key from Secrets Manager."""
+        secret_name = f"vector-db/pinecone/{key_type}"
+        if secret_name not in self._key_cache:
+            response = self.secrets_client.get_secret_value(SecretId=secret_name)
+            secret = json.loads(response["SecretString"])
+            self._key_cache[secret_name] = secret["api_key"]
+        return self._key_cache[secret_name]
+    
+    def get_access_context(self, jwt_payload: dict) -&gt; VectorAccess:
+        """
+        Map a verified JWT to a VectorAccess context.
+        The JWT comes from your IdP (Okta, Auth0, Cognito, etc.)
+        """
+        tenant_id = jwt_payload["tenant_id"]
+        user_roles = jwt_payload.get("roles", [])
+        
+        # Determine permitted operations from roles
+        ops = [VectorOperation.READ]
+        if "data-engineer" in user_roles or "service-account" in user_roles:
+            ops.append(VectorOperation.WRITE)
+        if "data-admin" in user_roles:
+            ops.append(VectorOperation.DELETE)
+        if "vector-admin" in user_roles:
+            ops.append(VectorOperation.ADMIN)
+        
+        # Determine classification ceiling from clearance attribute
+        clearance = jwt_payload.get("clearance_level", 1)
+        ceiling_map = {1: "public", 2: "internal", 3: "confidential", 4: "restricted"}
+        classification_ceiling = ceiling_map.get(clearance, "public")
+        
+        return VectorAccess(
+            tenant_namespace=tenant_id,
+            permitted_operations=ops,
+            classification_ceiling=classification_ceiling
+        )
+    
+    def can_perform(self, access: VectorAccess, operation: VectorOperation) -&gt; bool:
+        return operation in access.permitted_operations
+    
+    def execute_query(
+        self,
+        access: VectorAccess,
+        query_vector: list[float],
+        top_k: int = 10
+    ) -&gt; list[dict]:
+        """
+        Execute a read operation if the access context permits it.
+        The Pinecone API key is retrieved from Secrets Manager,
+        never passed through the calling code.
+        """
+        if not self.can_perform(access, VectorOperation.READ):
+            raise PermissionError(f"Tenant {access.tenant_namespace} lacks READ permission")
+        
+        api_key = self._get_pinecone_key(key_type="app")
+        pc = Pinecone(api_key=api_key)
+        index = pc.Index("document-store")
+        
+        # Classification filter derived from access context, not caller input
+        classification_filter = self._classification_filter(access.classification_ceiling)
+        
+        results = index.query(
+            vector=query_vector,
+            top_k=top_k,
+            namespace=access.tenant_namespace,
+            filter=classification_filter,
+            include_metadata=True
+        )
+        
+        return [
+            {
+                "id": match.id,
+                "score": match.score,
+                "content": match.metadata.get("content", ""),
+                "classification": match.metadata.get("classification", "")
+            }
+            for match in results.matches
+        ]
+    
+    def _classification_filter(self, ceiling: str) -&gt; dict:
+        allowed = {
+            "public": ["public"],
+            "internal": ["public", "internal"],
+            "confidential": ["public", "internal", "confidential"],
+            "restricted": ["public", "internal", "confidential", "restricted"]
+        }
+        return {"classification": {"$in": allowed.get(ceiling, ["public"])}}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Audit Logging for Vector Queries</h3>
+
+<p class="text-gray-300 leading-relaxed">Access control without audit logging is incomplete. In regulated environments — HIPAA, SOC 2, FedRAMP — you must be able to answer: who queried what, when, and what did they receive? For vector databases this is non-trivial because the query is a floating-point vector and the result is a ranked list, neither of which is easily stored in a traditional audit log.</p>
+
+<p class="text-gray-300 leading-relaxed">A practical audit schema stores the semantic query (the text before embedding), the resolved tenant and access context, and enough result metadata to reconstruct what was exposed without storing the full document contents:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL audit log table
+CREATE TABLE vector_query_audit (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    occurred_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    tenant_id       TEXT NOT NULL,
+    user_id         TEXT NOT NULL,
+    query_text      TEXT,               -- the original natural language query
+    query_hash      TEXT,               -- SHA-256 of the embedding for deduplication
+    top_k           INTEGER,
+    namespace       TEXT,
+    classification_ceiling  TEXT,
+    result_count    INTEGER,
+    result_ids      TEXT[],             -- IDs of returned documents
+    result_scores   FLOAT[],            -- similarity scores
+    request_ip      INET,
+    user_agent      TEXT,
+    duration_ms     INTEGER
+);
+
+-- Index for compliance queries
+CREATE INDEX ON vector_query_audit (tenant_id, occurred_at DESC);
+CREATE INDEX ON vector_query_audit (user_id, occurred_at DESC);
+
+-- Retention policy: audit rows are append-only
+-- Use pg_partman or a cron job to archive/drop old partitions
+ALTER TABLE vector_query_audit ENABLE ROW LEVEL SECURITY;
+
+-- Only audit readers (compliance role) and service accounts can read audit rows
+CREATE POLICY audit_read ON vector_query_audit
+    FOR SELECT
+    TO compliance_role, service_role
+    USING (true);
+
+-- Application role can only insert, never update or delete
+CREATE POLICY audit_insert ON vector_query_audit
+    FOR INSERT
+    TO app_role
+    WITH CHECK (true);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Audit logging wrapper around vector search
+import hashlib
+import time
+import psycopg2
+from contextlib import contextmanager
+
+class AuditedVectorSearch:
+    def __init__(self, vector_client, audit_db_conn_string: str):
+        self.vector_client = vector_client
+        self.audit_conn_string = audit_db_conn_string
+    
+    def search(
+        self,
+        tenant_id: str,
+        user_id: str,
+        query_text: str,
+        query_vector: list[float],
+        namespace: str,
+        classification_ceiling: str,
+        top_k: int = 10,
+        request_ip: str = None,
+        user_agent: str = None
+    ) -&gt; list[dict]:
+        start = time.monotonic()
+        
+        # Compute query fingerprint for deduplication analysis
+        query_hash = hashlib.sha256(
+            bytes(str(query_vector), "utf-8")
+        ).hexdigest()
+        
+        # Execute vector search
+        results = self.vector_client.execute_query(
+            access=VectorAccess(
+                tenant_namespace=tenant_id,
+                permitted_operations=[VectorOperation.READ],
+                classification_ceiling=classification_ceiling
+            ),
+            query_vector=query_vector,
+            top_k=top_k
+        )
+        
+        duration_ms = int((time.monotonic() - start) * 1000)
+        
+        # Write audit record — this happens regardless of result content
+        self._write_audit(
+            tenant_id=tenant_id,
+            user_id=user_id,
+            query_text=query_text,
+            query_hash=query_hash,
+            top_k=top_k,
+            namespace=namespace,
+            classification_ceiling=classification_ceiling,
+            result_count=len(results),
+            result_ids=[r["id"] for r in results],
+            result_scores=[r["score"] for r in results],
+            request_ip=request_ip,
+            user_agent=user_agent,
+            duration_ms=duration_ms
+        )
+        
+        return results
+    
+    def _write_audit(self, **kwargs) -&gt; None:
+        with psycopg2.connect(self.audit_conn_string) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO vector_query_audit (
+                        tenant_id, user_id, query_text, query_hash,
+                        top_k, namespace, classification_ceiling,
+                        result_count, result_ids, result_scores,
+                        request_ip, user_agent, duration_ms
+                    ) VALUES (
+                        %(tenant_id)s, %(user_id)s, %(query_text)s, %(query_hash)s,
+                        %(top_k)s, %(namespace)s, %(classification_ceiling)s,
+                        %(result_count)s, %(result_ids)s, %(result_scores)s,
+                        %(request_ip)s, %(user_agent)s, %(duration_ms)s
+                    )
+                """, kwargs)
+            conn.commit()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One important design decision: whether to log the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_text</code> (the natural language query before embedding) depends on your data classification policy. In some environments, the query itself — "show me documents about patient discharge against medical advice" — is as sensitive as the returned content. In those cases, log only the hash, and ensure the hash-to-text mapping is stored in a separate, higher-classification system accessible only to the compliance team.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Sensitive Data in Embedding Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">Access control at the vector database level is the last line of defense. The embedding pipeline — where raw text is converted to vectors — is an earlier and often overlooked attack surface. If your pipeline sends data to a third-party embedding API (OpenAI, Cohere, Google), that data leaves your security boundary.</p>
+
+<p class="text-gray-300 leading-relaxed">The mitigations depend on your threat model:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Private embedding models</strong> eliminate the third-party exposure entirely. Running an open-source model like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> from sentence-transformers on infrastructure you control means the raw text never leaves your network. The embedding quality may differ from frontier models, but for most enterprise retrieval tasks the gap is acceptable.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# On-premises embedding with sentence-transformers
+from sentence_transformers import SentenceTransformer
+import torch
+
+class PrivateEmbedder:
+    """
+    Embed text using a locally-hosted model.
+    No data leaves the network boundary.
+    """
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model = SentenceTransformer(model_name, device=device)
+        self.dimension = self.model.get_sentence_embedding_dimension()
+    
+    def embed(self, texts: list[str]) -&gt; list[list[float]]:
+        embeddings = self.model.encode(
+            texts,
+            batch_size=64,
+            normalize_embeddings=True,  # unit vectors for cosine similarity
+            show_progress_bar=False
+        )
+        return embeddings.tolist()
+    
+    def embed_one(self, text: str) -&gt; list[float]:
+        return self.embed([text])[0]
+
+embedder = PrivateEmbedder()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data masking before embedding</strong> applies when you must use a third-party API but some fields in your documents are sensitive PII or proprietary content. Before sending text to the embedding API, strip or replace the sensitive spans with placeholder tokens:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import re
+
+class DataMaskingPreprocessor:
+    """
+    Remove or replace sensitive patterns before embedding.
+    Masking is irreversible — the stored vector reflects the masked text,
+    so exact-match retrieval on original PII is not possible.
+    Use this only when semantic retrieval on non-PII context is sufficient.
+    """
+    
+    PATTERNS = {
+        "ssn": (r"\b\d{3}-\d{2}-\d{4}\b", "[SSN]"),
+        "credit_card": (r"\b(?:\d{4}[- ]?){3}\d{4}\b", "[CARD]"),
+        "email": (r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b", "[EMAIL]"),
+        "phone": (r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b", "[PHONE]"),
+    }
+    
+    def mask(self, text: str) -&gt; tuple[str, dict]:
+        """
+        Returns masked text and a record of replacements.
+        The replacement record should be stored in your secure vault,
+        not alongside the vector.
+        """
+        replacements = {}
+        masked = text
+        
+        for pattern_name, (pattern, placeholder) in self.PATTERNS.items():
+            matches = re.findall(pattern, masked)
+            if matches:
+                replacements[pattern_name] = matches
+                masked = re.sub(pattern, placeholder, masked)
+        
+        return masked, replacements
+
+preprocessor = DataMaskingPreprocessor()
+masked_text, pii_record = preprocessor.mask(
+    "Contact John at john.doe@acme.com or 555-123-4567 about invoice #A-4492"
+)
+# masked_text: "Contact John at [EMAIL] or [PHONE] about invoice #A-4492"
+# pii_record stored separately in your secrets vault</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">VPC endpoints and private links</strong> are the network-level complement to data masking. AWS PrivateLink for Bedrock, Azure Private Endpoints for Azure OpenAI, and GCP Private Service Connect for Vertex AI all allow your embedding calls to traverse private network paths rather than the public internet, reducing the exposure surface even when using managed embedding APIs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">A Unified Authorization Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Production systems rarely use a single vector database. A typical architecture might use pgvector for low-latency operational queries, Pinecone for high-scale semantic search, and Weaviate for knowledge graph traversal with vector similarity. Each database has its own access control model. Building authorization logic independently for each creates inconsistency and maintenance burden.</p>
+
+<p class="text-gray-300 leading-relaxed">A unified authorization layer abstracts the vector database behind a policy engine that speaks a single language regardless of the underlying store:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from abc import ABC, abstractmethod
+from typing import Protocol
+import opa_client  # Open Policy Agent Python client
+
+class VectorSearchBackend(Protocol):
+    def search(
+        self, 
+        collection: str, 
+        vector: list[float], 
+        filter_: dict,
+        top_k: int
+    ) -&gt; list[dict]: ...
+
+class PineconeBackend:
+    def __init__(self, api_key: str, index_name: str):
+        self.pc = Pinecone(api_key=api_key)
+        self.index = self.pc.Index(index_name)
+    
+    def search(self, collection: str, vector: list[float], filter_: dict, top_k: int) -&gt; list[dict]:
+        results = self.index.query(
+            vector=vector,
+            top_k=top_k,
+            namespace=collection,
+            filter=filter_,
+            include_metadata=True
+        )
+        return [{"id": m.id, "score": m.score, **m.metadata} for m in results.matches]
+
+class QdrantBackend:
+    def __init__(self, url: str, api_key: str):
+        self.client = QdrantClient(url=url, api_key=api_key)
+    
+    def search(self, collection: str, vector: list[float], filter_: dict, top_k: int) -&gt; list[dict]:
+        # Convert unified filter dict to Qdrant filter model
+        qdrant_filter = self._translate_filter(filter_)
+        results = self.client.search(
+            collection_name=collection,
+            query_vector=vector,
+            query_filter=qdrant_filter,
+            limit=top_k,
+            with_payload=True
+        )
+        return [{"id": str(r.id), "score": r.score, **(r.payload or {})} for r in results]
+    
+    def _translate_filter(self, filter_dict: dict) -&gt; Filter | None:
+        if not filter_dict:
+            return None
+        conditions = []
+        for key, value in filter_dict.items():
+            if isinstance(value, list):
+                conditions.append(FieldCondition(key=key, match=MatchAny(any=value)))
+            else:
+                conditions.append(FieldCondition(key=key, match=MatchValue(value=value)))
+        return Filter(must=conditions)
+
+
+class UnifiedVectorAuthority:
+    """
+    Single entry point for all vector search operations.
+    Policy decisions are delegated to Open Policy Agent.
+    Backend selection is driven by routing configuration.
+    """
+    
+    def __init__(self, opa_url: str, backends: dict[str, VectorSearchBackend]):
+        self.opa = opa_client.OpaClient(opa_url)
+        self.backends = backends  # e.g., {"pinecone": PineconeBackend(...), "qdrant": QdrantBackend(...)}
+    
+    def _evaluate_policy(self, identity: dict, resource: dict, action: str) -&gt; dict:
+        """
+        Query OPA for access decision.
+        Returns {"allow": bool, "filter": dict, "redact_fields": list[str]}
+        """
+        input_data = {
+            "identity": identity,
+            "resource": resource,
+            "action": action
+        }
+        result = self.opa.check_policy_rule(
+            policy_name="vector/authz",
+            rule_name="decision",
+            input_data=input_data
+        )
+        return result.get("result", {"allow": False, "filter": {}, "redact_fields": []})
+    
+    def search(
+        self,
+        identity: dict,          # {tenant_id, user_id, roles, clearance_level}
+        backend_name: str,       # "pinecone" | "qdrant" | "pgvector"
+        collection: str,
+        query_vector: list[float],
+        top_k: int = 10
+    ) -&gt; list[dict]:
+        # Step 1: Policy evaluation
+        decision = self._evaluate_policy(
+            identity=identity,
+            resource={"backend": backend_name, "collection": collection},
+            action="vector:search"
+        )
+        
+        if not decision["allow"]:
+            raise PermissionError(
+                f"User {identity['user_id']} is not permitted to search {collection}"
+            )
+        
+        # Step 2: Backend selection and query execution
+        backend = self.backends.get(backend_name)
+        if not backend:
+            raise ValueError(f"Unknown backend: {backend_name}")
+        
+        # filter_ comes from OPA policy, never from caller
+        results = backend.search(
+            collection=collection,
+            vector=query_vector,
+            filter_=decision.get("filter", {}),
+            top_k=top_k
+        )
+        
+        # Step 3: Field-level redaction based on policy output
+        redact_fields = decision.get("redact_fields", [])
+        if redact_fields:
+            results = [
+                {k: ("[REDACTED]" if k in redact_fields else v) for k, v in r.items()}
+                for r in results
+            ]
+        
+        return results</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The OPA policy file that governs these decisions is written in Rego and lives in your policy repository, version-controlled alongside your application code:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># rego
+# policy: vector/authz.rego
+
+package vector.authz
+
+import future.keywords.if
+import future.keywords.in
+
+# Default deny
+default decision = {"allow": false, "filter": {}, "redact_fields": []}
+
+decision = result if {
+    is_allowed
+    result := {
+        "allow": true,
+        "filter": access_filter,
+        "redact_fields": fields_to_redact
+    }
+}
+
+# Allow if tenant matches collection prefix and user has read role
+is_allowed if {
+    startswith(input.resource.collection, input.identity.tenant_id)
+    "read" in input.identity.roles
+    input.action == "vector:search"
+}
+
+# Build the metadata filter from clearance level
+access_filter := filter if {
+    level := input.identity.clearance_level
+    allowed := classification_for_level[level]
+    filter := {"classification": allowed}
+}
+
+classification_for_level := {
+    1: ["public"],
+    2: ["public", "internal"],
+    3: ["public", "internal", "confidential"],
+    4: ["public", "internal", "confidential", "restricted"]
+}
+
+# Redact PII fields for users without the data-steward role
+fields_to_redact := fields if {
+    not "data-steward" in input.identity.roles
+    fields := ["author_email", "author_phone", "employee_id"]
+} else := []</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This architecture provides a clean separation of concerns: the vector database handles geometry, the policy engine handles authorization, and the application handles business logic. Rotating a credential, tightening a classification rule, or adding a new backend requires changes in exactly one place.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector access control requires layered defenses.** Namespace or collection isolation prevents cross-tenant data access at the storage level; metadata filters enforce within-tenant classification controls; application-layer verification catches filter bypass scenarios. No single layer is sufficient on its own.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL RLS integrates directly with pgvector**, but ANN index performance degrades when RLS predicates are applied post-scan. Partition by tenant to ensure the query planner prunes to a single partition before scanning the vector index.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Managed vector databases (Pinecone, Weaviate, Qdrant) have different isolation guarantees.** Weaviate's multi-tenancy model is fail-closed — queries without a tenant key raise an error. Pinecone's namespace model is fail-open — omitting the namespace silently queries the default namespace. Design your application wrapper to enforce namespace injection server-side from a verified identity token, never from client-supplied input.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **API keys should follow least-privilege principles.** Store keys in a secrets manager, scope them to the minimum required operations, and retrieve them at runtime through an authorization proxy rather than distributing them to calling services or clients directly.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Audit logs for vector queries must capture the semantic intent, not just the raw vector.** Log the natural language query text (or its hash if the query itself is sensitive), the resolved access context, the result document IDs, and the similarity scores. This record supports compliance investigations, anomaly detection on unusual query patterns, and incident response when a potential data exposure needs to be scoped.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -6,6 +6,10 @@
   <title>Chapter 18: Autonomous Disaster Recovery — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 18: Autonomous Disaster Recovery. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -393,6 +397,19 @@ class RecoveryDecisionEngine:
 
         return RecoveryAction.ESCALATE_TO_HUMAN</code></pre>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Failure classified] --> B{split_brain?}
+    B -->|reachable| C[FENCE_OLD_PRIMARY]
+    B -->|unreachable| H[ESCALATE_TO_HUMAN]
+    B -->|no| D{DCS quorum healthy?}
+    D -->|no| H
+    D -->|yes| E{sync replica available<br/>and within RPO?}
+    E -->|yes| F[PROMOTE_SYNC_REPLICA]
+    E -->|no| G{async replica available<br/>and within RPO?}
+    G -->|yes| I[PROMOTE_ASYNC_REPLICA<br/>with data-loss ack]
+    G -->|no| H</pre></div>
+<p class="text-gray-300 leading-relaxed">*The recovery decision engine's mapping from failure class and topology state to action — every path that would exceed RPO without pre-authorization terminates in human escalation, never a silent promotion.*</p>
+
 <p class="text-gray-300 leading-relaxed">Notice the deliberate conservatism: the engine escalates to a human whenever data loss would exceed the RPO and a human sign-off was not pre-authorized. This reflects a core ADE principle — <strong class="text-white">autonomous systems must have explicit permission to cause data loss, not implicit permission by default.</strong> In practice, you can configure a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">data_loss_authorized: true</code> flag per environment (acceptable in a dev/staging cluster, never in production without an SLA change).</p>
 
 <p class="text-gray-300 leading-relaxed">The fencing action deserves special attention. Promoting a replica while the original primary is still reachable and accepting writes produces split-brain. The fence step must shoot the old primary in the head (STONITH — Shoot The Other Node In The Head) before completing promotion. On bare metal or VM infrastructure this is a power fence via IPMI/BMC. On cloud infrastructure it is an API call:</p>
@@ -438,6 +455,761 @@ def fence_ec2_instance(instance_id: str, region: str) -&gt; bool:
 
 <p class="text-gray-300 leading-relaxed">For PostgreSQL with pgBackRest, the autonomous validation pipeline looks like:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Autonomous backup validation script — runs on isolated restore host
+# Triggered by cron or Kubernetes CronJob every 6 hours
+
+set -euo pipefail
+
+RESTORE_TARGET_HOST="restore-validator.internal"
+RESTORE_DATA_DIR="/data/restore-validate"
+STANZA="pg-production"
+ALERT_WEBHOOK="${PAGERDUTY_WEBHOOK_URL}"
+SLACK_WEBHOOK="${SLACK_OPS_WEBHOOK}"
+
+log() { echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*"; }
+
+# Step 1: Clean restore target
+log "Clearing previous restore at ${RESTORE_DATA_DIR}"
+rm -rf "${RESTORE_DATA_DIR}"
+mkdir -p "${RESTORE_DATA_DIR}"
+
+# Step 2: Restore latest backup
+log "Starting pgBackRest restore for stanza ${STANZA}"
+RESTORE_START=$(date +%s)
+
+pgbackrest restore \
+  --stanza="${STANZA}" \
+  --pg1-path="${RESTORE_DATA_DIR}" \
+  --type=default \
+  --log-level-console=info \
+  --process-max=4 \
+  --recovery-option="recovery_target_action=promote"
+
+RESTORE_END=$(date +%s)
+RESTORE_DURATION=$((RESTORE_END - RESTORE_START))
+log "Restore completed in ${RESTORE_DURATION} seconds"
+
+# Step 3: Start PostgreSQL on restore host (non-production port)
+pg_ctl -D "${RESTORE_DATA_DIR}" -o "-p 5433" start
+sleep 10   # allow startup
+
+# Step 4: Validate integrity
+PSQL="psql -h localhost -p 5433 -U postgres"
+
+CHECKSUM_RESULT=$($PSQL -c "SELECT pg_catalog.pg_verify_checksums('${RESTORE_DATA_DIR}');" -t 2&gt;&1 || echo "FAILED")
+TABLE_COUNT=$($PSQL -c "SELECT count(*) FROM information_schema.tables WHERE table_schema='public';" -t 2&gt;&1)
+
+# Step 5: Validate RPO — how old is the restored data?
+LATEST_LSN=$($PSQL -c "SELECT pg_current_wal_lsn();" -t)
+DB_TIME=$($PSQL -c "SELECT now();" -t)
+CURRENT_TIME=$(date -u +%s)
+DB_EPOCH=$($PSQL -c "SELECT EXTRACT(EPOCH FROM now())::bigint;" -t)
+RPO_SECONDS=$((CURRENT_TIME - DB_EPOCH))
+
+log "Restore validation: checksum=${CHECKSUM_RESULT}, tables=${TABLE_COUNT}, RPO_seconds=${RPO_SECONDS}"
+
+# Step 6: Emit metrics to Prometheus pushgateway
+cat &lt;&lt;EOF | curl --data-binary @- http://pushgateway.internal:9091/metrics/job/backup_validation
+# TYPE backup_restore_duration_seconds gauge
+backup_restore_duration_seconds{stanza="${STANZA}"} ${RESTORE_DURATION}
+# TYPE backup_rpo_seconds gauge
+backup_rpo_seconds{stanza="${STANZA}"} ${RPO_SECONDS}
+# TYPE backup_validation_success gauge
+backup_validation_success{stanza="${STANZA}"} $([ "$CHECKSUM_RESULT" != "FAILED" ] && echo 1 || echo 0)
+EOF
+
+# Step 7: Alert if validation failed
+if [ "$CHECKSUM_RESULT" = "FAILED" ] || [ "$RPO_SECONDS" -gt 28800 ]; then
+    log "VALIDATION FAILED — alerting ops"
+    curl -s -X POST "${ALERT_WEBHOOK}" \
+      -H "Content-Type: application/json" \
+      -d "{\"severity\": \"critical\", \"summary\": \"Backup validation failed for stanza ${STANZA}\", \"rpo_seconds\": ${RPO_SECONDS}, \"checksum\": \"${CHECKSUM_RESULT}\"}"
+fi
+
+# Step 8: Shut down restore instance
+pg_ctl -D "${RESTORE_DATA_DIR}" stop -m fast
+log "Restore validation complete"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SQL Server equivalent uses T-SQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE VERIFYONLY</code> for rapid validation before committing to a full restore, then moves to a full shadow restore on a scheduled basis:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Rapid backup file verification (run every backup cycle)
+RESTORE VERIFYONLY
+FROM DISK = N'\\backup-share\AppDB\AppDB_FULL_20240115.bak'
+WITH
+    CHECKSUM,
+    STATS = 10;
+
+-- Full shadow restore to validation instance (scheduled, separate from production)
+RESTORE DATABASE [AppDB_Validate]
+FROM DISK = N'\\backup-share\AppDB\AppDB_FULL_20240115.bak'
+WITH
+    MOVE N'AppDB_data' TO N'D:\ValidateData\AppDB_validate.mdf',
+    MOVE N'AppDB_log'  TO N'D:\ValidateData\AppDB_validate.ldf',
+    NORECOVERY,
+    STATS = 5;
+
+-- Apply latest differential
+RESTORE DATABASE [AppDB_Validate]
+FROM DISK = N'\\backup-share\AppDB\AppDB_DIFF_20240115.bak'
+WITH
+    NORECOVERY,
+    STATS = 5;
+
+-- Apply log chain to bring within RPO
+RESTORE DATABASE [AppDB_Validate]
+FROM DISK = N'\\backup-share\AppDB\AppDB_LOG_20240115_2300.trn'
+WITH
+    RECOVERY,
+    STOPAT = '2024-01-15T23:59:59',
+    STATS = 5;
+
+-- Validate table counts and row counts post-restore
+USE [AppDB_Validate];
+SELECT
+    t.name AS table_name,
+    p.rows AS estimated_row_count
+FROM sys.tables t
+JOIN sys.partitions p
+    ON t.object_id = p.object_id
+WHERE p.index_id IN (0, 1)
+ORDER BY p.rows DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The shadow restore must run on a separate isolated instance — not a test schema on the production server. Restoring to the same instance risks corrupting production configuration, and the performance overhead of a large restore can degrade production query throughput.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Point-in-Time Recovery Automation</h3>
+
+<p class="text-gray-300 leading-relaxed">When data corruption or logical error is detected, the recovery action from the decision engine is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE_FROM_BACKUP</code>. Autonomous PITR must select the correct recovery target — not simply "restore the latest backup" but "restore to the point immediately before the corruption event was first detected."</p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous PITR pipeline needs three inputs:</p>
+<p class="text-gray-300 leading-relaxed">1. The corruption detection timestamp (from the monitoring system)</p>
+<p class="text-gray-300 leading-relaxed">2. The backup catalog (pgBackRest info or SQL Server msdb history)</p>
+<p class="text-gray-300 leading-relaxed">3. The WAL/log archive to replay forward from the backup</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — Autonomous PITR selection:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import subprocess
+import json
+import datetime
+import logging
+
+logger = logging.getLogger("autonomous_pitr")
+
+def select_pitr_target(corruption_detected_at: datetime.datetime, stanza: str) -&gt; dict:
+    """
+    Select the appropriate backup and PITR target for autonomous restoration.
+    Returns a dict with backup_label, recovery_target_time, and estimated_restore_minutes.
+    corruption_detected_at: timezone-aware datetime of first corruption signal
+    """
+    # Add safety margin — restore to 5 minutes before detection
+    # to avoid restoring to a point that might already contain corruption
+    target_time = corruption_detected_at - datetime.timedelta(minutes=5)
+
+    # Query pgBackRest backup catalog
+    result = subprocess.run(
+        ["pgbackrest", "--stanza", stanza, "--output", "json", "info"],
+        capture_output=True, text=True, check=True
+    )
+    catalog = json.loads(result.stdout)
+
+    # Find the most recent full or differential backup before target_time
+    best_backup = None
+    for stanza_info in catalog:
+        if stanza_info["name"] != stanza:
+            continue
+        for backup in reversed(stanza_info.get("backup", [])):
+            backup_stop_time = datetime.datetime.fromisoformat(
+                backup["timestamp"]["stop"].replace("Z", "+00:00")
+            )
+            if backup_stop_time &lt;= target_time:
+                best_backup = backup
+                break
+
+    if best_backup is None:
+        raise RuntimeError(
+            f"No backup found before corruption target {target_time.isoformat()} "
+            f"in stanza {stanza}"
+        )
+
+    backup_size_gb = best_backup["info"]["size"] / (1024 ** 3)
+    # Estimate using a restore-throughput constant calibrated against your own
+    # storage tier — measure it during a real restore rather than assuming a figure
+    RESTORE_THROUGHPUT_MB_PER_SEC = 200
+    estimated_restore_minutes = (backup_size_gb * 1024) / (RESTORE_THROUGHPUT_MB_PER_SEC * 60)
+
+    logger.info(
+        "Selected backup %s (stopped at %s) for PITR target %s; "
+        "estimated restore time: %.1f minutes",
+        best_backup["label"],
+        best_backup["timestamp"]["stop"],
+        target_time.isoformat(),
+        estimated_restore_minutes
+    )
+
+    return {
+        "backup_label": best_backup["label"],
+        "recovery_target_time": target_time.isoformat(),
+        "estimated_restore_minutes": estimated_restore_minutes,
+        "backup_size_gb": round(backup_size_gb, 2)
+    }
+
+
+def execute_pitr(stanza: str, restore_data_dir: str, recovery_target_time: str) -&gt; bool:
+    """
+    Execute pgBackRest PITR to a specific target time.
+    Returns True on success, False on failure.
+    """
+    logger.info("Executing PITR to %s", recovery_target_time)
+    try:
+        subprocess.run(
+            [
+                "pgbackrest", "restore",
+                "--stanza", stanza,
+                "--pg1-path", restore_data_dir,
+                "--type", "time",
+                "--target", recovery_target_time,
+                "--target-action", "promote",
+                "--recovery-option", "recovery_target_inclusive=false",
+                "--process-max", "4",
+                "--log-level-console", "info"
+            ],
+            check=True
+        )
+        logger.info("PITR restore completed successfully")
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.error("PITR restore failed: %s", exc)
+        return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Autonomous PITR via msdb backup history:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the correct backup set for autonomous PITR
+-- @corruption_time: the timestamp of first detected corruption
+DECLARE @corruption_time DATETIME2 = '2024-01-15T22:47:00';
+DECLARE @pitr_target     DATETIME2 = DATEADD(MINUTE, -5, @corruption_time);
+DECLARE @database_name   NVARCHAR(128) = N'AppDB';
+
+-- Find most recent full backup before PITR target
+SELECT TOP 1
+    bs.backup_set_id,
+    bs.backup_start_date,
+    bs.backup_finish_date,
+    bs.backup_size,
+    bs.compressed_backup_size,
+    bmf.physical_device_name,
+    bs.first_lsn,
+    bs.last_lsn,
+    bs.database_backup_lsn,
+    'FULL' AS backup_type
+FROM msdb.dbo.backupset bs
+JOIN msdb.dbo.backupmediafamily bmf
+    ON bs.media_set_id = bmf.media_set_id
+WHERE bs.database_name = @database_name
+  AND bs.type = 'D'                         -- Full backup
+  AND bs.backup_finish_date &lt;= @pitr_target
+ORDER BY bs.backup_finish_date DESC;
+
+-- Then find the differential and log chain to bring to PITR target
+SELECT
+    bs.backup_set_id,
+    bs.type AS backup_type,
+    bs.backup_start_date,
+    bs.backup_finish_date,
+    bmf.physical_device_name,
+    bs.first_lsn,
+    bs.last_lsn
+FROM msdb.dbo.backupset bs
+JOIN msdb.dbo.backupmediafamily bmf
+    ON bs.media_set_id = bmf.media_set_id
+WHERE bs.database_name = @database_name
+  AND bs.type IN ('I', 'L')                 -- Differential and Log
+  AND bs.backup_finish_date &gt; (
+        SELECT TOP 1 backup_finish_date
+        FROM msdb.dbo.backupset
+        WHERE database_name = @database_name
+          AND type = 'D'
+          AND backup_finish_date &lt;= @pitr_target
+        ORDER BY backup_finish_date DESC
+      )
+  AND bs.backup_start_date &lt;= @pitr_target
+ORDER BY bs.backup_start_date;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once the backup chain is identified, the automated restore script iterates through the results, issuing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE DATABASE ... WITH NORECOVERY</code> for each backup in the chain and a final <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESTORE DATABASE ... WITH RECOVERY, STOPAT = @pitr_target</code> for the last log backup.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Circuit Breakers and Recovery Runbook Orchestration</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous DR without circuit breakers is dangerous. An incorrectly classified failure can trigger a chain of recovery actions that deepens the incident — for example, repeatedly promoting replicas in a loop, or initiating PITR on a database that was actually only experiencing a network hiccup. Circuit breakers impose a hard limit on autonomous action frequency and allow the system to pause and escalate rather than spiral.</p>
+
+<p class="text-gray-300 leading-relaxed">The circuit breaker pattern for DR has three states: <strong class="text-white">Closed</strong> (normal operation, recovery actions allowed), <strong class="text-white">Open</strong> (recovery actions suspended, human required), and <strong class="text-white">Half-Open</strong> (a limited test action is permitted to probe whether conditions have normalized).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
+import threading
+from enum import Enum
+
+class CBState(Enum):
+    CLOSED    = "closed"
+    OPEN      = "open"
+    HALF_OPEN = "half_open"
+
+class DRCircuitBreaker:
+    """
+    Circuit breaker for autonomous DR action execution.
+    
+    failure_threshold: number of failed recovery attempts within window to open
+    recovery_timeout:  seconds in OPEN state before moving to HALF_OPEN
+    action_window:     rolling window in seconds for counting failures
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        recovery_timeout: int = 300,
+        action_window: int = 600
+    ):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout  = recovery_timeout
+        self.action_window     = action_window
+
+        self._state            = CBState.CLOSED
+        self._failure_times: list[float] = []
+        self._opened_at: float = 0.0
+        self._lock             = threading.Lock()
+
+    @property
+    def state(self) -&gt; CBState:
+        with self._lock:
+            if self._state == CBState.OPEN:
+                if time.time() - self._opened_at &gt;= self.recovery_timeout:
+                    self._state = CBState.HALF_OPEN
+                    return CBState.HALF_OPEN
+            return self._state
+
+    def allow_action(self) -&gt; bool:
+        """Returns True if an autonomous recovery action is permitted."""
+        s = self.state
+        return s in (CBState.CLOSED, CBState.HALF_OPEN)
+
+    def record_success(self):
+        with self._lock:
+            self._state = CBState.CLOSED
+            self._failure_times.clear()
+
+    def record_failure(self):
+        now = time.time()
+        with self._lock:
+            # Evict old failures outside the window
+            cutoff = now - self.action_window
+            self._failure_times = [t for t in self._failure_times if t &gt;= cutoff]
+            self._failure_times.append(now)
+
+            if (self._state == CBState.HALF_OPEN
+                    or len(self._failure_times) &gt;= self.failure_threshold):
+                self._state    = CBState.OPEN
+                self._opened_at = now
+
+    def status_dict(self) -&gt; dict:
+        return {
+            "state": self.state.value,
+            "failure_count_in_window": len(self._failure_times),
+            "opened_at": self._opened_at if self._opened_at else None,
+        }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The runbook orchestrator wraps every recovery action in the circuit breaker and emits the result to both the metrics pipeline and the incident management system:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import asyncio
+import logging
+from typing import Callable, Awaitable
+
+logger = logging.getLogger("runbook_orchestrator")
+
+class RunbookOrchestrator:
+
+    def __init__(self, circuit_breaker: DRCircuitBreaker, alert_client):
+        self.cb           = circuit_breaker
+        self.alert_client = alert_client
+
+    async def execute(
+        self,
+        action_name: str,
+        action_fn: Callable[[], Awaitable[bool]],
+        context: dict
+    ) -&gt; bool:
+        """
+        Execute a DR recovery action with circuit breaker protection.
+        action_fn must return True on success, False on failure.
+        """
+        if not self.cb.allow_action():
+            logger.error(
+                "Circuit breaker OPEN — autonomous action %s blocked. "
+                "State: %s", action_name, self.cb.status_dict()
+            )
+            await self.alert_client.page(
+                severity="critical",
+                summary=f"DR circuit breaker open — {action_name} requires human execution",
+                context=context
+            )
+            return False
+
+        logger.info("Executing autonomous DR action: %s | context: %s", action_name, context)
+        try:
+            success = await action_fn()
+            if success:
+                self.cb.record_success()
+                logger.info("Action %s succeeded", action_name)
+                await self.alert_client.notify(
+                    severity="info",
+                    summary=f"Autonomous DR action completed: {action_name}",
+                    context=context
+                )
+            else:
+                self.cb.record_failure()
+                logger.error("Action %s returned failure", action_name)
+                await self.alert_client.page(
+                    severity="high",
+                    summary=f"Autonomous DR action failed: {action_name}",
+                    context=context
+                )
+            return success
+        except Exception as exc:
+            self.cb.record_failure()
+            logger.exception("Action %s raised exception: %s", action_name, exc)
+            await self.alert_client.page(
+                severity="critical",
+                summary=f"Autonomous DR action raised exception: {action_name}",
+                context={**context, "exception": str(exc)}
+            )
+            return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three failures within a 10-minute window opens the circuit breaker for 5 minutes. During that open window, the orchestrator blocks all autonomous actions and pages a human. This prevents the system from executing six failed promotions in a row while the on-call engineer is being woken up. Once the circuit re-enters Half-Open after 5 minutes, it permits one probe action; if that succeeds, the circuit closes and autonomous operation resumes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Post-Recovery Integrity Validation</h3>
+
+<p class="text-gray-300 leading-relaxed">Completing a failover or restore is not recovery — validated recovery is recovery. Autonomous DR systems must execute a post-recovery validation suite before re-admitting application traffic. Traffic re-admission is gated on validation passing, not simply on the database process being reachable.</p>
+
+<p class="text-gray-300 leading-relaxed">The validation suite checks four categories: connectivity, data integrity, replication topology restoration, and application-level smoke tests.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — Post-recovery validation:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1. Connectivity and role check — confirms this is now the primary
+SELECT
+    pg_is_in_recovery()          AS is_standby,
+    pg_postmaster_start_time()   AS postmaster_start,
+    current_setting('cluster_name') AS cluster_name,
+    pg_current_wal_lsn()         AS current_lsn;
+-- is_standby must be FALSE after promotion
+
+-- 2. Replication topology check — confirm new standby is connecting
+SELECT
+    application_name,
+    client_addr,
+    state,
+    sync_state,
+    (sent_lsn - replay_lsn) AS lag_bytes
+FROM pg_stat_replication;
+-- Expect at least one row with state='streaming' within 60 seconds of promotion
+
+-- 3. Data integrity spot check — verify critical tables accessible
+SELECT
+    schemaname,
+    tablename,
+    n_live_tup,
+    n_dead_tup,
+    last_autovacuum,
+    last_autoanalyze
+FROM pg_stat_user_tables
+WHERE schemaname = 'public'
+ORDER BY n_live_tup DESC
+LIMIT 20;
+
+-- 4. Extension and sequence integrity
+SELECT
+    sequence_name,
+    last_value,
+    increment_by
+FROM information_schema.sequences
+WHERE sequence_schema = 'public'
+ORDER BY sequence_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Post-recovery validation:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- 1. AG health check after failover
+SELECT
+    ag.name AS ag_name,
+    ar.replica_server_name,
+    ars.role_desc,
+    ars.operational_state_desc,
+    ars.connected_state_desc,
+    ars.synchronization_health_desc,
+    drs.synchronization_state_desc,
+    drs.log_send_queue_size,
+    drs.redo_queue_size
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar
+    ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars
+    ON ar.replica_id = ars.replica_id
+JOIN sys.dm_hadr_database_replica_states drs
+    ON ar.replica_id = drs.replica_id
+ORDER BY ars.role_desc, ar.replica_server_name;
+
+-- 2. Database consistency check on newly promoted primary
+-- Run after promotion, before re-admitting traffic
+DBCC CHECKDB (N'AppDB') WITH NO_INFOMSGS, ALL_ERRORMSGS;
+
+-- 3. Identity and sequence object integrity
+SELECT
+    OBJECT_SCHEMA_NAME(object_id) AS schema_name,
+    OBJECT_NAME(object_id) AS table_name,
+    last_value,
+    increment_by,
+    is_exhausted
+FROM sys.sequences
+ORDER BY schema_name, table_name;
+
+-- 4. Agent jobs re-enabled check (SQL Agent jobs are disabled on AG secondary)
+SELECT
+    job_id,
+    name,
+    enabled,
+    date_modified
+FROM msdb.dbo.sysjobs
+WHERE enabled = 0
+  AND name NOT LIKE '%_DO_NOT_ENABLE%'
+ORDER BY name;
+-- Jobs that were disabled on secondary must be re-enabled on new primary</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SQL Agent job re-enablement check is one of the most commonly missed post-failover steps in manual DR processes. When a SQL Server AG secondary becomes primary, SQL Agent jobs that were suppressed to prevent double-execution must be automatically re-enabled. This is typically handled by a post-failover alert policy or an automated script that watches for AG role change events and triggers the re-enablement:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous job re-enablement after AG promotion
+-- Triggered by SQL Agent alert on AG role change event (event ID 1480)
+DECLARE @new_role NVARCHAR(60);
+SET @new_role = (
+    SELECT TOP 1 role_desc
+    FROM sys.dm_hadr_availability_replica_states
+    WHERE is_local = 1
+);
+
+IF @new_role = N'PRIMARY'
+BEGIN
+    -- Re-enable all jobs that carry the auto-manage tag in their description
+    UPDATE msdb.dbo.sysjobs
+    SET enabled = 1
+    WHERE enabled = 0
+      AND description LIKE '%AG_AUTO_MANAGE%';
+
+    -- Log the re-enablement
+    EXEC msdb.dbo.sp_add_jobhistory
+        @job_id = NULL,
+        @step_id = 0,
+        @sql_message_id = 0,
+        @sql_severity = 0,
+        @message = 'Autonomous AG failover: re-enabled tagged SQL Agent jobs on new primary',
+        @run_status = 1,
+        @run_date = CONVERT(INT, CONVERT(VARCHAR, GETDATE(), 112)),
+        @run_time = 0;
+END</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The traffic admission gate is a separate component — typically a load balancer health check endpoint or a DNS TTL expiry — that the validation suite controls. Only when all four validation categories pass does the suite signal the load balancer to re-route connections to the new primary. In Kubernetes environments this is a readiness probe endpoint implemented in the database sidecar container; in traditional environments it is a script that updates a HAProxy backend weight or a Route 53 health check status.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Geo-Redundant and Multi-Region Autonomous DR</h3>
+
+<p class="text-gray-300 leading-relaxed">Single-region autonomous DR handles the majority of failure scenarios. Region-level failures — AZ outages, cloud region degradation, network backbone events — require a distinct architecture: geo-redundant replication with an autonomous cross-region election mechanism.</p>
+
+<p class="text-gray-300 leading-relaxed">The fundamental challenge with cross-region autonomous failover is network latency. Synchronous replication across regions introduces write latency equal to the round-trip time between regions. For most regions this is 20–80 ms, which is unacceptable for OLTP workloads with tight SLAs. The production pattern is therefore:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Intra-region:** synchronous replication, automatic failover, RPO = 0</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cross-region:** asynchronous replication, autonomous failover with explicit data-loss acknowledgment, RPO = replication lag at time of failure</li>
+
+<p class="text-gray-300 leading-relaxed">This asymmetric replication design requires the recovery decision engine to know which tier it is operating in. A cross-region failover is always a data-loss event and must be logged as such in the audit trail.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL cross-region replication configuration:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On primary: create a cascading replication slot for the DR region
+SELECT pg_create_physical_replication_slot('dr_region_us_west_2', true, false);
+
+-- Verify slot state before relying on it
+SELECT
+    slot_name,
+    plugin,
+    slot_type,
+    active,
+    confirmed_flush_lsn,
+    (pg_current_wal_lsn() - confirmed_flush_lsn) AS lag_bytes,
+    pg_size_pretty(pg_current_wal_lsn() - confirmed_flush_lsn) AS lag_pretty
+FROM pg_replication_slots
+WHERE slot_name = 'dr_region_us_west_2';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One critical operational detail: replication slots retain WAL segments on the primary until the replica confirms receipt. In a cross-region scenario, if the DR region becomes unreachable for an extended period, WAL accumulates on the primary and can exhaust disk space. Autonomous DR systems must monitor slot lag and automatically drop inactive slots that exceed a WAL accumulation threshold:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous slot health monitor
+-- Run every 5 minutes; drop slots exceeding the WAL accumulation limit
+DO $$
+DECLARE
+    slot_rec RECORD;
+    max_lag_bytes BIGINT := 10737418240;  -- 10 GB WAL accumulation limit
+    lag BIGINT;
+BEGIN
+    FOR slot_rec IN
+        SELECT slot_name, active,
+               (pg_current_wal_lsn() - confirmed_flush_lsn) AS lag_bytes
+        FROM pg_replication_slots
+        WHERE slot_type = 'physical'
+    LOOP
+        IF NOT slot_rec.active AND slot_rec.lag_bytes &gt; max_lag_bytes THEN
+            RAISE WARNING 'Dropping inactive slot % with lag % bytes exceeding threshold',
+                slot_rec.slot_name, slot_rec.lag_bytes;
+            PERFORM pg_drop_replication_slot(slot_rec.slot_name);
+        END IF;
+    END LOOP;
+END $$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Cross-region AG with asynchronous DR replica:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Add async DR replica to existing synchronous AG
+ALTER AVAILABILITY GROUP [AG_Production]
+ADD REPLICA ON N'sql-dr-west' WITH (
+    ENDPOINT_URL = N'TCP://sql-dr-west.us-west-2.internal:5022',
+    AVAILABILITY_MODE = ASYNCHRONOUS_COMMIT,     -- async — no latency impact on primary
+    FAILOVER_MODE = MANUAL,                       -- cross-region failover requires human or explicit script
+    SEEDING_MODE = AUTOMATIC,
+    SECONDARY_ROLE (ALLOW_CONNECTIONS = READ_ONLY)
+);
+
+-- Monitor cross-region replica lag
+SELECT
+    ar.replica_server_name,
+    drs.database_name,
+    drs.synchronization_state_desc,
+    drs.log_send_queue_size          AS unsent_log_kb,
+    drs.redo_queue_size              AS unredone_log_kb,
+    drs.log_send_rate                AS send_rate_kb_per_sec,
+    drs.redo_rate                    AS redo_rate_kb_per_sec,
+    DATEDIFF(SECOND, drs.last_commit_time, GETUTCDATE()) AS estimated_lag_seconds
+FROM sys.dm_hadr_database_replica_states drs
+JOIN sys.availability_replicas ar
+    ON drs.replica_id = ar.replica_id
+WHERE ar.replica_server_name = N'sql-dr-west'
+  AND drs.is_local = 0;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For cross-region autonomous failover in SQL Server, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FAILOVER_MODE = MANUAL</code> means the failover cluster will not automatically trigger the role change. The autonomous DR script must explicitly issue the failover command after passing the decision engine's data-loss acknowledgment gate:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous cross-region failover script (executed on DR replica)
+-- Requires prior data-loss acknowledgment from decision engine
+
+-- Step 1: Verify this is the DR replica and it is secondary
+IF (SELECT role_desc FROM sys.dm_hadr_availability_replica_states WHERE is_local = 1) != 'SECONDARY'
+BEGIN
+    RAISERROR('This script must run on the secondary DR replica', 16, 1);
+    RETURN;
+END
+
+-- Step 2: Record pre-failover state for audit
+INSERT INTO dbo.dr_audit_log (
+    event_time, event_type, ag_name, replica_name,
+    lag_seconds_at_failover, initiated_by
+)
+SELECT
+    GETUTCDATE(), 'CROSS_REGION_FAILOVER_INITIATED',
+    ag.name, ar.replica_server_name,
+    DATEDIFF(SECOND, drs.last_commit_time, GETUTCDATE()),
+    SYSTEM_USER
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_database_replica_states drs ON ar.replica_id = drs.replica_id
+WHERE drs.is_local = 1;
+
+-- Step 3: Execute forced failover with data loss (explicit acknowledgment)
+ALTER AVAILABILITY GROUP [AG_Production] FORCE_FAILOVER_ALLOW_DATA_LOSS;
+
+-- Step 4: Update listener DNS to point to new primary (via external script call)
+-- xp_cmdshell to route53-update.ps1 or equivalent
+EXEC xp_cmdshell 'powershell.exe -File C:\DR\update-dns-listener.ps1 -AgName AG_Production';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The DNS update step after cross-region failover is frequently overlooked. AG listeners are cluster-aware within a WSFC; across regions they require a separate DNS entry or global load balancer update. The autonomous pipeline must handle this as part of the runbook, not as an afterthought.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability and the DR Simulation Framework</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous DR system that has never been tested is a liability. The simulation framework executes DR scenarios against the production topology on a schedule — not against a separate test environment — but with application traffic isolated to a shadow copy. This is analogous to chaos engineering but with a specific DR focus.</p>
+
+<p class="text-gray-300 leading-relaxed">The DR simulation framework maintains a catalog of scenarios and their expected outcomes:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from dataclasses import dataclass
+from typing import Callable, Awaitable
+
+@dataclass
+class DRScenario:
+    name: str
+    description: str
+    inject_fn: Callable[[], Awaitable[None]]    # fault injection
+    expected_recovery_action: str               # from RecoveryAction enum
+    max_recovery_seconds: int                   # SLO for autonomous recovery
+    validation_fn: Callable[[], Awaitable[bool]] # post-recovery check
+
+DR_SCENARIOS = [
+    DRScenario(
+        name="primary_process_kill",
+        description="Kill PostgreSQL process on primary — expect sync replica promotion within 30s",
+        inject_fn=kill_primary_process,
+        expected_recovery_action="promote_sync_replica",
+        max_recovery_seconds=30,
+        validation_fn=validate_new_primary_accepting_writes
+    ),
+    DRScenario(
+        name="network_partition_primary",
+        description="Block all network traffic to/from primary — expect fencing and promotion",
+        inject_fn=apply_iptables_blackhole_to_primary,
+        expected_recovery_action="fence_old_primary",
+        max_recovery_seconds=60,
+        validation_fn=validate_new_primary_accepting_writes
+    ),
+    DRScenario(
+        name="backup_restore_integrity",
+        description="Execute full PITR to 1 hour ago — validate data matches expected state",
+        inject_fn=no_injection_required,
+        expected_recovery_action="restore_from_backup",
+        max_recovery_seconds=1800,
+        validation_fn=validate_pitr_data_integrity
+    ),
+    DRScenario(
+        name="replication_slot_bloat",
+        description="Pause DR replica for 30 minutes — expect slot drop at WAL accumulation limit",
+        inject_fn=pause_dr_replica_replication,
+        expected_recovery_action="slot_auto_drop",
+        max_recovery_seconds=300,
+        validation_fn=validate_slot_dropped_and_wal_space_recovered
+    ),
+]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Each simulation run produces a DR readiness report: which scenarios passed, which failed, what the actual recovery time was versus the SLO, and whether any circuit breakers opened during the run. This report feeds directly into the incident management system's DR readiness dashboard.</p>
+
+<p class="text-gray-300 leading-relaxed">The observability layer for autonomous DR should expose the following metrics as a minimum:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | Type | Purpose |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_failover_total</code> | Counter | Count of autonomous failovers by type |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_failover_duration_seconds</code> | Histogram | Time from failure detection to traffic restored |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_classification_confidence</code> | Gauge | Current classifier confidence on active signal |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_circuit_breaker_state</code> | Gauge | 0=closed, 1=half-open, 2=open |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_backup_rpo_seconds</code> | Gauge | Age of most recently validated backup restore |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_replication_lag_bytes</code> | Gauge | Current replication lag per replica |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_simulation_last_pass_timestamp</code> | Gauge | Unix timestamp of last passing simulation run |</p>
+
+<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dr_simulation_last_pass_timestamp</code> has not updated in more than 7 days, the system automatically files an incident. A DR system that hasn't been validated recently is not a DR system you can trust for autonomous execution.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Failure classification precedes recovery action.** Treating all failures as "failover" produces wrong recovery paths; a voting-window classifier that waits 10–30 seconds for signal convergence prevents false positives and wrong-class recoveries while keeping RTO within SLO.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RPO is an explicit gate in the decision engine, not an aspiration.** The recovery decision engine must compare actual replication lag bytes against the configured RPO threshold and refuse to promote replicas that exceed it without an explicit pre-authorized data-loss acknowledgment. This transforms RPO from a metric you measure after a disaster into a constraint you enforce before one occurs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Circuit breakers prevent autonomous systems from deepening incidents.** Three failed recovery attempts within a rolling window should open the circuit breaker, block further autonomous action, and escalate to a human — stopping the system from executing a cascade of failed promotions while the on-call engineer is responding.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Continuous shadow restores are the only reliable backup validation.** Verifying backup files with checksums is necessary but not sufficient; only a full autonomous restore to an isolated instance, followed by integrity checks and RPO age measurement, can confirm that your backup chain is actually recoverable when the decision engine selects `RESTORE_FROM_BACKUP`.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Post-recovery validation gates traffic re-admission.** The database process being reachable is not recovery; validated recovery requires confirming primary role, replication topology restoration, data integrity spot checks, and application-level smoke tests — and only after all four pass should the load balancer or DNS be updated to re-admit production traffic.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

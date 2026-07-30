@@ -6,6 +6,10 @@
   <title>Chapter 27: Evaluating RAG Quality: Metrics That Matter — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 27: Evaluating RAG Quality: Metrics That Matter. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -514,6 +518,223 @@ LIMIT 20;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Shadow scoring</strong> runs the evaluation metrics asynchronously on production traffic. For each query, the system logs the question, retrieved chunks, and generated answer to a queue. A background worker submits samples to the RAGAS or DeepEval scorer and writes results to the evaluation schema. This adds zero latency to the user path while providing continuous quality data.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Async shadow scoring with Celery + Redis
+# Logs production queries and evaluates them in the background
+# pip install celery redis ragas langchain-openai psycopg2-binary
+
+from celery import Celery
+import psycopg2
+import json
+import os
+from datetime import datetime
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy
+from datasets import Dataset
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+app = Celery(
+    "shadow_scorer",
+    broker=os.environ["REDIS_URL"],
+    backend=os.environ["REDIS_URL"]
+)
+
+PG_DSN = os.environ["PG_CONNECTION_STRING"]
+
+@app.task(bind=True, max_retries=3)
+def score_production_sample(
+    self,
+    question: str,
+    answer: str,
+    contexts: list,
+    run_id: int
+):
+    """
+    Background task: score a single production query and persist results.
+    Called after the user receives their response—zero latency impact.
+    """
+    try:
+        dataset = Dataset.from_dict({
+            "question": [question],
+            "answer": [answer],
+            "contexts": [contexts],
+            "ground_truth": [""],  # not available for live traffic
+        })
+
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+        embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+
+        # Only faithfulness and answer_relevancy work without ground truth
+        result = evaluate(
+            dataset,
+            metrics=[faithfulness, answer_relevancy],
+            llm=llm,
+            embeddings=embeddings,
+        )
+
+        row = result.to_pandas().iloc[0]
+
+        conn = psycopg2.connect(PG_DSN)
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO rag_eval_sample_results
+                        (run_id, question, generated_answer,
+                         faithfulness, answer_relevancy, hallucinated)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (
+                    run_id,
+                    question,
+                    answer,
+                    float(row["faithfulness"]),
+                    float(row["answer_relevancy"]),
+                    float(row["faithfulness"]) &lt; 0.70,
+                ))
+        conn.close()
+
+    except Exception as exc:
+        raise self.retry(exc=exc, countdown=60)
+
+
+def handle_rag_request(question: str, run_id: int):
+    """
+    Main request handler. Returns answer immediately; scoring is async.
+    """
+    # (retrieval and generation omitted—same as prior examples)
+    retrieved_docs = []        # populate from vector search
+    answer = ""                # populate from LLM
+    contexts = [d.page_content for d in retrieved_docs]
+
+    # Fire-and-forget scoring task
+    score_production_sample.delay(question, answer, contexts, run_id)
+
+    return answer</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Drift detection</strong> is the production monitoring concern that goes beyond individual query scores. As your document corpus updates, as user query patterns shift, or as the underlying LLM is updated by its provider, quality metrics drift. Tracking a rolling 7-day average of faithfulness, answer relevancy, and retrieval precision against the baseline established at deployment lets you detect drift before users file support tickets.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Rolling 7-day average metrics for drift detection
+-- Run this as a scheduled query or materialized view refresh
+
+CREATE MATERIALIZED VIEW rag_quality_rolling_7d AS
+SELECT
+    date_trunc('day', r.run_at) AS eval_day,
+    AVG(s.faithfulness)         AS avg_faithfulness,
+    AVG(s.answer_relevancy)     AS avg_answer_relevancy,
+    SUM(CASE WHEN s.hallucinated THEN 1 ELSE 0 END)::NUMERIC
+        / COUNT(*)              AS hallucination_rate,
+    COUNT(*)                    AS sample_count
+FROM rag_eval_sample_results s
+JOIN rag_eval_runs r ON s.run_id = r.run_id
+WHERE r.run_at &gt;= now() - INTERVAL '90 days'
+GROUP BY date_trunc('day', r.run_at)
+ORDER BY eval_day;
+
+-- Refresh on a schedule (pg_cron or external scheduler)
+-- SELECT cron.schedule('refresh-rag-quality', '0 * * * *',
+--     'REFRESH MATERIALIZED VIEW rag_quality_rolling_7d');
+
+-- Alert query: day where faithfulness dropped below baseline - 0.08
+WITH baseline AS (
+    SELECT AVG(avg_faithfulness) AS baseline_faith
+    FROM rag_quality_rolling_7d
+    WHERE eval_day BETWEEN
+        (SELECT MIN(eval_day) FROM rag_quality_rolling_7d)
+        AND (SELECT MIN(eval_day) FROM rag_quality_rolling_7d) + INTERVAL '14 days'
+)
+SELECT
+    q.eval_day,
+    q.avg_faithfulness,
+    b.baseline_faith,
+    q.avg_faithfulness - b.baseline_faith AS drift
+FROM rag_quality_rolling_7d q
+CROSS JOIN baseline b
+WHERE q.avg_faithfulness &lt; b.baseline_faith - 0.08
+ORDER BY q.eval_day DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building an Evaluation-Driven Development Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">The metrics and tooling described in this chapter only create value when they're wired into the development workflow rather than run as one-off checks. The pattern that works in practice mirrors database change management:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Freeze an evaluation dataset before changing anything.</strong> Before modifying chunk size, swapping embedding models, or adjusting retrieval K, run a baseline evaluation and record the run in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rag_eval_runs</code>. This baseline is your before-state. Without it, you can't compute delta.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Make exactly one change per experiment.</strong> Changing the embedding model and the chunk size simultaneously makes it impossible to attribute score changes. Treat each configuration axis as a controlled variable—the same discipline as changing one query hint at a time during plan tuning.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Use statistical significance for borderline changes.</strong> A faithfulness delta of 0.02 across 50 samples is noise. Across 500 samples it may be signal. Bootstrap confidence intervals on your evaluation metrics before concluding that a change improved or degraded quality.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Bootstrap confidence interval for a metric delta between two eval runs
+import numpy as np
+from typing import List
+
+def bootstrap_ci(
+    scores: List[float],
+    n_bootstrap: int = 2000,
+    ci: float = 0.95
+) -&gt; tuple:
+    """Returns (mean, lower_bound, upper_bound) for a list of per-sample scores."""
+    rng = np.random.default_rng(seed=42)
+    boot_means = [
+        np.mean(rng.choice(scores, size=len(scores), replace=True))
+        for _ in range(n_bootstrap)
+    ]
+    lower = np.percentile(boot_means, (1 - ci) / 2 * 100)
+    upper = np.percentile(boot_means, (1 + ci) / 2 * 100)
+    return float(np.mean(scores)), float(lower), float(upper)
+
+
+def compare_eval_runs(
+    baseline_scores: List[float],
+    candidate_scores: List[float],
+    metric_name: str
+):
+    b_mean, b_lo, b_hi = bootstrap_ci(baseline_scores)
+    c_mean, c_lo, c_hi = bootstrap_ci(candidate_scores)
+    delta = c_mean - b_mean
+
+    # If the candidate's CI lower bound exceeds the baseline mean,
+    # the improvement is statistically reliable at 95% confidence.
+    significant = c_lo &gt; b_mean
+
+    print(f"{metric_name}:")
+    print(f"  Baseline:  {b_mean:.4f} [{b_lo:.4f}, {b_hi:.4f}]")
+    print(f"  Candidate: {c_mean:.4f} [{c_lo:.4f}, {c_hi:.4f}]")
+    print(f"  Delta:     {delta:+.4f}  Significant: {significant}")
+
+
+# Example
+baseline_faithfulness  = [0.82, 0.75, 0.91, 0.68, 0.88]  # expand to 200+ in practice
+candidate_faithfulness = [0.85, 0.79, 0.93, 0.74, 0.90]
+
+compare_eval_runs(baseline_faithfulness, candidate_faithfulness, "faithfulness")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Gate deployments on metric thresholds.</strong> A pipeline version that degrades faithfulness by more than 0.03 or drops recall below 0.70 should not ship without explicit review. Encoding these thresholds in the CI pipeline treats RAG quality with the same rigor as query regression tests—both are quantitative, both are automated, and both block problematic changes before they reach production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">5. Review failure cases, not just aggregate scores.</strong> Aggregate metrics tell you the direction of change; sample-level failure analysis tells you why. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rag_eval_sample_results</code> table sorted by lowest faithfulness is your equivalent of the slow query log: the worst-performing queries reveal systematic patterns—query types where chunking fails, topics where the embedding model underperforms, or question structures that cause the LLM to ignore relevant context.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">A Note on Evaluation Dataset Maintenance</h3>
+
+<p class="text-gray-300 leading-relaxed">Evaluation datasets decay. As the document corpus updates, labeled relevant chunks become stale: a chunk that was the ground-truth answer to a question may be superseded by an updated document, and a new evaluation sample built against the old corpus will give misleading results. Treating the evaluation dataset as a versioned, maintained artifact—not a static file created once—is the difference between evaluation that informs decisions and evaluation that provides false confidence.</p>
+
+<p class="text-gray-300 leading-relaxed">Tag each evaluation dataset version in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rag_eval_runs.eval_dataset_tag</code>. When the corpus undergoes significant updates, schedule a dataset review: re-run the labeled samples against the new corpus to verify that ground-truth chunk IDs still resolve to current content, and retire or update samples whose ground truth has changed. This is maintenance work, but it is the maintenance that keeps the measurement framework honest.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RAG quality has three independent failure modes—retrieval, generation, and correctness—each requiring its own metrics.** Optimizing only end-to-end accuracy without decomposing the pipeline makes root cause analysis slow and unreliable.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Precision@K, Recall@K, and MRR measure the retrieval layer** against a labeled evaluation set. Building that labeled set—200 to 300 question-chunk pairs at minimum—is the prerequisite step most teams skip, and skipping it means flying blind on the component that most directly determines answer quality.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RAGAS and DeepEval automate generation quality scoring** using LLM-as-judge patterns. Faithfulness, answer relevancy, context precision, and context recall each signal a different failure mode; treating them as a diagnostic suite rather than a single composite score localizes problems faster.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storing evaluation results in a relational schema—versioned by pipeline configuration—enables regression detection and trend analysis** with the same SQL queries used for any other time-series data. The `rag_eval_runs` and `rag_eval_sample_results` tables are the RAG equivalent of a slow query log: queryable, actionable, and essential for production discipline.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Shadow scoring and rolling drift detection extend evaluation from offline snapshots to continuous production monitoring.** Firing evaluation tasks asynchronously on live traffic, then aggregating results with a rolling window query, turns quality measurement from a periodic event into an always-on signal—closing the feedback loop between production behavior and pipeline improvements.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 37: Predictive Scaling — The DBA Handbook</title>
   <meta name="description" content="The DBA Handbook Chapter 37: Predictive Scaling. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -19,8 +23,8 @@
       <div class="flex items-center gap-1 text-xs">
         <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
         <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
-        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
-        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../book.html"      class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Books</a>
+        <a href="index.html"        class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Chapters</a>
         <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
         <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
         <a href="../products.html"
@@ -320,16 +324,387 @@ ORDER BY qs.total_logical_reads DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Predictive scaling based on historical patterns works well until the pattern changes. And patterns change constantly in production environments — new features get deployed, marketing campaigns drive unexpected traffic, user behavior shifts seasonally, and external events create demand spikes that no historical model would have anticipated. A predictive scaling system that cannot recognize when reality has diverged from its model will either consistently under-provision for novel events or, worse, over-provision so aggressively to protect against uncertainty that it becomes too expensive to operate.</p>
 
-<p class="text-gray-300 leading-relaxed">The first line of defense against model drift is a feedback loop that continuously compares actual workload measurements against the model's predictions. If the current TPS is persistently running 40% above the P90 baseline for this time slot, that is a signal that either a new traffic</p>
+<p class="text-gray-300 leading-relaxed">The first line of defense against model drift is a feedback loop that continuously compares actual workload measurements against the model's predictions. If the current TPS is persistently running 40% above the P90 baseline for this time slot, that is a signal that either a new traffic pattern has emerged or a one-time anomaly is in progress. The system needs to distinguish between the two, because the correct response is different: a structural shift in traffic patterns should trigger a model update, while a one-time spike should trigger a temporary scale-out without poisoning the baseline.</p>
+
+<p class="text-gray-300 leading-relaxed">A simple but effective approach is to maintain two prediction windows in parallel: a *long-range baseline* built from the full historical retention period, and a *short-range adaptive baseline* built from only the most recent two to three weeks of data. When the two baselines diverge significantly — say, the short-range P90 is more than 30% higher than the long-range P90 for the same day-of-week/hour slot — the system flags a potential trend shift and begins weighting the short-range baseline more heavily in its scaling decisions while also alerting the operations team to investigate.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect model drift: compare short-range vs. long-range P90 baselines
+WITH long_range AS (
+    SELECT
+        EXTRACT(ISODOW FROM captured_at)::INT   AS day_of_week,
+        EXTRACT(HOUR  FROM captured_at)::INT    AS hour_of_day,
+        PERCENTILE_CONT(0.90) WITHIN GROUP
+            (ORDER BY tps_commit)               AS p90_tps_long
+    FROM dba_metrics.workload_snapshots
+    WHERE captured_at &gt;= NOW() - INTERVAL '90 days'
+      AND db_name = 'production_db'
+    GROUP BY 1, 2
+),
+short_range AS (
+    SELECT
+        EXTRACT(ISODOW FROM captured_at)::INT   AS day_of_week,
+        EXTRACT(HOUR  FROM captured_at)::INT    AS hour_of_day,
+        PERCENTILE_CONT(0.90) WITHIN GROUP
+            (ORDER BY tps_commit)               AS p90_tps_short
+    FROM dba_metrics.workload_snapshots
+    WHERE captured_at &gt;= NOW() - INTERVAL '21 days'
+      AND db_name = 'production_db'
+    GROUP BY 1, 2
+)
+SELECT
+    l.day_of_week,
+    l.hour_of_day,
+    ROUND(l.p90_tps_long::NUMERIC,  2)          AS p90_long_range,
+    ROUND(s.p90_tps_short::NUMERIC, 2)          AS p90_short_range,
+    ROUND(((s.p90_tps_short - l.p90_tps_long)
+           / NULLIF(l.p90_tps_long, 0) * 100)::NUMERIC, 1)
+                                                AS pct_drift,
+    CASE
+        WHEN s.p90_tps_short &gt; l.p90_tps_long * 1.3 THEN 'TREND_UP_SIGNIFICANT'
+        WHEN s.p90_tps_short &gt; l.p90_tps_long * 1.1 THEN 'TREND_UP_MINOR'
+        WHEN s.p90_tps_short &lt; l.p90_tps_long * 0.7 THEN 'TREND_DOWN_SIGNIFICANT'
+        ELSE                                          'STABLE'
+    END                                         AS drift_classification
+FROM long_range l
+JOIN short_range s
+    ON l.day_of_week = s.day_of_week
+    AND l.hour_of_day = s.hour_of_day
+WHERE ABS((s.p90_tps_short - l.p90_tps_long)
+          / NULLIF(l.p90_tps_long, 0)) &gt; 0.1
+ORDER BY ABS((s.p90_tps_short - l.p90_tps_long)
+             / NULLIF(l.p90_tps_long, 0)) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect model drift: compare short-range vs. long-range P90 baselines
+WITH long_range AS (
+    SELECT
+        DATEPART(WEEKDAY, captured_at)          AS day_of_week,
+        DATEPART(HOUR, captured_at)             AS hour_of_day,
+        PERCENTILE_CONT(0.90) WITHIN GROUP
+            (ORDER BY batch_requests_sec)
+            OVER (PARTITION BY DATEPART(WEEKDAY, captured_at),
+                               DATEPART(HOUR, captured_at))
+                                                AS p90_long
+    FROM dba_metrics.workload_snapshots
+    WHERE captured_at &gt;= DATEADD(DAY, -90, GETUTCDATE())
+      AND db_name = 'production_db'
+),
+short_range AS (
+    SELECT
+        DATEPART(WEEKDAY, captured_at)          AS day_of_week,
+        DATEPART(HOUR, captured_at)             AS hour_of_day,
+        PERCENTILE_CONT(0.90) WITHIN GROUP
+            (ORDER BY batch_requests_sec)
+            OVER (PARTITION BY DATEPART(WEEKDAY, captured_at),
+                               DATEPART(HOUR, captured_at))
+                                                AS p90_short
+    FROM dba_metrics.workload_snapshots
+    WHERE captured_at &gt;= DATEADD(DAY, -21, GETUTCDATE())
+      AND db_name = 'production_db'
+),
+deduped_long  AS (SELECT DISTINCT day_of_week, hour_of_day, p90_long  FROM long_range),
+deduped_short AS (SELECT DISTINCT day_of_week, hour_of_day, p90_short FROM short_range)
+SELECT
+    l.day_of_week,
+    l.hour_of_day,
+    ROUND(l.p90_long,  2)                       AS p90_long_range,
+    ROUND(s.p90_short, 2)                       AS p90_short_range,
+    ROUND(((s.p90_short - l.p90_long)
+           / NULLIF(l.p90_long, 0)) * 100, 1)  AS pct_drift,
+    CASE
+        WHEN s.p90_short &gt; l.p90_long * 1.3 THEN 'TREND_UP_SIGNIFICANT'
+        WHEN s.p90_short &gt; l.p90_long * 1.1 THEN 'TREND_UP_MINOR'
+        WHEN s.p90_short &lt; l.p90_long * 0.7 THEN 'TREND_DOWN_SIGNIFICANT'
+        ELSE                                      'STABLE'
+    END                                         AS drift_classification
+FROM deduped_long  AS l
+JOIN deduped_short AS s
+    ON l.day_of_week = s.day_of_week
+    AND l.hour_of_day = s.hour_of_day
+WHERE ABS((s.p90_short - l.p90_long) / NULLIF(l.p90_long, 0)) &gt; 0.1
+ORDER BY ABS((s.p90_short - l.p90_long) / NULLIF(l.p90_long, 0)) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Anomaly detection for one-time spikes is a separate concern from drift detection. A single Friday that ran 200% above the P90 because a viral social media post drove unusual traffic should not permanently reshape your baseline. One defensible approach is to exclude from baseline computations any samples that fall above the P99.5 of the historical distribution for that time slot — treating those samples as outliers rather than signals. The trade-off is that if true structural growth is rapid, clipping outliers can cause the model to lag behind reality. The right balance depends on how volatile your workload is, and most teams benefit from making the outlier exclusion threshold a configurable parameter that they tune over time.</p>
+
+<p class="text-gray-300 leading-relaxed">Feedback loops also need to account for the scaling actions themselves. If the predictive system pre-provisioned two additional read replicas before Friday's 4 PM peak, the TPS measurement during that peak will look different than it would have without the replicas — some queries that would have queued or timed out instead completed successfully, making the peak appear less severe than it actually was in terms of demand. This is a form of observer effect: the act of scaling changes what you observe. When computing future baselines, annotating samples with whether a scaling action was in effect at that time allows you to apply a correction factor, though in practice many teams find that a simpler approach — maintaining a separate "scaled" vs. "unscaled" tag on snapshots and computing baselines only from unscaled windows — is easier to reason about and audit.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Scheduling and Orchestrating Predictive Actions</h3>
+
+<p class="text-gray-300 leading-relaxed">The mechanics of scheduling predictive scaling actions depend on what tools are available in your environment, but the logical structure is consistent across environments. You need a process that runs on a regular cadence — typically every five to fifteen minutes — that looks at the upcoming workload predictions for the next one to two hours, compares them against current resource state, and decides whether a scaling action should be initiated now to arrive in time.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    Telemetry[("Workload Snapshots\nTPS, waits, connections")] --> Model["Seasonal Baseline Model\n(P50/P90/P99 by hour)"]
+    Model --> Decision{"Predicted load\nexceeds threshold?"}
+    Decision -->|yes| Queue[("Scaling Action Queue")]
+    Decision -->|no| Telemetry
+    Queue --> Daemon["External Daemon\n(polls queue)"]
+    Daemon --> CloudAPI["Cloud Autoscaling API\n(add replica / expand pool)"]
+    CloudAPI --> Capacity["New Capacity Online"]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Figure: The predictive scaling pipeline — telemetry feeds a seasonal model, predicted breaches are queued as scaling actions, and an external daemon dispatches them to the cloud provider's API ahead of the anticipated peak.*</p>
+
+<p class="text-gray-300 leading-relaxed">In PostgreSQL environments, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> is a convenient in-database scheduler for the telemetry collection and prediction-evaluation queries, but the actual scaling API calls should still be dispatched outside the database. A common pattern is to have pg_cron write scaling recommendations to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_metrics.scaling_queue</code> table, and have an external lightweight daemon — a Python script, a Go binary, a systemd service — poll that queue and execute the corresponding API calls.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the scaling action queue table
+CREATE TABLE IF NOT EXISTS dba_metrics.scaling_queue (
+    id                  BIGSERIAL       PRIMARY KEY,
+    created_at          TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    target_time         TIMESTAMPTZ     NOT NULL,
+    action_type         TEXT            NOT NULL,  -- 'ADD_REPLICA','REMOVE_REPLICA','POOL_EXPAND', etc.
+    action_params       JSONB           NOT NULL DEFAULT '{}',
+    status              TEXT            NOT NULL DEFAULT 'PENDING',
+        -- PENDING, DISPATCHED, COMPLETED, FAILED
+    dispatched_at       TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ,
+    notes               TEXT
+);
+
+CREATE INDEX IF NOT EXISTS ix_scaling_queue_status_target
+    ON dba_metrics.scaling_queue (status, target_time)
+    WHERE status = 'PENDING';
+
+-- Populate queue entries based on upcoming predicted peaks
+-- This query is run by pg_cron every 15 minutes
+INSERT INTO dba_metrics.scaling_queue (target_time, action_type, action_params)
+SELECT
+    -- Schedule the action to fire (provisioning_lag_minutes) before the predicted peak
+    DATE_TRUNC('hour', NOW()) +
+        MAKE_INTERVAL(hours =&gt; sp.hour_of_day) -
+        MAKE_INTERVAL(mins  =&gt; 15)              AS target_time,
+    CASE rec.recommended_action
+        WHEN 'SCALE_AGGRESSIVELY' THEN 'ADD_REPLICA'
+        WHEN 'SCALE_STANDARD'     THEN 'ADD_REPLICA'
+        WHEN 'SCALE_WARM'         THEN 'POOL_EXPAND'
+    END                                         AS action_type,
+    JSONB_BUILD_OBJECT(
+        'db_name',            'production_db',
+        'recommended_action', rec.recommended_action,
+        'predicted_p90_tps',  sp.p90_tps,
+        'threshold',          st.tps_scale_threshold
+    )                                           AS action_params
+FROM dba_metrics.seasonal_profile    sp
+CROSS JOIN dba_metrics.scaling_thresholds st
+JOIN LATERAL (
+    SELECT
+        CASE
+            WHEN sp.p90_tps &gt; st.tps_scale_threshold * 1.5 THEN 'SCALE_AGGRESSIVELY'
+            WHEN sp.p90_tps &gt; st.tps_scale_threshold        THEN 'SCALE_STANDARD'
+            WHEN sp.p90_tps &gt; st.tps_scale_threshold * 0.8  THEN 'SCALE_WARM'
+            ELSE NULL
+        END AS recommended_action
+) rec ON rec.recommended_action IS NOT NULL
+WHERE st.db_name = 'production_db'
+  -- Only queue for the next 2 hours, avoid duplicates
+  AND sp.hour_of_day IN (
+        EXTRACT(HOUR FROM NOW())::INT + 1,
+        EXTRACT(HOUR FROM NOW())::INT + 2
+  )
+  AND sp.day_of_week = EXTRACT(ISODOW FROM NOW())::INT
+  -- Skip if already queued for this target slot
+  AND NOT EXISTS (
+      SELECT 1 FROM dba_metrics.scaling_queue sq
+      WHERE sq.status IN ('PENDING', 'DISPATCHED')
+        AND sq.action_type = CASE rec.recommended_action
+                                WHEN 'SCALE_AGGRESSIVELY' THEN 'ADD_REPLICA'
+                                WHEN 'SCALE_STANDARD'     THEN 'ADD_REPLICA'
+                                WHEN 'SCALE_WARM'         THEN 'POOL_EXPAND'
+                             END
+        AND sq.target_time = DATE_TRUNC('hour', NOW()) +
+                             MAKE_INTERVAL(hours =&gt; sp.hour_of_day) -
+                             MAKE_INTERVAL(mins  =&gt; 15)
+  );</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the scaling action queue table
+IF OBJECT_ID('dba_metrics.scaling_queue', 'U') IS NULL
+BEGIN
+    CREATE TABLE dba_metrics.scaling_queue (
+        id              BIGINT IDENTITY(1,1)  PRIMARY KEY,
+        created_at      DATETIMEOFFSET        NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+        target_time     DATETIMEOFFSET        NOT NULL,
+        action_type     NVARCHAR(50)          NOT NULL,
+        action_params   NVARCHAR(MAX)         NOT NULL DEFAULT '{}',  -- JSON
+        status          NVARCHAR(20)          NOT NULL DEFAULT 'PENDING',
+        dispatched_at   DATETIMEOFFSET,
+        completed_at    DATETIMEOFFSET,
+        notes           NVARCHAR(MAX)
+    );
+
+    CREATE INDEX ix_scaling_queue_status_target
+        ON dba_metrics.scaling_queue (status, target_time)
+        WHERE status = 'PENDING';
+END;
+
+-- Populate queue entries (run via SQL Server Agent every 15 minutes)
+INSERT INTO dba_metrics.scaling_queue (target_time, action_type, action_params)
+SELECT
+    DATEADD(MINUTE, -15,
+        DATEADD(HOUR, sp.hour_of_day,
+            CAST(CAST(GETUTCDATE() AS DATE) AS DATETIME2)))
+                                                AS target_time,
+    CASE
+        WHEN sp.p90_requests &gt; st.requests_scale_threshold * 1.5 THEN 'ADD_REPLICA'
+        WHEN sp.p90_requests &gt; st.requests_scale_threshold       THEN 'ADD_REPLICA'
+        WHEN sp.p90_requests &gt; st.requests_scale_threshold * 0.8 THEN 'POOL_EXPAND'
+    END                                         AS action_type,
+    (SELECT
+        'production_db'                         AS db_name,
+        sp.p90_requests                         AS predicted_p90,
+        st.requests_scale_threshold             AS threshold
+     FOR JSON PATH, WITHOUT_ARRAY_WRAPPER)      AS action_params
+FROM dba_metrics.seasonal_profile   AS sp
+CROSS JOIN dba_metrics.scaling_thresholds AS st
+WHERE st.db_name = 'production_db'
+  AND sp.p90_requests &gt; st.requests_scale_threshold * 0.8
+  AND sp.hour_of_day IN (
+        DATEPART(HOUR, GETUTCDATE()) + 1,
+        DATEPART(HOUR, GETUTCDATE()) + 2
+  )
+  AND sp.day_of_week = DATEPART(WEEKDAY, GETUTCDATE())
+  AND NOT EXISTS (
+      SELECT 1 FROM dba_metrics.scaling_queue sq
+      WHERE sq.status IN ('PENDING', 'DISPATCHED')
+        AND sq.action_type = CASE
+                WHEN sp.p90_requests &gt; st.requests_scale_threshold * 1.5 THEN 'ADD_REPLICA'
+                WHEN sp.p90_requests &gt; st.requests_scale_threshold       THEN 'ADD_REPLICA'
+                ELSE 'POOL_EXPAND'
+             END
+        AND sq.target_time = DATEADD(MINUTE, -15,
+                DATEADD(HOUR, sp.hour_of_day,
+                    CAST(CAST(GETUTCDATE() AS DATE) AS DATETIME2)))
+  );</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The external daemon that processes the queue is straightforward in concept: poll for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PENDING</code> entries whose <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">target_time</code> is at or before the current time, mark them <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DISPATCHED</code>, call the appropriate API, and mark them <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COMPLETED</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FAILED</code> with a note. Using a database table as the queue rather than an in-memory queue or message broker has a significant operational advantage: if the daemon crashes and restarts, it picks up any actions that were dispatched but not confirmed, and the full history of scaling actions is permanently auditable alongside the workload telemetry that triggered them.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating with Cloud Provider Autoscaling APIs</h3>
+
+<p class="text-gray-300 leading-relaxed">Most cloud-hosted database services expose autoscaling primitives that can be driven programmatically. Understanding what is actually adjustable via API, what requires a maintenance window, and what is truly seamless is important for designing realistic predictive scaling policies.</p>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">AWS</strong>, Aurora PostgreSQL and Aurora MySQL support the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RegisterScalableTarget</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PutScalingPolicy</code> APIs through the Application Auto Scaling service. Aurora Serverless v2 adjusts ACU capacity automatically, but you can influence the minimum and maximum ACU bounds via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modify-db-cluster</code> API call, which takes effect with low latency and no downtime. RDS read replicas can be created via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">create-db-instance-read-replica</code> and promoted or deleted on demand. These operations are available through the AWS SDK, the CLI, and Terraform or CloudFormation if you prefer infrastructure-as-code driven scaling.</p>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">Azure</strong>, Azure SQL Database elastic pools expose scaling through the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Update-AzSqlElasticPool</code> PowerShell cmdlet or the equivalent REST API. Azure SQL Managed Instance scaling is more constrained — vCore and storage tier changes require a maintenance window and are not suitable for real-time predictive scaling. For read scale-out, Business Critical and Premium tiers provide a built-in read-only replica accessible via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ApplicationIntent=ReadOnly</code> connection string parameter, which is always on and requires no provisioning.</p>
+
+<p class="text-gray-300 leading-relaxed">On <strong class="text-white">Google Cloud</strong>, Cloud SQL instance tier changes require a restart and are not suitable for real-time scaling. Read replicas, however, can be created and deleted with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gcloud sql instances create</code> command that takes roughly five minutes, making them viable as predictive scale-out targets for read-heavy workloads. AlloyDB, GCP's PostgreSQL-compatible service, supports read pool scaling — adding or removing read instances from the pool — with lower latency than standard Cloud SQL replicas.</p>
+
+<p class="text-gray-300 leading-relaxed">For on-premises or self-managed deployments, the scalable levers are fewer but still meaningful. PgBouncer configuration reload (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SIGHUP</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RELOAD</code>) can expand pool sizes within seconds. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM SET work_mem</code> followed by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT pg_reload_conf()</code> can adjust per-session memory without a restart, though this must be done carefully to avoid total memory pressure. SQL Server Resource Governor can dynamically reassign workload groups to different resource pools, allowing you to shift CPU and memory limits between workloads at runtime without touching configuration files.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building an Observability Layer for the Predictive System Itself</h3>
+
+<p class="text-gray-300 leading-relaxed">A predictive scaling system is itself a system that can fail, produce incorrect predictions, fire actions at the wrong time, or accumulate technical debt as the workload evolves. Treating the predictive system's own behavior as something worth monitoring is not optional — it is the only way to maintain confidence in the system over time.</p>
+
+<p class="text-gray-300 leading-relaxed">The key metrics to track at the meta level are prediction accuracy, action latency, and action outcome. Prediction accuracy measures how closely the model's P90 estimate matched the actual P90 observed during each hour slot. Action latency measures the time from when the scaling queue entry was created to when the provisioned capacity was actually serving queries. Action outcome tracks whether each scaling action achieved its intended effect — did adding a replica actually reduce query latency and connection wait times, or did the bottleneck turn out to be somewhere else?</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retrospective prediction accuracy report
+-- Compares what the model predicted vs. what actually happened
+SELECT
+    TO_CHAR(w.captured_at, 'YYYY-MM-DD HH24:00')   AS hour_slot,
+    sp.p90_tps                                       AS predicted_p90,
+    PERCENTILE_CONT(0.90) WITHIN GROUP
+        (ORDER BY w.tps_commit)                      AS actual_p90,
+    ROUND(ABS(sp.p90_tps -
+              PERCENTILE_CONT(0.90) WITHIN GROUP
+                  (ORDER BY w.tps_commit)::NUMERIC)
+          / NULLIF(sp.p90_tps, 0) * 100, 1)         AS pct_error,
+    CASE
+        WHEN ABS(sp.p90_tps -
+                 PERCENTILE_CONT(0.90) WITHIN GROUP
+                     (ORDER BY w.tps_commit)::NUMERIC)
+             / NULLIF(sp.p90_tps, 0) &lt; 0.10         THEN 'ACCURATE'
+        WHEN PERCENTILE_CONT(0.90) WITHIN GROUP
+                 (ORDER BY w.tps_commit) &gt; sp.p90_tps THEN 'UNDER_PREDICTED'
+        ELSE                                              'OVER_PREDICTED'
+    END                                              AS prediction_quality
+FROM dba_metrics.workload_snapshots w
+JOIN dba_metrics.seasonal_profile sp
+    ON EXTRACT(ISODOW FROM w.captured_at)::INT = sp.day_of_week
+    AND EXTRACT(HOUR FROM w.captured_at)::INT  = sp.hour_of_day
+WHERE w.captured_at &gt;= NOW() - INTERVAL '30 days'
+  AND w.db_name = 'production_db'
+GROUP BY
+    TO_CHAR(w.captured_at, 'YYYY-MM-DD HH24:00'),
+    sp.p90_tps
+ORDER BY hour_slot;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Retrospective prediction accuracy report
+SELECT
+    FORMAT(w.captured_at, 'yyyy-MM-dd HH:00')       AS hour_slot,
+    sp.p90_requests                                  AS predicted_p90,
+    PERCENTILE_CONT(0.90) WITHIN GROUP
+        (ORDER BY w.batch_requests_sec)
+        OVER (PARTITION BY FORMAT(w.captured_at, 'yyyy-MM-dd HH:00'),
+                           sp.p90_requests)          AS actual_p90,
+    ROUND(ABS(sp.p90_requests -
+              PERCENTILE_CONT(0.90) WITHIN GROUP
+                  (ORDER BY w.batch_requests_sec)
+                  OVER (PARTITION BY FORMAT(w.captured_at, 'yyyy-MM-dd HH:00'),
+                                     sp.p90_requests))
+          / NULLIF(sp.p90_requests, 0) * 100, 1)    AS pct_error,
+    CASE
+        WHEN ABS(sp.p90_requests -
+                 PERCENTILE_CONT(0.90) WITHIN GROUP
+                     (ORDER BY w.batch_requests_sec)
+                     OVER (PARTITION BY FORMAT(w.captured_at, 'yyyy-MM-dd HH:00'),
+                                        sp.p90_requests))
+             / NULLIF(sp.p90_requests, 0) &lt; 0.10    THEN 'ACCURATE'
+        WHEN PERCENTILE_CONT(0.90) WITHIN GROUP
+                 (ORDER BY w.batch_requests_sec)
+                 OVER (PARTITION BY FORMAT(w.captured_at, 'yyyy-MM-dd HH:00'),
+                                    sp.p90_requests)
+             &gt; sp.p90_requests                       THEN 'UNDER_PREDICTED'
+        ELSE                                              'OVER_PREDICTED'
+    END                                              AS prediction_quality
+FROM dba_metrics.workload_snapshots AS w
+JOIN dba_metrics.seasonal_profile   AS sp
+    ON DATEPART(WEEKDAY, w.captured_at) = sp.day_of_week
+    AND DATEPART(HOUR,   w.captured_at) = sp.hour_of_day
+WHERE w.captured_at &gt;= DATEADD(DAY, -30, GETUTCDATE())
+  AND w.db_name = 'production_db'
+ORDER BY hour_slot;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running this accuracy report weekly and reviewing the results with the team is one of the most effective ways to maintain and improve a predictive scaling system over time. Slots that consistently show <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNDER_PREDICTED</code> are candidates for threshold tightening or model window adjustment. Slots that consistently show <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OVER_PREDICTED</code> may indicate that a regularly scheduled job that once ran during that period has been moved or decommissioned. Neither insight is visible without the retrospective comparison.</p>
+
+<p class="text-gray-300 leading-relaxed">The scaling action audit log should capture not just what was done, but what state the system was in when the action was taken — what the live workload measurement was at the moment of dispatch, what the model predicted, and what the outcome metrics showed thirty minutes later. This audit trail is what allows post-incident analysis to distinguish between "the predictive system fired correctly and the spike was absorbed" and "the predictive system fired but the spike was larger than anticipated and demand still exceeded capacity."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Practical Deployment Considerations</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying a predictive scaling system into a production environment for the first time carries its own risks, and the best practice is to operate in *advisory mode* before *autonomous mode*. In advisory mode, the system computes predictions, evaluates scaling decisions, and writes recommendations to the scaling queue — but a human must approve and execute each action. This phase, running for two to four weeks, builds team confidence in the model, surfaces edge cases where the automation would have made a poor decision, and builds the institutional knowledge needed to tune the thresholds.</p>
+
+<p class="text-gray-300 leading-relaxed">After advisory mode, the transition to autonomous mode should be gated behind a clear set of safety invariants. At minimum: the system should never scale down resources during a live high-load period (check that the current TPS is below a safe threshold before executing any scale-in action), it should never queue more scaling actions than a configured maximum per hour (rate limiting prevents runaway scaling loops), and every autonomous action should have a corresponding alert sent to the on-call channel so that the human team is always aware of what the system is doing.</p>
+
+<p class="text-gray-300 leading-relaxed">Capacity cost visibility is another consideration that separates mature predictive scaling implementations from naive ones. If the system is adding read replicas every Friday afternoon and removing them Sunday evening, that cost needs to be visible and attributed. Most cloud providers expose cost tagging APIs that allow dynamically created resources to be tagged with metadata identifying them as predictive scaling artifacts. Using those tags consistently makes it straightforward to pull a weekly cost-versus-performance report that shows whether the predictive investment is delivering measurable SLA improvements relative to its cost.</p>
+
+<p class="text-gray-300 leading-relaxed">Finally, document the model assumptions explicitly and keep that documentation current. The seasonal baseline was built on data from a specific period. If the business changes — a major customer migration, a new product launch, a sunset of a legacy integration that drove significant DB load — the baseline may need to be rebuilt or the relevant time slots manually adjusted. Treating the predictive model as living documentation rather than a set-and-forget configuration is the difference between a system that improves with time and one that silently degrades into irrelevance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Predictive scaling succeeds where reactive scaling fails** because it accounts for provisioning latency: resources must be online before demand peaks, not after, and historical workload patterns — especially weekly and daily seasonality — provide the forecast foundation that makes lead-time planning possible.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Instrumentation is the non-negotiable foundation**: time-series snapshots of TPS, connection counts, wait events, and I/O pressure, retained at five-minute granularity for at least ninety days, are the minimum dataset required to build a reliable seasonal workload profile that can drive meaningful scaling decisions.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Non-compute scaling actions — buffer pre-warming, connection pool pre-expansion, and proactive autovacuum — often deliver as much performance stability ahead of a predicted peak as adding new hardware, and they operate on timescales of seconds rather than minutes.**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Model drift detection using dual-window baselines (long-range vs. short-range) is essential for keeping predictions aligned with reality** in workloads that are growing, seasonally shifting, or subject to application-level changes that alter query patterns and data access behavior over time.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Operate in advisory mode before autonomous mode**, maintain a permanent audit trail linking every scaling action to the prediction and live telemetry that triggered it, and run weekly prediction accuracy retrospectives — these three practices are what turn a predictive scaling experiment into a production-grade reliability tool.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 flex justify-between text-xs">

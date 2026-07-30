@@ -6,6 +6,10 @@
   <title>Chapter 33: Autonomous SQL Server Systems — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 33: Autonomous SQL Server Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -450,6 +454,1235 @@ ORDER BY score DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed">For environments running Always On across Azure VMs or on-premises with Pacemaker on Linux, the autonomous controller monitors redo queue depth as a leading indicator of failover risk. A secondary with a growing redo queue that is not catching up indicates either an I/O-bound secondary or a network partition that will worsen before it improves.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- AG replica health monitor for autonomous controller
+-- Collects redo queue, send queue, and synchronization state per replica
+
+SELECT
+    ag.name                                     AS ag_name,
+    ar.replica_server_name,
+    ar.availability_mode_desc,
+    ar.failover_mode_desc,
+    drs.database_name,
+    drs.synchronization_state_desc,
+    drs.synchronization_health_desc,
+    drs.redo_queue_size                         AS redo_queue_kb,
+    drs.redo_rate                               AS redo_rate_kb_per_sec,
+    CASE
+        WHEN drs.redo_rate &gt; 0
+        THEN drs.redo_queue_size / drs.redo_rate
+        ELSE NULL
+    END                                         AS estimated_catchup_secs,
+    drs.log_send_queue_size                     AS send_queue_kb,
+    drs.log_send_rate                           AS send_rate_kb_per_sec,
+    drs.last_redone_time,
+    drs.last_received_time,
+    ars.role_desc,
+    ars.connected_state_desc,
+    ars.operational_state_desc,
+    GETUTCDATE()                                AS sampled_at
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar
+    ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars
+    ON ar.replica_id = ars.replica_id
+JOIN sys.dm_hadr_database_replica_states drs
+    ON ar.replica_id = drs.replica_id
+ORDER BY ag.name, ar.replica_server_name, drs.database_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Python autonomous AG controller acts on this data in two modes: *watchdog mode* (continuous monitoring with corrective actions short of failover) and *failover arbitration mode* (triggered only when the primary is confirmed unhealthy).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+from datetime import datetime, timedelta
+from enum import Enum
+
+logger = logging.getLogger('autonomous_ag')
+
+class ReplicaHealth(Enum):
+    HEALTHY    = 'HEALTHY'
+    DEGRADED   = 'DEGRADED'
+    CRITICAL   = 'CRITICAL'
+    UNREACHABLE= 'UNREACHABLE'
+
+@dataclass
+class ReplicaState:
+    ag_name: str
+    replica_server_name: str
+    availability_mode: str
+    failover_mode: str
+    database_name: str
+    sync_state: str
+    sync_health: str
+    redo_queue_kb: Optional[float]
+    redo_rate_kb_per_sec: Optional[float]
+    estimated_catchup_secs: Optional[float]
+    send_queue_kb: Optional[float]
+    role: str
+    connected_state: str
+    operational_state: str
+    sampled_at: datetime
+
+    @property
+    def health(self) -&gt; ReplicaHealth:
+        if self.connected_state != 'CONNECTED' or self.operational_state != 'ONLINE':
+            return ReplicaHealth.UNREACHABLE
+        if self.sync_health == 'NOT_HEALTHY':
+            return ReplicaHealth.CRITICAL
+        if self.sync_health == 'PARTIALLY_HEALTHY':
+            return ReplicaHealth.DEGRADED
+        # Redo queue growing faster than it drains — degraded signal
+        if (self.redo_queue_kb is not None
+                and self.estimated_catchup_secs is not None
+                and self.estimated_catchup_secs &gt; 300):        # 5 minutes behind
+            return ReplicaHealth.DEGRADED
+        return ReplicaHealth.HEALTHY
+
+
+class AutonomousAGController:
+    """
+    Watchdog and arbitration controller for SQL Server Always On AGs.
+    Operates in watchdog mode continuously; escalates to failover arbitration
+    only after quorum of health checks confirms primary failure.
+    """
+
+    REDO_QUEUE_WARN_KB    = 512 * 1024   # 512 MB redo lag triggers warning
+    REDO_QUEUE_SUSPEND_KB = 2 * 1024 * 1024  # 2 GB lag triggers data movement review
+    FAILOVER_CONFIRM_CYCLES = 3          # Primary must fail N consecutive cycles
+    CYCLE_INTERVAL_SECS   = 15
+
+    def __init__(self, primary_conn_str: str,
+                 secondary_conn_strs: dict[str, str],
+                 dry_run: bool = False):
+        self.primary_conn_str     = primary_conn_str
+        self.secondary_conn_strs  = secondary_conn_strs
+        self.dry_run              = dry_run
+        self._primary_fail_count  = 0
+        self._last_failover_time: Optional[datetime] = None
+
+    def _conn(self, conn_str: str):
+        return pyodbc.connect(conn_str, timeout=5, autocommit=True)
+
+    def collect_replica_states(self, conn_str: str) -&gt; list[ReplicaState]:
+        sql = open('ag_health_monitor.sql').read()   # The query above
+        try:
+            with self._conn(conn_str) as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql)
+                rows = cursor.fetchall()
+                return [ReplicaState(
+                    ag_name=r.ag_name,
+                    replica_server_name=r.replica_server_name,
+                    availability_mode=r.availability_mode_desc,
+                    failover_mode=r.failover_mode_desc,
+                    database_name=r.database_name,
+                    sync_state=r.synchronization_state_desc,
+                    sync_health=r.synchronization_health_desc,
+                    redo_queue_kb=r.redo_queue_kb,
+                    redo_rate_kb_per_sec=r.redo_rate_kb_per_sec,
+                    estimated_catchup_secs=r.estimated_catchup_secs,
+                    send_queue_kb=r.send_queue_kb,
+                    role=r.role_desc,
+                    connected_state=r.connected_state_desc,
+                    operational_state=r.operational_state_desc,
+                    sampled_at=r.sampled_at,
+                ) for r in rows]
+        except Exception as e:
+            logger.error("REPLICA_COLLECT_FAILED conn=%s error=%s", conn_str, e)
+            return []
+
+    def check_primary_reachable(self) -&gt; bool:
+        try:
+            with self._conn(self.primary_conn_str) as conn:
+                conn.cursor().execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def handle_lagging_replica(self, state: ReplicaState):
+        """
+        When a synchronous secondary lags beyond REDO_QUEUE_WARN_KB,
+        evaluate whether to temporarily change it to asynchronous mode
+        to protect primary throughput — a reversible, safe corrective action.
+        """
+        if state.redo_queue_kb is None:
+            return
+
+        if state.redo_queue_kb &gt; self.REDO_QUEUE_WARN_KB:
+            logger.warning(
+                "REPLICA_LAG ag=%s replica=%s db=%s redo_queue_kb=%.0f "
+                "catchup_secs=%s",
+                state.ag_name, state.replica_server_name, state.database_name,
+                state.redo_queue_kb,
+                f"{state.estimated_catchup_secs:.0f}"
+                    if state.estimated_catchup_secs else "unknown"
+            )
+
+        if (state.redo_queue_kb &gt; self.REDO_QUEUE_SUSPEND_KB
+                and state.availability_mode == 'SYNCHRONOUS_COMMIT'
+                and not self.dry_run):
+            # Switching to async protects primary commit latency while
+            # the secondary catches up; schedule a reversion check
+            logger.warning(
+                "ASYNC_DOWNGRADE ag=%s replica=%s — redo queue critical",
+                state.ag_name, state.replica_server_name
+            )
+            self._change_replica_mode(
+                state.ag_name, state.replica_server_name, 'ASYNCHRONOUS_COMMIT'
+            )
+
+    def _change_replica_mode(self, ag_name: str, replica_name: str, mode: str):
+        sql = f"""
+            ALTER AVAILABILITY GROUP [{ag_name}]
+            MODIFY REPLICA ON N'{replica_name}'
+            WITH (AVAILABILITY_MODE = {mode})
+        """
+        try:
+            with self._conn(self.primary_conn_str) as conn:
+                conn.cursor().execute(sql)
+            logger.info(
+                "REPLICA_MODE_CHANGED ag=%s replica=%s mode=%s",
+                ag_name, replica_name, mode
+            )
+        except Exception as e:
+            logger.error(
+                "REPLICA_MODE_CHANGE_FAILED ag=%s replica=%s error=%s",
+                ag_name, replica_name, e
+            )
+
+    def initiate_failover(self, target_replica: str, ag_name: str):
+        """
+        Initiates a manual failover to a specific secondary.
+        Only called after FAILOVER_CONFIRM_CYCLES of confirmed primary failure
+        and only if the target has MANUAL or AUTOMATIC failover mode configured.
+        """
+        # Enforce a minimum interval between autonomous failovers
+        if (self._last_failover_time is not None
+                and datetime.utcnow() - self._last_failover_time
+                    &lt; timedelta(minutes=30)):
+            logger.error(
+                "FAILOVER_THROTTLED — last failover was less than 30 minutes ago"
+            )
+            return
+
+        sql = f"ALTER AVAILABILITY GROUP [{ag_name}] FAILOVER"
+        conn_str = self.secondary_conn_strs.get(target_replica)
+        if not conn_str:
+            logger.error("FAILOVER_NO_CONN_STR replica=%s", target_replica)
+            return
+
+        logger.critical(
+            "FAILOVER_INITIATED ag=%s target=%s dry_run=%s",
+            ag_name, target_replica, self.dry_run
+        )
+        if not self.dry_run:
+            try:
+                with self._conn(conn_str) as conn:
+                    conn.cursor().execute(sql)
+                self._last_failover_time = datetime.utcnow()
+            except Exception as e:
+                logger.error("FAILOVER_FAILED ag=%s error=%s", ag_name, e)
+
+    def select_best_failover_target(
+            self, states: list[ReplicaState]) -&gt; Optional[tuple[str, str]]:
+        """
+        Among synchronous secondaries, pick the one with the smallest
+        redo queue (closest to primary). Returns (replica_name, ag_name).
+        """
+        candidates = [
+            s for s in states
+            if s.role == 'SECONDARY'
+            and s.availability_mode == 'SYNCHRONOUS_COMMIT'
+            and s.health != ReplicaHealth.UNREACHABLE
+        ]
+        if not candidates:
+            return None
+        best = min(candidates,
+                   key=lambda s: s.redo_queue_kb or float('inf'))
+        return (best.replica_server_name, best.ag_name)
+
+    def run_watchdog(self):
+        """Main watchdog loop. Runs indefinitely."""
+        logger.info("WATCHDOG_START primary=%s", self.primary_conn_str)
+        while True:
+            primary_up = self.check_primary_reachable()
+
+            if not primary_up:
+                self._primary_fail_count += 1
+                logger.warning(
+                    "PRIMARY_UNREACHABLE consecutive_failures=%d",
+                    self._primary_fail_count
+                )
+                if self._primary_fail_count &gt;= self.FAILOVER_CONFIRM_CYCLES:
+                    # Collect state from a secondary to identify best target
+                    for name, conn_str in self.secondary_conn_strs.items():
+                        states = self.collect_replica_states(conn_str)
+                        if states:
+                            target = self.select_best_failover_target(states)
+                            if target:
+                                self.initiate_failover(*target)
+                            break
+            else:
+                self._primary_fail_count = 0
+                states = self.collect_replica_states(self.primary_conn_str)
+                for state in states:
+                    if state.role == 'SECONDARY':
+                        self.handle_lagging_replica(state)
+
+            time.sleep(self.CYCLE_INTERVAL_SECS)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One detail that trips up many implementations: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER AVAILABILITY GROUP ... FAILOVER</code> statement must be issued *from the target secondary*, not from the primary. The controller connects to the secondary's connection string for the failover command, which is why <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">secondary_conn_strs</code> is a required parameter rather than being derived from DMV data.</p>
+
+<p class="text-gray-300 leading-relaxed">For environments using the Windows Server Failover Cluster layer, automatic failover for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUTOMATIC</code> failover mode replicas is already handled by WSFC without any application-layer code. The Python controller above is designed for scenarios where WSFC automatic failover is not in play — Linux HA clusters, Azure environments using a load balancer listener without WSFC, or configurations where the DBA team wants application-layer override capability above the WSFC decision.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Intelligent Connection Routing and Read-Scale Autonomy</h3>
+
+<p class="text-gray-300 leading-relaxed">Availability Groups introduce multiple replicas that can serve read traffic, but the default routing behavior — round-robin across read-only routing lists — is static. An autonomous routing layer adjusts replica selection based on replica health, redo lag, and current replica load in real time.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's built-in read-only routing is configured via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PRIMARY_ROLE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SECONDARY_ROLE</code> routing lists on availability replicas. The autonomous layer supplements this with a routing proxy that re-evaluates replica suitability at connection time.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — configuring the read-only routing foundation:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Set read-only routing URLs and priority list for AG 'ProductionAG'
+-- Run on the primary
+
+ALTER AVAILABILITY GROUP [ProductionAG]
+MODIFY REPLICA ON N'SQLNODE2'
+WITH (
+    SECONDARY_ROLE (
+        ALLOW_CONNECTIONS = READ_ONLY,
+        READ_ONLY_ROUTING_URL = N'TCP://sqlnode2.corp.local:1433'
+    )
+);
+
+ALTER AVAILABILITY GROUP [ProductionAG]
+MODIFY REPLICA ON N'SQLNODE3'
+WITH (
+    SECONDARY_ROLE (
+        ALLOW_CONNECTIONS = READ_ONLY,
+        READ_ONLY_ROUTING_URL = N'TCP://sqlnode3.corp.local:1433'
+    )
+);
+
+-- Set routing list on primary: prefer SQLNODE2, fall back to SQLNODE3
+ALTER AVAILABILITY GROUP [ProductionAG]
+MODIFY REPLICA ON N'SQLNODE1'
+WITH (
+    PRIMARY_ROLE (
+        READ_ONLY_ROUTING_LIST = (
+            ('SQLNODE2', 'SQLNODE3')  -- load-balanced pair
+        )
+    )
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomous routing controller wraps the connection acquisition logic in Python, scoring each replica before assigning a connection:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from dataclasses import dataclass
+from typing import Optional
+import pyodbc
+import threading
+import time
+
+@dataclass
+class ReplicaScore:
+    name: str
+    conn_str: str
+    redo_lag_kb: float
+    active_sessions: int
+    avg_wait_ms: float
+    is_healthy: bool
+
+    @property
+    def score(self) -&gt; float:
+        """Lower score is better. Combines lag, load, and wait pressure."""
+        if not self.is_healthy:
+            return float('inf')
+        # Normalize each component to a 0–100 scale before weighting
+        lag_score     = min(self.redo_lag_kb / 10_000, 100)   # cap at 10 GB equiv
+        load_score    = min(self.active_sessions / 200, 100)   # cap at 200 sessions
+        wait_score    = min(self.avg_wait_ms / 500, 100)       # cap at 500ms avg wait
+        return (lag_score * 0.4) + (load_score * 0.35) + (wait_score * 0.25)
+
+
+class AutonomousReadRouter:
+    """
+    Scores AG read replicas and routes read connections to the best
+    available secondary. Thread-safe; refreshes scores at a configurable interval.
+    """
+
+    SCORE_REFRESH_SECS = 10
+
+    def __init__(self, replica_configs: dict[str, str]):
+        """
+        replica_configs: {replica_name: connection_string}
+        """
+        self.replica_configs = replica_configs
+        self._scores: list[ReplicaScore] = []
+        self._lock   = threading.Lock()
+        self._refresh_thread = threading.Thread(
+            target=self._background_refresh, daemon=True
+        )
+        self._refresh_thread.start()
+
+    def _score_replica(self, name: str, conn_str: str) -&gt; ReplicaScore:
+        try:
+            with pyodbc.connect(conn_str, timeout=3) as conn:
+                cursor = conn.cursor()
+                # Redo lag for this replica
+                cursor.execute("""
+                    SELECT
+                        ISNULL(SUM(redo_queue_size), 0) AS redo_lag_kb
+                    FROM sys.dm_hadr_database_replica_states
+                    WHERE is_local = 1
+                """)
+                redo_lag_kb = cursor.fetchone().redo_lag_kb or 0.0
+
+                # Active session count
+                cursor.execute("""
+                    SELECT COUNT(*) AS session_count
+                    FROM sys.dm_exec_sessions
+                    WHERE is_user_process = 1
+                """)
+                active_sessions = cursor.fetchone().session_count or 0
+
+                # Average wait time from recent wait stats
+                cursor.execute("""
+                    SELECT
+                        ISNULL(
+                            SUM(wait_time_ms) * 1.0 /
+                            NULLIF(SUM(waiting_tasks_count), 0),
+                        0) AS avg_wait_ms
+                    FROM sys.dm_os_wait_stats
+                    WHERE wait_type NOT IN (
+                        'SLEEP_TASK', 'WAITFOR', 'XE_TIMER_EVENT',
+                        'BROKER_TO_FLUSH', 'REQUEST_FOR_DEADLOCK_MONITOR'
+                    )
+                """)
+                avg_wait_ms = cursor.fetchone().avg_wait_ms or 0.0
+
+                return ReplicaScore(
+                    name=name, conn_str=conn_str,
+                    redo_lag_kb=redo_lag_kb,
+                    active_sessions=active_sessions,
+                    avg_wait_ms=avg_wait_ms,
+                    is_healthy=True
+                )
+        except Exception:
+            return ReplicaScore(
+                name=name, conn_str=conn_str,
+                redo_lag_kb=float('inf'), active_sessions=0,
+                avg_wait_ms=0.0, is_healthy=False
+            )
+
+    def _background_refresh(self):
+        while True:
+            scores = [
+                self._score_replica(name, conn_str)
+                for name, conn_str in self.replica_configs.items()
+            ]
+            with self._lock:
+                self._scores = sorted(scores, key=lambda s: s.score)
+            time.sleep(self.SCORE_REFRESH_SECS)
+
+    def get_read_connection(self) -&gt; Optional[pyodbc.Connection]:
+        """Returns a connection to the best available read replica."""
+        with self._lock:
+            candidates = [s for s in self._scores if s.is_healthy]
+        if not candidates:
+            raise RuntimeError("No healthy read replicas available")
+        best = candidates[0]
+        return pyodbc.connect(best.conn_str)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The routing layer deliberately keeps the scoring logic transparent and overridable. When a replica enters a planned maintenance window — index rebuilds, DBCC CHECKDB, or backup operations — the autonomous maintenance scheduler (described in the next subpart) posts a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REPLICA_MAINTENANCE</code> event that temporarily sets that replica's health flag to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">False</code>, pulling it out of the routing pool without requiring any network-level change.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Index and Statistics Management</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's built-in maintenance plans and Ola Hallengren's maintenance solution are both schedule-driven rather than condition-driven. Autonomous index management replaces the schedule with a continuous assessment loop: collect fragmentation state, score rebuild vs. reorganize decisions by impact and available maintenance window, and execute within cost guardrails.</p>
+
+<p class="text-gray-300 leading-relaxed">The core signal is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_index_physical_stats</code>, but querying it directly in SAMPLED mode at scale has a non-trivial I/O cost. The autonomous collector uses a tiered scan strategy: small tables are scanned nightly in DETAILED mode; large tables use LIMITED mode daily with DETAILED mode deferred to weekly off-peak windows.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous index fragmentation assessment with tiered scan mode
+-- Returns actionable rows with recommended operation and estimated cost
+
+SELECT
+    OBJECT_SCHEMA_NAME(ips.object_id)   AS schema_name,
+    OBJECT_NAME(ips.object_id)          AS table_name,
+    i.name                              AS index_name,
+    ips.index_id,
+    ips.index_type_desc,
+    ips.avg_fragmentation_in_percent,
+    ips.page_count,
+    ips.record_count,
+    ips.avg_page_space_used_in_percent,
+    -- Decide operation based on fragmentation and page count
+    CASE
+        WHEN ips.page_count &lt; 1000
+            THEN 'SKIP'            -- too small to matter
+        WHEN ips.avg_fragmentation_in_percent &lt; 5
+            THEN 'SKIP'
+        WHEN ips.avg_fragmentation_in_percent BETWEEN 5 AND 30
+            THEN 'REORGANIZE'
+        ELSE 'REBUILD'
+    END                                 AS recommended_op,
+    -- Rough rebuild cost estimate: pages * avg_page_size_kb
+    ips.page_count * 8 / 1024.0        AS estimated_mb,
+    GETUTCDATE()                        AS assessed_at
+FROM sys.dm_db_index_physical_stats(
+    DB_ID(), NULL, NULL, NULL, 'SAMPLED'
+) ips
+JOIN sys.indexes i
+    ON ips.object_id = i.object_id
+    AND ips.index_id = i.index_id
+WHERE i.index_id &gt; 0          -- exclude heap scans
+  AND ips.page_count &gt; 100    -- minimum page threshold
+ORDER BY ips.avg_fragmentation_in_percent DESC, ips.page_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL equivalent — index bloat assessment:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- pg_stat_user_indexes + pgstatindex for autonomous bloat detection
+-- Requires pg_stat_statements extension for usage frequency weighting
+
+SELECT
+    schemaname,
+    tablename,
+    indexname,
+    idx_scan                        AS index_scans,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    -- Bloat estimate using pgstattuple (requires superuser or pg_stat_scan_tables)
+    -- For a lightweight proxy, use dead tuple ratio on the table
+    n_dead_tup,
+    n_live_tup,
+    CASE
+        WHEN n_live_tup + n_dead_tup = 0 THEN 0
+        ELSE ROUND(
+            n_dead_tup::numeric / (n_live_tup + n_dead_tup) * 100, 2
+        )
+    END                             AS dead_tuple_pct,
+    CASE
+        WHEN idx_scan = 0
+         AND pg_relation_size(indexrelid) &gt; 10 * 1024 * 1024
+            THEN 'CONSIDER_DROP'
+        WHEN n_dead_tup &gt; n_live_tup * 0.2
+            THEN 'REINDEX_CONCURRENT'
+        ELSE 'SKIP'
+    END                             AS recommended_op,
+    NOW()                           AS assessed_at
+FROM pg_stat_user_indexes
+JOIN pg_stat_user_tables USING (schemaname, tablename)
+ORDER BY pg_relation_size(indexrelid) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Python autonomous index manager wraps the assessment with an execution budget: it tracks total I/O and lock time consumed during a maintenance window and stops before the window closes, persisting remaining work for the next cycle.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import pyodbc
+import logging
+import time
+from dataclasses import dataclass
+from typing import Iterator
+from datetime import datetime, timedelta
+
+logger = logging.getLogger('autonomous_index')
+
+@dataclass
+class IndexAction:
+    schema_name: str
+    table_name: str
+    index_name: str
+    index_id: int
+    recommended_op: str      # 'REBUILD' | 'REORGANIZE' | 'SKIP'
+    estimated_mb: float
+    avg_fragmentation: float
+    page_count: int
+
+class AutonomousIndexManager:
+    """
+    Condition-driven index maintenance for SQL Server.
+    Executes within a time and I/O budget, yielding gracefully if
+    the maintenance window closes.
+    """
+
+    REBUILD_ONLINE_THRESHOLD_MB  = 50_000  # Tables &gt; 50 GB: prefer ONLINE rebuild
+    REORG_FRAG_MIN               = 5.0
+    REBUILD_FRAG_MIN             = 30.0
+    DEFAULT_WINDOW_MINUTES       = 120
+
+    def __init__(self, conn_str: str, dry_run: bool = False,
+                 window_minutes: int = DEFAULT_WINDOW_MINUTES):
+        self.conn_str       = conn_str
+        self.dry_run        = dry_run
+        self.window_end     = datetime.utcnow() + timedelta(minutes=window_minutes)
+
+    def _conn(self):
+        return pyodbc.connect(self.conn_str, autocommit=True)
+
+    def _within_window(self) -&gt; bool:
+        return datetime.utcnow() &lt; self.window_end
+
+    def assess(self) -&gt; list[IndexAction]:
+        sql = open('index_fragmentation_assessment.sql').read()
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            return [
+                IndexAction(
+                    schema_name=r.schema_name,
+                    table_name=r.table_name,
+                    index_name=r.index_name,
+                    index_id=r.index_id,
+                    recommended_op=r.recommended_op,
+                    estimated_mb=r.estimated_mb,
+                    avg_fragmentation=r.avg_fragmentation_in_percent,
+                    page_count=r.page_count,
+                )
+                for r in cursor.fetchall()
+                if r.recommended_op != 'SKIP'
+            ]
+
+    def _build_maintenance_sql(self, action: IndexAction) -&gt; str:
+        fq_table = f"[{action.schema_name}].[{action.table_name}]"
+        index    = f"[{action.index_name}]"
+
+        if action.recommended_op == 'REORGANIZE':
+            return (
+                f"ALTER INDEX {index} ON {fq_table} "
+                f"REORGANIZE"
+            )
+        elif action.recommended_op == 'REBUILD':
+            online = (action.estimated_mb &gt; self.REBUILD_ONLINE_THRESHOLD_MB
+                      and self._is_enterprise_edition())
+            online_clause = "WITH (ONLINE = ON, MAXDOP = 4)" if online \
+                            else "WITH (MAXDOP = 4)"
+            return (
+                f"ALTER INDEX {index} ON {fq_table} "
+                f"REBUILD {online_clause}"
+            )
+        raise ValueError(f"Unknown op: {action.recommended_op}")
+
+    def _is_enterprise_edition(self) -&gt; bool:
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT SERVERPROPERTY('EngineEdition') AS edition"
+            )
+            return cursor.fetchone().edition == 3   # 3 = Enterprise
+
+    def execute_maintenance(self, actions: list[IndexAction]):
+        # Sort: reorganize first (lower locking cost), then rebuild by size asc
+        sorted_actions = sorted(
+            actions,
+            key=lambda a: (0 if a.recommended_op == 'REORGANIZE' else 1,
+                           a.estimated_mb)
+        )
+
+        completed = 0
+        skipped   = 0
+
+        for action in sorted_actions:
+            if not self._within_window():
+                logger.info(
+                    "WINDOW_CLOSED completed=%d skipped=%d remaining=%d",
+                    completed, skipped, len(sorted_actions) - completed - skipped
+                )
+                break
+
+            sql = self._build_maintenance_sql(action)
+            logger.info(
+                "INDEX_MAINT op=%s table=%s.%s index=%s frag=%.1f%% est_mb=%.0f",
+                action.recommended_op, action.schema_name,
+                action.table_name, action.index_name,
+                action.avg_fragmentation, action.estimated_mb
+            )
+
+            if not self.dry_run:
+                try:
+                    start = time.monotonic()
+                    with self._conn() as conn:
+                        conn.cursor().execute(sql)
+                    elapsed = time.monotonic() - start
+                    logger.info(
+                        "INDEX_MAINT_DONE elapsed_secs=%.1f", elapsed
+                    )
+                    completed += 1
+                except Exception as e:
+                    logger.error(
+                        "INDEX_MAINT_FAILED table=%s.%s index=%s error=%s",
+                        action.schema_name, action.table_name,
+                        action.index_name, e
+                    )
+                    skipped += 1
+            else:
+                completed += 1
+
+        logger.info(
+            "MAINTENANCE_CYCLE_END completed=%d skipped=%d",
+            completed, skipped
+        )
+
+    def run_cycle(self):
+        actions = self.assess()
+        logger.info("ASSESSMENT_COMPLETE actionable_indexes=%d", len(actions))
+        self.execute_maintenance(actions)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Statistics management follows the same pattern. The autonomous stats controller evaluates modification counters from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_stats_properties</code> against a density-aware threshold — tables with highly skewed distributions need stats updated at a lower modification threshold than uniform distributions, because the optimizer's cardinality estimates degrade faster on skewed data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous statistics staleness assessment
+-- Uses modification counter relative to table size + density proxy
+
+SELECT
+    OBJECT_SCHEMA_NAME(s.object_id)     AS schema_name,
+    OBJECT_NAME(s.object_id)            AS table_name,
+    s.name                              AS stats_name,
+    sp.last_updated,
+    sp.rows,
+    sp.rows_sampled,
+    sp.modification_counter,
+    -- Dynamic threshold: smaller tables need proportionally more sensitivity
+    CASE
+        WHEN sp.rows &lt; 500             THEN 500
+        WHEN sp.rows &lt; 25000           THEN CAST(sp.rows * 0.20 AS INT)
+        ELSE CAST(500 + sp.rows * 0.02 AS INT)   -- sub-linear heuristic for large tables;
+                                                   -- tune against your own workload rather
+                                                   -- than treating this as an engine default
+    END                                 AS update_threshold,
+    CASE
+        WHEN sp.modification_counter &gt;= CASE
+            WHEN sp.rows &lt; 500         THEN 500
+            WHEN sp.rows &lt; 25000       THEN CAST(sp.rows * 0.20 AS INT)
+            ELSE CAST(500 + sp.rows * 0.02 AS INT)
+        END
+        THEN 'UPDATE_STATS'
+        ELSE 'SKIP'
+    END                                 AS recommended_op,
+    DATEDIFF(HOUR, sp.last_updated, GETUTCDATE()) AS hours_since_update
+FROM sys.stats s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) sp
+JOIN sys.objects o ON s.object_id = o.object_id
+WHERE o.type = 'U'                 -- user tables only
+  AND sp.rows &gt; 0
+  AND (
+      sp.last_updated &lt; DATEADD(DAY, -1, GETUTCDATE())  -- always refresh daily at minimum
+      OR sp.modification_counter &gt;= CASE
+          WHEN sp.rows &lt; 500         THEN 500
+          WHEN sp.rows &lt; 25000       THEN CAST(sp.rows * 0.20 AS INT)
+          ELSE CAST(500 + sp.rows * 0.02 AS INT)
+      END
+  )
+ORDER BY sp.modification_counter DESC, hours_since_update DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL equivalent — auto-analyze staleness assessment:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- pg_stat_user_tables provides n_mod_since_analyze for equivalent threshold logic
+
+SELECT
+    schemaname,
+    relname                             AS table_name,
+    n_live_tup,
+    n_dead_tup,
+    n_mod_since_analyze,
+    last_analyze,
+    last_autoanalyze,
+    EXTRACT(EPOCH FROM (NOW() - GREATEST(
+        last_analyze, last_autoanalyze
+    ))) / 3600                          AS hours_since_analyze,
+    -- Mirror SQL Server's dynamic threshold logic
+    CASE
+        WHEN n_live_tup &lt; 500          THEN 500
+        WHEN n_live_tup &lt; 25000        THEN (n_live_tup * 0.20)::int
+        ELSE (500 + n_live_tup * 0.02)::int
+    END                                 AS update_threshold,
+    CASE
+        WHEN n_mod_since_analyze &gt;= CASE
+            WHEN n_live_tup &lt; 500      THEN 500
+            WHEN n_live_tup &lt; 25000    THEN (n_live_tup * 0.20)::int
+            ELSE (500 + n_live_tup * 0.02)::int
+        END
+        OR GREATEST(last_analyze, last_autoanalyze) &lt; NOW() - INTERVAL '1 day'
+        THEN 'ANALYZE'
+        ELSE 'SKIP'
+    END                                 AS recommended_op
+FROM pg_stat_user_tables
+WHERE n_live_tup &gt; 0
+ORDER BY n_mod_since_analyze DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The statistics update execution mirrors the index maintenance pattern: sorted by modification count descending (highest urgency first), executed within the same maintenance window budget, and logged to the same audit table so the controller can demonstrate ROI over time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Memory and Resource Governor Management</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's Resource Governor is one of the most powerful — and most underused — autonomous control surfaces in the engine. At steady state, most installations run with the default pool and a single workload group. The autonomous architecture treats Resource Governor as a dynamic pressure valve: when the sensor network detects memory pressure, CPU saturation, or blocking chains, the controller adjusts pool limits and workload group classifications in real time.</p>
+
+<p class="text-gray-300 leading-relaxed">The feedback loop works as follows: the wait stats sensor detects sustained <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESOURCE_SEMAPHORE</code> waits (query memory grant queuing), which signals that the memory grant pool is exhausted. The controller inspects <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_memory_grants</code> to identify which workload groups are consuming grants, and either caps the offending groups or redistributes the MAX_MEMORY_PERCENT between pools.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Memory grant pressure diagnostic for autonomous controller
+SELECT
+    mg.session_id,
+    mg.request_id,
+    mg.grant_time,
+    mg.requested_memory_kb,
+    mg.granted_memory_kb,
+    mg.used_memory_kb,
+    mg.max_used_memory_kb,
+    mg.queue_id,
+    mg.wait_order,
+    mg.wait_time_ms,
+    mg.is_next_candidate,
+    wg.name                             AS workload_group,
+    rp.name                             AS resource_pool,
+    rp.max_memory_percent,
+    wg.max_request_grant_memory_kb,
+    es.login_name,
+    es.program_name,
+    SUBSTRING(qt.text, (er.statement_start_offset/2)+1,
+        ((CASE er.statement_end_offset
+            WHEN -1 THEN DATALENGTH(qt.text)
+            ELSE er.statement_end_offset END
+          - er.statement_start_offset)/2)+1) AS statement_text
+FROM sys.dm_exec_query_memory_grants mg
+JOIN sys.dm_exec_sessions            es ON mg.session_id = es.session_id
+JOIN sys.dm_exec_requests            er ON mg.session_id = er.session_id
+                                       AND mg.request_id = er.request_id
+JOIN sys.dm_resource_governor_workload_groups wg
+    ON mg.group_id = wg.group_id
+JOIN sys.dm_resource_governor_resource_pools rp
+    ON wg.pool_id = rp.pool_id
+CROSS APPLY sys.dm_exec_sql_text(er.sql_handle) qt
+ORDER BY mg.granted_memory_kb DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When the autonomous controller identifies a resource pool absorbing disproportionate memory, it issues a live reconfiguration:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>class AutonomousResourceGovernor:
+    """
+    Dynamically adjusts SQL Server Resource Governor pool limits
+    in response to memory and CPU pressure signals.
+    """
+
+    def __init__(self, conn_str: str, dry_run: bool = False):
+        self.conn_str = conn_str
+        self.dry_run  = dry_run
+
+    def _conn(self):
+        return pyodbc.connect(self.conn_str, autocommit=True)
+
+    def get_pool_memory_usage(self) -&gt; list[dict]:
+        sql = """
+            SELECT
+                rp.name                         AS pool_name,
+                rp.max_memory_percent,
+                rp.min_memory_percent,
+                rp_stats.target_memory_kb,
+                rp_stats.used_memory_kb,
+                CAST(rp_stats.used_memory_kb AS FLOAT)
+                    / NULLIF(rp_stats.target_memory_kb, 0) * 100
+                                                AS utilization_pct
+            FROM sys.dm_resource_governor_resource_pools rp
+            JOIN sys.dm_resource_governor_resource_pools_history_ex rp_stats
+                ON rp.pool_id = rp_stats.pool_id
+        """
+        try:
+            with self._conn() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql)
+                cols = [col[0] for col in cursor.description]
+                return [dict(zip(cols, row)) for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error("POOL_USAGE_FAILED error=%s", e)
+            return []
+
+    def reduce_pool_memory(self, pool_name: str, new_max_pct: int):
+        """Reduce a pool's maximum memory allocation."""
+        # Enforce a floor to prevent starving the pool entirely
+        new_max_pct = max(new_max_pct, 10)
+        sql = f"""
+            ALTER RESOURCE POOL [{pool_name}]
+            WITH (MAX_MEMORY_PERCENT = {new_max_pct});
+            ALTER RESOURCE GOVERNOR RECONFIGURE;
+        """
+        logger.info(
+            "POOL_MEMORY_REDUCE pool=%s new_max_pct=%d dry_run=%s",
+            pool_name, new_max_pct, self.dry_run
+        )
+        if not self.dry_run:
+            try:
+                with self._conn() as conn:
+                    for stmt in sql.split(';'):
+                        stmt = stmt.strip()
+                        if stmt:
+                            conn.cursor().execute(stmt)
+            except Exception as e:
+                logger.error(
+                    "POOL_MEMORY_REDUCE_FAILED pool=%s error=%s",
+                    pool_name, e
+                )
+
+    def rebalance_under_pressure(self):
+        """
+        When total memory grant wait time is elevated, reduce the max memory
+        of the highest-consuming non-default pool by 10 percentage points,
+        rechecking after two collection cycles before further reduction.
+        """
+        pools = self.get_pool_memory_usage()
+        # Exclude the internal and default pools from adjustment
+        adjustable = [
+            p for p in pools
+            if p['pool_name'] not in ('internal', 'default')
+            and p['utilization_pct'] is not None
+        ]
+        if not adjustable:
+            return
+
+        # Target the pool with highest utilization above 85%
+        offender = max(adjustable, key=lambda p: p['utilization_pct'])
+        if offender['utilization_pct'] &gt; 85:
+            current_max = offender['max_memory_percent']
+            self.reduce_pool_memory(
+                offender['pool_name'],
+                max(current_max - 10, 10)
+            )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The reversion path is equally important: once <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RESOURCE_SEMAPHORE</code> waits return to baseline, the controller incrementally restores pool limits toward their configured maximums. All changes are recorded in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba.resource_governor_changes</code> audit table with the triggering signal, the before/after configuration, and the timestamp of both the change and any reversion, creating an evidence trail that demonstrates the system's decision-making over time.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Azure SQL and the Cloud Autonomy Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">When SQL Server workloads run on Azure SQL Database or Azure SQL Managed Instance, the autonomy surface shifts. The platform handles storage scaling, OS patching, and basic HA invisibly. The ADE's responsibility moves up the stack: tier selection, DTU/vCore right-sizing, elastic pool management, and integration with Azure's native intelligence features like automatic tuning and Query Performance Insight.</p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL's automatic tuning can create, drop, and force indexes and plans without human intervention. The ADE layer does not replace this — it supervises it. The supervision pattern uses the Azure SQL REST API and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_tuning_recommendations</code> view in concert:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+from datetime import datetime, timedelta
+import pyodbc
+
+class AzureSQLAutonomyLayer:
+    """
+    Supervises Azure SQL automatic tuning actions and escalates
+    those that cross defined impact thresholds to a human review queue.
+    """
+
+    # Tuning actions with impact scores above this are reviewed before applying
+    HUMAN_REVIEW_SCORE_THRESHOLD = 80
+    # Automatically approve low-impact tuning recommendations
+    AUTO_APPROVE_SCORE_MAX       = 40
+
+    def __init__(self, conn_str: str,
+                 subscription_id: str,
+                 resource_group: str,
+                 server_name: str,
+                 database_name: str,
+                 bearer_token: str):
+        self.conn_str       = conn_str
+        self.base_url = (
+            f"https://management.azure.com/subscriptions/{subscription_id}"
+            f"/resourceGroups/{resource_group}"
+            f"/providers/Microsoft.Sql/servers/{server_name}"
+            f"/databases/{database_name}"
+        )
+        self.headers = {
+            "Authorization": f"Bearer {bearer_token}",
+            "Content-Type":  "application/json"
+        }
+
+    def get_automatic_tuning_state(self) -&gt; dict:
+        url = f"{self.base_url}/automaticTuning?api-version=2021-11-01"
+        response = requests.get(url, headers=self.headers, timeout=15)
+        response.raise_for_status()
+        return response.json()
+
+    def set_tuning_option(self, option: str, desired_state: str):
+        """
+        option: 'createIndex' | 'dropIndex' | 'forceLastGoodPlan'
+        desired_state: 'Auto' | 'Disabled' | 'Manual'
+        """
+        url  = f"{self.base_url}/automaticTuning?api-version=2021-11-01"
+        body = {
+            "properties": {
+                "desiredState": "Custom",
+                "options": {
+                    option: {"desiredState": desired_state}
+                }
+            }
+        }
+        response = requests.patch(url, json=body,
+                                  headers=self.headers, timeout=15)
+        response.raise_for_status()
+        logger.info(
+            "AZURE_TUNING_SET option=%s state=%s", option, desired_state
+        )
+
+    def review_recommendations(self):
+        """
+        Pull tuning recommendations and route each by impact score:
+        - Low impact (&lt; AUTO_APPROVE_SCORE_MAX): approve automatically
+        - High impact (&gt; HUMAN_REVIEW_SCORE_THRESHOLD): queue for human review
+        - Mid range: apply with enhanced monitoring for 24 hours
+        """
+        sql = """
+            SELECT
+                name, type, reason, score,
+                JSON_VALUE(details, '$.implementationDetails.script')
+                    AS action_script,
+                valid_since, last_refresh
+            FROM sys.dm_db_tuning_recommendations
+            WHERE state = JSON_VALUE(state, '$.currentValue')
+              AND score IS NOT NULL
+            ORDER BY score DESC
+        """
+        with pyodbc.connect(self.conn_str) as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+        for row in rows:
+            score = row.score or 0
+            if score &gt; self.HUMAN_REVIEW_SCORE_THRESHOLD:
+                logger.warning(
+                    "TUNING_HUMAN_REVIEW name=%s type=%s score=%d",
+                    row.name, row.type, score
+                )
+                # Post to ticketing system / Slack escalation channel
+                self._escalate_to_human(row)
+            elif score &lt;= self.AUTO_APPROVE_SCORE_MAX:
+                logger.info(
+                    "TUNING_AUTO_APPROVE name=%s type=%s score=%d",
+                    row.name, row.type, score
+                )
+                # Low-risk: the platform will apply; just log the acknowledgment
+            else:
+                logger.info(
+                    "TUNING_MONITORED_APPLY name=%s type=%s score=%d "
+                    "— enhanced monitoring window started",
+                    row.name, row.type, score
+                )
+
+    def _escalate_to_human(self, recommendation):
+        # Implementation depends on organization's ticketing / alerting stack
+        logger.critical(
+            "ESCALATE name=%s script=%s",
+            recommendation.name,
+            recommendation.action_script
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The elastic pool right-sizing loop addresses a common Azure SQL anti-pattern: workloads are placed in an elastic pool sized for peak capacity, but individual databases rarely peak simultaneously. The autonomous tier manager monitors per-database DTU/vCore consumption against pool capacity on a rolling hourly basis and emits resize recommendations when sustained under- or over-utilization is detected:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def evaluate_elastic_pool_sizing(
+        pool_stats: list[dict],
+        pool_max_edtus: int,
+        observation_hours: int = 24
+) -&gt; str:
+    """
+    Given per-database eDTU consumption over the observation window,
+    return a sizing recommendation: 'DOWNSIZE', 'UPSIZE', or 'OPTIMAL'.
+    """
+    import numpy as np
+
+    total_consumed = [row['total_edtu'] for row in pool_stats]
+    p95_consumed   = np.percentile(total_consumed, 95)
+    p50_consumed   = np.percentile(total_consumed, 50)
+
+    utilization_p95 = p95_consumed / pool_max_edtus
+
+    if utilization_p95 &gt; 0.85:
+        return 'UPSIZE'
+    if utilization_p95 &lt; 0.30 and p50_consumed / pool_max_edtus &lt; 0.20:
+        return 'DOWNSIZE'
+    return 'OPTIMAL'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The cloud autonomy layer also manages geo-redundancy configuration: when disaster recovery RPO requirements tighten (detectable through application-layer SLA contract metadata stored in a configuration database), the controller enables active geo-replication or adjusts the failover group policy through the ARM API rather than waiting for a manual change request to work through an operations queue.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating SQL Server Autonomy Into a Unified Control Plane</h3>
+
+<p class="text-gray-300 leading-relaxed">The subparts above describe individual autonomous subsystems — wait stats collection, Query Store governance, AG management, index maintenance, Resource Governor tuning, and Azure SQL supervision. In production, these must compose into a single control plane rather than operating as independent scripts that might issue conflicting actions.</p>
+
+<p class="text-gray-300 leading-relaxed">The unified SQL Server autonomy controller implements a priority hierarchy and mutual exclusion between action types:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from enum import IntEnum
+import threading
+import logging
+from datetime import datetime, timedelta
+from typing import Callable, Optional
+
+logger = logging.getLogger('autonomy_controller')
+
+class ActionPriority(IntEnum):
+    CRITICAL   = 1   # Failover, primary-unreachable response
+    HIGH       = 2   # Plan regression force, memory pressure relief
+    MEDIUM     = 3   # Index rebuild, stats update, replica mode change
+    LOW        = 4   # Elastic pool resize recommendation, audit logging
+
+class AutonomyAction:
+    def __init__(self, name: str, priority: ActionPriority,
+                 fn: Callable, cooldown_minutes: int = 10):
+        self.name             = name
+        self.priority         = priority
+        self.fn               = fn
+        self.cooldown_minutes = cooldown_minutes
+        self._last_executed: Optional[datetime] = None
+        self._lock            = threading.Lock()
+
+    def is_cooled_down(self) -&gt; bool:
+        if self._last_executed is None:
+            return True
+        return (datetime.utcnow() - self._last_executed
+                &gt; timedelta(minutes=self.cooldown_minutes))
+
+    def execute(self):
+        with self._lock:
+            if not self.is_cooled_down():
+                logger.debug(
+                    "ACTION_SUPPRESSED name=%s (cooldown active)", self.name
+                )
+                return
+            try:
+                logger.info("ACTION_START name=%s priority=%s",
+                            self.name, self.priority.name)
+                self.fn()
+                self._last_executed = datetime.utcnow()
+                logger.info("ACTION_COMPLETE name=%s", self.name)
+            except Exception as e:
+                logger.error("ACTION_FAILED name=%s error=%s", self.name, e)
+
+
+class SQLServerAutonomyController:
+    """
+    Unified control plane that composes all SQL Server autonomous subsystems
+    and enforces priority ordering and mutual exclusion between action types.
+    """
+
+    def __init__(self):
+        self._actions: list[AutonomyAction] = []
+        self._critical_lock = threading.Lock()
+        self._maintenance_active = False
+
+    def register(self, action: AutonomyAction):
+        self._actions.append(action)
+        # Keep sorted by priority so highest-priority actions run first
+        self._actions.sort(key=lambda a: a.priority)
+
+    def run_evaluation_cycle(self, triggered_action_names: list[str]):
+        """
+        Run a single evaluation cycle for the named actions.
+        CRITICAL actions acquire the critical lock, blocking all others
+        until the critical action completes.
+        """
+        to_run = [
+            a for a in self._actions
+            if a.name in triggered_action_names
+        ]
+
+        critical = [a for a in to_run if a.priority == ActionPriority.CRITICAL]
+        non_critical = [a for a in to_run if a.priority != ActionPriority.CRITICAL]
+
+        if critical:
+            with self._critical_lock:
+                for action in critical:
+                    action.execute()
+            # After a critical action, suppress non-critical for safety
+            logger.info(
+                "POST_CRITICAL_SUPPRESS suppressed=%d actions",
+                len(non_critical)
+            )
+            return
+
+        # Non-critical actions run sequentially in priority order
+        # Skip maintenance-class actions if a maintenance window is not active
+        for action in non_critical:
+            if action.priority == ActionPriority.MEDIUM:
+                if not self._maintenance_active:
+                    logger.debug(
+                        "ACTION_DEFERRED name=%s (outside maintenance window)",
+                        action.name
+                    )
+                    continue
+            action.execute()
+
+    def set_maintenance_window(self, active: bool):
+        self._maintenance_active = active
+        logger.info("MAINTENANCE_WINDOW active=%s", active)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The evaluation cycle is driven by the sensor network. Each sensor posts named events to an internal queue when it detects a threshold crossing; the controller dequeues these events and maps them to registered action names. This event-driven architecture means the controller does not run a fixed-interval polling loop for every subsystem — actions are triggered by signals, not by clocks, which reduces unnecessary load and makes the decision chain auditable: every action execution has a traceable triggering event in the log.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    S[Sensor Network: DMVs, Query Store, AG state] --> Q[Event Queue]
+    Q --> C{Action Priority}
+    C -->|CRITICAL| CL[Critical Lock: exclusive execution]
+    C -->|HIGH| H[Execute Immediately]
+    C -->|MEDIUM| M{Maintenance Window Active?}
+    C -->|LOW| L[Execute Immediately]
+    CL --> SUP[Suppress Non-Critical, Then Execute]
+    M -->|Yes| MX[Execute]
+    M -->|No| DEF[Defer to Next Window]
+    SUP --> AUD[(dba.autonomy_audit)]
+    H --> AUD
+    MX --> AUD
+    L --> AUD</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The unified control plane's priority routing: CRITICAL actions acquire an exclusive lock and suppress everything else, MEDIUM actions defer outside maintenance windows, and every executed action lands in the same audit table.*</p>
+
+<p class="text-gray-300 leading-relaxed">The final integration step is the audit and observability layer. Every action execution — whether it forces a Query Store plan, adjusts a Resource Governor pool, or initiates an AG failover — writes a structured record to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba.autonomy_audit</code> table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: autonomy audit table
+CREATE TABLE dba.autonomy_audit (
+    audit_id          BIGINT IDENTITY PRIMARY KEY,
+    action_name       NVARCHAR(100)   NOT NULL,
+    priority          NVARCHAR(20)    NOT NULL,
+    triggering_signal NVARCHAR(500)   NOT NULL,
+    action_sql        NVARCHAR(MAX),
+    outcome           NVARCHAR(20)    NOT NULL,  -- 'SUCCESS' | 'FAILED' | 'SUPPRESSED'
+    error_detail      NVARCHAR(MAX),
+    dry_run           BIT             NOT NULL DEFAULT 0,
+    executed_at       DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    duration_ms       INT,
+    rolled_back_at    DATETIME2,
+    rollback_reason   NVARCHAR(500)
+);
+
+CREATE INDEX ix_autonomy_audit_executed_at
+    ON dba.autonomy_audit (executed_at DESC)
+    INCLUDE (action_name, outcome);</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL equivalent: autonomy audit table
+CREATE TABLE dba.autonomy_audit (
+    audit_id          BIGSERIAL PRIMARY KEY,
+    action_name       TEXT            NOT NULL,
+    priority          TEXT            NOT NULL,
+    triggering_signal TEXT            NOT NULL,
+    action_sql        TEXT,
+    outcome           TEXT            NOT NULL,  -- 'SUCCESS' | 'FAILED' | 'SUPPRESSED'
+    error_detail      TEXT,
+    dry_run           BOOLEAN         NOT NULL DEFAULT FALSE,
+    executed_at       TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    duration_ms       INTEGER,
+    rolled_back_at    TIMESTAMPTZ,
+    rollback_reason   TEXT
+);
+
+CREATE INDEX ix_autonomy_audit_executed_at
+    ON dba.autonomy_audit (executed_at DESC)
+    INCLUDE (action_name, outcome);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This audit table serves multiple purposes beyond debugging. It is the evidence layer for change management processes that require documentation of every database configuration change. It is the training data for future ML-based decision models that replace threshold-based rules with learned behavior. And it is the rollback reference: when a forced plan or Resource Governor adjustment needs to be reverted, the audit record contains the exact SQL to reverse it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **DMVs are sensors, not reports.** The autonomous SQL Server architecture treats Dynamic Management Views as a real-time sensor network, collecting differential deltas at sub-minute intervals and feeding them into time-series baselines rather than instantaneous thresholds. Workload-aware, hour-of-week percentile baselines replace static alert limits and dramatically reduce false-positive–driven action storms.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query Store closes the plan governance loop.** Autonomous plan regression detection, validation, and forcing transforms Query Store from a passive diagnostic tool into an active decision surface. The bidirectional design — forcing regressions and unforcing stale forced plans — is what separates genuine autonomy from one-directional manual interventions accumulated over time.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Always On automation requires application-layer arbitration above the cluster.** WSFC and Pacemaker handle quorum-level failover, but the ADE layer adds replica lag scoring, proactive synchronous-to-asynchronous mode transitions under redo queue pressure, and intelligent failover target selection — actions the cluster layer cannot make without workload context.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index and statistics maintenance become condition-driven, not schedule-driven.** Replacing fixed maintenance windows with continuous fragmentation and modification-counter assessment, executed within time-budgeted windows that yield gracefully before closing, ensures maintenance work is proportional to actual need rather than calendar position.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A unified control plane with priority ordering and mutual exclusion is non-negotiable.** Individual autonomous subsystems operating without coordination can issue conflicting actions — a Resource Governor change during an AG failover, or an index rebuild during peak memory pressure. The `SQLServerAutonomyController` enforces a strict priority hierarchy, suppresses non-critical actions in the wake of critical events, and writes every decision to an audit table that serves as both the change management record and the training corpus for future decision model improvements.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

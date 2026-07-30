@@ -6,6 +6,10 @@
   <title>Chapter 19: Milvus: Open-Source Vector Search at Enterprise Scale — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 19: Milvus: Open-Source Vector Search at Enterprise Scale. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -59,6 +63,26 @@
 <p class="text-gray-300 leading-relaxed">| Storage | Object storage (S3/MinIO) + etcd + message bus (Pulsar/Kafka) | Durability, WAL, metadata |</p>
 
 <p class="text-gray-300 leading-relaxed">This is architecturally analogous to separating the PostgreSQL planner, executor, storage manager, and WAL writer into independently scalable services — something relational databases have only recently begun doing in products like Aurora and Spanner. For vector workloads, this disaggregation matters because index building is CPU-and-memory-intensive work that would otherwise contend with query serving. A Milvus Index Node can build an IVF_FLAT or HNSW index on a 100M-vector segment while Query Nodes continue serving search requests without interference.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    Client[Client SDK]
+    Proxy[Access Layer: Proxy<br/>routing, load balancing]
+    Coord[Coordinator Layer<br/>Root / Query / Data / Index coordinators]
+    QN[Query Nodes<br/>serve search]
+    DN[Data Nodes<br/>ingest, persist]
+    IN[Index Nodes<br/>build indexes]
+    Storage[(Storage Layer<br/>Object storage + etcd + Pulsar/Kafka)]
+
+    Client --> Proxy
+    Proxy --> Coord
+    Coord --> QN
+    Coord --> DN
+    Coord --> IN
+    QN <--> Storage
+    DN <--> Storage
+    IN <--> Storage</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The four layers scale independently: Query Nodes handle search load, Data Nodes handle ingestion, and Index Nodes build indexes in the background — none of them contend with each other for CPU or memory.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Segment Model</strong></p>
 
@@ -560,6 +584,441 @@ def search_with_document_diversity(query_embedding: list[float], top_k: int = 10
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Batch Ingestion with OpenAI Embeddings</strong></p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import time
+import numpy as np
+from typing import Iterator
+from pymilvus import connections, Collection, utility
+from openai import OpenAI
+
+connections.connect(alias="default", host="localhost", port="19530")
+openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+collection = Collection("document_chunks")
+
+def generate_embeddings_batch(texts: list[str], model: str = "text-embedding-3-small") -&gt; list[list[float]]:
+    """
+    Generate embeddings with automatic retry and rate-limit handling.
+    OpenAI allows up to 2048 texts per batch call for embedding models.
+    """
+    response = openai_client.embeddings.create(
+        input=texts,
+        model=model
+    )
+    return [item.embedding for item in response.data]
+
+def chunk_iterator(documents: list[dict], chunk_size: int = 512) -&gt; Iterator[dict]:
+    """
+    Yield individual chunks from a list of documents.
+    Each document is a dict with 'id', 'content_type', and 'text' fields.
+    """
+    for doc in documents:
+        words = doc["text"].split()
+        for i in range(0, len(words), chunk_size):
+            chunk_text = " ".join(words[i:i + chunk_size])
+            yield {
+                "document_id": doc["id"],
+                "chunk_index": i // chunk_size,
+                "content_type": doc.get("content_type", "paragraph"),
+                "created_at": int(time.time()),
+                "text": chunk_text
+            }
+
+def ingest_documents(
+    documents: list[dict],
+    batch_size: int = 200,
+    flush_every_n_batches: int = 10
+) -&gt; dict:
+    """
+    Ingest documents into Milvus with batched embedding generation.
+    batch_size=200 balances OpenAI API throughput with memory usage.
+    flush_every_n_batches triggers segment sealing to make data queryable.
+    """
+    total_inserted = 0
+    batch_count = 0
+    chunks = list(chunk_iterator(documents))
+
+    for batch_start in range(0, len(chunks), batch_size):
+        batch = chunks[batch_start:batch_start + batch_size]
+        texts = [c["text"] for c in batch]
+
+        # Generate embeddings for this batch
+        embeddings = generate_embeddings_batch(texts)
+
+        # Prepare columnar data — Milvus insert expects lists per field
+        insert_data = {
+            "document_id": [c["document_id"] for c in batch],
+            "chunk_index": [c["chunk_index"] for c in batch],
+            "content_type": [c["content_type"] for c in batch],
+            "created_at": [c["created_at"] for c in batch],
+            "embedding": embeddings
+        }
+
+        result = collection.insert(insert_data)
+        total_inserted += len(result.primary_keys)
+        batch_count += 1
+
+        # Periodically flush to seal growing segments and make data queryable
+        # Without flush, inserted data is only visible to searches after
+        # the message bus consumer processes it — usually within seconds,
+        # but flush guarantees visibility
+        if batch_count % flush_every_n_batches == 0:
+            collection.flush()
+            print(f"Flushed after {total_inserted} insertions")
+
+    # Final flush to ensure all data is persisted and queryable
+    collection.flush()
+
+    return {
+        "total_chunks": len(chunks),
+        "total_inserted": total_inserted,
+        "batches_processed": batch_count
+    }
+
+# Sample usage
+sample_documents = [
+    {
+        "id": "pg-docs-v16-ch01",
+        "content_type": "paragraph",
+        "text": "PostgreSQL is a powerful, open-source object-relational database system..."
+    },
+    {
+        "id": "pg-docs-v16-ch02",
+        "content_type": "paragraph",
+        "text": "Connection pooling reduces the overhead of establishing new database connections..."
+    }
+]
+
+stats = ingest_documents(sample_documents, batch_size=200)
+print(f"Ingestion complete: {stats}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Upsert and Deletion</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus supports upserts (insert or replace by primary key) and soft-delete semantics. Deleted records are marked with a tombstone and excluded from search results; the physical space is reclaimed during compaction. This is analogous to PostgreSQL's MVCC model where dead tuples are vacuumed asynchronously.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("document_chunks")
+
+# Upsert: replaces existing record if primary key exists
+# Useful when re-processing a document with updated content
+def upsert_chunks(chunks_data: dict) -&gt; int:
+    result = collection.upsert(chunks_data)
+    collection.flush()
+    return len(result.primary_keys)
+
+# Delete by primary key — immediate for query purposes after flush
+def delete_chunks_by_id(chunk_ids: list[int]):
+    id_list = ", ".join(str(i) for i in chunk_ids)
+    expr = f"chunk_id in [{id_list}]"
+    collection.delete(expr)
+    collection.flush()
+
+# Delete all chunks belonging to a document — filter-based delete
+def delete_document(document_id: str):
+    expr = f'document_id == "{document_id}"'
+    collection.delete(expr)
+    collection.flush()
+    print(f"Deleted all chunks for document: {document_id}")
+
+# Example: remove a document that has been superseded
+delete_document("pg-docs-v15-ch01")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compaction and Index Rebuild</strong></p>
+
+<p class="text-gray-300 leading-relaxed">After heavy deletes, Milvus segment files contain tombstoned records that waste memory when loaded. Trigger manual compaction to physically reclaim space, then optionally rebuild indexes if segment fragmentation is high.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection, utility
+import time
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("document_chunks")
+
+# Trigger compaction — runs asynchronously in the background
+compaction_id = collection.compact()
+print(f"Compaction triggered, job ID: {compaction_id}")
+
+# Poll until compaction completes
+while True:
+    state = collection.get_compaction_state()
+    print(f"Compaction state: {state.state}")
+    if str(state.state) in ("Completed", "Failed"):
+        break
+    time.sleep(5)
+
+# Check collection statistics after compaction
+stats = utility.get_query_segment_info("document_chunks")
+print(f"Segment count after compaction: {len(stats)}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.6 Multi-Tenancy Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">Multi-tenancy in vector databases is a first-class design concern that does not have a single right answer. Milvus offers three patterns, each with different isolation, performance, and operational complexity characteristics — an almost exact parallel to the multi-tenancy patterns in relational database design.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 1: Collection-per-Tenant</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Each tenant has a dedicated collection. This gives maximum isolation: tenant data is physically separate, indexes are independent, and you can drop a tenant's collection without affecting others.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection, CollectionSchema, FieldSchema, DataType, utility
+
+connections.connect(alias="default", host="localhost", port="19530")
+
+def create_tenant_collection(tenant_id: str, vector_dim: int = 1536) -&gt; Collection:
+    """
+    Create a dedicated collection for a tenant.
+    Collection names must be alphanumeric — sanitize tenant IDs.
+    """
+    collection_name = f"tenant_{tenant_id.replace('-', '_')}"
+
+    if utility.has_collection(collection_name):
+        return Collection(collection_name)
+
+    fields = [
+        FieldSchema(name="chunk_id", dtype=DataType.INT64, is_primary=True, auto_id=True),
+        FieldSchema(name="document_id", dtype=DataType.VARCHAR, max_length=128),
+        FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=vector_dim)
+    ]
+    schema = CollectionSchema(fields=fields)
+    collection = Collection(name=collection_name, schema=schema)
+
+    collection.create_index(
+        field_name="embedding",
+        index_params={"metric_type": "COSINE", "index_type": "HNSW", "params": {"M": 16, "efConstruction": 200}}
+    )
+    return collection
+
+def drop_tenant(tenant_id: str):
+    """Remove a tenant's collection entirely — instant, no residual data."""
+    collection_name = f"tenant_{tenant_id.replace('-', '_')}"
+    if utility.has_collection(collection_name):
+        utility.drop_collection(collection_name)
+        print(f"Dropped collection for tenant: {tenant_id}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The limitation: Milvus has a practical limit on the number of simultaneously loaded collections (typically in the hundreds, bounded by Query Node memory). This pattern does not scale beyond a few hundred active tenants without implementing a load/unload scheduling layer.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 2: Partition-per-Tenant</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A single collection with tenant-specific partitions. Partitions in Milvus are physical subdivisions of a collection — search can be scoped to one or more partitions, isolating tenant data at query time while sharing a single collection's overhead.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection, Partition
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("shared_document_chunks")
+
+def get_or_create_tenant_partition(tenant_id: str) -&gt; Partition:
+    partition_name = f"tenant_{tenant_id}"
+    if not collection.has_partition(partition_name):
+        collection.create_partition(partition_name)
+    return Partition(collection, partition_name)
+
+def insert_for_tenant(tenant_id: str, data: dict) -&gt; list[int]:
+    partition = get_or_create_tenant_partition(tenant_id)
+    result = partition.insert(data)
+    return result.primary_keys
+
+def search_for_tenant(tenant_id: str, query_embedding: list[float], top_k: int = 10):
+    partition_name = f"tenant_{tenant_id}"
+    # Load only this tenant's partition — other tenants' data stays unloaded
+    collection.load(partition_names=[partition_name])
+
+    results = collection.search(
+        data=[query_embedding],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"ef": 64}},
+        limit=top_k,
+        partition_names=[partition_name]
+    )
+    return results[0]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Partitions scale to around 1,024 per collection in Milvus 2.4. This pattern is appropriate for SaaS applications with up to several hundred tenants that have predictable, moderate-sized datasets per tenant.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 3: Field-based Tenant Isolation with Filtering</strong></p>
+
+<p class="text-gray-300 leading-relaxed">All tenant data lives in a single collection with a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tenant_id</code> scalar field. Every query includes a filter expression scoping results to the requesting tenant. This is the simplest operationally but requires rigorous application-layer enforcement — there is no database-level guarantee that a query cannot accidentally omit the tenant filter.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from pymilvus import connections, Collection
+
+connections.connect(alias="default", host="localhost", port="19530")
+collection = Collection("shared_document_chunks")
+collection.load()
+
+def search_tenant_strict(
+    tenant_id: str,
+    query_embedding: list[float],
+    top_k: int = 10
+) -&gt; list[dict]:
+    """
+    Always inject tenant_id filter — never allow unfiltered search.
+    Enforce at this layer so application code cannot accidentally bypass tenant isolation.
+    """
+    results = collection.search(
+        data=[query_embedding],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"ef": 64}},
+        limit=top_k,
+        expr=f'tenant_id == "{tenant_id}"',
+        output_fields=["document_id", "chunk_index", "tenant_id"]
+    )
+    # Verify no cross-tenant leakage — defensive check in high-compliance contexts
+    for hit in results[0]:
+        assert hit.entity.get("tenant_id") == tenant_id, \
+            f"Cross-tenant data leakage detected: got {hit.entity.get('tenant_id')}"
+    return results[0]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern scales to unlimited tenants with no collection or partition count limits, but recall degrades proportionally with the fraction of the collection that belongs to each tenant. A tenant with 0.01% of records in a 1B-vector collection will experience poor recall because the ANN graph was built over all tenants' data, and HNSW pruning may skip relevant neighbors that happen to be separated by other tenants' records in the graph.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.7 Operational Concerns: Monitoring, Backup, and Upgrades</h3>
+
+<p class="text-gray-300 leading-relaxed">Running Milvus in production means owning the same operational surface area as any stateful distributed system. This section covers the monitoring signals, backup strategy, and upgrade path that keep a Milvus cluster healthy over time.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Prometheus and Grafana Integration</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus exposes a rich set of Prometheus metrics. The following are the highest-signal metrics for production dashboards:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># prometheus-scrape-config.yaml snippet
+scrape_configs:
+  - job_name: 'milvus'
+    static_configs:
+      - targets:
+          - 'milvus-proxy:9091'
+          - 'milvus-querynode-0:9091'
+          - 'milvus-querynode-1:9091'
+          - 'milvus-datanode-0:9091'
+          - 'milvus-indexnode-0:9091'
+    metrics_path: '/metrics'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Key metrics to alert on:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | Alert Threshold | Meaning |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus_proxy_search_latency_p99</code> | >500ms | Search latency SLA breach |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus_querynode_cache_hit_rate</code> | <85% | Insufficient Query Node memory |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus_querynode_sq_req_count</code> | Rate drop >20% | Query Node crash or overload |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus_datanode_consume_msg_count</code> | Rate stall | Message bus backpressure |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus_indexnode_index_task_count</code> | Queue depth >100 | Index build falling behind ingestion |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">etcd_server_has_leader</code> | 0 | etcd quorum lost — cluster is unavailable |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup Strategy</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus does not have a built-in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> equivalent. Backup is a combination of:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Object storage versioning</strong>: Enable S3 versioning on your Milvus bucket. Segment files are immutable once written; versioning gives you point-in-time recovery without a dedicated backup job.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">etcd snapshot</strong>: etcd holds all collection metadata, index definitions, and segment assignments. Snapshot it on a schedule using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">etcdctl snapshot save</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Milvus Backup tool</strong>: The official <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">milvus-backup</code> CLI can take logical backups of specific collections, streaming segment files to a separate S3 location.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Install milvus-backup CLI
+wget https://github.com/zilliztech/milvus-backup/releases/latest/download/milvus-backup_linux_amd64.tar.gz
+tar -xzf milvus-backup_linux_amd64.tar.gz
+
+# Create a backup configuration
+cat &gt; backup-config.yaml &lt;&lt; 'EOF'
+milvus:
+  address: localhost
+  port: 19530
+
+minio:
+  address: localhost
+  port: 9000
+  bucketName: milvus-production
+  backupBucketName: milvus-backups
+  rootPath: files
+
+backup:
+  maxSegmentGroupSize: 2G
+EOF
+
+# Backup a specific collection
+./milvus-backup create \
+  --config backup-config.yaml \
+  --name "document_chunks_backup_$(date +%Y%m%d)" \
+  --colls document_chunks
+
+# List available backups
+./milvus-backup list --config backup-config.yaml
+
+# Restore a collection from backup
+./milvus-backup restore \
+  --config backup-config.yaml \
+  --name document_chunks_backup_20240115 \
+  --suffix "_restored"   # Restores as document_chunks_restored to avoid name collision</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Rolling Upgrades</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Milvus uses a rolling upgrade process for Kubernetes deployments: update the Helm chart version, and Kubernetes will cycle Pods one at a time. The critical constraint is that coordinators (Root, Query, Data, Index) must be upgraded before worker nodes, because coordinators control the protocol version negotiation. The Milvus compatibility matrix guarantees that one minor version of difference between coordinators and workers is supported, enabling zero-downtime rolling upgrades within a minor version family.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Check current deployment version
+helm list --namespace milvus
+
+# Upgrade Milvus with rolling restart — coordinator pods upgrade first
+# because the Helm chart orders Pod updates by deployment dependency
+helm upgrade milvus milvus/milvus \
+  --namespace milvus \
+  --values milvus-values.yaml \
+  --version 4.2.0 \
+  --set coordinator.activeStandby.enabled=true   # Enable HA mode for zero-downtime
+
+# Monitor rollout progress
+kubectl rollout status deployment/milvus-querynode --namespace milvus
+kubectl rollout status deployment/milvus-datanode --namespace milvus</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.8 Milvus vs. Alternatives: When to Choose What</h3>
+
+<p class="text-gray-300 leading-relaxed">With a full picture of Milvus's architecture and operational model, we can revisit the positioning question with engineering precision rather than marketing language.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Milvus vs. pgvector</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Choose pgvector when: your vector dataset fits comfortably in PostgreSQL's working memory (under ~10M vectors for interactive latency), you need transactional consistency between vector and relational data, or your team's operational experience is entirely centered on PostgreSQL. pgvector's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hnsw</code> index is competitive with Milvus HNSW up to this scale, and the operational simplicity of a single database cannot be overstated.</p>
+
+<p class="text-gray-300 leading-relaxed">Choose Milvus when: you have more than ~50M vectors, you need multi-modal search (dense + sparse hybrid) as a first-class feature, or you need independent scaling of ingestion and query compute. Milvus also supports GPU-accelerated index building natively, which pgvector does not.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Milvus vs. Pinecone</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Pinecone is a managed service with a deliberately simple operational surface. If your organization lacks Kubernetes expertise or cannot dedicate engineering time to operating a distributed system, Pinecone's operational simplicity has real value. Milvus's advantages over Pinecone are: no data leaves your infrastructure (compliance), no per-vector storage costs (cost at scale), and full control over index parameters and hardware.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Milvus vs. Weaviate</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Weaviate bundles vectorization, schema management, and a GraphQL query interface alongside vector search. It is a better fit for applications that want a single system to own the object store, the embedding pipeline, and the search layer. Milvus is a pure vector search engine — it expects you to bring your own embedding pipeline and metadata store. Teams that have already built embedding pipelines and want maximum search performance and scalability without a bundled object store tend to prefer Milvus.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Decision Matrix</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Criterion | pgvector | Milvus | Pinecone | Weaviate |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Operational complexity | Low | High | Very Low | Medium |</p>
+<p class="text-gray-300 leading-relaxed">| Max practical scale | ~50M vectors | Billions | Billions (managed) | Hundreds of millions |</p>
+<p class="text-gray-300 leading-relaxed">| Hybrid dense+sparse | Limited | Native | Available | Available |</p>
+<p class="text-gray-300 leading-relaxed">| Transactional consistency | Full ACID | Eventual | Eventual | Eventual |</p>
+<p class="text-gray-300 leading-relaxed">| GPU acceleration | No | Yes | Managed | No |</p>
+<p class="text-gray-300 leading-relaxed">| Self-hosted | Yes | Yes | No | Yes |</p>
+<p class="text-gray-300 leading-relaxed">| Multi-tenancy support | Schema/RLS | Partition/Collection | Namespace | Tenant field |</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Disaggregated architecture enables independent scaling**: Milvus separates proxy, coordinator, query, data, and index roles into independently scalable components. This means you can add Query Nodes to handle more concurrent searches without touching ingestion capacity, or add Index Nodes to accelerate index builds during a bulk load without competing with live query serving — a design that monolithic vector stores cannot match at the same scale.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index selection is a first-class engineering decision**: HNSW is the right default for most workloads under 500M vectors where low latency is the priority, IVF variants suit memory-constrained environments, and DISKANN enables billion-scale deployments that cannot fit in RAM. Treat the `M` and `ef` parameters as tunable knobs analogous to PostgreSQL's `work_mem` and `effective_cache_size` — start with documented defaults, measure recall and latency, then adjust.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid dense+sparse search consistently outperforms either alone**: For knowledge retrieval over technical content, combining HNSW-indexed dense embeddings with sparse inverted indexes and fusing results via RRF produces materially better recall than dense search alone. Milvus's native support for `SPARSE_FLOAT_VECTOR` fields and `AnnSearchRequest` fusion makes this pattern straightforward to implement without external reranking infrastructure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Multi-tenancy pattern selection has lasting consequences**: Collection-per-tenant gives the strongest isolation but limits active tenant count; partition-per-tenant scales to hundreds of tenants with selective loading; filter-based isolation scales to any tenant count but relies entirely on application-layer enforcement and degrades recall for small tenants in large shared collections. Choose based on your tenant count, data size per tenant, and compliance requirements — and choose before your first bulk load.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Operational maturity requires owning the full stack**: Milvus's power comes with the full operational responsibility of a distributed system: Prometheus monitoring with latency and cache-hit-rate alerts, etcd snapshot backups alongside object storage versioning, and a disciplined Helm-based upgrade path that respects coordinator-before-worker ordering. Teams that underestimate this surface area typically encounter their first production incident before they have instrumentation in place to diagnose it.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

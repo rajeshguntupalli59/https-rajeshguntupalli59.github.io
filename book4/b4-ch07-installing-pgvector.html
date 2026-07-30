@@ -6,6 +6,10 @@
   <title>Chapter 7: Installing and Configuring pgvector — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 7: Installing and Configuring pgvector. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -409,6 +413,394 @@ COMMIT;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The typical production pattern is a Python pipeline that reads document content from PostgreSQL, calls an embedding model, and writes vectors back to the same database. Here is a complete, runnable example using OpenAI's embedding API and psycopg3:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import os
+import psycopg
+import numpy as np
+from openai import OpenAI
+from typing import List, Tuple
+
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+DATABASE_URL = os.environ["DATABASE_URL"]  # postgresql://user:pass@host:5432/dbname
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+def get_embeddings(texts: List[str], model: str = "text-embedding-3-small") -&gt; List[List[float]]:
+    """
+    Batch embedding call. OpenAI allows up to 2048 inputs per request.
+    text-embedding-3-small: 1536 dimensions, cost-effective for most use cases.
+    text-embedding-3-large: 3072 dimensions, higher quality at higher cost.
+    """
+    response = client.embeddings.create(
+        input=texts,
+        model=model,
+        encoding_format="float"
+    )
+    return [item.embedding for item in response.data]
+
+
+def embed_documents_batch(batch_size: int = 100) -&gt; None:
+    """
+    Process documents without embeddings in batches.
+    Uses SKIP LOCKED to support parallel workers without conflicts.
+    """
+    with psycopg.connect(DATABASE_URL) as conn:
+        # Count pending work
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM documents WHERE embedding IS NULL")
+            total_pending = cur.fetchone()[0]
+        print(f"Documents pending embedding: {total_pending}")
+
+        processed = 0
+        while True:
+            with conn.cursor() as cur:
+                # Fetch a batch; SKIP LOCKED enables safe parallel processing
+                cur.execute(
+                    """
+                    SELECT id, content FROM documents
+                    WHERE embedding IS NULL
+                    ORDER BY id
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                    """,
+                    (batch_size,)
+                )
+                rows = cur.fetchall()
+
+            if not rows:
+                break
+
+            ids = [row[0] for row in rows]
+            texts = [row[1] for row in rows]
+
+            # Call embedding API
+            embeddings = get_embeddings(texts)
+
+            # Bulk update using executemany
+            with conn.cursor() as cur:
+                cur.executemany(
+                    "UPDATE documents SET embedding = %s::vector WHERE id = %s",
+                    [
+                        ("[" + ",".join(str(x) for x in emb) + "]", doc_id)
+                        for emb, doc_id in zip(embeddings, ids)
+                    ]
+                )
+            conn.commit()
+
+            processed += len(ids)
+            print(f"Processed {processed}/{total_pending} documents")
+
+    print("Embedding pipeline complete.")
+
+
+def similarity_search(
+    query: str,
+    top_k: int = 5,
+    category_filter: str = None
+) -&gt; List[Tuple]:
+    """
+    End-to-end similarity search: embed query, retrieve nearest neighbors.
+    """
+    query_embedding = get_embeddings([query])[0]
+    vec_literal = "[" + ",".join(str(x) for x in query_embedding) + "]"
+
+    filter_clause = ""
+    params = [vec_literal, top_k]
+    if category_filter:
+        filter_clause = "WHERE metadata-&gt;&gt;'category' = %s"
+        params = [vec_literal, category_filter, top_k]
+
+    sql = f"""
+        SELECT
+            id,
+            content,
+            metadata,
+            1 - (embedding &lt;=&gt; %s::vector) AS cosine_similarity
+        FROM documents
+        {filter_clause}
+        ORDER BY embedding &lt;=&gt; %s::vector
+        LIMIT %s
+    """
+
+    # Rebuild params correctly for the query structure
+    if category_filter:
+        params = [vec_literal, category_filter, vec_literal, top_k]
+    else:
+        params = [vec_literal, vec_literal, top_k]
+
+    with psycopg.connect(DATABASE_URL) as conn:
+        conn.execute("SET hnsw.ef_search = 100")
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            results = cur.fetchall()
+
+    return results
+
+
+if __name__ == "__main__":
+    # Run the embedding pipeline
+    embed_documents_batch(batch_size=100)
+
+    # Test search
+    results = similarity_search(
+        query="How do I configure connection pooling in PostgreSQL?",
+        top_k=5
+    )
+    for doc_id, content, metadata, similarity in results:
+        print(f"[{similarity:.4f}] {content[:80]}...")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FOR UPDATE SKIP LOCKED</code> pattern deserves emphasis. Without it, running multiple embedding workers in parallel causes the same rows to be selected by multiple workers simultaneously, resulting in redundant API calls and update conflicts. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SKIP LOCKED</code> makes each worker atomically claim a batch that no other worker is currently processing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Hybrid Search: Combining Vector and Full-Text</h3>
+
+<p class="text-gray-300 leading-relaxed">Pure vector search excels at semantic similarity but can miss exact keyword matches that a user expects. A document mentioning "PgBouncer" by name may not surface at the top of a cosine search for "PgBouncer" if the embedding space for the query overlaps more strongly with conceptually related content. Full-text search, conversely, finds exact matches but cannot generalize across paraphrases or synonyms. Combining both in a hybrid search query gives you the best of both worlds.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ts_vector</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ts_query</code> full-text infrastructure coexists naturally with pgvector on the same table.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Add a full-text search column alongside the embedding column
+ALTER TABLE documents ADD COLUMN fts_vector TSVECTOR
+    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED;
+
+CREATE INDEX documents_fts_idx ON documents USING GIN (fts_vector);
+
+-- Hybrid search: combine BM25-style full-text rank with cosine similarity
+-- Reciprocal Rank Fusion (RRF) is a principled way to merge two ranked lists
+-- RRF score = 1/(k + rank_vector) + 1/(k + rank_fts), k=60 is a common default
+
+WITH vector_ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (ORDER BY embedding &lt;=&gt; $1::vector) AS rank_v
+    FROM documents
+    WHERE embedding IS NOT NULL
+    ORDER BY embedding &lt;=&gt; $1::vector
+    LIMIT 100  -- oversample before fusion
+),
+fts_ranked AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (ORDER BY ts_rank_cd(fts_vector, query) DESC) AS rank_f
+    FROM documents,
+         plainto_tsquery('english', $2) AS query
+    WHERE fts_vector @@ query
+    ORDER BY ts_rank_cd(fts_vector, query) DESC
+    LIMIT 100
+),
+fused AS (
+    SELECT
+        COALESCE(v.id, f.id) AS id,
+        COALESCE(1.0 / (60 + v.rank_v), 0) +
+        COALESCE(1.0 / (60 + f.rank_f), 0) AS rrf_score
+    FROM vector_ranked v
+    FULL OUTER JOIN fts_ranked f ON v.id = f.id
+)
+SELECT
+    d.id,
+    d.content,
+    d.metadata,
+    fused.rrf_score
+FROM fused
+JOIN documents d ON d.id = fused.id
+ORDER BY rrf_score DESC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Reciprocal Rank Fusion formula (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1 / (k + rank)</code>) down-weights lower-ranked results from each signal and combines them without requiring score normalization — cosine distances and BM25 scores live in different numerical ranges and cannot be directly added without calibration. RRF sidesteps this by operating purely on ranks.</p>
+
+<p class="text-gray-300 leading-relaxed">For production use, parameterize both <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$1</code> (the query vector, pre-computed in application code) and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$2</code> (the raw query string for full-text). A single round-trip to the database handles the entire hybrid retrieval.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Partitioning Large Embedding Tables</h3>
+
+<p class="text-gray-300 leading-relaxed">For tables expected to grow into tens of millions of rows, PostgreSQL's declarative partitioning can manage index size and enable partition pruning. Common strategies are range partitioning by ingestion date and hash partitioning by a stable identifier.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Range-partitioned documents table (partition by month)
+CREATE TABLE documents_partitioned (
+    id          BIGSERIAL,
+    content     TEXT NOT NULL,
+    metadata    JSONB,
+    embedding   vector(1536),
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+
+-- Create partitions
+CREATE TABLE documents_2024_q1
+    PARTITION OF documents_partitioned
+    FOR VALUES FROM ('2024-01-01') TO ('2024-04-01');
+
+CREATE TABLE documents_2024_q2
+    PARTITION OF documents_partitioned
+    FOR VALUES FROM ('2024-04-01') TO ('2024-07-01');
+
+-- HNSW indexes must be created per partition
+-- pgvector does not support global partitioned indexes
+CREATE INDEX ON documents_2024_q1
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+CREATE INDEX ON documents_2024_q2
+    USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+
+-- Queries against the parent table benefit from partition pruning
+-- when a WHERE clause on created_at eliminates irrelevant partitions
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, content
+FROM documents_partitioned
+WHERE created_at &gt;= '2024-04-01' AND created_at &lt; '2024-07-01'
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The critical limitation to understand: each partition has its own HNSW or IVFFlat index covering only the rows in that partition. A query against the parent table that cannot be pruned to a single partition will perform parallel index scans across all partitions and merge-sort the results. For exact nearest-neighbor search over the full dataset, this works correctly. For approximate search, recall is computed independently per partition, which can degrade overall recall — the true global top-10 may be distributed across partitions, but each partition only surfaces its local approximate top-10.</p>
+
+<p class="text-gray-300 leading-relaxed">Strategies to mitigate this:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Oversample per partition.</strong> Query each partition for top-100, then rerank the merged 100×N candidates in application code.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Partition by a filter dimension.</strong> If your application always filters by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">metadata->>'tenant_id'</code>, partition by tenant hash so each query touches exactly one partition.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Use pg_partman</strong> for automatic partition creation and management, especially for time-range partitions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Vector Query Performance</h3>
+
+<p class="text-gray-300 leading-relaxed">Standard PostgreSQL monitoring tools apply to pgvector workloads with a few additions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Check whether queries are using the vector index or falling back to seqscan
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT id, content
+FROM documents
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 10;
+
+-- What to look for in the plan:
+-- "Index Scan using documents_embedding_hnsw_idx" — index is being used
+-- "Seq Scan" — index is NOT being used (check enable_indexscan, table size, or index existence)
+
+-- pgvector disables index scan when the planner estimates it is cheaper to seqscan
+-- Force index usage for benchmarking:
+SET enable_seqscan = OFF;
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id, content FROM documents
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 10;
+
+-- Track slow vector queries via pg_stat_statements
+-- Requires pg_stat_statements in shared_preload_libraries
+SELECT
+    LEFT(query, 100) AS query_snippet,
+    calls,
+    ROUND(mean_exec_time::numeric, 2) AS mean_ms,
+    ROUND(total_exec_time::numeric / 1000, 2) AS total_sec,
+    ROUND(stddev_exec_time::numeric, 2) AS stddev_ms
+FROM pg_stat_statements
+WHERE query ILIKE '%&lt;=&gt;%'
+   OR query ILIKE '%&lt;-&gt;%'
+   OR query ILIKE '%&lt;#&gt;%'
+ORDER BY mean_exec_time DESC
+LIMIT 20;
+
+-- Monitor HNSW index bloat from deletes
+SELECT
+    schemaname,
+    tablename,
+    indexname,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    idx_scan,
+    idx_tup_read,
+    idx_tup_fetch
+FROM pg_stat_user_indexes
+WHERE indexname LIKE '%hnsw%' OR indexname LIKE '%ivfflat%';
+
+-- Table-level stats for vacuum health
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    ROUND(100.0 * n_dead_tup / NULLIF(n_live_tup + n_dead_tup, 0), 1) AS dead_pct,
+    last_autovacuum,
+    last_autoanalyze
+FROM pg_stat_user_tables
+WHERE relname LIKE '%document%';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The planner and the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">enable_indexscan</code> flag:</strong> pgvector's approximate index scan is treated as an index scan by the planner. The planner may choose a sequential scan when the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LIMIT</code> is high (because fetching many rows from an index scan has higher overhead than a single seqscan), when statistics are stale, or when the query has a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code> clause that filters more rows than the planner expects. Running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE documents</code> after bulk inserts keeps statistics current and prevents the planner from making poor choices.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vector.hnsw_ef_search</code> at the database level</strong> is useful as a baseline:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Set a default ef_search for all connections without application-level control
+ALTER DATABASE mydb SET hnsw.ef_search = 100;
+-- Individual sessions can still override with SET hnsw.ef_search = N</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Security and Multi-Tenancy Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">When multiple tenants share a single pgvector database, ensuring that similarity searches cannot leak vectors or content across tenant boundaries requires standard PostgreSQL row-level security — the same mechanisms that govern any shared-schema multi-tenancy.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Multi-tenant embedding table with RLS
+CREATE TABLE tenant_documents (
+    id          BIGSERIAL PRIMARY KEY,
+    tenant_id   UUID NOT NULL,
+    content     TEXT NOT NULL,
+    embedding   vector(1536),
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX ON tenant_documents
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Row-level security
+ALTER TABLE tenant_documents ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation ON tenant_documents
+    USING (tenant_id = current_setting('app.tenant_id')::uuid);
+
+-- Application sets the tenant context per connection/transaction
+-- With PgBouncer transaction mode, SET LOCAL is required:
+BEGIN;
+SET LOCAL app.tenant_id = '550e8400-e29b-41d4-a716-446655440000';
+SELECT id, content, 1 - (embedding &lt;=&gt; $1::vector) AS similarity
+FROM tenant_documents
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 10;
+COMMIT;
+-- RLS automatically filters to the current tenant's rows
+-- The HNSW index is shared but the RLS predicate is applied after graph traversal</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One nuance specific to vector workloads: RLS predicates are applied *after* the HNSW graph traversal returns its approximate neighbor set. This means the index may traverse graph nodes belonging to other tenants during search, even though those rows are filtered from the final result. For the vast majority of applications this is acceptable — the content of other tenants' vectors is not exposed, only the topology of the HNSW graph is traversed. For workloads where even graph topology leakage is a concern (highly sensitive multi-tenant environments), the alternative is separate tables per tenant or separate schemas, each with their own HNSW index.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Upgrading pgvector</h3>
+
+<p class="text-gray-300 leading-relaxed">pgvector minor-version upgrades (e.g., 0.6.x → 0.7.0) are handled via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER EXTENSION</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- After installing the new pgvector binaries on the OS:
+ALTER EXTENSION vector UPDATE TO '0.7.0';
+
+-- Check the result
+SELECT extname, extversion FROM pg_extension WHERE extname = 'vector';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">HNSW indexes built with earlier versions do not need to be rebuilt for minor-version upgrades unless the release notes explicitly state otherwise. IVFFlat indexes are more sensitive to version differences — check the pgvector changelog before assuming cross-version compatibility.</p>
+
+<p class="text-gray-300 leading-relaxed">For major PostgreSQL version upgrades (e.g., PostgreSQL 15 → 16), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_upgrade</code> works with pgvector provided the pgvector binaries for the target PostgreSQL version are installed on the new cluster before running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_upgrade</code>. The indexes are preserved.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pgvector installs as a standard PostgreSQL extension.** No changes to `shared_preload_libraries` are needed; `CREATE EXTENSION vector` is the only required step after placing the binaries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose the distance operator based on the embedding model's training, not preference.** Cosine (`<=>`) is correct for most sentence transformer and OpenAI embedding models; verify in the model's documentation before choosing L2 or inner product.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW is the better default index for most production workloads** because it supports incremental inserts, delivers higher recall at comparable query speeds, and does not require pre-populated data for index construction. IVFFlat remains appropriate when build-time memory is the binding constraint.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Session-level parameters (`hnsw.ef_search`, `ivfflat.probes`) must be re-applied per transaction** when using PgBouncer in transaction pooling mode; use `SET LOCAL` inside explicit transaction blocks to ensure consistent search quality without parameter bleed-across connections.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid search via Reciprocal Rank Fusion** combines vector similarity and full-text search without score normalization, handling the case where exact keyword matches and semantic similarity each contribute different signals to retrieval quality.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -6,6 +6,10 @@
   <title>Chapter 28: Indexing Pipelines: Keeping Vectors Fresh — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 28: Indexing Pipelines: Keeping Vectors Fresh. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -56,6 +60,16 @@
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Embedding generation</strong> — each chunk is sent to an embedding model (OpenAI, Cohere, a local sentence-transformer). This takes time and costs money.</p>
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Upsert to vector store</strong> — the resulting vector and its metadata are written to the vector database.</p>
 <p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Index rebuild or incremental update</strong> — depending on the vector store, the ANN index may need to be explicitly rebuilt or optimized after writes accumulate.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Source data change] --> B[Chunking]
+    B --> C[Embedding generation]
+    C --> D[Upsert to vector store]
+    D --> E[Index rebuild /<br/>incremental update]
+    E --> F[Query-ready]
+    style A fill:#e8e8e8
+    style F fill:#c8e6c9</pre></div>
+<p class="text-gray-300 leading-relaxed">*Steps 2–5 run asynchronously in most production systems; the gap between the source write (A) and a query-ready index (F) is the indexing latency you must actively manage.*</p>
 
 <p class="text-gray-300 leading-relaxed">Steps 2 through 5 are asynchronous in most production systems. The gap between step 1 and step 5 defines your indexing latency — and for freshness-sensitive applications, this gap is what you must actively manage.</p>
 
@@ -379,7 +393,9 @@ WHERE tablename = 'document_chunks';
 
 -- Rebuild HNSW index with updated ef_construction for larger datasets
 -- This acquires ShareUpdateExclusiveLock — queries continue during build
-BEGIN;
+-- Note: CONCURRENTLY statements cannot run inside an explicit transaction
+-- block, so issue these as separate top-level statements, not wrapped
+-- in BEGIN/COMMIT.
 
 DROP INDEX CONCURRENTLY idx_chunks_embedding_hnsw;
 
@@ -387,8 +403,6 @@ CREATE INDEX CONCURRENTLY idx_chunks_embedding_hnsw
     ON document_chunks
     USING hnsw (embedding vector_cosine_ops)
     WITH (m = 16, ef_construction = 128);   -- Increased for better recall
-
-COMMIT;
 
 -- Run VACUUM to reclaim space from deleted chunks
 VACUUM ANALYZE document_chunks;</code></pre>
@@ -527,7 +541,404 @@ def validate_retrieval_parity(
 
 <p class="text-gray-300 leading-relaxed">For large indexes — tens of millions of vectors — the reindex operation can take hours to days. At 1,000 embeddings per second (aggressive batching, high API tier), a 10M-vector index takes about 2.8 hours just for the embedding API calls, not counting write latency. Plan the migration window accordingly, and track progress with a simple counter against your document count.</p>
 
+<p class="text-gray-300 leading-relaxed">---### Monitoring Index Freshness in Production</p>
+
+<p class="text-gray-300 leading-relaxed">A pipeline that ingests without monitoring is a pipeline that silently drifts. You need instrumentation at every stage: how far behind is the indexer, how many documents are waiting, and whether the index quality has degraded.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The core metrics to track:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Indexing lag** — time between `updated_at` on the source record and `indexed_at` on the corresponding chunk. This is your pipeline latency.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Queue depth** — how many source records have `updated_at > last_indexed_at`. This tells you whether the pipeline is keeping up with the write rate.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index-to-source count ratio** — the number of distinct `doc_id` values in your vector table divided by the number of documents in your source. A ratio below 1.0 means documents are missing from the index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Recall over time** — periodic sampling against a held-out evaluation set. This catches both index degradation and embedding quality regressions.</li>
+
+<p class="text-gray-300 leading-relaxed">Here is a monitoring query set for the pgvector pipeline:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+
+-- 1. Indexing lag: average and 99th-percentile delay between
+--    source update and vector write
+SELECT
+    AVG(EXTRACT(EPOCH FROM (dc.indexed_at - dc.updated_at))) AS avg_lag_seconds,
+    PERCENTILE_CONT(0.99) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (dc.indexed_at - dc.updated_at))
+    ) AS p99_lag_seconds,
+    MAX(EXTRACT(EPOCH FROM (dc.indexed_at - dc.updated_at))) AS max_lag_seconds
+FROM document_chunks dc
+WHERE dc.indexed_at &gt; NOW() - INTERVAL '1 hour';
+
+-- 2. Queue depth: source records not yet reflected in the vector table.
+--    Run against your source database (adjust table/column names as needed)
+SELECT COUNT(*) AS unindexed_count
+FROM products p
+WHERE p.updated_at &gt; (
+    SELECT last_indexed_at
+    FROM indexer_state
+    WHERE pipeline_id = 'products'
+)
+AND p.deleted_at IS NULL;
+
+-- 3. Coverage ratio: distinct indexed doc_ids vs. source document count
+SELECT
+    (SELECT COUNT(DISTINCT doc_id) FROM document_chunks WHERE source = 'products')
+        AS indexed_docs,
+    (SELECT COUNT(*) FROM products WHERE deleted_at IS NULL)
+        AS source_docs,
+    ROUND(
+        (SELECT COUNT(DISTINCT doc_id) FROM document_chunks WHERE source = 'products')::numeric
+        / NULLIF((SELECT COUNT(*) FROM products WHERE deleted_at IS NULL), 0),
+        4
+    ) AS coverage_ratio;
+
+-- 4. Orphaned chunks: chunks for doc_ids that no longer exist in the source.
+--    These represent delete events that the pipeline missed.
+SELECT dc.doc_id, COUNT(*) AS chunk_count
+FROM document_chunks dc
+LEFT JOIN products p
+    ON dc.doc_id = 'product-' || p.product_id::text
+WHERE dc.source = 'products'
+  AND p.product_id IS NULL
+GROUP BY dc.doc_id
+ORDER BY chunk_count DESC
+LIMIT 50;
+
+-- 5. Recent indexing throughput: chunks written per minute over the last hour
+SELECT
+    DATE_TRUNC('minute', indexed_at) AS minute_bucket,
+    COUNT(*) AS chunks_written
+FROM document_chunks
+WHERE indexed_at &gt; NOW() - INTERVAL '1 hour'
+GROUP BY 1
+ORDER BY 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Equivalent queries for SQL Server</strong> (if your source system is SQL Server and you're monitoring the pipeline state table there):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
+
+-- 1. Indexing lag
+SELECT
+    AVG(DATEDIFF(SECOND, dc.updated_at, dc.indexed_at)) AS avg_lag_seconds,
+    MAX(DATEDIFF(SECOND, dc.updated_at, dc.indexed_at)) AS max_lag_seconds
+FROM document_chunks dc
+WHERE dc.indexed_at &gt; DATEADD(HOUR, -1, GETUTCDATE());
+
+-- 2. Queue depth
+SELECT COUNT(*) AS unindexed_count
+FROM products p
+WHERE p.updated_at &gt; (
+    SELECT last_indexed_at
+    FROM indexer_state
+    WHERE pipeline_id = 'products'
+)
+AND p.deleted_at IS NULL;
+
+-- 3. Coverage ratio
+SELECT
+    indexed_docs,
+    source_docs,
+    ROUND(CAST(indexed_docs AS DECIMAL(18,4)) / NULLIF(source_docs, 0), 4)
+        AS coverage_ratio
+FROM (
+    SELECT
+        (SELECT COUNT(DISTINCT doc_id)
+         FROM document_chunks WHERE source = 'products') AS indexed_docs,
+        (SELECT COUNT(*)
+         FROM products WHERE deleted_at IS NULL) AS source_docs
+) t;
+
+-- 4. Recent throughput: chunks written per minute
+SELECT
+    DATEADD(MINUTE,
+        DATEDIFF(MINUTE, '2000-01-01', indexed_at),
+        '2000-01-01') AS minute_bucket,
+    COUNT(*) AS chunks_written
+FROM document_chunks
+WHERE indexed_at &gt; DATEADD(HOUR, -1, GETUTCDATE())
+GROUP BY DATEADD(MINUTE,
+    DATEDIFF(MINUTE, '2000-01-01', indexed_at),
+    '2000-01-01')
+ORDER BY 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Alerting thresholds to establish:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | Warning | Critical |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| P99 indexing lag | > 5 minutes | > 30 minutes |</p>
+<p class="text-gray-300 leading-relaxed">| Queue depth | > 500 documents | > 5,000 documents |</p>
+<p class="text-gray-300 leading-relaxed">| Coverage ratio | < 0.98 | < 0.95 |</p>
+<p class="text-gray-300 leading-relaxed">| Orphaned chunk count | > 100 | > 1,000 |</p>
+
+<p class="text-gray-300 leading-relaxed">Set these as time-series alerts in whatever observability stack you already operate — Prometheus with Grafana, Datadog, CloudWatch. The queries above can be wrapped in a metrics scraper that runs every minute and emits gauge values.</p>
+
 <p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Recall Degradation Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">Lag metrics tell you about pipeline health. They do not tell you about index quality. A pipeline can be fully current — zero lag, perfect coverage — but the HNSW graph can still have degraded recall if it was built under heavy write pressure or with parameters that were too small for the current dataset size.</p>
+
+<p class="text-gray-300 leading-relaxed">The way to detect recall degradation is to maintain a <strong class="text-white">golden evaluation set</strong>: a small collection of queries with known ground-truth results, determined by brute-force exact search over a snapshot of the dataset. You then periodically run these queries through the ANN index and measure how many of the ground-truth results appear in the top-k.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — recall benchmark against a golden evaluation set
+import psycopg2
+import numpy as np
+from typing import List, Tuple
+
+def brute_force_top_k(
+    query_vector: List[float],
+    conn,
+    top_k: int = 10
+) -&gt; List[str]:
+    """
+    Exact nearest neighbors using sequential scan.
+    Used only for evaluation, not for production queries.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT doc_id
+            FROM document_chunks
+            ORDER BY embedding &lt;=&gt; %s::vector
+            LIMIT %s
+            """,
+            (query_vector, top_k)
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def ann_top_k(
+    query_vector: List[float],
+    conn,
+    top_k: int = 10,
+    ef_search: int = 40
+) -&gt; List[str]:
+    """
+    Approximate nearest neighbors using HNSW index.
+    """
+    with conn.cursor() as cur:
+        cur.execute(f"SET hnsw.ef_search = {ef_search}")
+        cur.execute(
+            """
+            SELECT doc_id
+            FROM document_chunks
+            ORDER BY embedding &lt;=&gt; %s::vector
+            LIMIT %s
+            """,
+            (query_vector, top_k)
+        )
+        return [row[0] for row in cur.fetchall()]
+
+
+def measure_recall(
+    evaluation_set: List[Tuple[List[float], List[str]]],
+    conn,
+    top_k: int = 10,
+    ef_search: int = 40
+) -&gt; float:
+    """
+    evaluation_set: list of (query_vector, ground_truth_doc_ids) pairs.
+    Returns mean recall@top_k across all evaluation queries.
+    """
+    recalls = []
+    for query_vector, ground_truth in evaluation_set:
+        ann_results = set(ann_top_k(query_vector, conn, top_k, ef_search))
+        ground_truth_set = set(ground_truth[:top_k])
+        if not ground_truth_set:
+            continue
+        hit_count = len(ann_results & ground_truth_set)
+        recalls.append(hit_count / len(ground_truth_set))
+
+    return float(np.mean(recalls)) if recalls else 0.0
+
+
+# Build the evaluation set once (or refresh monthly)
+def build_evaluation_set(
+    sample_queries: List[str],
+    embeddings_client,
+    conn,
+    top_k: int = 10
+) -&gt; List[Tuple[List[float], List[str]]]:
+    evaluation_set = []
+    vectors = embeddings_client.embed_documents(sample_queries)
+    for vec in vectors:
+        ground_truth = brute_force_top_k(vec, conn, top_k)
+        evaluation_set.append((vec, ground_truth))
+    return evaluation_set
+
+
+# Periodic recall check — run this in a scheduled job (e.g., daily)
+conn = psycopg2.connect(DB_CONN)
+# evaluation_set loaded from persistent storage (pickle, JSON, etc.)
+# evaluation_set = load_evaluation_set("eval_set.pkl")
+
+# recall = measure_recall(evaluation_set, conn, top_k=10, ef_search=40)
+# if recall &lt; 0.85:
+#     trigger_index_rebuild_alert(recall)
+# print(f"Recall@10 (ef_search=40): {recall:.4f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A recall below 0.85 at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search=40</code> with an HNSW index built at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16, ef_construction=64</code> is a signal that either the index parameters need adjustment for the current dataset size, or the index has accumulated enough write-induced graph distortion to warrant a rebuild. Neither situation is an emergency, but both warrant scheduled maintenance.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Backfill Strategies for Large Datasets</h3>
+
+<p class="text-gray-300 leading-relaxed">When you first deploy a vector index on an existing dataset, or when you perform a full reindex after a model migration, you need a controlled backfill that does not overwhelm your embedding API, your database write capacity, or your operational budget.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parallel worker pattern with a work queue:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — parallel backfill with a work queue
+import concurrent.futures
+import queue
+import threading
+import time
+import psycopg2
+import logging
+from typing import Iterator
+
+MAX_WORKERS = 8          # Number of concurrent embedding+write workers
+EMBED_BATCH_SIZE = 100   # Documents per embedding API call
+WRITE_BATCH_SIZE = 500   # Chunks per database write batch
+RATE_LIMIT_RPS = 50      # Target requests per second to embedding API
+
+
+def iter_source_documents(source_conn, batch_size: int = 1000) -&gt; Iterator[list]:
+    """
+    Yield batches of (product_id, description, category) rows
+    from the source database.
+    """
+    offset = 0
+    while True:
+        with source_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT product_id, description, category
+                FROM products
+                WHERE deleted_at IS NULL
+                ORDER BY product_id
+                LIMIT %s OFFSET %s
+                """,
+                (batch_size, offset)
+            )
+            rows = cur.fetchall()
+        if not rows:
+            break
+        yield rows
+        offset += len(rows)
+        if len(rows) &lt; batch_size:
+            break
+
+
+def backfill_worker(
+    work_queue: queue.Queue,
+    vector_conn_string: str,
+    worker_id: int,
+    counter: list,   # Shared mutable counter [total_processed]
+    counter_lock: threading.Lock
+):
+    """
+    Worker thread: dequeues document batches, embeds, and writes.
+    """
+    conn = psycopg2.connect(vector_conn_string)
+    processed = 0
+
+    while True:
+        try:
+            batch = work_queue.get(timeout=5)
+        except queue.Empty:
+            break
+
+        try:
+            for product_id, description, category in batch:
+                index_document(
+                    doc_id=f"product-{product_id}",
+                    content=description or "",
+                    metadata={"source": "products", "category": category or ""},
+                    conn=conn
+                )
+                processed += 1
+
+            work_queue.task_done()
+
+            with counter_lock:
+                counter[0] += len(batch)
+                if counter[0] % 1000 == 0:
+                    logging.info(f"Backfill progress: {counter[0]} documents indexed")
+
+        except Exception as e:
+            logging.error(f"Worker {worker_id} failed on batch: {e}")
+            work_queue.task_done()
+
+    conn.close()
+    logging.info(f"Worker {worker_id} finished, processed {processed} documents locally")
+
+
+def run_backfill(source_conn_string: str, vector_conn_string: str):
+    source_conn = psycopg2.connect(source_conn_string)
+    work_queue = queue.Queue(maxsize=MAX_WORKERS * 4)
+    counter = [0]
+    counter_lock = threading.Lock()
+
+    workers = []
+    for i in range(MAX_WORKERS):
+        t = threading.Thread(
+            target=backfill_worker,
+            args=(work_queue, vector_conn_string, i, counter, counter_lock),
+            daemon=True
+        )
+        t.start()
+        workers.append(t)
+
+    # Feed the queue from the source
+    for batch in iter_source_documents(source_conn, batch_size=50):
+        work_queue.put(batch)
+        # Throttle producer to avoid overwhelming the queue
+        time.sleep(len(batch) / (RATE_LIMIT_RPS * MAX_WORKERS))
+
+    work_queue.join()
+    for t in workers:
+        t.join()
+
+    source_conn.close()
+    logging.info(f"Backfill complete. Total documents: {counter[0]}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Checkpointing the backfill.</strong> Large backfills fail partway through. Always checkpoint progress so a restart picks up where it left off rather than starting over. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNIQUE (doc_id, chunk_index)</code> constraint on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> table combined with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT DO UPDATE</code> upsert semantics means re-processing already-indexed documents is safe — it overwrites without creating duplicates. The only cost is the redundant embedding API call, which is wasteful but not dangerous.</p>
+
+<p class="text-gray-300 leading-relaxed">For extra safety, maintain an explicit checkpoint table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+CREATE TABLE backfill_checkpoint (
+    backfill_id     TEXT PRIMARY KEY,
+    last_product_id BIGINT NOT NULL,
+    total_indexed   BIGINT NOT NULL DEFAULT 0,
+    started_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Update checkpoint after each batch
+INSERT INTO backfill_checkpoint (backfill_id, last_product_id, total_indexed)
+VALUES ('migration-2024-11', 42000, 42000)
+ON CONFLICT (backfill_id)
+DO UPDATE SET
+    last_product_id = EXCLUDED.last_product_id,
+    total_indexed   = EXCLUDED.total_indexed,
+    updated_at      = NOW();
+
+-- Resume from checkpoint
+SELECT last_product_id FROM backfill_checkpoint
+WHERE backfill_id = 'migration-2024-11';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector index freshness is not automatic.** Unlike B-tree indexes that update transactionally, vector indexes require an explicit pipeline that runs chunking, embedding generation, and upsert as separate asynchronous steps. The gap between a source write and its vector representation is a design choice you must actively manage.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose your CDC approach based on your freshness SLA.** Watermark polling (30–90 second lag) is simple and sufficient for most applications. Debezium-to-Kafka CDC (sub-5-second lag) is appropriate when stale results are directly harmful — live inventory, breaking news, or customer-facing personalization. Do not add Kafka complexity unless you genuinely need sub-minute freshness.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW indexes degrade under write pressure and need periodic rebuilds.** pgvector accepts live inserts but accumulates graph distortion over time. Use `CREATE INDEX CONCURRENTLY` to rebuild during low-traffic windows without blocking queries. Treat this as scheduled maintenance, not an emergency procedure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding model migrations require blue-green reindexing.** Vectors from different models occupy incompatible spaces. When upgrading models, dual-write to both old and new indexes during the transition, validate retrieval parity with Jaccard similarity checks across a representative query set, and only cut over query traffic after the new index meets your recall threshold.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Instrument both pipeline health and index quality as separate concerns.** Lag metrics, queue depth, and coverage ratios tell you whether documents are reaching the index. Periodic recall benchmarks against a golden evaluation set tell you whether the index itself is returning accurate results. You need both — a current but degraded index fails users just as much as a high-quality but stale one.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

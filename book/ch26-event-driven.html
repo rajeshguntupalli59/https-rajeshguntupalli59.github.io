@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 26: Event-Driven Design — The DBA Handbook</title>
   <meta name="description" content="The DBA Handbook Chapter 26: Event-Driven Design. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -19,8 +23,8 @@
       <div class="flex items-center gap-1 text-xs">
         <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
         <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
-        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
-        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../book.html"      class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Books</a>
+        <a href="index.html"        class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Chapters</a>
         <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
         <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
         <a href="../products.html"
@@ -57,6 +61,23 @@
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">The Transactional Outbox Pattern in Practice</h3>
 
 <p class="text-gray-300 leading-relaxed">The outbox table is simple by design. It holds event payloads alongside enough metadata for a processor to understand ordering, type, and delivery status.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant App as Application
+    participant DB as Database
+    participant Relay as Outbox Relay
+    participant Broker as Kafka / RabbitMQ
+    App->>DB: BEGIN
+    App->>DB: INSERT business row (orders)
+    App->>DB: INSERT event (event_outbox)
+    App->>DB: COMMIT
+    Relay->>DB: Poll unprocessed events
+    DB-->>Relay: Return pending rows
+    Relay->>Broker: Publish event
+    Broker-->>Relay: Ack
+    Relay->>DB: Mark event processed</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Figure: The transactional outbox pattern — the business write and the event write commit atomically in one transaction, and a separate relay process forwards the event to the broker only after commit.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL outbox table
@@ -454,16 +475,166 @@ EXEC sys.sp_cdc_change_job
 
 <p class="text-gray-300 leading-relaxed">Production event-driven systems need observability across three dimensions: lag (how far behind are consumers?), error rate (how many events are landing in the dead letter queue?), and throughput (events per second, which reveals upstream problems when it drops unexpectedly).</p>
 
-<p class="text-gray-300 leading-relaxed">In PostgreSQL, replication slot lag is visible in</p>
+<p class="text-gray-300 leading-relaxed">In PostgreSQL, replication slot lag is visible in<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_replication_slots</code>, as shown earlier. Outbox backlog is trivially queryable:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: monitor outbox backlog depth and oldest unprocessed event
+SELECT
+    COUNT(*)                            AS pending_events,
+    MIN(created_at)                     AS oldest_pending,
+    NOW() - MIN(created_at)             AS max_lag,
+    COUNT(*) FILTER (WHERE retry_count &gt;= 3) AS near_dead_letter
+FROM event_outbox
+WHERE processed_at IS NULL;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: monitor outbox backlog depth and oldest unprocessed event
+SELECT
+    COUNT(*)                                        AS pending_events,
+    MIN(created_at)                                 AS oldest_pending,
+    DATEDIFF(SECOND, MIN(created_at),
+             SYSDATETIMEOFFSET())                   AS max_lag_seconds,
+    SUM(CASE WHEN retry_count &gt;= 3 THEN 1 ELSE 0 END) AS near_dead_letter
+FROM event_outbox
+WHERE processed_at IS NULL;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These queries belong in your monitoring dashboards and should trigger alerts when <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_lag</code> exceeds your SLA threshold. A lag spike that coincides with a relay process restart is expected and recoverable. A lag spike that grows continuously indicates a relay that can't keep up with write volume — the trigger to scale out relay workers or increase batch sizes.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server CDC specifically, watch the Agent jobs directly:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: check CDC Agent job status
+SELECT
+    j.name,
+    jh.run_status,  -- 1=succeeded, 0=failed, 4=in progress
+    jh.run_date,
+    jh.run_time,
+    jh.message
+FROM msdb.dbo.sysjobs j
+JOIN msdb.dbo.sysjobhistory jh
+    ON j.job_id = jh.job_id
+WHERE j.name LIKE 'cdc.%'
+ORDER BY jh.run_date DESC, jh.run_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A failed CDC Agent job is invisible to application-level monitoring unless you explicitly query for it. Many teams discover a CDC outage only when a downstream consumer reports stale data, sometimes hours after the Agent job silently failed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating with External Brokers</h3>
+
+<p class="text-gray-300 leading-relaxed">Once you have events flowing reliably — whether through an outbox relay or a CDC pipeline — the next question is where they land. Kafka is the most common destination in high-throughput production systems, but the choice of broker does not fundamentally change the database-side design. A few integration points are worth addressing explicitly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema Management and Event Contracts</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When a database column changes — a field is renamed, a type is widened, a new required field appears — downstream consumers that depend on the event schema may break. This is the event schema evolution problem, and it's strictly harder than API versioning because events may already be in-flight or stored in a log.</p>
+
+<p class="text-gray-300 leading-relaxed">The mitigation is to treat event schemas as versioned contracts. Use a schema registry (Confluent Schema Registry is the most common Kafka-adjacent option) to enforce compatibility rules before a new schema version is accepted. PostgreSQL's JSONB flexibility can hide schema drift in local queries, but it doesn't protect downstream consumers from receiving a field they didn't expect to be absent or renamed.</p>
+
+<p class="text-gray-300 leading-relaxed">Practically speaking, backward-compatible changes — adding optional fields — are safe. Removing fields, renaming fields, or changing field types are breaking changes that require versioned event types and coordinated consumer upgrades.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Exactly-Once Semantics</strong></p>
+
+<p class="text-gray-300 leading-relaxed">No combination of a standard relational database and an external broker gives you true exactly-once delivery without application-level cooperation. What you can achieve reliably is at-least-once delivery with idempotent consumers, which is functionally equivalent to exactly-once for most business use cases. The outbox-plus-idempotent-consumer pattern described in this chapter is the standard approach, and it works. Chasing true exactly-once at the infrastructure level introduces complexity that rarely justifies itself in practice.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Transactional Producers in Kafka</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Kafka's transactional producer API — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">initTransactions()</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">beginTransaction()</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commitTransaction()</code> — allows a producer to write to Kafka atomically across multiple partitions and to a consumer group offset topic, enabling exactly-once semantics within the Kafka ecosystem. This is valuable for Kafka-to-Kafka transformations but does not solve the dual-write problem between a database and Kafka. The outbox pattern remains the correct boundary at the database edge, regardless of what the downstream broker supports.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Event Sourcing: When the Log Is the Database</h3>
+
+<p class="text-gray-300 leading-relaxed">Event sourcing takes the event-driven idea further: instead of storing current state in rows and emitting events as a side effect, the event log itself is the system of record. Current state is derived by replaying events. This is a distinct architectural decision with its own trade-offs, and it sits further from the traditional DBA domain — but it interacts with databases in specific ways worth understanding.</p>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL is a reasonable event store for low-to-moderate volume event-sourced systems. An append-only events table with good indexing on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aggregate_id</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sequence_number</code> can handle write throughput that satisfies many applications. Dedicated event store products (EventStoreDB, for instance) offer subscription and snapshot features purpose-built for the pattern, but the operational simplicity of staying in PostgreSQL has real value.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: a simple append-only event store table
+CREATE TABLE domain_events (
+    id              BIGSERIAL PRIMARY KEY,
+    aggregate_id    UUID          NOT NULL,
+    aggregate_type  TEXT          NOT NULL,
+    sequence_number BIGINT        NOT NULL,
+    event_type      TEXT          NOT NULL,
+    payload         JSONB         NOT NULL,
+    metadata        JSONB         NOT NULL DEFAULT '{}',
+    occurred_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT uq_aggregate_sequence
+        UNIQUE (aggregate_id, sequence_number)
+);
+
+CREATE INDEX idx_domain_events_aggregate
+    ON domain_events (aggregate_id, sequence_number);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UNIQUE</code> constraint on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(aggregate_id, sequence_number)</code> enforces optimistic concurrency: if two processes try to append the same sequence number for the same aggregate simultaneously, one will fail with a unique violation. Application code catches this and retries. This is the event sourcing equivalent of an optimistic lock.</p>
+
+<p class="text-gray-300 leading-relaxed">To read current state, you replay the event stream for a given aggregate:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: load all events for an aggregate in order
+SELECT
+    sequence_number,
+    event_type,
+    payload,
+    occurred_at
+FROM domain_events
+WHERE aggregate_id = $1
+ORDER BY sequence_number ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For long-lived aggregates with many events, full replay on every read becomes expensive. Snapshots solve this: periodically store a materialized snapshot of current state alongside the event sequence number it represents, and on load, start from the most recent snapshot and replay only the events after it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: snapshot table for event-sourced aggregates
+CREATE TABLE aggregate_snapshots (
+    aggregate_id    UUID        NOT NULL,
+    aggregate_type  TEXT        NOT NULL,
+    sequence_number BIGINT      NOT NULL,
+    state           JSONB       NOT NULL,
+    taken_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    CONSTRAINT pk_snapshots PRIMARY KEY (aggregate_id, sequence_number)
+);
+
+-- Load: get most recent snapshot then events after it
+WITH latest_snapshot AS (
+    SELECT sequence_number, state
+    FROM aggregate_snapshots
+    WHERE aggregate_id = $1
+    ORDER BY sequence_number DESC
+    LIMIT 1
+)
+SELECT
+    e.sequence_number,
+    e.event_type,
+    e.payload
+FROM domain_events e
+LEFT JOIN latest_snapshot s ON TRUE
+WHERE e.aggregate_id = $1
+  AND e.sequence_number &gt; COALESCE(s.sequence_number, 0)
+ORDER BY e.sequence_number ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Event sourcing is not appropriate for every domain, and it carries costs in query complexity and snapshot management that traditional row-based storage avoids. However, understanding the pattern matters for DBAs because teams that adopt it often underestimate the operational requirements: retention policies for the event log, snapshot compaction strategies, and the fact that "deleting" data requires soft-delete events or more invasive log compaction — which can create compliance complications around data deletion requirements.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The transactional outbox pattern solves the dual-write problem** by writing events into a table within the same database transaction as the business data change. The relay process forwards events after commit, so atomicity is guaranteed without distributed coordination.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Change Data Capture reads the transaction log**, not the tables directly, making it the most reliable way to capture all data changes regardless of which application path caused them. PostgreSQL uses logical replication slots with the `pgoutput` plugin; SQL Server uses the `sp_cdc_enable_table` system procedure and SQL Server Agent jobs. Both require active monitoring — slot lag in PostgreSQL and Agent job health in SQL Server are the most common sources of silent failure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LISTEN/NOTIFY in PostgreSQL and Service Broker in SQL Server** provide native, in-database messaging for lower-volume scenarios. LISTEN/NOTIFY is best used as a low-latency wake signal paired with a durable outbox, not as a standalone delivery mechanism. Service Broker provides durable, transactional queuing fully inside SQL Server, suitable for internal workflow orchestration.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Idempotent consumers and at-least-once delivery** are the practical production standard. Design consumers to handle duplicate events using upsert semantics with sequence-number guards, and implement dead letter queues for events that repeatedly fail processing rather than allowing a single bad event to block the entire pipeline.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Operational observability requires explicit attention to backlog depth, consumer lag, dead letter queue growth, and retention policy enforcement.** Outbox tables and CDC change tables grow without bound unless pruned. Relay processes and CDC Agent jobs can fail silently. Monitoring these dimensions proactively — rather than discovering failures through downstream symptom reports — is what separates a functioning event-driven system from one that quietly degrades under load.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 flex justify-between text-xs">

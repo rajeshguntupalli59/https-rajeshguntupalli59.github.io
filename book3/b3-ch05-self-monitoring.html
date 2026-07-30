@@ -6,6 +6,10 @@
   <title>Chapter 5: Self-Monitoring Database Architectures — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 5: Self-Monitoring Database Architectures. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -115,6 +119,21 @@ SELECT
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A lightweight collector (Prometheus `postgres_exporter` or a custom Python agent) runs as a sidecar process co-located with each database node — not inside it — and pushes metrics to a remote aggregator.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The aggregator (Prometheus with remote write, VictoriaMetrics, or TimescaleDB) lives on independent infrastructure with no database dependency.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The decision engine (Alertmanager rules, a custom Python daemon, or a Kubernetes operator) reads from the aggregator and never talks directly to the database node for telemetry.</li>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    subgraph Primary Node
+        DBA[(Database)]
+        SA[Sidecar Collector]
+    end
+    subgraph Replica Node
+        DBB[(Database)]
+        SB[Sidecar Collector]
+    end
+    SA -->|push metrics| AGG[External Aggregator<br/>Prometheus / VictoriaMetrics / TimescaleDB]
+    SB -->|push metrics| AGG
+    AGG --> DE[Decision Engine<br/>never queries DB nodes directly]
+    DE -->|primary metrics go silent at T+30s| FA[Trigger failover evaluation]</pre></div>
+<p class="text-gray-300 leading-relaxed">*Sidecar-plus-external-aggregator topology: the collector runs alongside each node but the aggregator and decision engine live on independent infrastructure, so a failed primary is still observable.*</p>
 
 <p class="text-gray-300 leading-relaxed">This topology means a failed primary is still observable from the external aggregator, because the replica's sidecar continues emitting. The decision engine sees the primary's metrics go silent at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">T+30s</code> (scrape interval expiry), which is itself a signal that triggers the autonomous failover evaluation path.</p>
 
@@ -348,6 +367,106 @@ ORDER BY valid_from;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The following Python function implements this scoring model against a running PostgreSQL instance:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+from dataclasses import dataclass
+from typing import Dict
+
+@dataclass
+class HealthScore:
+    composite: float
+    sub_scores: Dict[str, float]
+    autonomous_mode: str  # 'act', 'recommend', or 'observe'
+
+def compute_pg_health_score(dsn: str, baseline: Dict) -&gt; HealthScore:
+    """
+    Compute a weighted autonomous health score for a PostgreSQL instance.
+    baseline: dict of 7-day rolling averages {
+        'p99_latency_ms': float, 'avg_connections': float
+    }
+    """
+    scores = {}
+
+    with psycopg2.connect(dsn) as conn, conn.cursor() as cur:
+
+        # --- Availability (30%) ---
+        cur.execute("""
+            SELECT count(*) FROM pg_stat_replication
+            WHERE state = 'streaming'
+        """)
+        streaming_replicas = cur.fetchone()[0]
+        scores['availability'] = min(1.0, streaming_replicas / 1.0)  # Expect ≥1
+
+        # --- Replication health (25%) ---
+        cur.execute("""
+            SELECT COALESCE(MAX(EXTRACT(EPOCH FROM replay_lag)), 0)
+            FROM pg_stat_replication
+        """)
+        lag_seconds = cur.fetchone()[0] or 0
+        # Score: 1.0 at 0s lag, decays linearly to 0 at 300s lag
+        scores['replication'] = max(0.0, 1.0 - (lag_seconds / 300.0))
+
+        # --- Resource pressure (20%) ---
+        cur.execute("""
+            SELECT count(*) AS active,
+                   (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') AS max_conn
+            FROM pg_stat_activity WHERE state = 'active'
+        """)
+        res = cur.fetchone()
+        conn_ratio = res[0] / res[1] if res[1] &gt; 0 else 1.0
+        scores['resource_pressure'] = max(0.0, 1.0 - conn_ratio)
+
+        # --- Query performance (15%) ---
+        cur.execute("""
+            SELECT COALESCE(
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY mean_exec_time), 0
+            )
+            FROM pg_stat_statements
+        """)
+        p99 = cur.fetchone()[0] or 0.0
+        baseline_p99 = baseline.get('p99_latency_ms', p99 or 1.0)
+        ratio = p99 / baseline_p99 if baseline_p99 &gt; 0 else 1.0
+        # Score: 1.0 at or below baseline, decays linearly to 0 at 2x baseline
+        scores['query_performance'] = max(0.0, min(1.0, 1.0 - (ratio - 1.0)))
+
+        # --- Configuration drift (10%) ---
+        cur.execute("""
+            SELECT count(*) FROM pg_settings
+            WHERE source = 'session' AND setting != boot_val
+        """)
+        drift_count = cur.fetchone()[0]
+        scores['configuration_drift'] = max(0.0, 1.0 - (drift_count / 10.0))
+
+    weights = {
+        'availability': 0.30,
+        'replication': 0.25,
+        'resource_pressure': 0.20,
+        'query_performance': 0.15,
+        'configuration_drift': 0.10,
+    }
+    composite = sum(scores[k] * weights[k] for k in weights)
+
+    if composite &gt;= 0.6:
+        mode = 'act'
+    elif composite &gt;= 0.4:
+        mode = 'recommend'
+    else:
+        mode = 'observe'
+
+    return HealthScore(composite=composite, sub_scores=scores, autonomous_mode=mode)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The scoring thresholds above (0.6 for act mode, 0.4 for recommend mode) are starting points, not fixed constants — they must be tuned against a specific environment's actual incident history. A team adopting this model should treat the initial thresholds as a hypothesis and validate them against months of historical health-score-versus-incident data before trusting the gate in production.</p>
+
+<p class="text-gray-300 leading-relaxed">The health score's real value is not the number itself but what it gates: it is the single decision point that separates "the system is confident enough to act" from "the system should defer to a human." Every autonomous action described elsewhere in this book should, in a mature implementation, check this gate — or an equivalent one — before executing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Self-monitoring is not more metrics — it is metrics with structure, timeliness, and self-referential integrity, so a dead collector doesn't leave the autonomous engine reasoning from stale or absent data.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Metric pipelines must be architecturally independent of the components they observe: a sidecar-plus-external-aggregator topology ensures a failed primary is still visible to the decision engine, because the signal path doesn't run through the primary itself.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Static thresholds degrade as workloads change; dynamic baselines (rolling averages, standard deviation bands) and trend-projection alerts (`predict_linear`) let the system detect both current violations and problems that haven't happened yet.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> TimescaleDB continuous aggregates and SQL Server temporal tables give the autonomous engine two distinct kinds of memory — what the system was doing, and what it was configured to do — and both are necessary to distinguish a recurring problem from a newly introduced misconfiguration.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A composite, weighted health score is the gate that determines whether the system operates in observe, recommend, or act mode; the weights and thresholds must be tuned to the specific environment rather than treated as universal defaults.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

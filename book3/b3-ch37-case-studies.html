@@ -6,6 +6,10 @@
   <title>Chapter 37: Real-World Autonomous DBA Case Studies — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 37: Real-World Autonomous DBA Case Studies. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -469,6 +473,306 @@ ORDER BY lag_bytes_raw DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The Kubernetes controller patched CloudNativePG's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Cluster</code> resource to add replicas dynamically:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import kopf
+import kubernetes
+import logging
+import time
+from prometheus_api_client import PrometheusConnect
+
+PROMETHEUS_URL   = "http://prometheus.monitoring.svc.cluster.local:9090"
+CNPG_GROUP       = "postgresql.cnpg.io"
+CNPG_VERSION     = "v1"
+CNPG_PLURAL      = "clusters"
+NAMESPACE        = "databases"
+CLUSTER_NAME     = "ecommerce-pg"
+MIN_REPLICAS     = 2
+MAX_REPLICAS     = 8
+SCALE_UP_RATIO   = 0.75
+SCALE_DOWN_RATIO = 0.35
+SCALE_COOLDOWN   = 180  # seconds between scale events
+
+prom  = PrometheusConnect(url=PROMETHEUS_URL, disable_ssl=True)
+k8s   = kubernetes.client.CustomObjectsApi()
+last_scale_time = 0
+
+def get_connection_utilization() -&gt; float:
+    result = prom.custom_query(
+        'sum(pg_stat_activity_count{state="active",cluster="ecommerce-pg"}) '
+        '/ sum(pg_settings_max_connections{cluster="ecommerce-pg"})'
+    )
+    if result:
+        return float(result[0]["value"][1])
+    return 0.0
+
+def get_current_replica_count() -&gt; int:
+    cluster = k8s.get_namespaced_custom_object(
+        group=CNPG_GROUP, version=CNPG_VERSION,
+        namespace=NAMESPACE, plural=CNPG_PLURAL,
+        name=CLUSTER_NAME
+    )
+    return cluster["spec"]["instances"]
+
+def patch_replica_count(new_count: int) -&gt; None:
+    patch = {"spec": {"instances": new_count}}
+    k8s.patch_namespaced_custom_object(
+        group=CNPG_GROUP, version=CNPG_VERSION,
+        namespace=NAMESPACE, plural=CNPG_PLURAL,
+        name=CLUSTER_NAME, body=patch
+    )
+    logging.info(f"Patched CloudNativePG cluster to {new_count} instances")
+
+def get_max_replication_lag_bytes() -&gt; int:
+    result = prom.custom_query(
+        'max(pg_replication_lag_bytes{cluster="ecommerce-pg"})'
+    )
+    if result:
+        return int(float(result[0]["value"][1]))
+    return 0
+
+@kopf.timer("postgresql.cnpg.io", "v1", "clusters", interval=60.0)
+def autoscale_loop(spec, name, namespace, **kwargs):
+    global last_scale_time
+    if name != CLUSTER_NAME or namespace != NAMESPACE:
+        return
+
+    now = time.time()
+    if (now - last_scale_time) &lt; SCALE_COOLDOWN:
+        logging.debug("Inside cooldown window — skipping scale evaluation")
+        return
+
+    utilization  = get_connection_utilization()
+    current_reps = get_current_replica_count()
+    lag_bytes    = get_max_replication_lag_bytes()
+
+    logging.info(
+        f"Utilization={utilization:.2f}, replicas={current_reps}, "
+        f"max_lag_bytes={lag_bytes}"
+    )
+
+    LAG_CEILING = 30 * 1024 * 1024  # 30 MB
+
+    if utilization &gt; SCALE_UP_RATIO:
+        if lag_bytes &gt; LAG_CEILING:
+            logging.warning(
+                "High connection pressure but replication lag exceeds 30MB — "
+                "holding replica count, throttling background jobs instead"
+            )
+            throttle_background_jobs()
+        elif current_reps &lt; MAX_REPLICAS:
+            patch_replica_count(current_reps + 1)
+            last_scale_time = now
+    elif utilization &lt; SCALE_DOWN_RATIO and current_reps &gt; MIN_REPLICAS:
+        patch_replica_count(current_reps - 1)
+        last_scale_time = now
+
+def throttle_background_jobs() -&gt; None:
+    """
+    Signals the job priority queue to pause non-critical batch work
+    by setting a cluster-wide throttle flag in the coordination table.
+    """
+    import psycopg2
+    import os
+    conn = psycopg2.connect(os.environ["PG_CONN_STR"])
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO ops.scaling_signals (signal_key, signal_value, updated_at)
+        VALUES ('background_throttle', 'true', now())
+        ON CONFLICT (signal_key) DO UPDATE
+            SET signal_value = 'true',
+                updated_at   = now()
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    logging.info("Background job throttle signal set")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The most significant lesson from this deployment was the interaction between replica provisioning latency and connection pool saturation. CloudNativePG required approximately 45–90 seconds to bring a new replica online and fully sync. During that window, if the spike was sharp enough, pgBouncer's pool would saturate and begin queuing connections. The mitigation was to trigger pool expansion (pgBouncer's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code> via its admin interface) immediately — before the replica was ready — so that queued connections had somewhere to land as soon as the replica joined the pool. The sequence mattered: pool first, then replica.</p>
+
+<p class="text-gray-300 leading-relaxed">The second lesson was that the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SCALE_COOLDOWN</code> window needed to be asymmetric: 60 seconds for scale-up (to react quickly), 300 seconds for scale-down (to avoid thrashing when traffic declines slowly). A symmetric cooldown caused premature scale-down during the trailing edge of flash sales, requiring an immediate re-scale that itself triggered the cooldown again.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Case Study 5: Autonomous Compliance Auditing and Remediation in a Financial Services PostgreSQL Deployment</h3>
+
+<p class="text-gray-300 leading-relaxed">A regional bank's data engineering team operated PostgreSQL 15 databases containing customer PII, transaction records, and loan origination data, subject to audit requirements from both their internal compliance framework and external regulatory guidance. Their pain point was not detection — they had extensive logging — but remediation latency: when a compliance violation was identified (a column without row-level security, an unencrypted backup path, a role with excessive <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GRANT</code> permissions), the ticket-to-fix cycle averaged 11 business days due to approval workflows and DBA bandwidth.</p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous compliance agent shortened this cycle by classifying violations into three tiers:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 1 (Auto-Remediate)**: Violations where the corrective action is reversible, low-risk, and pre-approved by the security team (e.g., revoking a PUBLIC schema execute permission, adding a column-level `SECURITY LABEL`).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 2 (Auto-Draft + Human Approve)**: Violations where the fix is known but the blast radius requires sign-off (e.g., modifying RLS policies on tables with active sessions, revoking a role with 50+ dependent objects).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tier 3 (Alert Only)**: Violations requiring architectural judgment (e.g., an entire schema missing encryption at rest, a cross-database link to an unapproved external system).</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Compliance scan: roles with LOGIN that have SUPERUSER or CREATEROLE without MFA label
+CREATE OR REPLACE VIEW compliance.excessive_privilege_roles AS
+SELECT
+    r.rolname,
+    r.rolsuper,
+    r.rolcreaterole,
+    r.rolcreatedb,
+    r.rolcanlogin,
+    sl.label        AS security_label
+FROM pg_roles r
+LEFT JOIN pg_shseclabel sl
+    ON sl.objoid   = r.oid
+    AND sl.provider = 'mfa_policy'
+WHERE r.rolcanlogin = TRUE
+  AND (r.rolsuper = TRUE OR r.rolcreaterole = TRUE)
+  AND (sl.label IS NULL OR sl.label &lt;&gt; 'mfa_required');
+
+-- Compliance scan: tables in regulated schemas without RLS enabled
+CREATE OR REPLACE VIEW compliance.tables_missing_rls AS
+SELECT
+    n.nspname    AS schema_name,
+    c.relname    AS table_name,
+    c.relrowsecurity
+FROM pg_class c
+JOIN pg_namespace n ON c.relnamespace = n.oid
+WHERE n.nspname IN ('customer_data', 'loan_origination', 'transactions')
+  AND c.relkind = 'r'
+  AND c.relrowsecurity = FALSE;
+
+-- Compliance scan: PUBLIC schema permissions that should be restricted
+CREATE OR REPLACE VIEW compliance.public_schema_overexposure AS
+SELECT
+    grantee,
+    table_schema,
+    table_name,
+    privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND grantee       = 'PUBLIC'
+  AND privilege_type IN ('INSERT', 'UPDATE', 'DELETE', 'TRUNCATE');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomous remediation function for Tier 1 violations:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Tier 1 auto-remediation: revoke PUBLIC schema DML permissions
+CREATE OR REPLACE PROCEDURE compliance.auto_remediate_public_exposure()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema  TEXT;
+    v_table   TEXT;
+    v_priv    TEXT;
+    v_sql     TEXT;
+BEGIN
+    FOR v_schema, v_table, v_priv IN
+        SELECT table_schema, table_name, privilege_type
+        FROM compliance.public_schema_overexposure
+    LOOP
+        v_sql := format(
+            'REVOKE %I ON %I.%I FROM PUBLIC',
+            v_priv, v_schema, v_table
+        );
+
+        -- Audit before execution
+        INSERT INTO compliance.remediation_log
+            (violation_type, object_identifier, action_sql,
+             tier, remediated_at, initiated_by)
+        VALUES
+            ('public_schema_overexposure',
+             v_schema || '.' || v_table,
+             v_sql, 1, now(), 'autonomous-compliance-agent');
+
+        EXECUTE v_sql;
+    END LOOP;
+END;
+$$;
+
+-- Enable RLS on regulated tables (Tier 1 where no active sessions on table)
+CREATE OR REPLACE PROCEDURE compliance.auto_enable_rls_safe()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_schema  TEXT;
+    v_table   TEXT;
+    v_active  INT;
+    v_sql     TEXT;
+BEGIN
+    FOR v_schema, v_table IN
+        SELECT schema_name, table_name
+        FROM compliance.tables_missing_rls
+    LOOP
+        -- Only auto-enable RLS if no active queries are currently touching this table
+        SELECT COUNT(*) INTO v_active
+        FROM pg_stat_activity psa
+        JOIN pg_locks pl ON psa.pid = pl.pid
+        JOIN pg_class pc ON pl.relation = pc.oid
+        JOIN pg_namespace pn ON pc.relnamespace = pn.oid
+        WHERE pn.nspname = v_schema
+          AND pc.relname = v_table
+          AND psa.state  = 'active';
+
+        IF v_active = 0 THEN
+            v_sql := format(
+                'ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
+                v_schema, v_table
+            );
+
+            INSERT INTO compliance.remediation_log
+                (violation_type, object_identifier, action_sql,
+                 tier, remediated_at, initiated_by)
+            VALUES
+                ('missing_rls', v_schema || '.' || v_table,
+                 v_sql, 1, now(), 'autonomous-compliance-agent');
+
+            EXECUTE v_sql;
+        ELSE
+            -- Escalate to Tier 2: table is active, needs human approval
+            INSERT INTO compliance.remediation_queue
+                (violation_type, object_identifier, recommended_sql,
+                 tier, queued_at, approval_status)
+            VALUES
+                ('missing_rls', v_schema || '.' || v_table,
+                 format('ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
+                        v_schema, v_table),
+                 2, now(), 'pending');
+        END IF;
+    END LOOP;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Tier 2 workflow connected to the bank's internal approval platform via a webhook: once a record appeared in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance.remediation_queue</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approval_status = 'pending'</code>, a notification triggered a Slack approval message with a one-click approval button. Approved records updated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approval_status = 'approved'</code> and triggered the agent to execute the stored <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recommended_sql</code>. The average Tier 2 remediation time dropped from 11 business days to 6.2 hours — driven almost entirely by the pre-drafted SQL that security reviewers could read, approve, or reject without any DBA ticket creation or back-and-forth.</p>
+
+<p class="text-gray-300 leading-relaxed">The most important architectural lesson from this case study was the value of the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remediation_log</code> table as a compliance artifact. External auditors could query the log to verify that violations were detected and remediated within specific SLA windows, with full SQL provenance. The autonomous system was not just faster — it was more auditable than the manual process, which relied on ticket comments and email threads that were difficult to correlate with actual database state changes.</p>
+
+<p class="text-gray-300 leading-relaxed">A secondary lesson was the necessity of scoping Tier 1 carefully. On the third week of deployment, the agent auto-revoked an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXECUTE</code> permission on a stored procedure that a batch job had relied on for 4 years — a procedure that was not documented anywhere except a comment in the source code of a decommissioned internal tool. The batch job failed silently overnight. This prompted a refinement: Tier 1 actions now require the affected object to appear in a pre-approved object registry (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compliance.tier1_eligible_objects</code>) before autonomous action can proceed. The registry is maintained by DBAs and reviewed quarterly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Synthesis: Patterns Across All Five Deployments</h3>
+
+<p class="text-gray-300 leading-relaxed">Examining the five case studies together, several design patterns appear consistently in autonomous DBA systems that survive production contact:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Layered decision gates, not binary triggers</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Every deployment used a multi-stage decision process before acting. Detection triggered evaluation; evaluation triggered either autonomous action or escalation; action triggered verification. No deployment allowed a single metric threshold to directly trigger a destructive or irreversible change. The trading firm's three-poll failure threshold, the healthcare platform's 2.5x regression ratio, and the compliance agent's Tier 1/2/3 classification all embody this principle.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Audit-first, act-second</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In every case, the system wrote an audit record before executing a change — not after. This ordering matters: if the execution fails mid-operation, the audit record still exists and contains the intended action, enabling forensic reconstruction. The SQL Server index agent, the compliance remediation procedure, and the plan stabilizer all follow this pattern.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Asymmetric conservatism</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Autonomous systems consistently applied different thresholds for action versus inaction. The Kubernetes autoscaler used a 60-second cooldown for scale-up and a 300-second cooldown for scale-down. The compliance agent applied stricter preconditions to Tier 1 than to Tier 2 escalations (because Tier 1 executes without human review). Systems that used symmetric thresholds oscillated or over-acted.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Human override surfaces, not human override requirements</strong></p>
+
+<p class="text-gray-300 leading-relaxed">All five systems provided mechanisms for humans to override or inspect autonomous decisions without requiring humans to be in the critical path of every decision. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">plan_override_registry</code>, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remediation_queue</code>, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tier1_eligible_objects</code> registry, and the Slack approval workflow all represent designed override surfaces — places where human judgment can inject itself without breaking the automation loop.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">5. Production failure as design input</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The silent batch job failure from the compliance case, the replica provisioning lag from the Kubernetes autoscaler, and the schema-change-versus-data-drift distinction from the healthcare platform all led to architectural refinements that would not have been discoverable through any amount of upfront design. Each case study team built a feedback loop from production incidents back into the autonomous system's decision logic — not just into runbooks.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous systems earn trust through auditability, not just performance**: every production deployment in this chapter succeeded in gaining organizational acceptance partly because the system's decisions were fully logged with provenance, enabling retrospective review by both engineers and external auditors.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Detection signal quality determines autonomous system reliability more than remediation sophistication**: the trading firm's heartbeat table outperformed Patroni's own API as a failure signal; the healthcare platform's regression ratio proved more stable than raw execution time comparisons; signal design deserves as much engineering attention as the remediation logic.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The boundary between Tier 1 (auto-act) and Tier 2 (human-approve) actions must be defined by blast radius and reversibility, not by technical complexity**: some technically simple actions (revoking a permission) have large blast radii; some technically complex actions (online index rebuild) are easily reversible. Conflating complexity with risk leads to either under-automation or over-automation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cooldown windows and lag guards are not optional safety theater — they are architectural requirements**: every case study that skipped or underestimated these guards experienced oscillation, thrashing, or a preventable failure before adding them back; asymmetric cooldowns (faster to engage protective action, slower to disengage it) consistently outperformed symmetric ones.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The object registry pattern — maintaining a pre-approved list of objects eligible for autonomous action — is the practical solution to the scope creep problem in autonomous remediation systems**: without it, autonomous agents inevitably encounter edge cases (undocumented dependencies, legacy objects, objects shared across teams) that cause silent failures; with it, the blast radius of any autonomous action is bounded and reviewable before deployment.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

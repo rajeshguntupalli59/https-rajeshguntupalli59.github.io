@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 3: AI Tools Every DBA Must Know — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 3: AI Tools Every DBA Must Know. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -370,7 +374,7 @@ async def fetch_metric_context(instance: str, alert_time: str) -&gt; str:
         "tps": f'pg:tps:rate5m{{instance="{instance}"}}',
         "active_connections": f'pg_stat_activity_count{{instance="{instance}",state="active"}}',
         "cache_hit_ratio": f'pg_stat_database_blks_hit{{instance="{instance}"}} / (pg_stat_database_blks_hit{{instance="{instance}"}} + pg_stat_database_blks_read{{instance="{instance}"}})',
-        "replication_lag_bytes": f'pg_replication_slots_confirmed_flush_lsn{{instance="{instance}}"}',
+        "replication_lag_bytes": f'pg_replication_slots_confirmed_flush_lsn{{instance="{instance}"}}',
     }
 
     context_lines = []
@@ -480,15 +484,287 @@ EXECUTION PLAN:
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure OpenAI Service</strong> provides GPT-4 and GPT-4o via endpoints in your Azure subscription, with private endpoint support, Azure Active Directory authentication, and content filtering policies that satisfy most enterprise compliance requirements. For DBAs running SQL Server on Azure or Azure SQL, this is the natural fit.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from openai import AzureOpenAI
+import os
+
+def analyze_azure_sql_blocking(blocking_chain_xml: str) -&gt; dict:
+    """
+    Analyzes a SQL Server blocking chain captured via sys.dm_exec_requests
+    using Azure OpenAI Service with AAD authentication.
+    """
+    client = AzureOpenAI(
+        azure_endpoint=os.environ["AZURE_OPENAI_ENDPOINT"],  # e.g., https://myinstance.openai.azure.com/
+        api_key=os.environ["AZURE_OPENAI_API_KEY"],
+        api_version="2024-02-01"
+    )
+
+    prompt = f"""
+You are a SQL Server internals expert. Analyze this blocking chain data from 
+sys.dm_exec_requests and sys.dm_os_waiting_tasks.
+
+Return JSON with:
+- "blocking_root": session_id of the root blocker
+- "wait_type": the primary wait type causing the chain
+- "likely_cause": one of "missing_index", "long_transaction", "lock_escalation", "implicit_transaction", "other"
+- "immediate_action": specific T-SQL or administrative action to resolve
+- "prevention": schema or application change to prevent recurrence
+
+BLOCKING CHAIN DATA:
+{blocking_chain_xml}
+"""
+
+    response = client.chat.completions.create(
+        model=os.environ["AZURE_OPENAI_DEPLOYMENT_NAME"],  # e.g., "gpt-4o"
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=1024,
+        response_format={"type": "json_object"}
+    )
+
+    return json.loads(response.choices[0].message.content)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">response_format={"type": "json_object"}</code> parameter available in newer Azure OpenAI deployments eliminates an entire class of parsing failures by instructing the model to guarantee valid JSON output. Use it whenever your downstream code expects structured data.</p>
+
+<p class="text-gray-300 leading-relaxed">One practical consideration when choosing between Bedrock and Azure OpenAI: the model selection differs. Bedrock gives you Claude natively with AWS-native IAM; Azure OpenAI gives you GPT-4 and GPT-4o natively with Azure RBAC. If your database team already has a preference for Claude's longer context handling, Bedrock is the cleaner path. If you're embedded in a Microsoft-centric enterprise where Azure Active Directory is the identity backbone, Azure OpenAI removes significant friction from security reviews.</p>
+
+<p class="text-gray-300 leading-relaxed">For both services, provision your AI access through the same infrastructure-as-code pipelines you use for database provisioning. Terraform modules for both Bedrock and Azure OpenAI are well-supported and allow you to codify model access, throughput limits, and logging configuration alongside your RDS or Azure SQL resources.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Wiring the Tools Together: A Reference Architecture</h3>
+
+<p class="text-gray-300 leading-relaxed">Individual tools are useful; composed workflows are transformative. The reference architecture below represents a production-viable AI-augmented DBA platform that you can build incrementally. It uses only open-source and broadly available services, and every component has a testable local equivalent.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A["Databases Under Management<br/>PostgreSQL (RDS/Aurora/self-managed)<br/>SQL Server (Azure SQL/RDS/on-prem)"] -->|metrics + logs + slow query events| B["Observability Layer<br/>exporters -> Prometheus -> Grafana"]
+    B -->|anomaly alerts + slow query events| C["AI Enrichment Service<br/>FastAPI/Lambda: fetch plans, call LLM API, route alerts"]
+    C -->|structured analysis + embeddings| D["Knowledge Store<br/>PostgreSQL + pgvector: query_signatures, incident_history, runbook_chunks"]
+    D -->|similarity search results| E["DBA Interface Layer<br/>Slack bot, Grafana panel, Jupyter notebook"]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Reference architecture: telemetry flows bottom-up from the databases through observability and AI enrichment into a queryable knowledge store, surfaced to the DBA through several interfaces.*</p>
+
+<p class="text-gray-300 leading-relaxed">The implementation sequence that works in practice is bottom-up: stand up the knowledge store first (it requires only PostgreSQL and pgvector), then instrument the observability layer, then build the AI enrichment service, and finally surface results through the DBA interface layer. Trying to build all layers simultaneously creates integration complexity before you have validated that individual pieces work.</p>
+
+<p class="text-gray-300 leading-relaxed">The enrichment service is the architectural heart of this system. Here is a more complete implementation that handles both slow query enrichment and runbook retrieval in a single service:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import asyncio
+import json
+import os
+from datetime import datetime
+
+import anthropic
+import asyncpg
+import httpx
+import openai
+from fastapi import FastAPI, Request, HTTPException
+
+app = FastAPI(title="DBA AI Enrichment Service")
+
+# Clients initialized once at startup
+anthropic_client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+openai_client = openai.OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+DB_CONN_STRING = os.environ["KNOWLEDGE_STORE_CONN"]
+
+
+async def get_db_pool():
+    return await asyncpg.create_pool(DB_CONN_STRING, min_size=2, max_size=10)
+
+db_pool = None
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    db_pool = await get_db_pool()
+
+
+def embed_text(text: str) -&gt; list[float]:
+    """Generate an embedding vector for a text string."""
+    response = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text[:8000]  # truncate to model limit
+    )
+    return response.data[0].embedding
+
+
+async def find_similar_incidents(embedding: list[float], limit: int = 3) -&gt; list[dict]:
+    """Retrieve the most similar past incidents from the knowledge store."""
+    embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                incident_id,
+                error_summary,
+                resolution_notes,
+                resolved_at,
+                1 - (embedding &lt;=&gt; $1::vector) AS similarity
+            FROM incident_history
+            WHERE 1 - (embedding &lt;=&gt; $1::vector) &gt; 0.75
+            ORDER BY embedding &lt;=&gt; $1::vector
+            LIMIT $2
+        """, embedding_str, limit)
+    return [dict(r) for r in rows]
+
+
+async def store_analysis(
+    query_hash: str,
+    normalized_sql: str,
+    embedding: list[float],
+    analysis: dict,
+    avg_duration_ms: float
+):
+    """Persist a query analysis and its embedding to the knowledge store."""
+    embedding_str = "[" + ",".join(str(v) for v in embedding) + "]"
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO query_signatures
+                (query_hash, normalized_sql, embedding, avg_duration_ms, plan_summary, capture_time)
+            VALUES ($1, $2, $3::vector, $4, $5, $6)
+            ON CONFLICT (query_hash) DO UPDATE
+                SET avg_duration_ms = EXCLUDED.avg_duration_ms,
+                    plan_summary = EXCLUDED.plan_summary,
+                    capture_time = EXCLUDED.capture_time
+        """,
+            query_hash,
+            normalized_sql,
+            embedding_str,
+            avg_duration_ms,
+            json.dumps(analysis),
+            datetime.utcnow()
+        )
+
+
+@app.post("/analyze-slow-query")
+async def analyze_slow_query(request: Request):
+    """
+    Accepts a slow query event, enriches it with LLM analysis and similar
+    historical incidents, and stores the result in the knowledge store.
+    """
+    body = await request.json()
+    query = body.get("query", "")
+    execution_plan = body.get("execution_plan", "")
+    query_hash = body.get("query_hash", "")
+    duration_ms = body.get("duration_ms", 0.0)
+    database_type = body.get("database_type", "postgresql")
+
+    if not query:
+        raise HTTPException(status_code=400, detail="query field is required")
+
+    # Generate embedding for similarity search
+    embedding = embed_text(query)
+
+    # Find similar past incidents
+    similar_incidents = await find_similar_incidents(embedding)
+    incident_context = ""
+    if similar_incidents:
+        incident_context = "\n\nSIMILAR PAST INCIDENTS:\n" + "\n".join(
+            f"- {inc['error_summary']} (resolved: {inc['resolution_notes']})"
+            for inc in similar_incidents
+        )
+
+    prompt = f"""
+You are a senior {database_type.upper()} performance engineer.
+Analyze the slow query below and return a JSON object with these keys:
+- "root_cause": concise description of the primary performance issue
+- "bottlenecks": list of specific plan nodes or operators causing the problem  
+- "index_recommendation": CREATE INDEX statement if applicable, else null
+- "rewrite_suggestion": improved SQL if a rewrite would help, else null
+- "severity": "critical" | "warning" | "acceptable"
+- "estimated_fix_effort": "minutes" | "hours" | "days"
+
+Return ONLY valid JSON.
+
+SLOW QUERY (duration: {duration_ms:.1f}ms):
+{query}
+
+EXECUTION PLAN:
+{execution_plan}
+{incident_context}
+"""
+
+    message = anthropic_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1024,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    try:
+        analysis = json.loads(message.content[0].text)
+    except json.JSONDecodeError:
+        # Retry with explicit JSON instruction on parse failure
+        retry_prompt = prompt + "\n\nIMPORTANT: Your response must be valid JSON only. No text before or after the JSON object."
+        retry_message = anthropic_client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=1024,
+            messages=[{"role": "user", "content": retry_prompt}]
+        )
+        analysis = json.loads(retry_message.content[0].text)
+
+    # Store for future similarity retrieval
+    await store_analysis(query_hash, query, embedding, analysis, duration_ms)
+
+    return {
+        "analysis": analysis,
+        "similar_incidents": similar_incidents,
+        "query_hash": query_hash
+    }
+
+
+@app.get("/similar-queries/{query_hash}")
+async def get_similar_queries(query_hash: str, limit: int = 5):
+    """Retrieve queries semantically similar to a known query by its hash."""
+    async with db_pool.acquire() as conn:
+        source_row = await conn.fetchrow(
+            "SELECT embedding FROM query_signatures WHERE query_hash = $1",
+            query_hash
+        )
+    if not source_row:
+        raise HTTPException(status_code=404, detail="Query hash not found")
+
+    embedding = source_row["embedding"]
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT query_hash, normalized_sql, avg_duration_ms,
+                   1 - (embedding &lt;=&gt; $1::vector) AS similarity
+            FROM query_signatures
+            WHERE query_hash != $2
+              AND 1 - (embedding &lt;=&gt; $1::vector) &gt; 0.80
+            ORDER BY embedding &lt;=&gt; $1::vector
+            LIMIT $3
+        """, embedding, query_hash, limit)
+
+    return [dict(r) for r in rows]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This service, deployed as a container alongside your Prometheus alertmanager, gives you a persistent, searchable intelligence layer over your database environment. Every slow query you analyze makes the next analysis better by building out the similarity index. Every incident you record becomes a retrievable case study for future on-call engineers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Choosing and Evaluating AI Tools Responsibly</h3>
+
+<p class="text-gray-300 leading-relaxed">The tooling landscape changes quickly, and tool selection deserves the same rigor you'd apply to choosing a database extension or a backup solution. Three criteria matter most for DBA tooling:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data privacy and egress controls</strong> — Execution plans, query text, and error messages can contain sensitive schema information and occasionally literal data values. Before routing any database diagnostic data to an external AI API, confirm that your usage agreement with the provider excludes your data from model training, that you have evaluated what data classifications your prompts may contain, and that your security and compliance teams have reviewed the data flow. Bedrock and Azure OpenAI provide stronger contractual controls here than direct consumer API calls.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Accuracy and hallucination risk</strong> — LLMs produce confident-sounding wrong answers. For database tooling, the highest-risk outputs are generated SQL (run in a read-only transaction or against a staging environment before production use) and index recommendations (validate with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">EXPLAIN</code> before creating). Build review steps into any workflow that results in DDL or DML execution. Never wire an LLM output directly to an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute()</code> call without human review or at minimum a query signature safelist.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Operational observability of the AI layer itself</strong> — Treat your AI enrichment service like any other production service: instrument its latency, error rate, and LLM API cost per request. Set spend alerts on your Bedrock or Azure OpenAI usage. Log every prompt and response in a structured format so you can audit decisions and debug hallucinations when they surface. The cost of an AI-augmented DBA workflow is manageable, but it scales with query volume, and an uninstrumented deployment will produce billing surprises.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLM APIs become highest-value when paired with structured database diagnostics**: the database produces the execution plan or wait stats; the LLM reasons over them in natural language. The LLM replaces rule engines, not database engines.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pgvector turns your existing PostgreSQL instance into a semantic knowledge store**: storing query embeddings, incident history, and runbook chunks alongside operational data enables similarity-based retrieval without introducing a separate vector database into your stack.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anomaly detection and LLM explanation are complementary, not competing**: Prometheus recording rules and Grafana ML handle statistically grounded detection; LLMs handle the contextual interpretation that turns a raw anomaly signal into an actionable on-call assessment.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Enterprise environments should use Bedrock or Azure OpenAI rather than direct consumer APIs**: the benefits — VPC-private endpoints, IAM/RBAC authentication, contractual data handling guarantees, and centralized billing — justify the additional setup complexity in regulated or large-scale environments.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Build the AI enrichment service as an observable, auditable component**: instrument its latency and cost, log every prompt and response, and enforce human review or safelisting before any LLM-generated SQL or DDL reaches a production execution path.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">

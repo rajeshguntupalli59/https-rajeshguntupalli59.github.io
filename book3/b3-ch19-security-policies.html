@@ -6,6 +6,10 @@
   <title>Chapter 19: Self-Tuning Security Policies — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 19: Self-Tuning Security Policies. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -527,7 +531,1000 @@ class EscalationDetector:
 
 <p class="text-gray-300 leading-relaxed">The JIT system has four components:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Access request API</strong> — service accounts or humans request access, specifying purpose, duration, and required privileges. Requests are evaluated against policy;</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Access request API</strong> — service accounts or humans request access, specifying purpose, duration, and required privileges. Requests are evaluated against policy; approved requests generate a time-bounded grant.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Grant executor</strong> — issues the grant with a recorded expiry timestamp.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Expiry enforcer</strong> — a background worker that polls for expired grants and revokes them.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Audit trail</strong> — every grant and every revocation is recorded with request metadata, approver identity, and actual usage statistics.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- JIT privilege management schema
+CREATE SCHEMA jit;
+
+CREATE TABLE jit.access_requests (
+    request_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    requested_by    TEXT NOT NULL,
+    principal_name  TEXT NOT NULL,
+    target_object   TEXT NOT NULL,   -- schema.table or schema.*
+    privilege_type  TEXT NOT NULL,
+    reason          TEXT NOT NULL,
+    ticket_ref      TEXT,            -- Jira/ServiceNow reference
+    requested_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    approved_by     TEXT,
+    approved_at     TIMESTAMPTZ,
+    expires_at      TIMESTAMPTZ,
+    status          TEXT NOT NULL DEFAULT 'PENDING'
+                    CHECK (status IN ('PENDING','APPROVED','ACTIVE',
+                                      'EXPIRED','REVOKED','DENIED')),
+    actual_usage    JSONB            -- populated on expiry: rows read, calls made
+);
+
+CREATE TABLE jit.active_grants (
+    grant_id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id      UUID NOT NULL REFERENCES jit.access_requests(request_id),
+    principal_name  TEXT NOT NULL,
+    target_schema   TEXT NOT NULL,
+    target_table    TEXT NOT NULL,
+    privilege_type  TEXT NOT NULL,
+    granted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    expires_at      TIMESTAMPTZ NOT NULL,
+    revoked_at      TIMESTAMPTZ,
+    revoke_reason   TEXT
+);
+
+CREATE INDEX idx_active_grants_expiry
+    ON jit.active_grants (expires_at)
+    WHERE revoked_at IS NULL;
+
+-- Grant executor: called by the access request approval workflow
+CREATE OR REPLACE FUNCTION jit.execute_grant(
+    p_request_id    UUID,
+    p_approver      TEXT,
+    p_duration      INTERVAL
+)
+RETURNS UUID
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_req           jit.access_requests%ROWTYPE;
+    v_grant_id      UUID;
+    v_expires_at    TIMESTAMPTZ;
+    v_sql           TEXT;
+BEGIN
+    SELECT * INTO v_req
+    FROM   jit.access_requests
+    WHERE  request_id = p_request_id
+      AND  status = 'PENDING'
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Request % not found or not in PENDING state', p_request_id;
+    END IF;
+
+    v_expires_at := NOW() + p_duration;
+
+    -- Build and execute the GRANT statement
+    -- target_object is validated against pg_class before execution
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname || '.' || c.relname = v_req.target_object
+           OR n.nspname = split_part(v_req.target_object, '.', 1)
+    ) THEN
+        RAISE EXCEPTION 'Target object % does not exist', v_req.target_object;
+    END IF;
+
+    v_sql := format(
+        'GRANT %s ON %s TO %I',
+        v_req.privilege_type,
+        v_req.target_object,
+        v_req.principal_name
+    );
+    EXECUTE v_sql;
+
+    -- Record the active grant
+    INSERT INTO jit.active_grants (
+        request_id, principal_name, target_schema, target_table,
+        privilege_type, expires_at
+    )
+    VALUES (
+        p_request_id,
+        v_req.principal_name,
+        split_part(v_req.target_object, '.', 1),
+        split_part(v_req.target_object, '.', 2),
+        v_req.privilege_type,
+        v_expires_at
+    )
+    RETURNING grant_id INTO v_grant_id;
+
+    -- Update request status
+    UPDATE jit.access_requests
+    SET status      = 'ACTIVE',
+        approved_by = p_approver,
+        approved_at = NOW(),
+        expires_at  = v_expires_at
+    WHERE request_id = p_request_id;
+
+    RAISE NOTICE 'JIT grant % issued for % on % until %',
+        v_grant_id, v_req.principal_name, v_req.target_object, v_expires_at;
+
+    RETURN v_grant_id;
+END;
+$$;
+
+-- Expiry enforcer: runs every minute via pg_cron or external scheduler
+CREATE OR REPLACE FUNCTION jit.enforce_expiry()
+RETURNS TABLE (
+    grant_id        UUID,
+    principal_name  TEXT,
+    target_object   TEXT,
+    revoke_sql      TEXT,
+    status          TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_grant     jit.active_grants%ROWTYPE;
+    v_sql       TEXT;
+    v_outcome   TEXT;
+BEGIN
+    FOR v_grant IN
+        SELECT *
+        FROM   jit.active_grants
+        WHERE  expires_at &lt;= NOW()
+          AND  revoked_at IS NULL
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        v_sql := format(
+            'REVOKE %s ON %I.%I FROM %I',
+            v_grant.privilege_type,
+            v_grant.target_schema,
+            v_grant.target_table,
+            v_grant.principal_name
+        );
+
+        BEGIN
+            EXECUTE v_sql;
+            v_outcome := 'REVOKED';
+        EXCEPTION WHEN OTHERS THEN
+            v_outcome := 'ERROR:' || SQLERRM;
+        END;
+
+        UPDATE jit.active_grants
+        SET revoked_at   = NOW(),
+            revoke_reason = 'EXPIRED'
+        WHERE grant_id = v_grant.grant_id;
+
+        UPDATE jit.access_requests
+        SET status = CASE WHEN v_outcome = 'REVOKED' THEN 'EXPIRED' ELSE 'REVOKED' END
+        WHERE request_id = v_grant.request_id;
+
+        grant_id       := v_grant.grant_id;
+        principal_name := v_grant.principal_name;
+        target_object  := v_grant.target_schema || '.' || v_grant.target_table;
+        revoke_sql     := v_sql;
+        status         := v_outcome;
+        RETURN NEXT;
+    END LOOP;
+END;
+$$;
+
+-- Schedule via pg_cron (if available)
+-- SELECT cron.schedule('jit-expiry-enforcer', '* * * * *', 'SELECT * FROM jit.enforce_expiry()');</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- JIT privilege management for SQL Server
+CREATE SCHEMA jit;
+GO
+
+CREATE TABLE jit.access_requests (
+    request_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
+    requested_by    SYSNAME          NOT NULL,
+    principal_name  SYSNAME          NOT NULL,
+    target_schema   SYSNAME          NOT NULL,
+    target_object   SYSNAME          NOT NULL,
+    privilege_type  NVARCHAR(50)     NOT NULL,
+    reason          NVARCHAR(500)    NOT NULL,
+    ticket_ref      NVARCHAR(100)    NULL,
+    requested_at    DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
+    approved_by     SYSNAME          NULL,
+    approved_at     DATETIME2        NULL,
+    expires_at      DATETIME2        NULL,
+    status          NVARCHAR(20)     NOT NULL DEFAULT 'PENDING'
+        CONSTRAINT chk_jit_status CHECK (
+            status IN ('PENDING','APPROVED','ACTIVE','EXPIRED','REVOKED','DENIED')
+        )
+);
+
+CREATE TABLE jit.active_grants (
+    grant_id        UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
+    request_id      UNIQUEIDENTIFIER NOT NULL
+                    REFERENCES jit.access_requests(request_id),
+    principal_name  SYSNAME          NOT NULL,
+    target_schema   SYSNAME          NOT NULL,
+    target_object   SYSNAME          NOT NULL,
+    privilege_type  NVARCHAR(50)     NOT NULL,
+    granted_at      DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
+    expires_at      DATETIME2        NOT NULL,
+    revoked_at      DATETIME2        NULL,
+    revoke_reason   NVARCHAR(100)    NULL
+);
+
+CREATE INDEX idx_jit_active_grants_expiry
+    ON jit.active_grants (expires_at)
+    WHERE revoked_at IS NULL;
+GO
+
+-- Grant executor stored procedure
+CREATE OR ALTER PROCEDURE jit.usp_execute_grant
+    @request_id     UNIQUEIDENTIFIER,
+    @approver       SYSNAME,
+    @duration_mins  INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @principal_name SYSNAME,
+        @target_schema  SYSNAME,
+        @target_object  SYSNAME,
+        @privilege_type NVARCHAR(50),
+        @expires_at     DATETIME2,
+        @grant_sql      NVARCHAR(500),
+        @grant_id       UNIQUEIDENTIFIER;
+
+    BEGIN TRANSACTION;
+
+    SELECT
+        @principal_name = principal_name,
+        @target_schema  = target_schema,
+        @target_object  = target_object,
+        @privilege_type = privilege_type
+    FROM jit.access_requests WITH (UPDLOCK, ROWLOCK)
+    WHERE request_id = @request_id
+      AND status = 'PENDING';
+
+    IF @principal_name IS NULL
+    BEGIN
+        ROLLBACK;
+        RAISERROR('Request not found or not in PENDING state.', 16, 1);
+        RETURN;
+    END;
+
+    -- Validate object exists
+    IF OBJECT_ID(QUOTENAME(@target_schema) + '.' + QUOTENAME(@target_object)) IS NULL
+    BEGIN
+        ROLLBACK;
+        RAISERROR('Target object does not exist.', 16, 1);
+        RETURN;
+    END;
+
+    SET @expires_at = DATEADD(MINUTE, @duration_mins, SYSUTCDATETIME());
+
+    SET @grant_sql = N'GRANT ' + @privilege_type
+        + N' ON ' + QUOTENAME(@target_schema) + N'.' + QUOTENAME(@target_object)
+        + N' TO '  + QUOTENAME(@principal_name);
+    EXEC sp_executesql @grant_sql;
+
+    SET @grant_id = NEWID();
+    INSERT INTO jit.active_grants (
+        grant_id, request_id, principal_name,
+        target_schema, target_object, privilege_type, expires_at
+    )
+    VALUES (
+        @grant_id, @request_id, @principal_name,
+        @target_schema, @target_object, @privilege_type, @expires_at
+    );
+
+    UPDATE jit.access_requests
+    SET status      = 'ACTIVE',
+        approved_by = @approver,
+        approved_at = SYSUTCDATETIME(),
+        expires_at  = @expires_at
+    WHERE request_id = @request_id;
+
+    COMMIT;
+
+    SELECT @grant_id AS grant_id, @expires_at AS expires_at;
+END;
+GO
+
+-- Expiry enforcer: scheduled via SQL Server Agent every minute
+CREATE OR ALTER PROCEDURE jit.usp_enforce_expiry
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @grant_id       UNIQUEIDENTIFIER,
+        @principal_name SYSNAME,
+        @target_schema  SYSNAME,
+        @target_object  SYSNAME,
+        @privilege_type NVARCHAR(50),
+        @request_id     UNIQUEIDENTIFIER,
+        @revoke_sql     NVARCHAR(500);
+
+    DECLARE expiry_cursor CURSOR FAST_FORWARD FOR
+        SELECT grant_id, principal_name, target_schema,
+               target_object, privilege_type, request_id
+        FROM   jit.active_grants
+        WHERE  expires_at &lt;= SYSUTCDATETIME()
+          AND  revoked_at IS NULL;
+
+    OPEN expiry_cursor;
+    FETCH NEXT FROM expiry_cursor INTO
+        @grant_id, @principal_name, @target_schema,
+        @target_object, @privilege_type, @request_id;
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @revoke_sql = N'REVOKE ' + @privilege_type
+            + N' ON ' + QUOTENAME(@target_schema) + N'.' + QUOTENAME(@target_object)
+            + N' FROM ' + QUOTENAME(@principal_name);
+
+        BEGIN TRY
+            EXEC sp_executesql @revoke_sql;
+
+            UPDATE jit.active_grants
+            SET revoked_at = SYSUTCDATETIME(), revoke_reason = 'EXPIRED'
+            WHERE grant_id = @grant_id;
+
+            UPDATE jit.access_requests
+            SET status = 'EXPIRED'
+            WHERE request_id = @request_id;
+        END TRY
+        BEGIN CATCH
+            UPDATE jit.active_grants
+            SET revoke_reason = 'ERROR:' + ERROR_MESSAGE()
+            WHERE grant_id = @grant_id;
+        END CATCH;
+
+        FETCH NEXT FROM expiry_cursor INTO
+            @grant_id, @principal_name, @target_schema,
+            @target_object, @privilege_type, @request_id;
+    END;
+
+    CLOSE expiry_cursor;
+    DEALLOCATE expiry_cursor;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The JIT system integrates with your service desk via webhook: when a developer submits an access request through their ticketing system, the webhook fires the approval API, the approver's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">+approve</code> comment in Jira triggers the grant executor, and the grant is live within seconds. The expiry enforcer does not care whether the developer remembers to return access—it revokes on schedule regardless. This transforms privilege hygiene from a discipline that depends on human memory into a property that is structurally guaranteed.</p>
+
+<p class="text-gray-300 leading-relaxed">A usage telemetry layer closes the feedback loop. When a JIT grant expires, the enforcer queries the audit log to determine whether the granted privilege was ever used. Grants that expire unused are flagged and fed back into the access request policy: if a particular role consistently requests access it never uses, the policy engine can automatically shorten the default grant window or require elevated justification for future requests.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant Dev as Requester
+    participant API as Access Request API
+    participant App as Approver (ticket +approve)
+    participant Exec as Grant Executor
+    participant DB as Database
+    participant Enf as Expiry Enforcer
+
+    Dev->>API: Request access (object, duration, reason)
+    API->>App: Route for approval
+    App-->>API: Approve
+    API->>Exec: execute_grant(request_id, approver, duration)
+    Exec->>DB: GRANT ... (time-bounded)
+    Exec->>DB: Insert active_grants row (expires_at)
+    loop Every minute
+        Enf->>DB: Find grants past expires_at
+        Enf->>DB: REVOKE + mark revoked
+    end</pre></div>
+<p class="text-gray-300 leading-relaxed">*Just-in-time privilege lifecycle: no standing grant survives past its recorded expiry without the enforcer revoking it.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.5 Automated Sensitive Data Discovery and Classification</h3>
+
+<p class="text-gray-300 leading-relaxed">The security controls in sections 19.1 through 19.4 all depend on knowing which data is sensitive. Manual classification is episodic and incomplete: it runs at project inception and is never revisited when columns are added, tables are renamed, or data patterns shift. Automated classification runs continuously, scanning for patterns that indicate sensitive data and updating the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">security.column_classifications</code> table that drives RLS policy generation and masking rules.</p>
+
+<p class="text-gray-300 leading-relaxed">The scanner operates in two modes:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern-based classification</strong> uses regular expression matching and column-name heuristics to detect common sensitive data types. Column names like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ssn</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">social_security</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">credit_card</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dob</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">date_of_birth</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">passport</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tax_id</code> are strong signals. Data-value scanning uses regex against sampled column contents—<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">\d{3}-\d{2}-\d{4}</code> for SSNs, Luhn-validated 13–19 digit sequences for card numbers, and so on.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lineage-based classification</strong> propagates labels through derived columns: if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">raw.customer.ssn</code> is classified <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PII</code>, then a view column <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT ssn AS social_sec_num FROM raw.customer</code> should inherit that classification automatically.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># data_classifier.py
+# Automated sensitive data discovery for PostgreSQL and SQL Server
+
+import re
+import psycopg2
+import pyodbc
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class ColumnClassification:
+    schema_name:    str
+    table_name:     str
+    column_name:    str
+    classification: str
+    confidence:     float      # 0.0 – 1.0
+    detection_method: str      # 'COLUMN_NAME', 'DATA_PATTERN', 'LINEAGE'
+    sample_match:   Optional[str] = None
+
+# Column-name heuristics: (pattern, classification, confidence)
+COLUMN_NAME_RULES = [
+    (re.compile(r'\b(ssn|social_sec|taxpayer_id|tin)\b',          re.I), 'PII',       0.95),
+    (re.compile(r'\b(credit_card|card_number|pan|cc_num)\b',      re.I), 'FINANCIAL', 0.95),
+    (re.compile(r'\b(dob|date_of_birth|birthdate|birth_date)\b',  re.I), 'PII',       0.90),
+    (re.compile(r'\b(passport|passport_no|passport_number)\b',    re.I), 'PII',       0.95),
+    (re.compile(r'\b(salary|compensation|bonus|wage)\b',          re.I), 'FINANCIAL', 0.85),
+    (re.compile(r'\b(email|email_addr|email_address)\b',          re.I), 'PII',       0.80),
+    (re.compile(r'\b(phone|mobile|cell|telephone)\b',             re.I), 'PII',       0.75),
+    (re.compile(r'\b(address|street|postal_code|zip_code)\b',     re.I), 'PII',       0.70),
+    (re.compile(r'\b(diagnosis|icd_code|mrn|patient_id)\b',       re.I), 'PHI',       0.90),
+    (re.compile(r'\b(password|pwd|passwd|secret|api_key|token)\b',re.I), 'INTERNAL',  0.95),
+]
+
+# Data-value regex patterns for content scanning
+DATA_PATTERN_RULES = [
+    (re.compile(r'^\d{3}-\d{2}-\d{4}$'),                 'PII',       0.90, 'SSN'),
+    (re.compile(r'^[0-9]{13,19}$'),                       'FINANCIAL', 0.75, 'PAN_CANDIDATE'),
+    (re.compile(r'^[A-Z0-9]{6,9}$'),                     'PII',       0.60, 'PASSPORT_CANDIDATE'),
+    (re.compile(r'^\d{4}[-/]\d{2}[-/]\d{2}$'),           'PII',       0.55, 'DOB_CANDIDATE'),
+    (re.compile(r'^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$'),
+                                                          'PII',       0.85, 'EMAIL'),
+]
+
+SAMPLE_SIZE = 200  # rows to sample per column for data-pattern scanning
+
+def luhn_check(number: str) -&gt; bool:
+    """Validate a candidate card number using the Luhn algorithm."""
+    digits = [int(d) for d in number if d.isdigit()]
+    odd_digits = digits[-1::-2]
+    even_digits = digits[-2::-2]
+    total = sum(odd_digits)
+    for d in even_digits:
+        total += sum(divmod(d * 2, 10))
+    return total % 10 == 0
+
+class PostgresClassifier:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+
+    def discover_columns(self) -&gt; list[tuple]:
+        """Return all user-table columns from information_schema."""
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_schema, table_name, column_name, data_type
+                    FROM   information_schema.columns
+                    WHERE  table_schema NOT IN
+                               ('pg_catalog','information_schema',
+                                'pg_toast','security','jit')
+                      AND  table_schema NOT LIKE 'pg_%'
+                    ORDER BY table_schema, table_name, ordinal_position
+                """)
+                return cur.fetchall()
+
+    def sample_column(self, schema: str, table: str, column: str,
+                      data_type: str) -&gt; list[str]:
+        """Sample up to SAMPLE_SIZE non-null text values from a column."""
+        if data_type not in ('text', 'character varying', 'character',
+                             'varchar', 'char', 'bpchar'):
+            return []
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f'SELECT {psycopg2.extensions.quote_ident(column, cur)}'
+                    f' FROM {psycopg2.extensions.quote_ident(schema, cur)}'
+                    f'.{psycopg2.extensions.quote_ident(table, cur)}'
+                    f' WHERE {psycopg2.extensions.quote_ident(column, cur)}'
+                    f' IS NOT NULL LIMIT %s',
+                    (SAMPLE_SIZE,)
+                )
+                return [row[0] for row in cur.fetchall() if row[0]]
+
+    def classify_column(self, schema: str, table: str, column: str,
+                        data_type: str) -&gt; Optional[ColumnClassification]:
+        # 1. Column-name heuristics
+        for pattern, classification, confidence in COLUMN_NAME_RULES:
+            if pattern.search(column):
+                return ColumnClassification(
+                    schema_name=schema, table_name=table,
+                    column_name=column, classification=classification,
+                    confidence=confidence, detection_method='COLUMN_NAME'
+                )
+
+        # 2. Data-value scanning
+        samples = self.sample_column(schema, table, column, data_type)
+        if not samples:
+            return None
+
+        match_counts: dict[str, int] = {}
+        for value in samples:
+            for pattern, classification, confidence, label in DATA_PATTERN_RULES:
+                if pattern.match(value):
+                    # Upgrade PAN_CANDIDATE confidence with Luhn check
+                    if label == 'PAN_CANDIDATE' and not luhn_check(value):
+                        continue
+                    match_counts[classification] = match_counts.get(classification, 0) + 1
+
+        if not match_counts:
+            return None
+
+        top_class = max(match_counts, key=match_counts.__getitem__)
+        hit_rate   = match_counts[top_class] / len(samples)
+
+        if hit_rate &lt; 0.30:   # require at least 30% of sample to match
+            return None
+
+        _, _, base_confidence, label = next(
+            r for r in DATA_PATTERN_RULES if r[3] and top_class in r[1]
+        ) if False else (None, None, 0.70, None)  # fallback
+
+        return ColumnClassification(
+            schema_name=schema, table_name=table,
+            column_name=column, classification=top_class,
+            confidence=round(hit_rate * 0.9, 3),
+            detection_method='DATA_PATTERN',
+            sample_match=f"{match_counts[top_class]}/{len(samples)} samples matched"
+        )
+
+    def run_scan(self) -&gt; list[ColumnClassification]:
+        results = []
+        for schema, table, column, data_type in self.discover_columns():
+            classification = self.classify_column(schema, table, column, data_type)
+            if classification:
+                results.append(classification)
+        return results
+
+    def persist_classifications(self, results: list[ColumnClassification]):
+        """Upsert findings into security.column_classifications."""
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                for r in results:
+                    cur.execute("""
+                        INSERT INTO security.column_classifications
+                            (schema_name, table_name, column_name,
+                             classification, rls_required, last_reviewed_at,
+                             reviewed_by)
+                        VALUES (%s, %s, %s, %s,
+                                %s,       -- rls_required: true for PII/PHI
+                                NOW(), 'auto_classifier')
+                        ON CONFLICT (schema_name, table_name, column_name)
+                        DO UPDATE SET
+                            classification   = EXCLUDED.classification,
+                            rls_required     = EXCLUDED.rls_required,
+                            last_reviewed_at = NOW(),
+                            reviewed_by      = 'auto_classifier'
+                        WHERE
+                            security.column_classifications.reviewed_by
+                                = 'auto_classifier'
+                            -- never overwrite a human-reviewed classification
+                    """, (
+                        r.schema_name, r.table_name, r.column_name,
+                        r.classification,
+                        r.classification in ('PII', 'PHI')
+                    ))
+            conn.commit()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The scanner is scheduled to run nightly on all schemas, and also triggered on-demand whenever the schema change detector records a DDL event of type <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ADD COLUMN</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE</code>. This event-driven invocation means that new columns with sensitive data are classified within minutes of creation, not at the next scheduled overnight run.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">persist_classifications</code> method contains one design principle worth highlighting: it will not overwrite a classification that was set by a human reviewer. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE reviewed_by = 'auto_classifier'</code> predicate ensures that if a security officer has manually marked a column as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PUBLIC</code> (perhaps because what looks like a phone number is actually a product SKU), the automation respects that decision and does not reverse it on the next scan.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.6 Anomalous Query Detection and Automatic Containment</h3>
+
+<p class="text-gray-300 leading-relaxed">Beyond explicit privilege escalation, the more subtle threat is queries that are technically authorized but behaviorally anomalous—a service account that normally reads 500 rows per minute suddenly running full table scans and exfiltrating millions of rows. The privilege is valid; the behavior is not.</p>
+
+<p class="text-gray-300 leading-relaxed">Anomalous query detection in the ADE architecture is built on a statistical model of per-principal access behavior. For each principal, the system maintains a behavioral profile:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hourly row throughput**: rolling mean and standard deviation of rows returned per hour.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Table access entropy**: how many distinct tables the principal typically touches per session. High entropy suddenly appearing in a low-entropy account is anomalous.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query fingerprint distribution**: the normalized hash fingerprint of queries typically executed. A new fingerprint type appearing at volume is a signal.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Result set size distribution**: the typical percentile distribution of rows per query. A query returning 100× the 99th percentile is anomalous.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Behavioral profiling infrastructure
+CREATE SCHEMA behavior;
+
+CREATE TABLE behavior.principal_baselines (
+    principal_name          TEXT PRIMARY KEY,
+    typical_conn_hours      INT[] NOT NULL DEFAULT '{}',
+    mean_rows_per_hour      NUMERIC(12,2),
+    stddev_rows_per_hour    NUMERIC(12,2),
+    mean_query_count        NUMERIC(10,2),
+    typical_table_entropy   NUMERIC(6,4),   -- normalized Shannon entropy
+    p99_result_rows         BIGINT,
+    baseline_start          TIMESTAMPTZ,
+    baseline_end            TIMESTAMPTZ,
+    last_updated            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sample_sessions         INT
+);
+
+-- Raw session telemetry (populated by pg_audit log consumer or pgBouncer hooks)
+CREATE TABLE behavior.session_telemetry (
+    telemetry_id        BIGSERIAL PRIMARY KEY,
+    principal_name      TEXT NOT NULL,
+    session_start       TIMESTAMPTZ NOT NULL,
+    session_end         TIMESTAMPTZ,
+    source_ip           INET,
+    rows_returned       BIGINT NOT NULL DEFAULT 0,
+    rows_modified       BIGINT NOT NULL DEFAULT 0,
+    distinct_tables     INT NOT NULL DEFAULT 0,
+    query_count         INT NOT NULL DEFAULT 0,
+    max_single_result   BIGINT NOT NULL DEFAULT 0,
+    new_fingerprints    INT NOT NULL DEFAULT 0  -- fingerprints not seen in last 30d
+);
+
+CREATE INDEX idx_telemetry_principal_time
+    ON behavior.session_telemetry (principal_name, session_start);
+
+-- Anomaly scoring function
+CREATE OR REPLACE FUNCTION behavior.score_session(
+    p_principal         TEXT,
+    p_rows_returned     BIGINT,
+    p_distinct_tables   INT,
+    p_max_single_result BIGINT,
+    p_new_fingerprints  INT,
+    p_session_hour      INT
+)
+RETURNS TABLE (
+    anomaly_score       NUMERIC(6,3),
+    breach_components   TEXT[]
+)
+LANGUAGE plpgsql STABLE
+AS $$
+DECLARE
+    v_baseline  behavior.principal_baselines%ROWTYPE;
+    v_score     NUMERIC(6,3) := 0;
+    v_breaches  TEXT[] := '{}';
+    v_z_rows    NUMERIC;
+BEGIN
+    SELECT * INTO v_baseline
+    FROM behavior.principal_baselines
+    WHERE principal_name = p_principal;
+
+    IF NOT FOUND THEN
+        -- No baseline: cannot score; return neutral
+        anomaly_score     := 0;
+        breach_components := ARRAY['NO_BASELINE'];
+        RETURN NEXT;
+        RETURN;
+    END IF;
+
+    -- Z-score on row throughput
+    IF v_baseline.stddev_rows_per_hour &gt; 0 THEN
+        v_z_rows := (p_rows_returned - v_baseline.mean_rows_per_hour)
+                    / v_baseline.stddev_rows_per_hour;
+        IF v_z_rows &gt; 3 THEN
+            v_score   := v_score + LEAST(v_z_rows / 3.0, 4.0);
+            v_breaches := v_breaches || format('HIGH_ROW_ZSCORE:%.1f', v_z_rows);
+        END IF;
+    END IF;
+
+    -- Result set size spike
+    IF v_baseline.p99_result_rows &gt; 0
+       AND p_max_single_result &gt; v_baseline.p99_result_rows * 10 THEN
+        v_score   := v_score + 3.0;
+        v_breaches := v_breaches || format(
+            'RESULT_SPIKE:%s_vs_p99_%s',
+            p_max_single_result, v_baseline.p99_result_rows
+        );
+    END IF;
+
+    -- Off-hours access
+    IF p_session_hour &lt;&gt; ALL(v_baseline.typical_conn_hours) THEN
+        v_score   := v_score + 1.0;
+        v_breaches := v_breaches || format('OFF_HOURS:%s', p_session_hour);
+    END IF;
+
+    -- New query fingerprints appearing at volume
+    IF p_new_fingerprints &gt; 5 THEN
+        v_score   := v_score + LEAST(p_new_fingerprints / 5.0, 3.0);
+        v_breaches := v_breaches || format('NEW_FINGERPRINTS:%s', p_new_fingerprints);
+    END IF;
+
+    -- Table entropy spike
+    IF v_baseline.typical_table_entropy &gt; 0
+       AND p_distinct_tables
+           &gt; (v_baseline.typical_table_entropy * 50 + 10) THEN
+        v_score   := v_score + 2.0;
+        v_breaches := v_breaches || format('TABLE_ENTROPY_SPIKE:%s', p_distinct_tables);
+    END IF;
+
+    anomaly_score     := ROUND(v_score, 3);
+    breach_components := v_breaches;
+    RETURN NEXT;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Behavioral anomaly scoring for SQL Server
+-- Baseline and telemetry tables mirror the PostgreSQL schema
+
+CREATE TABLE behavior.principal_baselines (
+    principal_name          SYSNAME         PRIMARY KEY,
+    typical_conn_hours      NVARCHAR(MAX)   NOT NULL DEFAULT '[]',  -- JSON array of ints
+    mean_rows_per_hour      DECIMAL(12,2)   NULL,
+    stddev_rows_per_hour    DECIMAL(12,2)   NULL,
+    mean_query_count        DECIMAL(10,2)   NULL,
+    typical_table_entropy   DECIMAL(6,4)    NULL,
+    p99_result_rows         BIGINT          NULL,
+    baseline_start          DATETIME2       NULL,
+    baseline_end            DATETIME2       NULL,
+    last_updated            DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    sample_sessions         INT             NULL
+);
+
+CREATE TABLE behavior.session_telemetry (
+    telemetry_id        BIGINT          IDENTITY(1,1) PRIMARY KEY,
+    principal_name      SYSNAME         NOT NULL,
+    session_start       DATETIME2       NOT NULL,
+    session_end         DATETIME2       NULL,
+    source_ip           NVARCHAR(45)    NULL,
+    rows_returned       BIGINT          NOT NULL DEFAULT 0,
+    rows_modified       BIGINT          NOT NULL DEFAULT 0,
+    distinct_tables     INT             NOT NULL DEFAULT 0,
+    query_count         INT             NOT NULL DEFAULT 0,
+    max_single_result   BIGINT          NOT NULL DEFAULT 0,
+    new_fingerprints    INT             NOT NULL DEFAULT 0
+);
+
+CREATE INDEX idx_telemetry_principal_time
+    ON behavior.session_telemetry (principal_name, session_start);
+GO
+
+-- Anomaly scoring procedure
+CREATE OR ALTER PROCEDURE behavior.usp_score_session
+    @principal          SYSNAME,
+    @rows_returned      BIGINT,
+    @distinct_tables    INT,
+    @max_single_result  BIGINT,
+    @new_fingerprints   INT,
+    @session_hour       INT,
+    @anomaly_score      DECIMAL(6,3) OUTPUT,
+    @breach_components  NVARCHAR(MAX) OUTPUT   -- comma-delimited
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @mean_rows          DECIMAL(12,2),
+        @stddev_rows        DECIMAL(12,2),
+        @p99_rows           BIGINT,
+        @typical_hours      NVARCHAR(MAX),
+        @typical_entropy    DECIMAL(6,4),
+        @z_rows             DECIMAL(10,4),
+        @score              DECIMAL(6,3) = 0,
+        @breaches           NVARCHAR(MAX) = '';
+
+    SELECT
+        @mean_rows       = mean_rows_per_hour,
+        @stddev_rows     = stddev_rows_per_hour,
+        @p99_rows        = p99_result_rows,
+        @typical_hours   = typical_conn_hours,
+        @typical_entropy = typical_table_entropy
+    FROM behavior.principal_baselines
+    WHERE principal_name = @principal;
+
+    IF @mean_rows IS NULL
+    BEGIN
+        SET @anomaly_score     = 0;
+        SET @breach_components = 'NO_BASELINE';
+        RETURN;
+    END;
+
+    -- Z-score on row throughput
+    IF ISNULL(@stddev_rows, 0) &gt; 0
+    BEGIN
+        SET @z_rows = (@rows_returned - @mean_rows) / @stddev_rows;
+        IF @z_rows &gt; 3
+        BEGIN
+            SET @score    = @score + CASE WHEN @z_rows / 3.0 &lt; 4.0
+                                          THEN @z_rows / 3.0
+                                          ELSE 4.0 END;
+            SET @breaches = @breaches
+                + 'HIGH_ROW_ZSCORE:' + CAST(ROUND(@z_rows,1) AS NVARCHAR(20)) + ',';
+        END;
+    END;
+
+    -- Result set size spike (10× the p99)
+    IF ISNULL(@p99_rows, 0) &gt; 0
+       AND @max_single_result &gt; @p99_rows * 10
+    BEGIN
+        SET @score    = @score + 3.0;
+        SET @breaches = @breaches
+            + 'RESULT_SPIKE:' + CAST(@max_single_result AS NVARCHAR(20))
+            + '_vs_p99_' + CAST(@p99_rows AS NVARCHAR(20)) + ',';
+    END;
+
+    -- Off-hours check using JSON array stored in typical_conn_hours
+    IF NOT EXISTS (
+        SELECT 1 FROM OPENJSON(@typical_hours)
+        WHERE CAST(value AS INT) = @session_hour
+    )
+    BEGIN
+        SET @score    = @score + 1.0;
+        SET @breaches = @breaches
+            + 'OFF_HOURS:' + CAST(@session_hour AS NVARCHAR(5)) + ',';
+    END;
+
+    -- New fingerprints volume
+    IF @new_fingerprints &gt; 5
+    BEGIN
+        SET @score = @score
+            + CASE WHEN @new_fingerprints / 5.0 &lt; 3.0
+                   THEN @new_fingerprints / 5.0
+                   ELSE 3.0 END;
+        SET @breaches = @breaches
+            + 'NEW_FINGERPRINTS:' + CAST(@new_fingerprints AS NVARCHAR(10)) + ',';
+    END;
+
+    -- Table entropy spike
+    IF ISNULL(@typical_entropy, 0) &gt; 0
+       AND @distinct_tables &gt; (@typical_entropy * 50 + 10)
+    BEGIN
+        SET @score    = @score + 2.0;
+        SET @breaches = @breaches
+            + 'TABLE_ENTROPY_SPIKE:' + CAST(@distinct_tables AS NVARCHAR(10)) + ',';
+    END;
+
+    SET @anomaly_score     = ROUND(@score, 3);
+    SET @breach_components = LEFT(@breaches, LEN(@breaches) - 1); -- trim trailing comma
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The scoring function produces a dimensionless anomaly score. Scores are thresholded into response tiers:</p>
+
+<p class="text-gray-300 leading-relaxed">| Score Range | Classification | Automated Response |</p>
+<p class="text-gray-300 leading-relaxed">|-------------|---------------|-------------------|</p>
+<p class="text-gray-300 leading-relaxed">| 0 – 2.0 | Normal | Log only |</p>
+<p class="text-gray-300 leading-relaxed">| 2.0 – 4.0 | Elevated | Alert security channel; increase audit verbosity for principal |</p>
+<p class="text-gray-300 leading-relaxed">| 4.0 – 6.0 | Suspicious | Throttle connection rate; require re-authentication on next query batch |</p>
+<p class="text-gray-300 leading-relaxed">| > 6.0 | Critical | Terminate sessions; quarantine principal account; page on-call |</p>
+
+<p class="text-gray-300 leading-relaxed">The threshold values are starting points, not fixed constants. The autonomic layer tracks the false-positive rate for each principal and adjusts thresholds upward when alerts consistently resolve as benign—a form of per-principal calibration that reduces alert fatigue without permanently suppressing genuine signals.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">19.7 Security Policy as Code: GitOps Integration and Auditability</h3>
+
+<p class="text-gray-300 leading-relaxed">All the mechanisms in this chapter—desired-state manifests, JIT grants, RLS policy versions, classification metadata—are meaningless from a compliance perspective if they cannot be audited. Self-tuning security must be at least as auditable as human-managed security, and ideally more so, because every automated change is machine-generated and therefore completely recordable.</p>
+
+<p class="text-gray-300 leading-relaxed">The audit architecture has three layers:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Immutable event log</strong>: Every automated security action—grant, revoke, policy update, account lock, session termination—is written to an append-only audit table. In PostgreSQL, this is enforced with a trigger that prevents <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code> on the audit table. In SQL Server, it is enforced via a ledger table (SQL Server 2022+) or a temporal table with restricted permissions on the history table.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE security.audit_log (
+    event_id        BIGSERIAL       PRIMARY KEY,
+    event_time      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    event_type      TEXT            NOT NULL,
+    actor           TEXT            NOT NULL,   -- 'system' or human identity
+    target_principal TEXT,
+    target_object   TEXT,
+    action_taken    TEXT            NOT NULL,
+    sql_executed    TEXT,
+    request_ref     UUID,                        -- links to JIT request if applicable
+    threat_level    TEXT,
+    outcome         TEXT            NOT NULL,   -- 'SUCCESS', 'FAILURE', 'PARTIAL'
+    detail          JSONB
+);
+
+-- Prevent modification of audit records
+CREATE OR REPLACE FUNCTION security.audit_immutability_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION
+        'Audit log is immutable. event_id=% cannot be modified or deleted.', OLD.event_id;
+END;
+$$;
+
+CREATE TRIGGER trg_audit_immutable
+    BEFORE UPDATE OR DELETE ON security.audit_log
+    FOR EACH ROW EXECUTE FUNCTION security.audit_immutability_guard();
+
+-- Revoke direct modification rights; audit writes go through a SECURITY DEFINER function
+REVOKE INSERT, UPDATE, DELETE ON security.audit_log FROM PUBLIC;
+
+CREATE OR REPLACE FUNCTION security.log_event(
+    p_event_type        TEXT,
+    p_actor             TEXT,
+    p_target_principal  TEXT,
+    p_target_object     TEXT,
+    p_action_taken      TEXT,
+    p_sql_executed      TEXT      DEFAULT NULL,
+    p_request_ref       UUID      DEFAULT NULL,
+    p_threat_level      TEXT      DEFAULT NULL,
+    p_outcome           TEXT      DEFAULT 'SUCCESS',
+    p_detail            JSONB     DEFAULT NULL
+)
+RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    v_id BIGINT;
+BEGIN
+    INSERT INTO security.audit_log (
+        event_type, actor, target_principal, target_object,
+        action_taken, sql_executed, request_ref,
+        threat_level, outcome, detail
+    )
+    VALUES (
+        p_event_type, p_actor, p_target_principal, p_target_object,
+        p_action_taken, p_sql_executed, p_request_ref,
+        p_threat_level, p_outcome, p_detail
+    )
+    RETURNING event_id INTO v_id;
+    RETURN v_id;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server (Ledger Table, SQL Server 2022+):</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Ledger table: cryptographically verifiable audit trail
+CREATE TABLE security.audit_log (
+    event_id        BIGINT          IDENTITY(1,1),
+    event_time      DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME(),
+    event_type      NVARCHAR(50)    NOT NULL,
+    actor           NVARCHAR(128)   NOT NULL,
+    target_principal SYSNAME        NULL,
+    target_object   NVARCHAR(500)   NULL,
+    action_taken    NVARCHAR(200)   NOT NULL,
+    sql_executed    NVARCHAR(MAX)   NULL,
+    request_ref     UNIQUEIDENTIFIER NULL,
+    threat_level    NVARCHAR(20)    NULL,
+    outcome         NVARCHAR(20)    NOT NULL,
+    detail          NVARCHAR(MAX)   NULL   -- JSON string
+)
+WITH (LEDGER = ON (APPEND_ONLY = ON));
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GitOps integration</strong>: The desired-state manifest lives in a Git repository. Every automated reconciliation that produces a policy change commits a diff back to the repository with a machine-authored commit message that includes the timestamp, the reconciliation run ID, and a summary of changes. Human engineers can review the history with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">git log --oneline security-manifest.yaml</code> and see the complete evolution of the security posture—who granted what, when automation changed it, and why.</p>
+
+<p class="text-gray-300 leading-relaxed">The reconciliation engine uses a write-back pattern: after executing changes, it serializes the new actual state back to YAML and opens a pull request against the manifest repository if the actual state diverges from the last committed manifest in any way that was not part of the current reconciliation run. This prevents silent divergence: if someone manually executes a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GRANT</code> outside the normal flow, the system detects it within the next reconciliation cycle and surfaces it as an open PR for review.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Compliance reporting</strong>: The audit log, combined with the classification metadata and the JIT access history, can generate compliance evidence automatically. A SOC 2 access review that would normally require a DBA to compile a spreadsheet of all access grants, their justifications, and their current status can be answered with a single query against the audit tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Access evidence report: all active grants with business justification
+-- (PostgreSQL)
+SELECT
+    ag.principal_name,
+    ag.target_schema || '.' || ag.target_table AS object_name,
+    ag.privilege_type,
+    ar.reason                           AS business_justification,
+    ar.ticket_ref,
+    ar.approved_by,
+    ar.approved_at,
+    ag.expires_at,
+    CASE
+        WHEN ag.expires_at &gt; NOW() THEN 'ACTIVE'
+        ELSE 'EXPIRED'
+    END                                 AS grant_status,
+    cc.classification                   AS data_sensitivity
+FROM jit.active_grants ag
+JOIN jit.access_requests ar
+    ON ar.request_id = ag.request_id
+LEFT JOIN security.column_classifications cc
+    ON  cc.schema_name = ag.target_schema
+    AND cc.table_name  = ag.target_table
+WHERE ag.revoked_at IS NULL
+  OR  ag.expires_at &gt; NOW() - INTERVAL '90 days'  -- include recently expired for review period
+ORDER BY cc.classification DESC, ag.principal_name, object_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This is the compounding advantage of autonomous security: not only does the system enforce policy, but it generates its own compliance evidence as a natural byproduct of operation, eliminating the audit preparation overhead that consumes significant DBA time in conventional environments.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Policy drift is structural, not accidental.** Static grants accumulate because the processes that create them have no automatic expiry or reconciliation mechanism. The autonomous remedy is a desired-state security manifest paired with a continuous reconciliation engine that computes and closes the gap between intended and actual privilege state.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Row-Level Security becomes a living control surface when driven by a classification metadata layer.** Automating the pipeline from data classification through policy generation ensures that newly added sensitive columns are protected within the next reconciliation cycle, not whenever a developer remembers to update the policy manually.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Just-in-Time privilege provisioning eliminates standing access as a structural property, not a discipline.** When access grants carry enforced expiry timestamps and the revocation is executed automatically by a background enforcer, privilege hygiene no longer depends on human memory or process compliance—it is guaranteed by the system's mechanics.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anomalous query detection must be behavioral, not purely signature-based.** A query is authorized or it is not; authorization checks alone cannot detect a compromised legitimate account. Behavioral profiling—tracking row throughput, result-set size distributions, fingerprint entropy, and access hours per principal—provides the statistical layer that surfaces anomalies even when the credential is valid.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous security is only trustworthy when it is fully auditable.** Every automated grant, revocation, session termination, and policy update must be recorded in an immutable, machine-readable audit log that feeds compliance reporting directly, and every policy change must be traceable through a GitOps history. The auditability of the system is not an add-on—it is the mechanism that makes autonomous action acceptable to governance and regulatory stakeholders.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -6,6 +6,10 @@
   <title>Chapter 4: The Vector Database Landscape: pgvector, Pinecone, Weaviate, Qdrant, Chroma — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 4: The Vector Database Landscape: pgvector, Pinecone, Weaviate, Qdrant, Chroma. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -67,17 +71,7 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Latency Benchmarks as a Reality Check</strong></p>
 
-<p class="text-gray-300 leading-relaxed">Published benchmarks from the ann-benchmarks project and Qdrant's own studies as of early 2024 give rough reference points at the glot-wiki-multilingual-1M dataset (960 dimensions, 1M vectors):</p>
-
-<p class="text-gray-300 leading-relaxed">| System | QPS (10 threads) | Recall@10 | Index Build Time |</p>
-<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
-<p class="text-gray-300 leading-relaxed">| Qdrant (HNSW) | ~8,500 | 0.98 | ~4 min |</p>
-<p class="text-gray-300 leading-relaxed">| Weaviate (HNSW) | ~5,200 | 0.97 | ~6 min |</p>
-<p class="text-gray-300 leading-relaxed">| pgvector (ivfflat) | ~1,800 | 0.95 | ~8 min |</p>
-<p class="text-gray-300 leading-relaxed">| pgvector (hnsw) | ~3,100 | 0.97 | ~12 min |</p>
-<p class="text-gray-300 leading-relaxed">| Chroma (HNSW) | ~2,400 | 0.96 | ~5 min |</p>
-
-<p class="text-gray-300 leading-relaxed">These numbers are illustrative under a specific workload; your production configuration, dimensionality, and hardware will shift them. The pattern they reveal — purpose-built systems outperform the extension by 2–5x at raw throughput — holds across most published benchmarks.</p>
+<p class="text-gray-300 leading-relaxed">Independent, reproducible cross-system benchmarks are harder to find than vendor marketing pages suggest — dataset, dimensionality, hardware, and index parameters all shift the numbers enough that a table copied from one source rarely transfers to your workload. The directional pattern reported across most public benchmarking efforts (including the community-run ann-benchmarks project, which benchmarks ANN libraries rather than full database systems) is that purpose-built vector engines tend to out-throughput pgvector's HNSW/IVFFlat implementation at a given recall target, sometimes substantially. Treat that as a prior to test, not a number to design around — run the comparison yourself against your own data, dimensionality, and hardware before committing to an architecture.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -424,6 +418,331 @@ print(response.generated)   # LLM-synthesized answer from retrieved context</cod
 
 <p class="text-gray-300 leading-relaxed">Qdrant (developed in Rust) is the performance-oriented choice among the open-source purpose-built systems. Its HNSW implementation with quantization support (scalar, product, and binary quantization) enables significantly higher vector density per node compared to Weaviate's pure float32 storage. The payload filter engine evaluates metadata conditions during the HNSW graph traversal rather than as a post-filter, which prevents the precision degradation that affects post-filter approaches at high selectivity ratios.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, Range, MatchValue,
+    ScalarQuantization, ScalarQuantizationConfig, ScalarType,
+    SearchRequest
+)
+from openai import OpenAI
+
+qdrant = QdrantClient(url="http://localhost:6333")
+openai_client = OpenAI()
+
+COLLECTION = "support_tickets"
+DIM        = 1536
+
+# Create collection with scalar quantization (int8)
+# Reduces memory 4x with ~2-5% recall drop at ef=128
+qdrant.recreate_collection(
+    collection_name = COLLECTION,
+    vectors_config  = VectorParams(size=DIM, distance=Distance.COSINE),
+    quantization_config = ScalarQuantization(
+        scalar = ScalarQuantizationConfig(
+            type       = ScalarType.INT8,
+            quantile   = 0.99,   # clip outliers beyond 99th percentile
+            always_ram = True    # keep quantized index in RAM, raw vectors on disk
+        )
+    )
+)
+
+# Create payload index for fast metadata filtering
+qdrant.create_payload_index(
+    collection_name = COLLECTION,
+    field_name      = "priority",
+    field_schema    = "keyword"
+)
+qdrant.create_payload_index(
+    collection_name = COLLECTION,
+    field_name      = "created_ts",
+    field_schema    = "integer"
+)
+
+def upsert_tickets(tickets: list[dict]) -&gt; None:
+    BATCH = 50
+    for i in range(0, len(tickets), BATCH):
+        batch   = tickets[i : i + BATCH]
+        texts   = [t["subject"] + " " + t["description"] for t in batch]
+        vectors = openai_client.embeddings.create(
+            model = "text-embedding-3-small",
+            input = texts
+        ).data
+        points = [
+            PointStruct(
+                id      = t["id"],   # integer or UUID string
+                vector  = vectors[j].embedding,
+                payload = {
+                    "subject":    t["subject"],
+                    "priority":   t["priority"],          # "high", "medium", "low"
+                    "created_ts": int(t["created_ts"]),   # Unix timestamp
+                    "customer_id": t["customer_id"]
+                }
+            )
+            for j, t in enumerate(batch)
+        ]
+        qdrant.upsert(collection_name=COLLECTION, points=points)
+
+def search_tickets(query: str, priority: str = None,
+                   days_back: int = 30, top_k: int = 10) -&gt; list[dict]:
+    import time
+    query_vec = openai_client.embeddings.create(
+        model="text-embedding-3-small", input=[query]
+    ).data[0].embedding
+
+    # Build filter with payload conditions
+    conditions = []
+    if priority:
+        conditions.append(FieldCondition(key="priority", match=MatchValue(value=priority)))
+    if days_back:
+        cutoff_ts = int(time.time()) - days_back * 86400
+        conditions.append(FieldCondition(key="created_ts", range=Range(gte=cutoff_ts)))
+
+    query_filter = Filter(must=conditions) if conditions else None
+
+    results = qdrant.search(
+        collection_name = COLLECTION,
+        query_vector    = query_vec,
+        query_filter    = query_filter,
+        limit           = top_k,
+        with_payload    = True,
+        search_params   = {"ef": 128, "exact": False}  # ef controls recall/speed tradeoff
+    )
+    return [
+        {
+            "id":          r.id,
+            "score":       r.score,
+            "subject":     r.payload.get("subject"),
+            "priority":    r.payload.get("priority"),
+            "customer_id": r.payload.get("customer_id")
+        }
+        for r in results
+    ]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Qdrant's payload filter pre-filtering model is worth understanding in detail. When you specify a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Filter</code> at query time, Qdrant evaluates whether to walk the HNSW graph with the filter applied inline (pre-filter) or to retrieve a candidate set and then apply the filter afterward (post-filter). It makes this decision automatically based on the estimated selectivity of the filter: high-selectivity filters (few matching points) trigger a different traversal strategy than low-selectivity ones. This adaptive behavior prevents the recall collapse that pure post-filter implementations exhibit when filter selectivity is very high. For workloads with aggressive metadata filtering — think per-user or per-tenant scoping — Qdrant's approach to this tradeoff is an important production consideration.</p>
+
+<p class="text-gray-300 leading-relaxed">Qdrant's distributed mode uses a shard-per-collection model with configurable replication factor. You specify the number of shards at collection creation time. Unlike Pinecone serverless (which manages sharding invisibly), Qdrant requires explicit capacity planning: too few shards limits write throughput, too many increases cross-node coordination overhead at query time. The general guidance from Qdrant's documentation is to size shards at roughly 200M vectors each for most hardware configurations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chroma</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Chroma sits at the opposite end of the operational spectrum from Qdrant. It is explicitly developer-first: single-file embedded mode, no infrastructure to run, a Python-native API, and direct LangChain and LlamaIndex integration out of the box. Chroma is the fastest path from "I need vector storage in my prototype" to working code, measured in minutes rather than hours.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import chromadb
+from chromadb.utils import embedding_functions
+
+# Embedded mode — persistent local storage, no server process required
+chroma = chromadb.PersistentClient(path="./chroma_data")
+
+# Chroma has built-in embedding functions for common providers
+oai_ef = embedding_functions.OpenAIEmbeddingFunction(
+    api_key    = "YOUR_OPENAI_API_KEY",
+    model_name = "text-embedding-3-small"
+)
+
+collection = chroma.get_or_create_collection(
+    name               = "research_papers",
+    embedding_function = oai_ef,
+    metadata           = {"hnsw:space": "cosine"}   # distance metric config
+)
+
+# Add documents — Chroma handles embedding automatically via the configured function
+collection.add(
+    ids        = ["paper_001", "paper_002", "paper_003"],
+    documents  = [
+        "Attention is All You Need: transformer architecture for sequence modeling",
+        "BERT: Pre-training of Deep Bidirectional Transformers",
+        "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"
+    ],
+    metadatas  = [
+        {"year": 2017, "venue": "NeurIPS", "citations": 80000},
+        {"year": 2018, "venue": "NAACL",   "citations": 75000},
+        {"year": 2020, "venue": "NeurIPS", "citations": 12000}
+    ]
+)
+
+# Query — returns distances, documents, and metadata in one call
+results = collection.query(
+    query_texts    = ["how transformers use attention mechanisms"],
+    n_results      = 2,
+    where          = {"year": {"$gte": 2018}},   # metadata filter
+    include        = ["documents", "metadatas", "distances"]
+)
+
+for doc, meta, dist in zip(
+    results["documents"][0],
+    results["metadatas"][0],
+    results["distances"][0]
+):
+    print(f"Distance: {dist:.4f} | Venue: {meta['venue']} | {doc[:80]}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Chroma's production limitations become visible quickly. Its default HNSW index is not distributed and has no native horizontal scaling. The client-server mode (connecting to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chromadb.HttpClient</code>) provides some separation of concerns but does not partition data across nodes. For workloads exceeding a few million vectors or requiring multi-instance write concurrency, Chroma's architecture will not support the load, and migration to a more capable system should be planned from the start.</p>
+
+<p class="text-gray-300 leading-relaxed">Where Chroma is genuinely strong: LangChain integration, rapid iteration on embedding strategies, evaluation harnesses, and offline batch processing pipelines. Many production RAG systems started as Chroma prototypes and migrated to Qdrant or Weaviate when scale requirements became clearer — the Chroma API's simplicity speeds up the early feedback loop without requiring operational investment.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Side-by-Side: Connection Patterns and Query Structures</h3>
+
+<p class="text-gray-300 leading-relaxed">The code differences across systems reflect their underlying design philosophies. Here is the same semantic search operation — retrieve the top-10 most similar documents to a query, filtered by category and a date range — expressed in all five systems.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector (PostgreSQL)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+SET hnsw.ef_search = 100;
+
+SELECT id, title, category, published_at,
+       1 - (embedding &lt;=&gt; $1::vector) AS similarity
+FROM articles
+WHERE category = $2
+  AND published_at &gt;= $3
+ORDER BY embedding &lt;=&gt; $1::vector
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python / Pinecone
+results = index.query(
+    vector    = query_embedding,
+    top_k     = 10,
+    filter    = {
+        "category":     {"$eq": category},
+        "published_ts": {"$gte": int(since_date.timestamp())}
+    },
+    include_metadata = True,
+    namespace        = "articles"
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python / Weaviate v4 client
+results = collection.query.hybrid(
+    query   = query_text,
+    alpha   = 0.75,
+    limit   = 10,
+    filters = wvc.query.Filter.by_property("category").equal(category) &
+              wvc.query.Filter.by_property("published_at").greater_than(since_date_iso)
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Qdrant</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python / Qdrant
+results = qdrant.search(
+    collection_name = "articles",
+    query_vector    = query_embedding,
+    query_filter    = Filter(must=[
+        FieldCondition(key="category",     match=MatchValue(value=category)),
+        FieldCondition(key="published_ts", range=Range(gte=int(since_date.timestamp())))
+    ]),
+    limit        = 10,
+    with_payload = True
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chroma</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python / Chroma
+results = collection.query(
+    query_texts = [query_text],
+    n_results   = 10,
+    where       = {
+        "$and": [
+            {"category":     {"$eq": category}},
+            {"published_ts": {"$gte": int(since_date.timestamp())}}
+        ]
+    },
+    include = ["documents", "metadatas", "distances"]
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SQL form (pgvector) is the most readable for anyone familiar with relational query patterns. The Python forms converge toward a similar structure — vector, filter, limit — but each system's filter syntax differs enough that switching systems requires rewriting query construction logic, which argues for an abstraction layer in any application that might migrate between backends.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operational Comparison: Deployment, Scaling, and Durability</h3>
+
+<p class="text-gray-300 leading-relaxed">Understanding how each system is deployed, scaled, and backed up is as important as query API surface when evaluating production suitability.</p>
+
+<p class="text-gray-300 leading-relaxed">| Dimension | pgvector | Pinecone | Weaviate | Qdrant | Chroma |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Deployment model | PostgreSQL extension | Managed cloud only | Self-host or WCD cloud | Self-host or Qdrant Cloud | Embedded or self-host |</p>
+<p class="text-gray-300 leading-relaxed">| Horizontal scaling | PostgreSQL sharding/Citus | Automatic (serverless) | Distributed nodes | Distributed shards | None (single-node) |</p>
+<p class="text-gray-300 leading-relaxed">| Durability model | PostgreSQL WAL + PITR | Fully managed | WAL + snapshots | WAL + snapshots | Filesystem (no WAL) |</p>
+<p class="text-gray-300 leading-relaxed">| Backup/restore | pg_dump, PITR, logical replication | Fully managed | Collection snapshots | Collection snapshots | Directory copy |</p>
+<p class="text-gray-300 leading-relaxed">| Multi-tenancy | Row-level security + schemas | Namespaces per index | Multi-tenancy via filters | Payload-based isolation | Collection per tenant |</p>
+<p class="text-gray-300 leading-relaxed">| Native hybrid search | External (tsvector + vector) | No (sparse+dense requires BYO sparse) | Yes (BM25 + HNSW, RRF) | Yes (sparse + dense) | No |</p>
+<p class="text-gray-300 leading-relaxed">| Transactions | Full ACID | None | None | None | None |</p>
+<p class="text-gray-300 leading-relaxed">| Cost model | Infrastructure cost | Per-RU/WU consumption | Infrastructure or WCD subscription | Infrastructure or Qdrant Cloud | Infrastructure (free tier) |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">A Note on Multi-Tenancy</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Multi-tenant isolation deserves more attention than single-tenant benchmarks suggest. At moderate tenant counts (tens to hundreds), all five systems can implement per-tenant isolation through metadata filters or separate collections. At high tenant counts (thousands to millions), the strategies diverge:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pgvector**: PostgreSQL row-level security with `tenant_id` column scales to any tenant count without per-tenant infrastructure, though partial indexes per tenant only make sense for high-volume tenants.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pinecone**: Namespaces are the natural multi-tenant primitive. High namespace counts are supported but each namespace shares the index's total capacity.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Weaviate**: Separate collections per tenant is the recommended pattern for strong isolation, but collection count at very high tenant scale becomes a management concern. The `multi-tenancy` module (added in later versions) provides first-class support.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Qdrant**: Payload-based isolation (filter by `customer_id`) is operationally simple. For strong isolation, separate collections per tenant work but carry per-collection overhead.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chroma**: Separate collections per tenant is the only practical isolation strategy; at high tenant counts this becomes unmanageable.</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Choosing Between Systems: A Decision Tree</h3>
+
+<p class="text-gray-300 leading-relaxed">Given the framework, data, and operational comparisons above, the following decision path covers the majority of production scenarios:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Start] --> B{Already on PostgreSQL<br/>and vectors under 10M?}
+    B -->|Yes| PG[pgvector]
+    B -->|No| C{Need ACID consistency between<br/>vectors and relational data?}
+    C -->|Yes| PG
+    C -->|No| D{Vectors over 50M, or need<br/>sub-20ms P99, or pure vector workload?}
+    D -->|No| PG
+    D -->|Yes| E{Need a managed service<br/>with no ops team?}
+    E -->|Yes| PC[Pinecone]
+    E -->|No| F{Need native hybrid search?}
+    F -->|Graph cross-references matter| WV[Weaviate]
+    F -->|Max density / quantization| QD[Qdrant]
+    F -->|Prototype or LangChain integration| CH[Chroma]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The decision tree in prose form below — the diagram is a visual shortcut to the same logic.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Start
+│
+├── Already running PostgreSQL and vectors &lt; 10M?
+│   └── YES → pgvector. Add HNSW index, deploy as PostgreSQL extension.
+│
+├── Need ACID consistency between vector and non-vector data?
+│   └── YES → pgvector. Transactions across embeddings and relational metadata
+│              require a relational engine.
+│
+├── Vectors &gt; 50M OR need sub-20ms P99 OR pure vector-only workload?
+│   └── YES → Go to purpose-built
+│       │
+│       ├── Need managed service, no ops team for vector infrastructure?
+│       │   └── YES → Pinecone (serverless for variable load, pod for steady state)
+│       │
+│       ├── Need native hybrid search (keyword + semantic in one query)?
+│       │   └── YES → Weaviate or Qdrant
+│       │       ├── Graph cross-references between objects matter?
+│       │       │   └── YES → Weaviate
+│       │       └── Maximum vector density / quantization / Rust performance?
+│       │           └── YES → Qdrant
+│       │
+│       └── Prototype, evaluation, offline pipeline, or LangChain integration?
+│           └── YES → Chroma (with migration plan when volume grows)
+│
+└── None of the above? Start with pgvector, migrate when constraints appear.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The last branch deserves emphasis. The operational cost of migrating from pgvector to a purpose-built system — re-indexing vectors, migrating embeddings, rewriting query code — is real but manageable if planned. Starting with pgvector and migrating when your workload demonstrates a genuine need for purpose-built performance is often lower total cost than provisioning Pinecone infrastructure for a workload that never grows past 2M vectors.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **pgvector is the pragmatic default for teams already on PostgreSQL**: it adds vector similarity search without introducing a new operational system, supports ACID transactions, and handles workloads up to tens of millions of vectors on well-tuned hardware before requiring architectural changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Pinecone eliminates infrastructure management at the cost of SQL and ACID**: its serverless model is the fastest path to production for teams without dedicated database operations capability, but every relational query pattern (joins, aggregations, cross-record logic) must be implemented in application code around the vector API.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Weaviate's hybrid search is its primary production differentiator**: the combination of BM25 and HNSW scoring in a single query path, fused via RRF, consistently outperforms pure vector search on real-world document retrieval benchmarks, making it the strongest choice for knowledge base and document retrieval applications.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Qdrant's pre-filter architecture and quantization support make it the performance choice for metadata-heavy workloads**: in-traversal filter evaluation prevents the recall degradation that post-filter systems exhibit under high selectivity, and scalar/binary quantization reduces memory requirements substantially with controlled recall tradeoffs.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chroma accelerates the prototype-to-feedback loop but is not a production-scale system**: its embedded mode and LangChain-native integration make early iteration fast, but the absence of horizontal scaling and WAL-based durability mean a planned migration to a more capable system should be part of any architecture that expects to grow beyond a few million vectors.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

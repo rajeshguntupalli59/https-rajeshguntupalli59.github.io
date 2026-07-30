@@ -6,6 +6,10 @@
   <title>Chapter 10: RDS Proxy: Connection Pooling at Scale — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 10: RDS Proxy: Connection Pooling at Scale. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -47,7 +51,7 @@
 
 <p class="text-gray-300 leading-relaxed">On-premises, you controlled both ends of the connection. You knew exactly how many application servers existed, you sized PgBouncer or pgpool-II based on those numbers, and you tuned <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgresql.conf</code> to match. The population was relatively static. In a cloud-native architecture, the application tier is ephemeral by design.</p>
 
-<p class="text-gray-300 leading-relaxed">Consider what happens when you deploy an AWS Lambda function that queries RDS PostgreSQL. Lambda has a concurrency limit of up to 10,000 simultaneous executions per account per region by default. If each invocation opens a database connection — even briefly — and your RDS PostgreSQL instance is sized at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> with 64 GB RAM, your practical <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> is around 1,700 (PostgreSQL's default formula is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LEAST(DBInstanceClassMemory/9531392, 5000)</code> for RDS, which you can verify by querying the parameter group). A traffic spike that triggers 2,000 concurrent Lambda invocations doesn't just degrade performance — it throws <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FATAL: sorry, too many clients already</code> errors and your application fails completely.</p>
+<p class="text-gray-300 leading-relaxed">Consider what happens when you deploy an AWS Lambda function that queries RDS PostgreSQL. Lambda has a concurrency limit of up to 10,000 simultaneous executions per account per region by default. If each invocation opens a database connection — even briefly — and your RDS PostgreSQL instance is sized at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> with 64 GB RAM, your practical <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> default is capped at 5,000 (PostgreSQL's default formula is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LEAST(DBInstanceClassMemory/9531392, 5000)</code> for RDS — at 64 GB of instance memory the formula's uncapped result already exceeds 5,000, so the hard cap is what applies; you can verify the actual value by querying the parameter group). A traffic spike that triggers 2,000 concurrent Lambda invocations doesn't just degrade performance — it throws <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FATAL: sorry, too many clients already</code> errors and your application fails completely.</p>
 
 <p class="text-gray-300 leading-relaxed">The same dynamic applies to containerized applications on ECS or EKS where horizontal pod autoscaling responds faster than your database can absorb connection growth. Each new pod starts fresh, establishes its own connections, and the old pod's connections may linger in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TIME_WAIT</code> or hold idle transactions open while the process terminates.</p>
 
@@ -68,7 +72,19 @@
 
 <p class="text-gray-300 leading-relaxed">For SQL Server users, RDS Proxy does not support SQL Server. RDS Proxy supports MySQL-compatible engines (RDS MySQL, Aurora MySQL) and PostgreSQL-compatible engines (RDS PostgreSQL, Aurora PostgreSQL). SQL Server on RDS still uses driver-level connection pooling. Keep that limitation in mind throughout this chapter.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Maximum connections math</strong>: When you create an RDS Proxy, you set a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--max-connections-percent</code> parameter (1–100, default 100). This tells the proxy what percentage of the database's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> it may use for the backend pool. The proxy itself can accept far more client connections than that — the proxy endpoint can handle up to 64,000 client connections simultaneously. The multiplexing ratio is what gives you scale. If your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections = 1700</code> and you leave <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max-connections-percent</code> at 100, the proxy will hold up to 1,700 backend connections but can serve tens of thousands of client connections across them — provided those client connections aren't all executing transactions simultaneously and aren't pinned.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Maximum connections math</strong>: When you create an RDS Proxy, you set a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--max-connections-percent</code> parameter (1–100, default 100). This tells the proxy what percentage of the database's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> it may use for the backend pool. The proxy itself can accept far more client connections than that — check current AWS documentation for the exact client-connection ceiling, but it is designed to comfortably exceed the backend connection pool by a wide margin. The multiplexing ratio is what gives you scale. If your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections = 1700</code> and you leave <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max-connections-percent</code> at 100, the proxy will hold up to 1,700 backend connections but can serve tens of thousands of client connections across them — provided those client connections aren't all executing transactions simultaneously and aren't pinned.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    C1[Client connection 1] --> P[RDS Proxy<br/>connection pool]
+    C2[Client connection 2] --> P
+    C3[Client connection 3] --> P
+    C4[...hundreds more] --> P
+    P --> D1[Backend connection 1]
+    P --> D2[Backend connection 2]
+    D1 --> DB[(RDS / Aurora database)]
+    D2 --> DB</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*RDS Proxy multiplexes many short-lived or idle client connections onto a much smaller, warm pool of backend database connections — until a client is pinned, at which point it falls back to a dedicated one-to-one connection.*</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -489,7 +505,562 @@ aws rds describe-db-proxies \
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">10.4 Monitoring Proxy Performance and Connection Pinning</h3>
 
-<p class="text-gray-300 leading-relaxed">CloudWatch publishes RDS</p>
+<p class="text-gray-300 leading-relaxed">CloudWatch publishes RDSProxy metrics under the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AWS/RDS</code> namespace with the dimension <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ProxyName</code>. The metrics you care about operationally break into three categories: connection counts, pooling efficiency, and latency.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection count metrics</strong>:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | What it tells you |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code> | Current number of client connections to the proxy |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> | Current number of backend connections the proxy holds to the database |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnectionsSetupSucceeded</code> | Rate of successful backend connection establishments |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnectionsSetupFailed</code> | Rate of failed backend connection establishments |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnectionsClosed</code> | Rate of client connection closures |</p>
+
+<p class="text-gray-300 leading-relaxed">The ratio of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> is your effective multiplexing ratio. If you have 2,000 client connections and 300 database connections, the proxy is working as intended. If those numbers are equal — or worse, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> is approaching your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> limit while <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ClientConnections</code> is only modestly higher — you have a pinning problem.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The pinning metric you must alarm on</strong>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>DatabaseConnectionsCurrentlySessionPinned</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This metric reports how many backend connections are currently pinned to a specific client. A non-zero value is not necessarily a crisis — some applications legitimately use temporary tables or multi-statement transactions that require pinning. But a value that climbs toward your total <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> count means you are getting no benefit from the proxy's multiplexing, and you should investigate which application code paths are causing the pins.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up a CloudWatch dashboard and alarms</strong>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># scripts/create_proxy_monitoring.py
+# Creates CloudWatch alarms and dashboard for RDS Proxy health
+
+import boto3
+import json
+
+PROXY_NAME = "prod-aurora-pg-proxy"
+SNS_TOPIC_ARN = "arn:aws:sns:us-east-1:123456789012:rds-alerts"
+REGION = "us-east-1"
+
+cw = boto3.client('cloudwatch', region_name=REGION)
+
+# Alarm: high pinning ratio — triggers when more than 25% of DB connections are pinned
+cw.put_metric_alarm(
+    AlarmName=f"{PROXY_NAME}-HighPinningRatio",
+    AlarmDescription=(
+        "More than 25% of proxy backend connections are session-pinned. "
+        "Investigate application code for SET statements, temp tables, or cursors."
+    ),
+    Namespace="AWS/RDS",
+    MetricName="DatabaseConnectionsCurrentlySessionPinned",
+    Dimensions=[{"Name": "ProxyName", "Value": PROXY_NAME}],
+    Statistic="Average",
+    Period=60,
+    EvaluationPeriods=3,
+    Threshold=0,   # absolute threshold isn't the right tool here; use metric math below
+    ComparisonOperator="GreaterThanThreshold",
+    TreatMissingData="notBreaching",
+    AlarmActions=[SNS_TOPIC_ARN],
+)
+
+# Better approach: alarm on pinning RATIO using metric math
+cw.put_metric_alarm(
+    AlarmName=f"{PROXY_NAME}-PinningRatioExceeds25Pct",
+    AlarmDescription=(
+        "Session pinning ratio exceeds 25% of total backend database connections."
+    ),
+    Metrics=[
+        {
+            "Id": "pinned",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/RDS",
+                    "MetricName": "DatabaseConnectionsCurrentlySessionPinned",
+                    "Dimensions": [{"Name": "ProxyName", "Value": PROXY_NAME}]
+                },
+                "Period": 60,
+                "Stat": "Average"
+            },
+            "ReturnData": False
+        },
+        {
+            "Id": "total_db",
+            "MetricStat": {
+                "Metric": {
+                    "Namespace": "AWS/RDS",
+                    "MetricName": "DatabaseConnections",
+                    "Dimensions": [{"Name": "ProxyName", "Value": PROXY_NAME}]
+                },
+                "Period": 60,
+                "Stat": "Average"
+            },
+            "ReturnData": False
+        },
+        {
+            "Id": "pinning_ratio",
+            "Expression": "IF(total_db &gt; 0, pinned / total_db * 100, 0)",
+            "Label": "PinningRatioPct",
+            "ReturnData": True,
+            "Period": 60
+        }
+    ],
+    ComparisonOperator": "GreaterThanThreshold",
+    Threshold": 25,
+    EvaluationPeriods": 3,
+    TreatMissingData": "notBreaching",
+    AlarmActions": [SNS_TOPIC_ARN],
+)
+
+# Alarm: connection borrow timeout — clients waiting for a backend connection
+cw.put_metric_alarm(
+    AlarmName=f"{PROXY_NAME}-BorrowTimeouts",
+    AlarmDescription=(
+        "Clients are timing out waiting for a backend connection from the proxy pool. "
+        "Consider reducing max_connections_percent or scaling the database instance."
+    ),
+    Namespace="AWS/RDS",
+    MetricName="ClientConnectionsWithLatency",  
+    # Use QueryDatabaseResponseLatency for query-level latency
+    # Use DatabaseConnectionRequests for borrow attempt rate
+    Dimensions=[{"Name": "ProxyName", "Value": PROXY_NAME}],
+    Statistic="Sum",
+    Period=60,
+    EvaluationPeriods=2,
+    Threshold=5,
+    ComparisonOperator="GreaterThanThreshold",
+    TreatMissingData="notBreaching",
+    AlarmActions=[SNS_TOPIC_ARN],
+)
+
+# Dashboard definition
+dashboard_body = {
+    "widgets": [
+        {
+            "type": "metric",
+            "x": 0, "y": 0, "width": 12, "height": 6,
+            "properties": {
+                "title": "Connection Multiplexing Ratio",
+                "view": "timeSeries",
+                "metrics": [
+                    ["AWS/RDS", "ClientConnections", "ProxyName", PROXY_NAME,
+                     {"label": "Client Connections", "color": "#2196F3"}],
+                    ["AWS/RDS", "DatabaseConnections", "ProxyName", PROXY_NAME,
+                     {"label": "Backend DB Connections", "color": "#FF9800"}],
+                    ["AWS/RDS", "DatabaseConnectionsCurrentlySessionPinned",
+                     "ProxyName", PROXY_NAME,
+                     {"label": "Pinned Connections", "color": "#F44336"}]
+                ],
+                "period": 60,
+                "stat": "Average",
+                "yAxis": {"left": {"min": 0}}
+            }
+        },
+        {
+            "type": "metric",
+            "x": 12, "y": 0, "width": 12, "height": 6,
+            "properties": {
+                "title": "Backend Connection Setup Rate",
+                "view": "timeSeries",
+                "metrics": [
+                    ["AWS/RDS", "DatabaseConnectionsSetupSucceeded",
+                     "ProxyName", PROXY_NAME,
+                     {"label": "Setup Succeeded /min", "color": "#4CAF50", "stat": "Sum"}],
+                    ["AWS/RDS", "DatabaseConnectionsSetupFailed",
+                     "ProxyName", PROXY_NAME,
+                     {"label": "Setup Failed /min", "color": "#F44336", "stat": "Sum"}]
+                ],
+                "period": 60
+            }
+        },
+        {
+            "type": "metric",
+            "x": 0, "y": 6, "width": 24, "height": 6,
+            "properties": {
+                "title": "Query Response Latency (Proxy adds overhead here)",
+                "view": "timeSeries",
+                "metrics": [
+                    ["AWS/RDS", "QueryDatabaseResponseLatency",
+                     "ProxyName", PROXY_NAME,
+                     {"label": "p50", "stat": "p50"}],
+                    ["AWS/RDS", "QueryDatabaseResponseLatency",
+                     "ProxyName", PROXY_NAME,
+                     {"label": "p95", "stat": "p95", "color": "#FF9800"}],
+                    ["AWS/RDS", "QueryDatabaseResponseLatency",
+                     "ProxyName", PROXY_NAME,
+                     {"label": "p99", "stat": "p99", "color": "#F44336"}]
+                ],
+                "period": 60
+            }
+        }
+    ]
+}
+
+cw.put_dashboard(
+    DashboardName=f"RDSProxy-{PROXY_NAME}",
+    DashboardBody=json.dumps(dashboard_body)
+)
+
+print(f"Dashboard created: RDSProxy-{PROXY_NAME}")
+print("Alarms created successfully")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note the syntax errors in the alarm for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PinningRatioExceeds25Pct</code> in the snippet above — in real code you would not mix quoted and unquoted key styles. The intent is illustrated correctly; the actual boto3 call requires consistent Python dictionary syntax throughout. Test your monitoring code in a staging environment before wiring it to production alerting.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Enabling proxy debug logging</strong> is a tool you reach for when alarms fire and you need to understand which application queries are causing pins. Debug logging is disabled by default because it produces substantial volume and has a cost in both CloudWatch Logs ingestion and a small performance overhead on the proxy itself. Enable it temporarily:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>aws rds modify-db-proxy \
+  --db-proxy-name prod-aurora-pg-proxy \
+  --debug-logging \
+  --region us-east-1
+
+# After enabling, tail the log group: /aws/rds/proxy/prod-aurora-pg-proxy
+# Filter for pinning events:
+aws logs filter-log-events \
+  --log-group-name "/aws/rds/proxy/prod-aurora-pg-proxy" \
+  --filter-pattern "pinned" \
+  --start-time $(date -d '30 minutes ago' +%s000) \
+  --region us-east-1 \
+  --query 'events[*].message' \
+  --output text
+
+# When done diagnosing, disable debug logging
+aws rds modify-db-proxy \
+  --db-proxy-name prod-aurora-pg-proxy \
+  --no-debug-logging \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The debug log entries for pinning events include the reason for the pin and the SQL statement that triggered it. A log line might read:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>[WARN] [clientId=c-0a1b2c3d] Pinning session to connection [connId=b-9f8e7d6c] 
+       because of statement: SET search_path TO analytics, public</code></pre>
+
+<p class="text-gray-300 leading-relaxed">That tells you exactly which application is issuing the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET search_path</code> and gives you an actionable fix: move the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">search_path</code> to a role-level default.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.5 Failover Behavior: What RDS Proxy Changes (and What It Doesn't)</h3>
+
+<p class="text-gray-300 leading-relaxed">RDS Proxy's behavior during an Aurora failover is one of its strongest operational selling points, and it is also one of the most commonly misunderstood. Let's be precise.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Without the proxy</strong>, an Aurora failover looks like this from the application's perspective:</p>
+<p class="text-gray-300 leading-relaxed">1. The writer instance fails or is manually failed over.</p>
+<p class="text-gray-300 leading-relaxed">2. Aurora promotes a reader to writer — this typically completes within 30 to 60 seconds for Aurora PostgreSQL.</p>
+<p class="text-gray-300 leading-relaxed">3. The cluster writer DNS endpoint (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cluster-id.cluster-xyz.region.rds.amazonaws.com</code>) updates its CNAME to point to the new writer — DNS TTL is typically 5 seconds, but client-side DNS caching in the JVM, Linux <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">nscd</code>, or application-level caching may hold the old IP for longer.</p>
+<p class="text-gray-300 leading-relaxed">4. Existing connections are dropped (TCP RST or timeout depending on the failure mode).</p>
+<p class="text-gray-300 leading-relaxed">5. Application must reconnect. If reconnect logic is not implemented, the application stays broken until a process restart.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">With the proxy</strong>, the application's view changes substantially:</p>
+<p class="text-gray-300 leading-relaxed">1. The writer instance fails.</p>
+<p class="text-gray-300 leading-relaxed">2. Aurora promotes a reader to writer.</p>
+<p class="text-gray-300 leading-relaxed">3. The proxy detects the topology change and transparently redirects new backend connections to the new writer — the proxy maintains its own connection to the cluster and watches for failover events through the Aurora internal notification mechanism, not just DNS.</p>
+<p class="text-gray-300 leading-relaxed">4. The proxy endpoint for your application <strong class="text-white">does not change</strong>. There is no DNS re-resolution required at the application level.</p>
+<p class="text-gray-300 leading-relaxed">5. Client connections to the proxy that were idle (not mid-transaction) are preserved transparently — the proxy queues incoming requests briefly while re-establishing its backend connections.</p>
+<p class="text-gray-300 leading-relaxed">6. Client connections that were mid-transaction when the failover hit will receive an error. This is unavoidable — the in-flight transaction was on the old writer and is gone. The proxy cannot make a transaction that was lost on a failed instance appear to succeed.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical result: the proxy reduces failover impact from "reconnect storm plus DNS propagation delay plus application-level reconnect logic" to "brief queuing plus mid-transaction errors only". Applications with appropriate retry logic on the transaction level — not just the connection level — see dramatically reduced failover disruption. Applications that assume a single query can never fail still break, but they break for a shorter window and recover without needing to re-establish thousands of connections simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">A concrete test</strong>: you can observe this behavior by intentionally triggering a failover against a proxied Aurora cluster while running a connection monitor. The following script measures perceived downtime from the application side:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># scripts/failover_test.py
+# Run this WHILE triggering a manual failover to measure client-side impact
+
+import psycopg2
+import time
+import datetime
+import os
+
+PROXY_ENDPOINT = os.environ['DB_PROXY_ENDPOINT']
+DB_NAME = os.environ['DB_NAME']
+DB_USER = os.environ['DB_USER']
+DB_PASSWORD = os.environ['DB_PASSWORD']
+
+def make_connection():
+    return psycopg2.connect(
+        host=PROXY_ENDPOINT,
+        port=5432,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        sslmode='require',
+        connect_timeout=5,
+        application_name='failover-test'
+    )
+
+def probe_once(conn=None):
+    """Returns (success, latency_ms, error_message)"""
+    start = time.monotonic()
+    try:
+        if conn is None:
+            conn = make_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        conn.commit()
+        latency = (time.monotonic() - start) * 1000
+        return True, latency, None, conn
+    except psycopg2.OperationalError as e:
+        latency = (time.monotonic() - start) * 1000
+        # Connection lost — try fresh reconnect
+        try:
+            new_conn = make_connection()
+            return False, latency, str(e), new_conn
+        except Exception as reconnect_err:
+            return False, latency, f"reconnect failed: {reconnect_err}", None
+
+print(f"{'Timestamp':&lt;26} {'Status':&lt;10} {'Latency(ms)':&lt;15} {'Notes'}")
+print("-" * 70)
+
+conn = make_connection()
+errors_seen = 0
+first_error_time = None
+last_error_time = None
+
+for _ in range(600):  # 10 minutes of probing at 1-second intervals
+    ts = datetime.datetime.now().isoformat(timespec='milliseconds')
+    success, latency_ms, error_msg, conn = probe_once(conn)
+    
+    status = "OK" if success else "ERROR"
+    note = ""
+    
+    if not success:
+        errors_seen += 1
+        if first_error_time is None:
+            first_error_time = ts
+        last_error_time = ts
+        note = error_msg[:50] if error_msg else ""
+    
+    print(f"{ts:&lt;26} {status:&lt;10} {latency_ms:&lt;15.1f} {note}")
+    time.sleep(1)
+
+print(f"\nSummary: {errors_seen} errors observed")
+if first_error_time:
+    print(f"First error: {first_error_time}")
+    print(f"Last error:  {last_error_time}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this script before triggering the failover (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws rds failover-db-cluster --db-cluster-identifier prod-aurora-cluster</code>). The output will show you exactly how many seconds of errors your application tier experiences. Without the proxy, you typically see a sustained error period during DNS propagation. With the proxy, you typically see a brief burst of errors confined to the moment of the writer promotion, followed by immediate recovery — the proxy requeues requests and re-establishes its backend connections without your application needing to reconnect.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The multi-AZ RDS (non-Aurora) failover story</strong> is slightly different. Standard RDS Multi-AZ failover relies on DNS failover to the standby. RDS Proxy helps here too — the proxy tracks the database endpoint and handles the backend reconnection, still giving you the same client-connection stability benefit. However, the failover duration for standard Multi-AZ RDS is longer than Aurora failover because the promotion process involves more steps, and the proxy is waiting for the new primary to become available before re-establishing the backend pool. The proxy does not shorten the database failover itself — it only reduces the application-side reconnection overhead once the new primary is up.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.6 Sizing and Scaling Considerations</h3>
+
+<p class="text-gray-300 leading-relaxed">RDS Proxy scales its own compute automatically — you do not choose an instance size for the proxy. AWS manages horizontal scaling of the proxy fleet. What you do control is the configuration that determines how efficiently the proxy uses backend connections, and that is where DBA judgment is applied.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backend connection pool sizing decisions</strong>:</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections_percent</code> parameter is your primary lever. Setting it to 100 (the default) instructs the proxy to potentially use all of the database's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> for the proxy pool. In practice this is rarely correct for two reasons:</p>
+
+<p class="text-gray-300 leading-relaxed">First, you almost always want to reserve some connections for emergency direct access. If a runaway proxy behavior or an application bug exhausts the pool, you need to be able to connect directly to the database as an administrator to diagnose the problem. A good rule of thumb is to reserve at least 5–10 connections for direct administrative access. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max-connections-percent = 90</code> and your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> set to 1,000, the proxy can use up to 900 connections and you always have 100 available for direct connections.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, the proxy is most efficient when it is not running at full pool saturation. A fully saturated pool means every incoming client request must wait for a backend connection to become free. The queuing delay compounds under load. Setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max-connections-percent</code> to 75–85% of what your database can actually sustain under realistic load gives the pool breathing room.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_idle_connections_percent</code></strong> controls how many idle connections the proxy keeps warm in the backend pool. Idle connections consume memory on the database host — each PostgreSQL connection holds a backend process in memory even when doing nothing. Set this too high and you're paying connection memory cost constantly. Set it too low and the proxy must establish new backend connections under sudden traffic spikes, which adds latency during the connection establishment phase. A value of 50 (the default) means the proxy keeps up to half its maximum backend connections open and idle, ready to be assigned to incoming client requests immediately.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Instance sizing for the database itself</strong> does not change because of the proxy — the proxy reduces the number of backend connections the database manages, but the database still needs to be sized for the actual query workload. Where the proxy helps is that you can often run a smaller database instance than you would have needed without it, because you are no longer allocating 9 MB of RAM per potential connection when only a fraction of those connections are ever active simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">A sizing worked example</strong> (qualitative, not prescriptive):</p>
+
+<p class="text-gray-300 leading-relaxed">Suppose you have an ECS service that autoscales from 10 to 200 tasks, each with a connection pool of 5 connections, giving a maximum potential connection demand of 1,000. Without the proxy, you size your database to handle 1,000 connections plus admin headroom. With the proxy, the database might actually only see 150–300 backend connections at peak because the proxy's multiplexing collapses idle-connection demand. You can size the database for the actual query concurrency rather than the theoretical connection count.</p>
+
+<p class="text-gray-300 leading-relaxed">Validate this by watching <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> in CloudWatch during your peak traffic period after deploying the proxy. The actual number you observe is your actual database connection load. Use that to inform whether you're running with more backend pool headroom than needed, or whether you're running close to saturation and should consider scaling the database.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.7 Limitations and When Not to Use RDS Proxy</h3>
+
+<p class="text-gray-300 leading-relaxed">Every managed service has a boundary at which it stops being the right tool. Knowing that boundary for RDS Proxy is as important as knowing how to configure it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Long-running transactions</strong>: RDS Proxy multiplexes connections between requests, but while a transaction is open, the backend connection is held exclusively for that client — this is the same as pinning for the duration of the transaction. Applications that open transactions and hold them open for seconds or minutes while doing application-side work (processing data between SQL statements, waiting for user input in web applications, etc.) will see poor pool utilization. Design your application transactions to be short: open late, close early. If your application design fundamentally requires long-held transactions, the proxy's multiplexing benefit is largely lost.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stored procedures and session state</strong>: Applications that rely heavily on session-level state — temporary tables across multiple requests, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET LOCAL</code> in transaction-scoped ways, advisory locks held across connections — require careful audit before proxying. None of these patterns become impossible with the proxy, but they may require session pinning, reducing the multiplexing benefit.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Binary protocols and non-standard drivers</strong>: RDS Proxy supports the standard PostgreSQL wire protocol and the MySQL wire protocol. Applications using non-standard connection mechanisms, administrative tools that use direct socket connections, or drivers with unusual protocol behavior may encounter compatibility issues. Test all connection paths — not just your main application — before enabling the proxy in production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cost considerations</strong>: RDS Proxy is not free. AWS charges per vCPU of the underlying database instance, per hour, while the proxy is attached. For small database instances with low connection counts, the cost may exceed the operational benefit. Evaluate the cost against the alternative of running a self-managed PgBouncer on an EC2 instance — for small workloads, PgBouncer on a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">t3.small</code> can be significantly cheaper. For large, high-connection workloads, RDS Proxy's managed nature and Aurora-native integration justify the cost. Review current AWS pricing for your region before committing.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server is not supported</strong>: Repeat this for your team: SQL Server on RDS does not support RDS Proxy. SQL Server's connection pooling is handled by the ODBC or ADO.NET driver, which is session-based. If you're running SQL Server on RDS and need connection pooling, you have three options: driver-level pooling (built into most .NET and Java connection frameworks), a third-party proxy like ProxySQL (which has limited SQL Server support), or refactoring to reduce connection pressure at the application level.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Proxy-to-database network latency</strong>: The proxy sits in your VPC and adds one network hop between your application and the database. For latency-sensitive OLTP workloads executing many small queries, this hop is measurable. In practice it is a fraction of a millisecond within a region, but if you are optimizing for sub-millisecond query execution times, measure the added latency in your environment before committing to the proxy architecture.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.8 Practical Runbook: Diagnosing a Connection Pool Exhaustion Event</h3>
+
+<p class="text-gray-300 leading-relaxed">When an on-call engineer gets paged at 2 AM with "database connections exhausted," having a structured diagnostic path matters more than knowing every possible cause. Here is the runbook as a DBA would actually use it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Establish current state</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># What does the proxy see right now?
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name ClientConnections \
+  --dimensions Name=ProxyName,Value=prod-aurora-pg-proxy \
+  --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 60 \
+  --statistics Average Maximum \
+  --output table
+
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name DatabaseConnections \
+  --dimensions Name=ProxyName,Value=prod-aurora-pg-proxy \
+  --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 60 \
+  --statistics Average Maximum \
+  --output table
+
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name DatabaseConnectionsCurrentlySessionPinned \
+  --dimensions Name=ProxyName,Value=prod-aurora-pg-proxy \
+  --start-time $(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
+  --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
+  --period 60 \
+  --statistics Average Maximum \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Connect directly to the database (bypassing the proxy) and query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code></strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: connect directly on port 5432 to the writer endpoint, not via proxy
+-- You reserved direct connections for exactly this scenario
+
+-- Who is connected and what are they doing?
+SELECT 
+    pid,
+    usename,
+    application_name,
+    client_addr,
+    state,
+    wait_event_type,
+    wait_event,
+    now() - query_start    AS query_duration,
+    now() - state_change   AS state_duration,
+    LEFT(query, 100)       AS query_snippet
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+ORDER BY query_duration DESC NULLS LAST;
+
+-- Count by state and application
+SELECT 
+    application_name,
+    state,
+    COUNT(*) AS connection_count,
+    MAX(now() - state_change) AS longest_in_state
+FROM pg_stat_activity
+WHERE backend_type = 'client backend'
+GROUP BY application_name, state
+ORDER BY connection_count DESC;
+
+-- Are there long-running idle-in-transaction connections?
+-- These hold backend connections pinned in the proxy
+SELECT 
+    pid,
+    usename,
+    application_name,
+    state,
+    now() - state_change AS idle_in_tx_duration,
+    LEFT(query, 200) AS last_query
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - state_change &gt; interval '30 seconds'
+ORDER BY idle_in_tx_duration DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: If idle-in-transaction connections are the cause, terminate them</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: terminate long-idle-in-transaction connections
+-- Use pg_terminate_backend, not pg_cancel_backend
+-- (cancel only stops the running query; terminate closes the connection)
+
+-- First preview what you'd terminate:
+SELECT 
+    pid,
+    usename,
+    application_name,
+    now() - state_change AS idle_duration
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - state_change &gt; interval '2 minutes';
+
+-- Then terminate:
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE state = 'idle in transaction'
+  AND now() - state_change &gt; interval '2 minutes';
+
+-- Verify the terminations took effect:
+SELECT COUNT(*) 
+FROM pg_stat_activity 
+WHERE state = 'idle in transaction';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 4: Check if a specific application host is responsible</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The proxy logs client IP addresses in debug mode. If debug logging is not already enabled:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable debug logging temporarily
+aws rds modify-db-proxy \
+  --db-proxy-name prod-aurora-pg-proxy \
+  --debug-logging
+
+# Wait 60 seconds for logs to appear, then query for connection events by client IP
+aws logs filter-log-events \
+  --log-group-name "/aws/rds/proxy/prod-aurora-pg-proxy" \
+  --filter-pattern "[timestamp, requestId, level, clientId, message=\"*client*connected*\"]" \
+  --start-time $(date -d '5 minutes ago' +%s000) \
+  --query 'events[*].message' \
+  --output text | sort | uniq -c | sort -rn | head -20</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 5: Immediate mitigation options</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If the pool is exhausted and the application is failing:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Option A: Temporarily increase max_connections_percent to give more backend connections
+# This only works if the database instance has headroom
+aws rds modify-db-proxy-target-group \
+  --db-proxy-name prod-aurora-pg-proxy \
+  --target-group-name default \
+  --connection-pool-config MaxConnectionsPercent=95
+
+# Option B: If a runaway process has filled the pool, restart the ECS service
+# (replace with your actual cluster/service names)
+aws ecs update-service \
+  --cluster prod-cluster \
+  --service my-application-service \
+  --force-new-deployment
+
+# Option C: If an autoscaling event caused the spike and you need to shed connections,
+# reduce ECS desired count temporarily
+aws ecs update-service \
+  --cluster prod-cluster \
+  --service my-application-service \
+  --desired-count 10</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 6: After mitigation, set a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle_in_transaction_session_timeout</code> to prevent recurrence</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: set at the database level to auto-terminate stuck transactions
+-- This catches connections that the proxy cannot clean up itself
+
+ALTER DATABASE production 
+  SET idle_in_transaction_session_timeout = '5min';
+
+-- Or at the role level for the application user specifically
+ALTER ROLE appuser 
+  SET idle_in_transaction_session_timeout = '5min';
+
+-- Verify the setting:
+SHOW idle_in_transaction_session_timeout;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This setting causes PostgreSQL to automatically terminate any backend that has been idle within a transaction for longer than the specified duration. The proxy will see the backend connection dropped and will establish a fresh one. Pairing this database-level protection with the proxy's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idle-client-timeout</code> gives you defense in depth: the proxy closes idle client connections before they accumulate, and the database closes stuck transactions before they pin backend connections indefinitely.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RDS Proxy multiplexes thousands of client connections onto a much smaller backend connection pool**, reducing per-connection memory overhead on the database and eliminating reconnect storms during traffic spikes — but this benefit only materializes when client connections are not session-pinned. Monitor `DatabaseConnectionsCurrentlySessionPinned` and treat a rising pinning ratio as a signal to audit application code for `SET` statements, temporary tables, and long-held idle transactions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connection pinning is the primary operational hazard of RDS Proxy**. Common causes include `SET search_path` in connection strings, `CREATE TEMP TABLE` in application code, and open cursors with `HOLD`. Fix pinning at the source: move role defaults to `ALTER ROLE ... SET`, avoid temporary tables in hot paths, and set `session_pinning_filters = ["EXCLUDE_VARIABLE_SETS"]` in the proxy target group configuration to exclude low-risk `SET` statements from triggering pins.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **IAM authentication through RDS Proxy eliminates long-lived passwords from application configuration**, replacing them with 15-minute cryptographic tokens tied to IAM roles. The IAM resource ARN in the `rds-db:connect` policy must reference the proxy's resource ID (the `prx-` identifier), not the proxy name or cluster ARN — a mistake that produces authentication errors indistinguishable from a wrong password at the application level.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **During Aurora failover, RDS Proxy preserves the application-facing endpoint and transparently re-establishes backend connections to the promoted writer**, reducing failover impact to mid-transaction errors only rather than a full reconnect storm across all application instances. The proxy does not shorten the Aurora failover duration itself — it reduces the application-side recovery work that follows.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RDS Proxy is not universally the right choice**: SQL Server on RDS is not supported, long-held transactions negate the multiplexing benefit, and for low-connection workloads the per-vCPU cost may exceed the value of the managed service compared to running self-managed PgBouncer. Validate the business case with actual connection count metrics, test `max_connections_percent` and `max_idle_connections_percent` against your real traffic patterns, and always reserve a portion of `max_connections` for direct administrative access independent of the proxy pool.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

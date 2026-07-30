@@ -6,6 +6,10 @@
   <title>Chapter 13: Self-Optimizing Storage and I/O — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 13: Self-Optimizing Storage and I/O. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -406,6 +410,430 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed">Autonomous partition creation is the most time-sensitive operation. A system that allows a partition to be missing during a high-write period will route all writes to the default partition (PostgreSQL) or fail (SQL Server with partition scheme exhaustion). The creation agent runs hourly and ensures partitions exist for the current period plus two future periods.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Procedure to autonomously create next-period partitions for time-partitioned tables
+CREATE OR REPLACE PROCEDURE auto_create_partitions(
+    p_parent_table TEXT,
+    p_schema TEXT DEFAULT 'public',
+    p_lookahead_days INT DEFAULT 7
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_partition_name TEXT;
+    v_start_date DATE;
+    v_end_date DATE;
+    v_current_date DATE := CURRENT_DATE;
+BEGIN
+    FOR i IN 0..p_lookahead_days LOOP
+        v_start_date := v_current_date + (i || ' days')::INTERVAL;
+        v_end_date   := v_start_date + INTERVAL '1 day';
+        v_partition_name := p_parent_table || '_' || TO_CHAR(v_start_date, 'YYYY_MM_DD');
+
+        -- Only create if partition does not already exist
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = v_partition_name
+              AND n.nspname = p_schema
+        ) THEN
+            EXECUTE FORMAT(
+                'CREATE TABLE %I.%I PARTITION OF %I.%I
+                 FOR VALUES FROM (%L) TO (%L)',
+                p_schema, v_partition_name,
+                p_schema, p_parent_table,
+                v_start_date, v_end_date
+            );
+            RAISE NOTICE 'Created partition: %.%', p_schema, v_partition_name;
+        END IF;
+    END LOOP;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extend a partition scheme to accommodate future periods
+-- Assumes partition function pfn_daily_range already exists
+DECLARE @next_boundary DATE = CAST(DATEADD(DAY, 7, GETDATE()) AS DATE);
+
+-- Add boundary points for each missing future day
+DECLARE @d DATE = CAST(DATEADD(DAY, 1, GETDATE()) AS DATE);
+WHILE @d &lt;= @next_boundary
+BEGIN
+    -- Only add if boundary does not already exist
+    IF NOT EXISTS (
+        SELECT 1 FROM sys.partition_range_values prv
+        JOIN sys.partition_functions pf ON pf.function_id = prv.function_id
+        WHERE pf.name = 'pfn_daily_range'
+          AND CAST(prv.value AS DATE) = @d
+    )
+    BEGIN
+        -- Partition scheme must have NEXT USED filegroup designated
+        ALTER PARTITION SCHEME psc_daily_range NEXT USED [warm_filegroup];
+        ALTER PARTITION FUNCTION pfn_daily_range() SPLIT RANGE (@d);
+        RAISERROR('Added partition boundary: %s', 0, 1, @d) WITH NOWAIT;
+    END
+    SET @d = DATEADD(DAY, 1, @d);
+END</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The partition lifecycle agent also handles the opposite end of the spectrum: identifying partitions that have transitioned from warm to cold based on observed access counts, and triggering compression or tablespace migration. In PostgreSQL, this means running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE partition_name SET TABLESPACE cold_sata</code> and optionally enabling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">toast</code> compression or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_compress</code> via a foreign data wrapper to object storage. In SQL Server, it means switching the partition out to a staging table on the cold filegroup and applying <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATA_COMPRESSION = PAGE</code> before switching it back in.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import psycopg2
+from datetime import datetime, timedelta
+import logging
+
+COLD_THRESHOLD_DAYS = 30       # partitions older than this are candidates for cold tier
+ACCESS_THRESHOLD = 10          # avg reads per collection interval below which = cold
+COLD_TABLESPACE = "cold_sata"
+HOT_TABLESPACE  = "hot_nvme"
+
+def get_partition_access_stats(conn, parent_table: str, schema: str = "public"):
+    """Return recent I/O stats for each child partition of parent_table."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT
+            child.relname                           AS partition_name,
+            child.oid                               AS partition_oid,
+            ts.spcname                              AS current_tablespace,
+            COALESCE(AVG(m.heap_blks_read_delta), 0) AS avg_reads,
+            MAX(m.collected_at)                      AS last_access
+        FROM pg_inherits inh
+        JOIN pg_class parent ON parent.oid = inh.inhparent
+        JOIN pg_namespace ns   ON ns.oid = parent.relnamespace
+        JOIN pg_class child    ON child.oid = inh.inhrelid
+        LEFT JOIN pg_tablespace ts ON ts.oid = child.reltablespace
+        LEFT JOIN io_metrics_history m ON m.relation_name = child.relname
+            AND m.collected_at &gt;= NOW() - INTERVAL '7 days'
+        WHERE parent.relname = %s
+          AND ns.nspname    = %s
+        GROUP BY child.relname, child.oid, ts.spcname
+    """, (parent_table, schema))
+    return cur.fetchall()
+
+def demote_cold_partitions(conn, parent_table: str, schema: str = "public", dry_run: bool = True):
+    rows = get_partition_access_stats(conn, parent_table, schema)
+    cur  = conn.cursor()
+
+    for partition_name, partition_oid, current_ts, avg_reads, last_access in rows:
+        # Determine partition age from name suffix (expects _YYYY_MM_DD convention)
+        try:
+            date_suffix = partition_name.split("_")[-3:]
+            partition_date = datetime.strptime("_".join(date_suffix), "%Y_%m_%d").date()
+        except (ValueError, IndexError):
+            logging.warning(f"Cannot parse date from partition name: {partition_name}")
+            continue
+
+        age_days = (datetime.utcnow().date() - partition_date).days
+
+        if age_days &gt;= COLD_THRESHOLD_DAYS and avg_reads &lt; ACCESS_THRESHOLD:
+            if current_ts == HOT_TABLESPACE or current_ts is None:
+                logging.info(
+                    f"Demoting {partition_name}: age={age_days}d, avg_reads={avg_reads:.1f}"
+                )
+                if not dry_run:
+                    cur.execute(
+                        f"ALTER TABLE {schema}.{partition_name} SET TABLESPACE {COLD_TABLESPACE}"
+                    )
+                    conn.commit()
+                    logging.info(f"Moved {partition_name} to {COLD_TABLESPACE}")
+            else:
+                logging.debug(f"{partition_name} already on non-hot tablespace: {current_ts}")
+        else:
+            logging.debug(
+                f"{partition_name}: age={age_days}d, avg_reads={avg_reads:.1f} — no action"
+            )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The combination of forward partition creation and backward partition demotion forms a complete data lifecycle pipeline. The system maintains a predictable working set on fast storage, prevents partition exhaustion failures, and continuously reclaims expensive NVMe capacity by moving dormant data to cheaper tiers — all without human scheduling.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Autonomous Buffer Pool Management and Prefetch Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">The database buffer pool is the primary mechanism for keeping frequently accessed pages in memory and avoiding physical I/O. Both PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> and SQL Server's buffer pool operate on an LRU-variant eviction policy, but neither engine ships with the ability to dynamically resize the buffer pool in response to changing workload characteristics. Autonomous buffer pool management bridges this gap.</p>
+
+<p class="text-gray-300 leading-relaxed">In PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> is a static allocation set at startup. The autonomous layer cannot resize it without a restart, but it can do the next best thing: tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> (which influences the query planner's willingness to choose index scans over sequential scans), manage <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> dynamically per session role, and use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_prewarm</code> to proactively load hot pages after a restart or partition migration.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Prewarm a table's buffer pages after partition migration to hot tablespace
+SELECT pg_prewarm(
+    'public.orders_2024_11_15',  -- newly promoted partition
+    'buffer',                    -- load into shared_buffers, not OS cache
+    'main',                      -- fork: main heap
+    NULL,                        -- first_block: NULL = start from beginning
+    NULL                         -- last_block: NULL = read to end
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, the buffer pool is managed dynamically by the memory manager (SQLOS), and the autonomous layer can influence it through Resource Governor memory limits, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code> adjustments, and Buffer Pool Extension (BPE) configuration on systems with fast SSD tiers. The more powerful lever in SQL Server is identifying which buffer pages are being evicted and why, using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_buffer_descriptors</code>.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the distribution of buffer pool pages by database and object
+-- to understand what is consuming the working set
+SELECT
+    DB_NAME(bd.database_id)             AS database_name,
+    OBJECT_NAME(p.object_id, bd.database_id) AS object_name,
+    i.name                              AS index_name,
+    COUNT(*)                            AS pages_in_buffer,
+    COUNT(*) * 8 / 1024                 AS size_in_buffer_mb,
+    SUM(CAST(bd.is_modified AS INT))    AS dirty_pages
+FROM sys.dm_os_buffer_descriptors bd
+JOIN sys.allocation_units au
+    ON bd.allocation_unit_id = au.allocation_unit_id
+JOIN sys.partitions p
+    ON au.container_id = CASE
+        WHEN au.type IN (1, 3) THEN p.hobt_id
+        WHEN au.type = 2       THEN p.partition_id
+    END
+JOIN sys.indexes i
+    ON i.object_id = p.object_id
+    AND i.index_id = p.index_id
+WHERE bd.database_id NOT IN (1, 2, 3, 4)  -- exclude system databases
+  AND bd.page_type = 'DATA_PAGE'
+GROUP BY bd.database_id, p.object_id, i.name
+HAVING COUNT(*) &gt; 100
+ORDER BY pages_in_buffer DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomous prefetch tuner operates at a different level. Rather than reacting to buffer pool contents, it predicts which pages will be needed and initiates reads before the query arrives. This is useful for scheduled workloads with known access patterns — nightly reporting jobs that always scan the same partition ranges, or ETL pipelines that process data in a known order.</p>
+
+<p class="text-gray-300 leading-relaxed">The prefetch system maintains a workload schedule: a table of recurring queries with their historical execution start times, observed I/O patterns (which table and partition ranges they read), and typical page counts. Before a scheduled job runs, the prefetch agent calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_prewarm</code> on the expected page ranges, or in SQL Server issues a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC PINTABLE</code> equivalent using Resource Governor to prioritize those pages against eviction.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from datetime import datetime, timedelta
+import psycopg2
+import schedule
+import time
+import logging
+
+PREWARM_LEAD_TIME_MINUTES = 10
+
+WORKLOAD_SCHEDULE = [
+    {
+        "name": "nightly_revenue_report",
+        "cron_time": "02:00",
+        "tables_to_prewarm": [
+            "public.orders_2024_11_14",
+            "public.orders_2024_11_15",
+            "public.orders_2024_11_16",
+        ],
+    },
+    {
+        "name": "weekly_churn_analysis",
+        "cron_time": "03:30",
+        "tables_to_prewarm": [
+            "public.customer_events_2024_10",
+            "public.customer_events_2024_11",
+        ],
+    },
+]
+
+def prewarm_tables(conn, tables):
+    cur = conn.cursor()
+    for table in tables:
+        try:
+            cur.execute("SELECT pg_prewarm(%s, 'buffer', 'main')", (table,))
+            blocks_loaded = cur.fetchone()[0]
+            conn.commit()
+            logging.info(f"Prewarmed {table}: {blocks_loaded} blocks loaded")
+        except Exception as e:
+            conn.rollback()
+            logging.error(f"Failed to prewarm {table}: {e}")
+
+def schedule_prewarm_jobs(conn):
+    for job in WORKLOAD_SCHEDULE:
+        job_hour, job_minute = map(int, job["cron_time"].split(":"))
+        prewarm_dt = datetime.now().replace(
+            hour=job_hour, minute=job_minute, second=0
+        ) - timedelta(minutes=PREWARM_LEAD_TIME_MINUTES)
+        prewarm_time_str = prewarm_dt.strftime("%H:%M")
+
+        schedule.every().day.at(prewarm_time_str).do(
+            prewarm_tables, conn=conn, tables=job["tables_to_prewarm"]
+        )
+        logging.info(
+            f"Scheduled prewarm for '{job['name']}' at {prewarm_time_str}"
+        )
+
+def run():
+    conn = psycopg2.connect("dbname=postgres user=monitor")
+    schedule_prewarm_jobs(conn)
+    while True:
+        schedule.run_pending()
+        time.sleep(30)
+
+if __name__ == "__main__":
+    run()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This predictive prefetch approach reduces the latency spike that occurs when a large reporting job starts cold. Instead of spending the first several minutes of execution time loading pages from disk, the job finds its data already resident in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> and begins processing at full speed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">WAL and Transaction Log I/O Optimization</h3>
+
+<p class="text-gray-300 leading-relaxed">The write-ahead log is the highest-priority I/O path in both PostgreSQL and SQL Server. Every committed transaction must have its WAL record durably written before the commit acknowledgment is returned to the client. Any contention, latency spike, or device saturation on the WAL device directly increases transaction commit latency for every session simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">Autonomous WAL optimization has three concerns: device placement, write batching behavior, and log size management.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Device placement</strong> is handled at the infrastructure level: WAL should live on a dedicated device separate from data files, ideally one optimized for sequential write throughput rather than random read IOPS. The autonomous agent validates this configuration by checking the mount point of the WAL directory (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_wal</code> in PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.master_files</code> for log files in SQL Server) against the list of known device paths and their I/O characteristics. When WAL and data share a device, an alert is raised and, if a suitable dedicated device is available in the device inventory, an automated migration is initiated.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Write batching</strong> in PostgreSQL is controlled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_writer_delay</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commit_delay</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commit_siblings</code>. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">commit_delay</code> parameter introduces a deliberate pause before flushing a commit, allowing other concurrent transactions to add their WAL records to the same flush — a group commit pattern. The autonomous controller adjusts these parameters based on observed <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers_full</code> events in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_wal</code> and the ratio of active sessions to commits per second.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL 14+: pg_stat_wal provides WAL I/O telemetry
+SELECT
+    wal_records,
+    wal_fpi,                    -- full page images written (write amplification indicator)
+    wal_bytes,
+    wal_buffers_full,           -- times WAL writer was forced due to full buffers
+    wal_write,
+    wal_sync,
+    wal_write_time,
+    wal_sync_time,
+    stats_reset
+FROM pg_stat_wal;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers_full</code> is non-zero and growing, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_buffers</code> is undersized. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_sync_time</code> dominates <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_write_time</code>, the underlying device cannot sustain the sync rate — the correct intervention is either device upgrade or, as a temporary measure, switching <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">local</code> for non-critical workloads. The autonomous system never changes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">synchronous_commit</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">off</code> without explicit operator permission, since this sacrifices crash safety. The decision is encoded as a policy flag:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>SYNCHRONOUS_COMMIT_POLICY = {
+    "allow_local":  True,   # may reduce to 'local' for replica-only durability
+    "allow_off":    False,  # never disable synchronous commit without human approval
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In SQL Server, the transaction log is managed through VLF (virtual log file) architecture. A log file that has been grown many times in small increments accumulates hundreds of small VLFs, which degrades log scan performance during recovery. The autonomous agent monitors VLF count using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCC LOGINFO</code> and proactively grows the log in larger increments to consolidate VLFs when the count exceeds a configurable threshold.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Count VLFs per database log file
+CREATE TABLE #vlf_info (
+    RecoveryUnitId  INT,
+    FileId          INT,
+    FileSize        BIGINT,
+    StartOffset     BIGINT,
+    FSeqNo          BIGINT,
+    Status          INT,
+    Parity          INT,
+    CreateLSN       NUMERIC(25,0)
+);
+
+EXEC sp_MSforeachdb '
+    USE [?];
+    INSERT INTO #vlf_info
+    EXEC(''DBCC LOGINFO WITH NO_INFOMSGS'');
+';
+
+SELECT
+    DB_NAME()     AS database_name,
+    COUNT(*)      AS vlf_count,
+    SUM(FileSize) / 1024 / 1024 AS total_log_mb,
+    SUM(CASE WHEN Status = 2 THEN 1 ELSE 0 END) AS active_vlfs
+FROM #vlf_info;
+
+DROP TABLE #vlf_info;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When VLF count exceeds the threshold (commonly set to 200 for databases under 100GB), the remediation path is to shrink the log file to minimum size (which forces VLF consolidation), then immediately grow it in a single large allocation. This is a brief operation that causes no data loss but does require the log to not be actively written — the agent schedules it during the low-traffic window identified by the I/O utilization monitor.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating Storage Autonomy with the Broader Control Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">Each of the subsystems described in this chapter — I/O instrumentation, tablespace tiering, checkpoint control, bloat remediation, partition lifecycle management, buffer pool prefetch, and WAL optimization — can function independently. But maximum effectiveness comes from integration: a shared signal bus where each subsystem both reads from and writes to a common state model.</p>
+
+<p class="text-gray-300 leading-relaxed">The integration point is the <strong class="text-white">storage control plane</strong>: a lightweight service that aggregates signals from all subsystems and arbitrates competing actions. Without arbitration, subsystems can conflict. A bloat remediation job and a tablespace migration might both attempt to acquire an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ACCESS EXCLUSIVE</code> lock on the same table simultaneously. A checkpoint control adjustment that increases <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> might interact adversely with a WAL device migration in progress. A partition prewarm job might run during peak I/O utilization and compete with active queries.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Tablespace Tiering] -->|register intent| G[Storage Control Plane]
+    B[Bloat Remediation] -->|register intent| G
+    C[Checkpoint Control] -->|register intent| G
+    D[Partition Lifecycle] -->|register intent| G
+    E[Buffer Pool / Prefetch] -->|register intent| G
+    F[WAL Optimization] -->|register intent| G
+    G -->|conflict check + I/O budget check| H{Grant or Defer}
+    H -->|granted| I[Action Executes]
+    H -->|denied: object locked or budget exceeded| J[Deferred / Retried Next Cycle]
+    G --> K[Audit Log]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Every autonomous storage subsystem registers its intent with the storage control plane before acting; the plane grants or defers based on object-level conflicts and the global I/O budget.*</p>
+
+<p class="text-gray-300 leading-relaxed">The control plane maintains a global I/O budget: a maximum number of concurrent I/O-intensive operations, a ceiling on MB/s consumed by background tasks, and an exclusion list of objects currently undergoing any autonomous action. Before any subsystem initiates an action, it registers an intent with the control plane, which checks for conflicts and grants or denies the action based on current system state.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import threading
+import time
+from dataclasses import dataclass, field
+from typing import Dict, Optional
+from enum import Enum
+
+class ActionType(Enum):
+    TABLESPACE_MOVE   = "tablespace_move"
+    BLOAT_REMEDIATION = "bloat_remediation"
+    PARTITION_CREATE  = "partition_create"
+    PARTITION_DEMOTE  = "partition_demote"
+    CHECKPOINT_TUNE   = "checkpoint_tune"
+    WAL_TUNE          = "wal_tune"
+    PREWARM           = "prewarm"
+
+@dataclass
+class ActionIntent:
+    action_type:   ActionType
+    target_object: str              # schema.table or partition name
+    estimated_io_mb: float
+    requester:     str
+    granted:       bool = False
+    started_at:    Optional[float] = None
+
+class StorageControlPlane:
+    MAX_CONCURRENT_IO_OPS   = 2
+    MAX_BACKGROUND_IO_MBS   = 200.0
+
+    def __init__(self):
+        self._lock          = threading.Lock()
+        self._active: Dict[str, ActionIntent] = {}
+        self._io_budget_used = 0.0
+
+    def request_action(self, intent: ActionIntent) -&gt; bool:
+        with self._lock:
+            # Check object-level conflict
+            if intent.target_object in self._active:
+                existing = self._active[intent.target_object]
+                print(
+                    f"CONFLICT: {intent.action_type.value} on {intent.target_object} "
+                    f"blocked by {existing.action_type.value} from {existing.requester}"
+                )
+                return False
+
+            # Check global I/O concurrency
+            if len(self._active) &gt;= self.MAX_CONCURRENT_IO_OPS:
+                print(f"IO_BUDGET: max concurrent ops reached, deferring {intent.action_type.value}")
+                return False
+
+            # Check I/O bandwidth budget
+            if self._io_budget_used + intent.estimated_io_mb &gt; self.MAX_BACKGROUND_IO_MBS:
+                print(f"IO_BUDGET: bandwidth ceiling reached, deferring {intent.action_type.value}")
+                return False
+
+            intent.granted   = True
+            intent.started_at = time.time()
+            self._active[intent.target_object] = intent
+            self._io_budget_used += intent.estimated_io_mb
+            return True
+
+    def release_action(self, target_object: str):
+        with self._lock:
+            if target_object in self._active:
+                released = self._active.pop(target_object)
+                self._io_budget_used = max(0.0, self._io_budget_used - released.estimated_io_mb)
+
+    def active_actions(self):
+        with self._lock:
+            return dict(self._active)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This control plane is deliberately simple — a threading lock over an in-memory dictionary. In production deployments across multiple database hosts, it would be backed by a distributed coordination service (etcd, Redis with Lua transactions, or a purpose-built sidecar). But the core contract is the same regardless of implementation: every background storage action must declare its intent, every execution is gated by a conflict check and a budget check, and every completion releases the held resources.</p>
+
+<p class="text-gray-300 leading-relaxed">The control plane also serves as the audit log entry point. Every granted and denied action is written to a structured log that the observability layer reads for post-hoc analysis. When storage performance degrades unexpectedly, the audit log shows precisely which autonomous operations were active at the time, making root cause analysis tractable rather than speculative.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability at three levels is non-negotiable**: object-level, engine-level, and block-device-level I/O metrics must be collected simultaneously and at sub-minute granularity. Conflating these three levels produces misleading signals that drive incorrect autonomous actions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tiering decisions must be based on measured heat scores, not age alone**: access frequency, write volume, and recency of modification together determine whether a relation belongs on fast NVMe or cold-tier storage. Age-based policies fail when access patterns shift and yesterday's archive becomes today's active dataset.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Checkpoint and WAL tuning must follow a one-parameter-per-cycle discipline**: changing `checkpoint_completion_target`, `max_wal_size`, `bgwriter_lru_maxpages`, and `bgwriter_delay` simultaneously makes causal attribution impossible. Autonomous controllers must change one variable, observe two full checkpoint cycles, and evaluate before proceeding.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partition lifecycle automation closes the gap between theoretical tiering policy and operational reality**: forward partition creation prevents exhaustion failures; backward partition demotion continuously reclaims fast-tier capacity. Neither is sufficient without the other, and both must integrate with the broader I/O control plane to avoid lock conflicts and bandwidth saturation.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A storage control plane with I/O budgeting and object-level conflict detection is required before deploying multiple autonomous storage subsystems concurrently**: without arbitration, independent subsystems will schedule conflicting operations, exhaust I/O bandwidth, and create the exact instability they were designed to prevent.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

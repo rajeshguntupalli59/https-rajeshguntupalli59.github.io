@@ -6,6 +6,10 @@
   <title>Chapter 38: Edge Deployment of Vector Search — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 38: Edge Deployment of Vector Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -283,6 +287,15 @@ echo "Qdrant edge node ready. Check RAM: $(free -h | awk '/^Mem/{print $3}')"</c
 
 <p class="text-gray-300 leading-relaxed">The hardest operational problem in edge vector deployment is not the initial data load—it's keeping edge indexes current as the central store evolves. This is the vector equivalent of replication lag, but with a fundamentally different character: you cannot apply vector index changes as a log of row mutations. An HNSW graph rebuild is not decomposable into atomic operations.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Central vector store<br/>canonical collection] -->|1: Snapshot-and-replace| B[Edge node:<br/>hot-swap full index]
+    A -->|2: Delta sync via changelog| C[Edge node:<br/>incremental upserts]
+    A -->|3: Versioned snapshot| D[Edge node:<br/>immutable, symlink swap]
+    B --> E[Local queries served<br/>with no network hop]
+    C --> E
+    D --> E</pre></div>
+<p class="text-gray-300 leading-relaxed">*Three synchronization patterns for keeping an edge index current with the central store — the right choice depends on update frequency and acceptable staleness.*</p>
+
 <p class="text-gray-300 leading-relaxed">The practical patterns are:</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Snapshot-and-replace.</strong> Periodically export the full collection from the central store as a binary snapshot, ship it to edge nodes, and hot-swap the index. Qdrant supports snapshots natively via its REST API. This is appropriate when the dataset is stable (changes fewer than 5% of vectors per day) and the snapshot fits within your transfer window.</p>
@@ -439,6 +452,615 @@ if __name__ == "__main__":
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Offline with stale index.** The edge index serves queries from its last-known-good state. Results may be incomplete (new vectors not yet synced) but are never wrong (no hallucinated data). The application should surface a freshness indicator to users: "Results reflect data as of 4 hours ago."</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Offline with missing index.** The edge node has just been provisioned and the initial sync has not completed, or the index has been deleted due to a storage failure. The application must degrade gracefully—either surfacing a text search fallback, a curated static list, or a "search unavailable" state.</li>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Offline-first vector search wrapper with graceful degradation
+# Appropriate for a retail kiosk or industrial mobile app
+
+import os
+import time
+import sqlite3
+import sqlite_vec
+import numpy as np
+import json
+import logging
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
+from sentence_transformers import SentenceTransformer
+
+logger = logging.getLogger("edge_search")
+
+
+class SearchMode(Enum):
+    VECTOR_LOCAL   = "vector_local"    # Local vector index, fully operational
+    TEXT_FALLBACK  = "text_fallback"   # FTS5 fulltext search, no vectors
+    STATIC_CATALOG = "static_catalog"  # Pre-baked result list, last resort
+    UNAVAILABLE    = "unavailable"     # All systems offline
+
+
+@dataclass
+class SearchResult:
+    doc_id: str
+    text: str
+    score: float
+    mode: SearchMode
+    freshness_seconds: int   # How old is the index data?
+
+
+class OfflineFirstVectorSearch:
+    """
+    Edge vector search with graceful degradation through multiple fallback modes.
+    Designed for environments where connectivity is intermittent.
+    """
+
+    def __init__(
+        self,
+        vector_db_path: str = "/data/edge_search.db",
+        static_catalog_path: str = "/data/static_catalog.json",
+        max_acceptable_staleness_hours: float = 48.0,
+    ):
+        self.vector_db_path = vector_db_path
+        self.static_catalog_path = static_catalog_path
+        self.max_staleness_seconds = max_acceptable_staleness_hours * 3600
+        self._model: Optional[SentenceTransformer] = None
+
+    def _get_model(self) -&gt; SentenceTransformer:
+        if self._model is None:
+            self._model = SentenceTransformer("all-MiniLM-L6-v2")
+        return self._model
+
+    def _check_index_health(self) -&gt; tuple[bool, int]:
+        """
+        Returns (is_healthy, staleness_seconds).
+        Reads a metadata row written by the sync process.
+        """
+        if not os.path.exists(self.vector_db_path):
+            return False, -1
+
+        try:
+            conn = sqlite3.connect(self.vector_db_path)
+            sqlite_vec.load(conn)
+
+            # Check that the vector table exists and has rows
+            row = conn.execute(
+                "SELECT COUNT(*) FROM vec_items"
+            ).fetchone()
+            if row[0] == 0:
+                conn.close()
+                return False, -1
+
+            # Check sync metadata written by the sync process
+            meta = conn.execute("""
+                SELECT last_sync_ts FROM sync_metadata
+                ORDER BY last_sync_ts DESC LIMIT 1
+            """).fetchone()
+            conn.close()
+
+            if meta is None:
+                return True, 999999  # Index exists but no sync record
+
+            last_sync_ts = meta[0]  # Unix timestamp written by sync job
+            staleness = int(time.time() - last_sync_ts)
+            return True, staleness
+
+        except Exception as e:
+            logger.warning(f"Index health check failed: {e}")
+            return False, -1
+
+    def _vector_search(self, query_text: str, top_k: int) -&gt; list[SearchResult]:
+        model = self._get_model()
+        query_vec = model.encode([query_text], normalize_embeddings=True)[0]
+
+        conn = sqlite3.connect(self.vector_db_path)
+        sqlite_vec.load(conn)
+
+        rows = conn.execute("""
+            SELECT
+                m.doc_id,
+                m.text,
+                m.payload,
+                v.distance,
+                s.last_sync_ts
+            FROM vec_items v
+            JOIN item_metadata m ON m.item_id = v.item_id
+            CROSS JOIN (SELECT MAX(last_sync_ts) AS last_sync_ts FROM sync_metadata) s
+            WHERE v.embedding MATCH ?
+              AND k = ?
+            ORDER BY v.distance
+        """, [query_vec.astype(np.float32).tobytes(), top_k]).fetchall()
+        conn.close()
+
+        last_sync_ts = rows[0][4] if rows else time.time()
+        staleness = int(time.time() - last_sync_ts)
+
+        return [
+            SearchResult(
+                doc_id=r[0],
+                text=r[1],
+                score=float(r[3]),
+                mode=SearchMode.VECTOR_LOCAL,
+                freshness_seconds=staleness,
+            )
+            for r in rows
+        ]
+
+    def _fts_fallback(self, query_text: str, top_k: int) -&gt; list[SearchResult]:
+        """
+        Full-text search using SQLite FTS5. Available even when vector index is broken.
+        Lower precision than vector search but always returns something for keyword queries.
+        """
+        if not os.path.exists(self.vector_db_path):
+            return []
+
+        try:
+            conn = sqlite3.connect(self.vector_db_path)
+            rows = conn.execute("""
+                SELECT
+                    m.doc_id,
+                    m.text,
+                    bm25(fts_items) AS score
+                FROM fts_items
+                JOIN item_metadata m ON m.doc_id = fts_items.doc_id
+                WHERE fts_items MATCH ?
+                ORDER BY score
+                LIMIT ?
+            """, [query_text, top_k]).fetchall()
+            conn.close()
+
+            return [
+                SearchResult(
+                    doc_id=r[0],
+                    text=r[1],
+                    score=float(r[2]),
+                    mode=SearchMode.TEXT_FALLBACK,
+                    freshness_seconds=999999,
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"FTS fallback failed: {e}")
+            return []
+
+    def _static_catalog_fallback(self, top_k: int) -&gt; list[SearchResult]:
+        """
+        Last-resort fallback: return top items from a pre-baked static catalog.
+        The catalog is a JSON file bundled with the application, never stale.
+        """
+        if not os.path.exists(self.static_catalog_path):
+            return []
+
+        try:
+            with open(self.static_catalog_path) as f:
+                catalog = json.load(f)
+
+            return [
+                SearchResult(
+                    doc_id=item["id"],
+                    text=item["text"],
+                    score=0.0,
+                    mode=SearchMode.STATIC_CATALOG,
+                    freshness_seconds=0,  # catalog is versioned, not time-based
+                )
+                for item in catalog[:top_k]
+            ]
+        except Exception as e:
+            logger.warning(f"Static catalog fallback failed: {e}")
+            return []
+
+    def search(self, query_text: str, top_k: int = 5) -&gt; tuple[list[SearchResult], SearchMode]:
+        """
+        Main search entry point. Returns results and the mode actually used.
+        Callers should surface the mode to users when it is not VECTOR_LOCAL.
+        """
+        healthy, staleness = self._check_index_health()
+
+        # Attempt vector search if index is healthy and not excessively stale
+        if healthy and (staleness &lt; self.max_staleness_seconds or staleness == -1):
+            try:
+                results = self._vector_search(query_text, top_k)
+                if results:
+                    return results, SearchMode.VECTOR_LOCAL
+            except Exception as e:
+                logger.error(f"Vector search failed: {e}")
+
+        # Fall back to FTS
+        logger.info("Falling back to FTS search")
+        fts_results = self._fts_fallback(query_text, top_k)
+        if fts_results:
+            return fts_results, SearchMode.TEXT_FALLBACK
+
+        # Fall back to static catalog
+        logger.info("Falling back to static catalog")
+        static_results = self._static_catalog_fallback(top_k)
+        if static_results:
+            return static_results, SearchMode.STATIC_CATALOG
+
+        return [], SearchMode.UNAVAILABLE
+
+
+# Example: retail kiosk application loop
+def kiosk_search_demo():
+    searcher = OfflineFirstVectorSearch(
+        max_acceptable_staleness_hours=24.0
+    )
+
+    queries = [
+        "wireless headphones under $300",
+        "running shoes for flat feet",
+        "gifts for coffee lovers",
+    ]
+
+    for query in queries:
+        results, mode = searcher.search(query, top_k=3)
+
+        freshness_msg = ""
+        if results and mode == SearchMode.VECTOR_LOCAL:
+            staleness_h = results[0].freshness_seconds / 3600
+            if staleness_h &gt; 1:
+                freshness_msg = f" (index is {staleness_h:.1f}h old)"
+
+        mode_warning = {
+            SearchMode.VECTOR_LOCAL:   "",
+            SearchMode.TEXT_FALLBACK:  " [keyword search — vector index unavailable]",
+            SearchMode.STATIC_CATALOG: " [showing popular items — search offline]",
+            SearchMode.UNAVAILABLE:    " [search unavailable]",
+        }[mode]
+
+        print(f"\nQuery: '{query}'{mode_warning}{freshness_msg}")
+        for r in results:
+            print(f"  {r.doc_id} | {r.text[:60]}")
+
+
+if __name__ == "__main__":
+    kiosk_search_demo()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key insight in this pattern is that the application never throws an exception to the user. Every failure mode produces a degraded-but-functional result. This matches the principle that search on a retail floor must always show *something*—a blank screen is worse than a list of popular items that ignores the query.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">WebAssembly: Bringing Vector Search to the Browser</h3>
+
+<p class="text-gray-300 leading-relaxed">Tier 1 edge—browser and mobile—requires a different execution model entirely. JavaScript runtimes cannot load native binaries; everything must run in WebAssembly. The two components you need are an embedding model and a vector search engine, both compiled to WASM.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Transformers.js</strong> provides ONNX-Runtime-compiled transformer models running in the browser via WebAssembly. Models are downloaded from Hugging Face and cached in the browser's Cache API. A quantized version of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code> is approximately 23MB after quantization—reasonable for a first-run download, cacheable thereafter.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQLite-vec compiled to WASM</strong> is the search engine. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sqlite-vec</code> project ships WASM builds. Combined with the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sql.js</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wa-sqlite</code> SQLite WASM bindings, you get a fully in-browser vector index backed by the Origin Private File System (OPFS) for persistence.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// JavaScript / browser (ES modules)
+// In-browser vector search using Transformers.js + SQLite-vec WASM
+// No server round-trip for either embedding generation or search
+
+import { pipeline } from "@xenova/transformers";
+import initSqlJs from "sql.js";
+// sqlite-vec WASM build; load as an ArrayBuffer from your CDN/assets
+import sqliteVecWasm from "./sqlite_vec.wasm?url";
+
+let db = null;
+let embedder = null;
+const DIM = 384;  // all-MiniLM-L6-v2
+
+/**
+ * Initialize the embedding model and SQLite-vec database.
+ * Call once at application startup.
+ * Downloads ~23MB of model weights on first load (cached by browser thereafter).
+ */
+export async function initEdgeSearch() {
+  // Load embedding model — runs entirely in WASM/WebWorker
+  embedder = await pipeline(
+    "feature-extraction",
+    "Xenova/all-MiniLM-L6-v2",
+    { quantized: true }   // INT8 quantized: ~23MB vs ~90MB for fp32
+  );
+
+  // Load SQLite with sqlite-vec extension
+  const SQL = await initSqlJs({
+    locateFile: () =&gt; sqliteVecWasm,
+  });
+
+  // Attempt to restore from OPFS (Origin Private File System) for persistence
+  let dbData = null;
+  try {
+    const root = await navigator.storage.getDirectory();
+    const fileHandle = await root.getFileHandle("edge_search.db");
+    const file = await fileHandle.getFile();
+    dbData = new Uint8Array(await file.arrayBuffer());
+    console.log(`Restored index from OPFS (${(dbData.length / 1024 / 1024).toFixed(1)} MB)`);
+  } catch {
+    console.log("No existing OPFS index; starting fresh.");
+  }
+
+  db = dbData ? new SQL.Database(dbData) : new SQL.Database();
+
+  // Create tables if first run
+  db.run(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(
+      item_id INTEGER PRIMARY KEY,
+      embedding FLOAT[${DIM}]
+    )
+  `);
+  db.run(`
+    CREATE TABLE IF NOT EXISTS item_metadata (
+      item_id INTEGER PRIMARY KEY,
+      doc_id  TEXT,
+      text    TEXT,
+      payload TEXT
+    )
+  `);
+
+  console.log("Edge search initialized.");
+}
+
+/**
+ * Embed and index an array of documents into the in-browser SQLite-vec index.
+ * @param {Array&lt;{id: string, text: string, metadata?: object}&gt;} documents
+ */
+export async function indexDocuments(documents) {
+  if (!db || !embedder) throw new Error("Call initEdgeSearch() first");
+
+  const texts = documents.map(d =&gt; d.text);
+
+  // Generate embeddings in the browser via WASM
+  const output = await embedder(texts, { pooling: "mean", normalize: true });
+  const embeddings = output.tolist(); // float32[][]
+
+  db.run("BEGIN TRANSACTION");
+  try {
+    const insertVec  = db.prepare(
+      "INSERT OR REPLACE INTO vec_items(item_id, embedding) VALUES (?, ?)"
+    );
+    const insertMeta = db.prepare(
+      "INSERT OR REPLACE INTO item_metadata(item_id, doc_id, text, payload) VALUES (?, ?, ?, ?)"
+    );
+
+    for (let i = 0; i &lt; documents.length; i++) {
+      const emb = new Float32Array(embeddings[i]);
+      insertVec.run([i, emb]);
+      insertMeta.run([i, documents[i].id, documents[i].text,
+                      JSON.stringify(documents[i].metadata ?? {})]);
+    }
+
+    insertVec.free();
+    insertMeta.free();
+    db.run("COMMIT");
+  } catch (e) {
+    db.run("ROLLBACK");
+    throw e;
+  }
+
+  // Persist to OPFS so the index survives page reload
+  await persistToOPFS();
+  console.log(`Indexed ${documents.length} documents in-browser.`);
+}
+
+/**
+ * Search the in-browser vector index.
+ * @param {string} queryText
+ * @param {number} topK
+ * @returns {Array&lt;{docId, text, metadata, distance}&gt;}
+ */
+export async function searchLocal(queryText, topK = 5) {
+  if (!db || !embedder) throw new Error("Call initEdgeSearch() first");
+
+  const output = await embedder([queryText], { pooling: "mean", normalize: true });
+  const queryVec = new Float32Array(output.tolist()[0]);
+
+  const stmt = db.prepare(`
+    SELECT
+      m.doc_id,
+      m.text,
+      m.payload,
+      v.distance
+    FROM vec_items v
+    JOIN item_metadata m ON m.item_id = v.item_id
+    WHERE v.embedding MATCH ?
+      AND k = ?
+    ORDER BY v.distance
+  `);
+
+  const rows = [];
+  stmt.bind([queryVec, topK]);
+  while (stmt.step()) {
+    const [docId, text, payload, distance] = stmt.getAsObject(["doc_id","text","payload","distance"]);
+    rows.push({ docId, text, metadata: JSON.parse(payload), distance });
+  }
+  stmt.free();
+
+  return rows;
+}
+
+async function persistToOPFS() {
+  try {
+    const data = db.export();  // Uint8Array of the SQLite file
+    const root = await navigator.storage.getDirectory();
+    const fileHandle = await root.getFileHandle("edge_search.db", { create: true });
+    const writable = await fileHandle.createWritable();
+    await writable.write(data);
+    await writable.close();
+  } catch (e) {
+    console.warn("OPFS persistence failed (may not be supported in this browser):", e);
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Browser-side vector search has concrete limits. A 50,000-vector index at 384 dimensions occupies roughly 75MB of memory as Float32 arrays, which is within the typical browser tab budget. At 768 dimensions (BERT-base), that doubles to 150MB and begins to compete with the rest of the page. For larger catalogs, apply scalar quantization to INT8 (4× reduction) before writing to the browser index, or shard the index across multiple OPFS files and use a routing layer to pick the relevant shard.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Security Considerations at the Edge</h3>
+
+<p class="text-gray-300 leading-relaxed">Edge deployments surface a threat model distinct from cloud deployments. A Qdrant instance running on a retail floor is physically accessible to an attacker in a way that a cloud database never is. The threat is not only network-based.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Physical access controls.</strong> The edge device should boot from an encrypted disk (LUKS on Linux, BitLocker on Windows IoT). The vector index itself may contain sensitive embeddings—for example, embeddings of customer images in a facial recognition system encode biometric information indirectly. If an attacker extracts the raw float vectors, inversion attacks (reconstructing approximate inputs from embeddings) are plausible for some model architectures.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Network segmentation.</strong> The Qdrant or SQLite-vec instance should not be reachable from the public network. Bind to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">127.0.0.1</code> or a local VLAN interface. If the edge application is a web server that also serves customers, place the vector search on a separate internal interface and never proxy direct access to the vector DB port.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">API key rotation.</strong> If the edge node connects to a central Qdrant or Pinecone instance to pull sync data, the API key on the edge device is a credential that could be extracted from the filesystem. Rotate these keys on a schedule and use short-lived tokens (OAuth 2.0 client credentials) where supported. Store keys in the OS keychain or TPM-backed secure enclave, not in plain configuration files.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Differential privacy for federated indexes.</strong> In cases where edge nodes generate embeddings from user behavior and those embeddings are sent back to the central store for model improvement, consider adding calibrated Laplace noise to embeddings before transmission. This prevents the central store from precisely reconstructing individual user interactions while preserving the aggregate signal for retraining.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Benchmarking Edge Hardware</h3>
+
+<p class="text-gray-300 leading-relaxed">Before committing to an edge hardware platform, profile the three operations that dominate vector search performance: embedding generation, index build, and query latency. The following shell-based benchmark harness uses Qdrant's built-in benchmark tool alongside a simple Python timing script.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shell
+# Edge hardware benchmarking: embedding + index build + query latency
+# Run on the target edge device (Raspberry Pi 4 / Jetson Nano / NUC)
+
+DEVICE_TAG=$(uname -m)-$(hostname)
+RESULTS_DIR="/tmp/edge_bench_${DEVICE_TAG}_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$RESULTS_DIR"
+
+echo "=== Edge Hardware Benchmark: $DEVICE_TAG ===" | tee "$RESULTS_DIR/report.txt"
+echo "CPU: $(lscpu | grep 'Model name' | cut -d: -f2 | xargs)" | tee -a "$RESULTS_DIR/report.txt"
+echo "RAM: $(free -h | awk '/^Mem/{print $2}')" | tee -a "$RESULTS_DIR/report.txt"
+echo "Storage: $(df -h /data | awk 'NR==2{print $2, $4, "free"}')" | tee -a "$RESULTS_DIR/report.txt"
+echo "" | tee -a "$RESULTS_DIR/report.txt"
+
+# 1. Embedding generation throughput (sentences/sec)
+echo "--- Embedding Generation Throughput ---" | tee -a "$RESULTS_DIR/report.txt"
+python3 - &lt;&lt; 'PYEOF' | tee -a "$RESULTS_DIR/report.txt"
+import time
+from sentence_transformers import SentenceTransformer
+
+model = SentenceTransformer("all-MiniLM-L6-v2")
+# Warm-up
+model.encode(["warmup sentence"])
+
+sentences = [f"This is test sentence number {i} for benchmarking purposes." for i in range(500)]
+
+t0 = time.perf_counter()
+_ = model.encode(sentences, batch_size=32, show_progress_bar=False)
+elapsed = time.perf_counter() - t0
+
+print(f"Embedded 500 sentences in {elapsed:.2f}s → {500/elapsed:.1f} sentences/sec")
+print(f"Estimated time to embed 100K docs: {100000 / (500/elapsed) / 60:.1f} minutes")
+PYEOF
+
+# 2. SQLite-vec index build time
+echo "" | tee -a "$RESULTS_DIR/report.txt"
+echo "--- SQLite-vec Index Build (10K vectors, dim=384) ---" | tee -a "$RESULTS_DIR/report.txt"
+python3 - &lt;&lt; 'PYEOF' | tee -a "$RESULTS_DIR/report.txt"
+import time, os, sqlite3, numpy as np
+import sqlite_vec
+
+BENCH_DB = "/tmp/bench_vec.db"
+DIM = 384
+N = 10000
+
+conn = sqlite3.connect(BENCH_DB)
+sqlite_vec.load(conn)
+conn.execute(f"CREATE VIRTUAL TABLE bench_vecs USING vec0(id INTEGER PRIMARY KEY, v FLOAT[{DIM}])")
+
+vecs = np.random.randn(N, DIM).astype(np.float32)
+vecs /= np.linalg.norm(vecs, axis=1, keepdims=True)
+
+t0 = time.perf_counter()
+conn.execute("BEGIN")
+for i, v in enumerate(vecs):
+    conn.execute("INSERT INTO bench_vecs(id, v) VALUES (?, ?)", [i, v.tobytes()])
+conn.execute("COMMIT")
+elapsed = time.perf_counter() - t0
+
+db_size_mb = os.path.getsize(BENCH_DB) / 1024 / 1024
+print(f"Inserted {N} vectors in {elapsed:.2f}s → {N/elapsed:.0f} vecs/sec")
+print(f"DB size: {db_size_mb:.1f} MB for {N} × dim{DIM}")
+
+# Query latency
+query = np.random.randn(DIM).astype(np.float32)
+query /= np.linalg.norm(query)
+
+latencies = []
+for _ in range(100):
+    t0 = time.perf_counter()
+    conn.execute(
+        "SELECT id, distance FROM bench_vecs WHERE v MATCH ? AND k = 10 ORDER BY distance",
+        [query.tobytes()]
+    ).fetchall()
+    latencies.append((time.perf_counter() - t0) * 1000)
+
+import statistics
+print(f"Query latency (100 runs, k=10): "
+      f"p50={statistics.median(latencies):.1f}ms "
+      f"p95={sorted(latencies)[95]:.1f}ms "
+      f"p99={sorted(latencies)[99]:.1f}ms")
+
+conn.close()
+os.unlink(BENCH_DB)
+PYEOF
+
+# 3. Qdrant query latency (if running)
+echo "" | tee -a "$RESULTS_DIR/report.txt"
+echo "--- Qdrant Edge Query Latency ---" | tee -a "$RESULTS_DIR/report.txt"
+if curl -sf http://localhost:6333/healthz &gt; /dev/null 2&gt;&1; then
+    python3 - &lt;&lt; 'PYEOF' | tee -a "$RESULTS_DIR/report.txt"
+import time, statistics, numpy as np
+from qdrant_client import QdrantClient
+
+client = QdrantClient(url="http://localhost:6333")
+collections = client.get_collections().collections
+if not collections:
+    print("No collections found — skipping Qdrant benchmark")
+else:
+    col = collections[0].name
+    info = client.get_collection(col)
+    dim = info.config.params.vectors.size
+    print(f"Benchmarking collection '{col}' (dim={dim})")
+
+    latencies = []
+    for _ in range(200):
+        q = np.random.randn(dim).astype(np.float32)
+        q /= np.linalg.norm(q)
+        t0 = time.perf_counter()
+        client.search(collection_name=col, query_vector=q.tolist(), limit=10)
+        latencies.append((time.perf_counter() - t0) * 1000)
+
+    print(f"Query latency (200 runs, k=10): "
+          f"p50={statistics.median(latencies):.1f}ms "
+          f"p95={sorted(latencies)[int(len(latencies)*0.95)]:.1f}ms "
+          f"p99={sorted(latencies)[int(len(latencies)*0.99)]:.1f}ms")
+PYEOF
+else
+    echo "Qdrant not running — skipping"
+fi
+
+echo "" | tee -a "$RESULTS_DIR/report.txt"
+echo "Benchmark complete. Results in $RESULTS_DIR/report.txt"
+cat "$RESULTS_DIR/report.txt"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When evaluating edge hardware, the metric that most surprises engineers is not raw query latency—HNSW on modern ARM chips is fast—but <strong class="text-white">embedding generation throughput</strong>. A MiniLM model running on a Raspberry Pi 4 CPU produces roughly 40–80 sentences per second. If your application must embed user queries at search time, that is imperceptible (one query = one embedding ≈ 12–25ms). If it must re-embed a 100K document catalog on every full sync, that is 20–40 minutes of CPU time. The right mitigation is to embed at the central store and ship float vectors in the sync payload rather than re-embedding on edge.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Putting It Together: A Retail Edge Deployment</h3>
+
+<p class="text-gray-300 leading-relaxed">To make the patterns concrete, consider a mid-size retailer deploying semantic product search on 800 point-of-sale kiosks in stores across a country. Each kiosk runs on an Intel NUC (16GB RAM, 512GB NVMe, intermittent WAN via store Wi-Fi). The product catalog has 250,000 SKUs, each embedded at 384 dimensions using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">all-MiniLM-L6-v2</code>.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Central infrastructure.</strong> A Qdrant Cloud instance holds the canonical collection. Product catalog updates—new SKUs, price changes, discontinuations—are pushed by the central ERP system via a Kafka topic consumed by an ingestion service that upserts into Qdrant.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Edge provisioning.</strong> New kiosks run a provisioning script on first boot that pulls a full Qdrant snapshot from an S3-compatible store (pre-built nightly from the central collection), hydrates the local Qdrant instance, and writes a sync state record. Snapshot size for 250K × 384-dim vectors with binary quantization is approximately 125MB—a reasonable first-boot download even on slow store Wi-Fi.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Ongoing sync.</strong> A systemd timer runs the delta sync script every 15 minutes. If the WAN is down, the job exits cleanly and retries on the next cycle. The local index stays at whatever state it last successfully synced to.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Application layer.</strong> The kiosk application uses the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">OfflineFirstVectorSearch</code> wrapper. If the local Qdrant instance is reachable and the index is less than 24 hours stale, queries go local (sub-10ms). If Qdrant is unhealthy (OOM-killed, disk full), the app falls back to an FTS5 index over product names maintained in SQLite. If the SQLite database is also missing, the app shows the store's top-50 bestsellers from a JSON file bundled with the application binary.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Observability.</strong> Each kiosk pushes a lightweight heartbeat every 5 minutes to a central monitoring endpoint when WAN is available: sync lag, index size, p95 query latency, and current search mode. The ops team can see at a glance how many kiosks are in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VECTOR_LOCAL</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TEXT_FALLBACK</code> vs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">STATIC_CATALOG</code> mode and dispatch store IT when a device drifts into persistent fallback.</p>
+
+<p class="text-gray-300 leading-relaxed">This architecture means a network outage or a Qdrant crash on a kiosk produces a degraded-but-functional experience—keyword search still works—rather than a broken one. A full store network outage still allows customers to find products. The catalog data, being relatively stable, makes stale vector results a minor quality concern rather than a correctness issue.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Edge vector search spans four distinct tiers**—browser/mobile, CDN worker, on-premise gateway, and near-edge regional—each with different RAM budgets, storage media, and connectivity assumptions. Match the engine to the tier: SQLite-vec for embedded/browser use, Qdrant binary with quantization for on-premise gateways, full-featured engines for near-edge.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index synchronization is the defining operational challenge.** Unlike row-based replication, HNSW graphs cannot be updated as a log of atomic mutations indefinitely without quality degradation. Design a sync strategy—snapshot-and-replace, delta upsert, or versioned immutable snapshots—that matches your update frequency and acceptable recall budget.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Offline-first architecture requires multiple fallback layers.** A production edge search system should gracefully degrade from local vector search → full-text search → static curated results rather than failing hard. Surface index freshness to users when results may be stale; never present stale data as current without disclosure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding generation throughput, not query latency, is the edge bottleneck.** Generating embeddings on low-power ARM hardware is 10–20× slower than querying an HNSW index. Push embedding computation to the central store and ship float vectors in sync payloads to avoid re-embedding large catalogs on constrained hardware.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Edge deployments introduce physical security concerns.** Vector indexes may encode sensitive biometric or behavioral signals indirectly. Encrypt edge storage at rest, bind database ports to localhost or internal interfaces only, use short-lived credentials for central sync, and add differential privacy noise to any embeddings transmitted back to central stores for model improvement.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 19: Integrating AI with Monitoring Systems — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 19: Integrating AI with Monitoring Systems. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -48,7 +52,7 @@
 
 <p class="text-gray-300 leading-relaxed">The core problem is the threshold model. Static thresholds assume that a metric crossing a fixed boundary always means the same thing. But a CPU spike to 85% during a weekly batch job is completely different from an 85% CPU spike at 3 AM on a Sunday. Disk I/O that looks alarming in isolation might be a predictable consequence of a known maintenance window. Classical monitoring tools — Prometheus, Nagios, Zabbix, SQL Server's built-in alerts — all share this foundational limitation. They fire alerts based on point-in-time conditions, with no memory of history and no understanding of context.</p>
 
-<p class="text-gray-300 leading-relaxed">Alert fatigue compounds the threshold problem. When every minor blip fires a PagerDuty notification, operators learn to ignore notifications. Studies across SRE organizations consistently find that more than 40% of production alerts are either false positives or resolved without human intervention. The response to alert fatigue is typically one of two bad options: raise the thresholds (and start missing real incidents) or suppress entire alert categories (and create blind spots). Neither is a real solution.</p>
+<p class="text-gray-300 leading-relaxed">Alert fatigue compounds the threshold problem. When every minor blip fires a PagerDuty notification, operators learn to ignore notifications. Anecdotally, most SRE and DBA teams running static thresholds report that a large share of their production alerts turn out to be false positives or resolve themselves without any human action. The response to alert fatigue is typically one of two bad options: raise the thresholds (and start missing real incidents) or suppress entire alert categories (and create blind spots). Neither is a real solution.</p>
 
 <p class="text-gray-300 leading-relaxed">Correlation is a third failure mode. When PostgreSQL starts degrading, you don't get one alert — you get twenty. Connection pool saturation fires. Long-running query alerts fire. Replication lag crosses its threshold. Disk write latency alerts trigger. Each alert system sees one slice of the event. No system is connecting the dots to say: "These twenty alerts are all downstream effects of a single autovacuum storm on a high-write table." A DBA sitting in front of the dashboards can often do this correlation, but at 3 AM, with forty browser tabs open, that human synthesis is slow and error-prone.</p>
 
@@ -436,15 +440,654 @@ def find_similar_past_incidents(
 
 <p class="text-gray-300 leading-relaxed">The generated narrative is most valuable when it arrives at the same time as the alert, not as a follow-up. A lightweight webhook consumer pattern works well here:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+import hashlib
+from datetime import datetime
+
+def send_enriched_alert(
+    narrative: str,
+    snapshot: dict,
+    anomaly_score: float,
+    slack_webhook_url: str,
+    pagerduty_routing_key: Optional[str] = None
+):
+    """Send AI-enriched alert to Slack and optionally trigger PagerDuty."""
+    
+    severity_emoji = "🔴" if anomaly_score &lt; -0.3 else "🟡"
+    
+    # Slack message with narrative
+    slack_payload = {
+        "blocks": [
+            {
+                "type": "header",
+                "text": {
+                    "type": "plain_text",
+                    "text": f"{severity_emoji} Database Anomaly Detected"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Anomaly Score:* `{anomaly_score:.3f}` | "
+                            f"*Timestamp:* {snapshot.get('timestamp', 'now')}"
+                }
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*AI Incident Analysis:*\n```{narrative[:2900]}```"
+                }
+            }
+        ]
+    }
+    
+    requests.post(slack_webhook_url, json=slack_payload, timeout=10)
+    
+    # PagerDuty trigger for high-severity anomalies
+    if pagerduty_routing_key and anomaly_score &lt; -0.3:
+        dedup_key = hashlib.md5(
+            f"{snapshot.get('timestamp', '')}-db-anomaly".encode()
+        ).hexdigest()
+        
+        pd_payload = {
+            "routing_key": pagerduty_routing_key,
+            "event_action": "trigger",
+            "dedup_key": dedup_key,
+            "payload": {
+                "summary": narrative.split('\n')[0][:1024],
+                "severity": "critical" if anomaly_score &lt; -0.5 else "warning",
+                "source": "ai-db-monitor",
+                "timestamp": snapshot.get("timestamp", datetime.utcnow().isoformat()),
+                "custom_details": {
+                    "anomaly_score": anomaly_score,
+                    "active_connections": snapshot.get("active_connections"),
+                    "lock_waits": snapshot.get("lock_waits"),
+                    "long_running_queries": snapshot.get("long_running_queries"),
+                    "buffer_hit_ratio": snapshot.get("buffer_hit_ratio"),
+                    "full_narrative": narrative
+                }
+            }
+        }
+        
+        requests.post(
+            "https://events.pagerduty.com/v2/enqueue",
+            json=pd_payload,
+            timeout=10
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One detail worth noting: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dedup_key</code> prevents PagerDuty from creating duplicate incidents when the same anomaly fires multiple alert evaluations in quick succession. Without deduplication, an anomaly that persists for ten minutes could generate dozens of PagerDuty incidents, each with its own page — recreating the alert fatigue problem you're trying to solve.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Grafana Integration: AI-Annotated Dashboards</h3>
+
+<p class="text-gray-300 leading-relaxed">Raw numbers on Grafana panels tell operators what changed; AI annotations tell them why it matters. The Grafana Annotations API lets you post timestamped text annotations directly onto dashboard panels, which means your AI pipeline can mark the exact moment an anomaly was detected and attach the incident narrative as annotation text visible on the timeline.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+from datetime import datetime
+import time
+
+class GrafanaAnnotator:
+    """Posts AI-generated annotations to Grafana dashboards."""
+    
+    def __init__(self, grafana_url: str, api_key: str):
+        self.grafana_url = grafana_url.rstrip('/')
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+    
+    def post_anomaly_annotation(
+        self,
+        narrative: str,
+        anomaly_score: float,
+        snapshot: dict,
+        dashboard_uid: str,
+        panel_id: Optional[int] = None
+    ) -&gt; int:
+        """
+        Post an annotation to a Grafana dashboard.
+        Returns the annotation ID for later updates (e.g., marking resolved).
+        """
+        epoch_ms = int(time.time() * 1000)
+        
+        # Truncate narrative to first two sections for dashboard readability
+        short_narrative = '\n'.join(narrative.split('\n')[:8])
+        
+        tags = ["ai-anomaly", f"score:{anomaly_score:.2f}"]
+        if anomaly_score &lt; -0.5:
+            tags.append("severity:critical")
+        elif anomaly_score &lt; -0.3:
+            tags.append("severity:warning")
+        
+        payload = {
+            "dashboardUID": dashboard_uid,
+            "time": epoch_ms,
+            "tags": tags,
+            "text": (
+                f"**AI Anomaly Detection** | Score: {anomaly_score:.3f}\n\n"
+                f"{short_narrative}"
+            )
+        }
+        
+        if panel_id is not None:
+            payload["panelId"] = panel_id
+        
+        response = requests.post(
+            f"{self.grafana_url}/api/annotations",
+            json=payload,
+            headers=self.headers,
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json()["id"]
+    
+    def resolve_annotation(self, annotation_id: int, resolution_summary: str):
+        """Update an existing annotation to mark the incident as resolved."""
+        response = requests.patch(
+            f"{self.grafana_url}/api/annotations/{annotation_id}",
+            json={
+                "tags": ["ai-anomaly", "resolved"],
+                "text": f"**RESOLVED**\n\n{resolution_summary}"
+            },
+            headers=self.headers,
+            timeout=10
+        )
+        response.raise_for_status()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Pairing this annotator with your anomaly detection loop creates a timeline on your Grafana dashboards where every AI-detected incident is marked, with its narrative summary attached directly to the chart. When a DBA opens the dashboard during an incident, they immediately see what the AI concluded — without having to switch to Slack or PagerDuty to find context.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Closing the Feedback Loop: Teaching the System from Resolved Incidents</h3>
+
+<p class="text-gray-300 leading-relaxed">The monitoring system described so far generates value from the moment you deploy it, but its real power compounds over time if — and only if — you build in the mechanism for human feedback to flow back into the model. This is the feedback loop, and it's what separates a one-time integration from a system that genuinely improves with use.</p>
+
+<p class="text-gray-300 leading-relaxed">The feedback mechanism has three components: incident tagging during the event, post-mortem capture after resolution, and periodic model retraining that incorporates the tagged data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Incident Tagging</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When an anomaly alert fires and is acknowledged by the on-call DBA, the system should create an incident record and tag all health snapshots from the surrounding time window:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def open_incident(
+    snapshot_id: int,
+    alert_narrative: str,
+    vector_pg_conn_string: str
+) -&gt; int:
+    """
+    Create an incident record when an alert is acknowledged.
+    Returns the new incident ID.
+    """
+    conn = psycopg2.connect(vector_pg_conn_string)
+    cur = conn.cursor()
+    
+    # Create the incident record
+    cur.execute("""
+        INSERT INTO incidents (occurred_at, ai_narrative, status)
+        VALUES (now(), %s, 'open')
+        RETURNING id
+    """, (alert_narrative,))
+    incident_id = cur.fetchone()[0]
+    
+    # Tag the triggering snapshot
+    cur.execute("""
+        UPDATE db_health_snapshots
+        SET incident_id = %s
+        WHERE id = %s
+    """, (incident_id, snapshot_id))
+    
+    # Tag all snapshots from the 10 minutes leading up to the anomaly
+    cur.execute("""
+        UPDATE db_health_snapshots
+        SET incident_id = %s
+        WHERE captured_at BETWEEN 
+            (SELECT captured_at - interval '10 minutes' FROM db_health_snapshots WHERE id = %s)
+            AND
+            (SELECT captured_at FROM db_health_snapshots WHERE id = %s)
+          AND incident_id IS NULL
+    """, (incident_id, snapshot_id, snapshot_id))
+    
+    conn.commit()
+    cur.close()
+    conn.close()
+    return incident_id
+
+
+def close_incident(
+    incident_id: int,
+    root_cause: str,
+    resolution: str,
+    ttm_minutes: int,
+    vector_pg_conn_string: str
+):
+    """
+    Record the post-mortem outcome for a resolved incident.
+    This data feeds into future AI narrative generation.
+    """
+    conn = psycopg2.connect(vector_pg_conn_string)
+    cur = conn.cursor()
+    
+    cur.execute("""
+        UPDATE incidents
+        SET 
+            status = 'resolved',
+            root_cause = %s,
+            resolution = %s,
+            ttm_minutes = %s,
+            resolved_at = now()
+        WHERE id = %s
+    """, (root_cause, resolution, ttm_minutes, incident_id))
+    
+    # Mark associated snapshots as resolved so they're included in future RAG retrieval
+    cur.execute("""
+        UPDATE db_health_snapshots
+        SET resolved = TRUE
+        WHERE incident_id = %s
+    """, (incident_id,))
+    
+    conn.commit()
+    cur.close()
+    conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: AI Narrative Quality Scoring</strong></p>
+
+<p class="text-gray-300 leading-relaxed">After an incident is resolved, ask the on-call DBA to score the AI narrative that was generated at alert time. A simple 1–5 rating and a free-text comment field are sufficient. This scoring data lets you measure whether your prompt engineering and model choices are actually helping operators, and it surfaces systematic failure modes — for example, discovering that the AI consistently misdiagnoses lock contention as connection pool exhaustion.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Add narrative scoring to the incidents table
+ALTER TABLE incidents
+    ADD COLUMN ai_narrative_score SMALLINT CHECK (ai_narrative_score BETWEEN 1 AND 5),
+    ADD COLUMN ai_narrative_feedback TEXT,
+    ADD COLUMN narrative_matched_root_cause BOOLEAN;
+
+-- Query to measure AI narrative accuracy over time
+SELECT
+    date_trunc('week', resolved_at) AS week,
+    COUNT(*) AS incidents_resolved,
+    ROUND(AVG(ai_narrative_score), 2) AS avg_narrative_score,
+    ROUND(
+        100.0 * SUM(CASE WHEN narrative_matched_root_cause THEN 1 ELSE 0 END)
+        / NULLIF(COUNT(narrative_matched_root_cause), 0),
+        1
+    ) AS root_cause_accuracy_pct
+FROM incidents
+WHERE status = 'resolved'
+  AND ai_narrative_score IS NOT NULL
+GROUP BY 1
+ORDER BY 1 DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Add narrative scoring columns (run against your monitoring database)
+ALTER TABLE incidents
+    ADD ai_narrative_score TINYINT CHECK (ai_narrative_score BETWEEN 1 AND 5),
+        ai_narrative_feedback NVARCHAR(MAX),
+        narrative_matched_root_cause BIT;
+
+-- Weekly AI narrative accuracy report
+SELECT
+    DATEADD(WEEK, DATEDIFF(WEEK, 0, resolved_at), 0) AS week_start,
+    COUNT(*) AS incidents_resolved,
+    ROUND(AVG(CAST(ai_narrative_score AS FLOAT)), 2) AS avg_narrative_score,
+    ROUND(
+        100.0 * SUM(CASE WHEN narrative_matched_root_cause = 1 THEN 1 ELSE 0 END)
+        / NULLIF(COUNT(narrative_matched_root_cause), 0),
+        1
+    ) AS root_cause_accuracy_pct
+FROM incidents
+WHERE status = 'resolved'
+  AND ai_narrative_score IS NOT NULL
+GROUP BY DATEADD(WEEK, DATEDIFF(WEEK, 0, resolved_at), 0)
+ORDER BY week_start DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: Prompt Refinement from Low-Score Incidents</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When narrative scores fall below 3, that's signal that something in the prompt or the context assembly is failing. A useful practice is to periodically run a batch review where you feed low-scored incidents to the LLM and ask it to explain what information would have led to a better diagnosis. This meta-analysis often surfaces missing metrics — for instance, discovering that autovacuum-related incidents are consistently misdiagnosed because your snapshot query doesn't capture <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables.n_dead_tup</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def identify_prompt_gaps(
+    low_score_incidents: list[dict],
+    llm_client
+) -&gt; str:
+    """
+    Ask an LLM to review low-quality incident narratives and identify 
+    what monitoring data was missing.
+    """
+    incidents_text = json.dumps(low_score_incidents, indent=2)
+    
+    prompt = f"""You are a senior database reliability engineer reviewing AI-generated 
+incident narratives that received low quality scores from the DBAs who used them.
+
+Here are the incidents, including the original AI narrative, the actual root cause 
+determined by the DBA, and the DBA's feedback:
+
+{incidents_text}
+
+For each incident where the AI narrative missed the actual root cause, identify:
+1. What specific database metrics or system view data was ABSENT from the context 
+   that would have made the correct diagnosis possible.
+2. What additional PostgreSQL or SQL Server queries should be added to the monitoring 
+   data collection to fill this gap.
+3. Whether the failure was a data gap (missing metrics) or a reasoning gap 
+   (data was present but misinterpreted).
+
+Format your response as a structured list of recommended monitoring additions, 
+with the specific SQL query for each addition."""
+
+    response = llm_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.content[0].text</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This creates a continuous improvement loop: your monitoring system identifies its own blind spots by reasoning about the incidents where it failed. Each improvement cycle adds new metrics to the collection pipeline, which improves future narratives, which gradually raises narrative quality scores — a genuine compounding return on the initial integration effort.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating with Cloud-Native Monitoring: Azure Monitor and AWS CloudWatch</h3>
+
+<p class="text-gray-300 leading-relaxed">Many production PostgreSQL and SQL Server deployments run on managed cloud services — Amazon RDS, Azure Database for PostgreSQL Flexible Server, Google Cloud SQL — where you can't run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> directly on the database host and don't have access to the operating system. Cloud-native monitoring replaces custom exporters with platform APIs, but the AI integration layer stays structurally identical.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Monitor for SQL Server (Azure SQL / SQL Managed Instance)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure Monitor Logs (the Log Analytics workspace) stores diagnostic telemetry from Azure SQL including query store data, wait statistics, and resource utilization. The Kusto Query Language (KQL) gives you a flexible interface to pull structured snapshots that can feed directly into your AI pipeline:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from azure.monitor.query import LogsQueryClient, LogsQueryStatus
+from azure.identity import DefaultAzureCredential
+from datetime import timedelta
+import pandas as pd
+
+def fetch_azure_sql_snapshot(workspace_id: str, server_name: str) -&gt; dict:
+    """
+    Pull a current health snapshot from Azure Monitor Logs 
+    for an Azure SQL or SQL Managed Instance target.
+    """
+    credential = DefaultAzureCredential()
+    client = LogsQueryClient(credential)
+    
+    kql_query = f"""
+    AzureDiagnostics
+    | where TimeGenerated &gt; ago(5m)
+    | where ResourceType == "SERVERS/DATABASES"
+    | where Resource contains "{server_name}"
+    | summarize 
+        avg_cpu_percent = avg(todouble(cpu_percent_s)),
+        avg_data_io_percent = avg(todouble(physical_data_read_percent_s)),
+        max_sessions = max(toint(sessions_count_s)),
+        avg_workers_percent = avg(todouble(workers_percent_s)),
+        max_log_write_percent = max(todouble(log_write_percent_s))
+      by bin(TimeGenerated, 1m), Resource
+    | order by TimeGenerated desc
+    | take 1
+    """
+    
+    response = client.query_workspace(
+        workspace_id=workspace_id,
+        query=kql_query,
+        timespan=timedelta(minutes=10)
+    )
+    
+    if response.status == LogsQueryStatus.SUCCESS and response.tables:
+        table = response.tables[0]
+        if table.rows:
+            row = table.rows[0]
+            cols = [c.name for c in table.columns]
+            data = dict(zip(cols, row))
+            return {
+                "timestamp": str(data.get("TimeGenerated")),
+                "resource": data.get("Resource"),
+                "avg_cpu_percent": data.get("avg_cpu_percent"),
+                "avg_data_io_percent": data.get("avg_data_io_percent"),
+                "max_sessions": data.get("max_sessions"),
+                "avg_workers_percent": data.get("avg_workers_percent"),
+                "max_log_write_percent": data.get("max_log_write_percent")
+            }
+    return {}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS CloudWatch for RDS PostgreSQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For RDS PostgreSQL, Enhanced Monitoring publishes OS-level metrics to CloudWatch at one-second granularity. Combined with RDS Performance Insights, you get the data density needed for meaningful AI analysis:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+from datetime import datetime, timedelta
+from typing import Optional
+
+def fetch_rds_health_snapshot(db_instance_id: str, region: str) -&gt; dict:
+    """
+    Pull current health metrics from CloudWatch and Performance Insights
+    for an RDS PostgreSQL instance.
+    """
+    cw = boto3.client('cloudwatch', region_name=region)
+    pi = boto3.client('pi', region_name=region)
+    
+    end_time = datetime.utcnow()
+    start_time = end_time - timedelta(minutes=5)
+    
+    # CloudWatch metrics
+    def get_metric_average(metric_name: str, unit: str) -&gt; Optional[float]:
+        resp = cw.get_metric_statistics(
+            Namespace='AWS/RDS',
+            MetricName=metric_name,
+            Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': db_instance_id}],
+            StartTime=start_time,
+            EndTime=end_time,
+            Period=300,
+            Statistics=['Average'],
+            Unit=unit
+        )
+        datapoints = resp.get('Datapoints', [])
+        if datapoints:
+            return datapoints[-1]['Average']
+        return None
+    
+    # Performance Insights — top wait events
+    pi_response = pi.get_resource_metrics(
+        ServiceType='RDS',
+        Identifier=f'db:{db_instance_id}',
+        MetricQueries=[
+            {
+                'Metric': 'db.load.avg',
+                'GroupBy': {'Group': 'db.wait_event', 'Limit': 5}
+            }
+        ],
+        StartTime=start_time,
+        EndTime=end_time,
+        PeriodInSeconds=300
+    )
+    
+    top_waits = []
+    for key in pi_response.get('MetricList', []):
+        for dp in key.get('DataPoints', []):
+            if dp.get('Value', 0) &gt; 0:
+                top_waits.append({
+                    "wait_event": key['Key'].get('Dimensions', {}).get('db.wait_event.name', 'unknown'),
+                    "avg_load": dp.get('Value')
+                })
+    top_waits.sort(key=lambda x: x['avg_load'], reverse=True)
+    
+    return {
+        "timestamp": end_time.isoformat(),
+        "db_instance_id": db_instance_id,
+        "cpu_utilization_pct": get_metric_average('CPUUtilization', 'Percent'),
+        "database_connections": get_metric_average('DatabaseConnections', 'Count'),
+        "read_latency_ms": (get_metric_average('ReadLatency', 'Seconds') or 0) * 1000,
+        "write_latency_ms": (get_metric_average('WriteLatency', 'Seconds') or 0) * 1000,
+        "freeable_memory_mb": (get_metric_average('FreeableMemory', 'Bytes') or 0) / (1024 * 1024),
+        "top_wait_events": top_waits[:5]
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once you have a snapshot from any of these sources — self-managed Prometheus, Azure Monitor, or CloudWatch — the downstream pipeline is identical: embed the snapshot, score it against the anomaly model, retrieve similar past incidents, generate a narrative, and deliver it to the on-call channel. The cloud-native monitoring integration is purely a data-source adapter; the AI reasoning layer is source-agnostic.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Putting It All Together: The Monitoring Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">The complete system comes together as a polling loop that runs every minute, coordinates all the components described in this chapter, and produces a continuous stream of AI-enriched incident intelligence. Here is a condensed but complete implementation that shows how all the pieces connect:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[1. Capture DB health snapshot] --> B[2. Embed + store in pgvector]
+    B --> C[3. Score against Isolation Forest model]
+    C -->|not anomalous| A
+    C -->|anomalous| D[4. Embed snapshot for similarity search]
+    D --> E[5. Retrieve similar past incidents]
+    E --> F[6. Generate AI narrative]
+    F --> G[7. Post annotation to Grafana]
+    F --> H[8. Send enriched alert to Slack/PagerDuty]
+    G --> I[On-call DBA response]
+    H --> I
+    I --> J[Post-mortem: tag incident, score narrative]
+    J -.retrain weekly.-> C</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The 60-second monitoring loop: most cycles end at step 3 with nothing anomalous; an anomaly triggers retrieval-augmented narrative generation before anything reaches a human, and resolved incidents feed back into the next retraining cycle.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
+import logging
+from dataclasses import dataclass
+from typing import Optional
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ai-db-monitor")
+
+@dataclass
+class MonitoringConfig:
+    pg_source_conn: str          # Database being monitored
+    vector_store_conn: str       # pgvector store for snapshots and incidents
+    anomaly_model_path: str
+    slack_webhook_url: str
+    grafana_url: str
+    grafana_api_key: str
+    grafana_dashboard_uid: str
+    pagerduty_routing_key: Optional[str] = None
+    poll_interval_seconds: int = 60
+
+
+def monitoring_loop(config: MonitoringConfig):
+    """
+    Main monitoring loop. Runs indefinitely, polling the database
+    every `poll_interval_seconds` and triggering AI analysis when anomalies
+    are detected.
+    """
+    annotator = GrafanaAnnotator(config.grafana_url, config.grafana_api_key)
+    llm_client = anthropic.Anthropic()
+    openai_client = OpenAI()
+    
+    logger.info("AI monitoring loop started.")
+    
+    while True:
+        loop_start = time.time()
+        
+        try:
+            # 1. Capture current database state
+            snapshot = capture_db_health_snapshot(config.pg_source_conn)
+            
+            # 2. Embed snapshot and store in vector store
+            embed_and_store_snapshot(snapshot, config.vector_store_conn)
+            
+            # 3. Score against anomaly model
+            anomaly_score, is_anomalous = score_current_state(
+                snapshot, config.anomaly_model_path
+            )
+            
+            logger.info(
+                f"Snapshot captured. Anomaly score: {anomaly_score:.3f}, "
+                f"anomalous: {is_anomalous}"
+            )
+            
+            if is_anomalous:
+                logger.warning(f"Anomaly detected! Score: {anomaly_score:.3f}")
+                
+                # 4. Generate embedding for similarity search
+                description = (
+                    f"PostgreSQL health: {snapshot['active_connections']} active "
+                    f"connections, {snapshot['lock_waits']} lock waits, "
+                    f"{snapshot['long_running_queries']} long-running queries, "
+                    f"buffer hit ratio {snapshot['buffer_hit_ratio']}%."
+                )
+                embed_response = openai_client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=description
+                )
+                current_embedding = embed_response.data[0].embedding
+                
+                # 5. Retrieve similar past incidents
+                similar_incidents = find_similar_past_incidents(
+                    current_embedding,
+                    config.vector_store_conn
+                )
+                
+                # 6. Generate AI narrative
+                narrative = generate_incident_narrative(
+                    current_snapshot=snapshot,
+                    anomaly_score=anomaly_score,
+                    recent_alerts=[],   # wire to your Prometheus Alertmanager here
+                    similar_past_incidents=similar_incidents
+                )
+                
+                # 7. Post to Grafana dashboard
+                annotation_id = annotator.post_anomaly_annotation(
+                    narrative=narrative,
+                    anomaly_score=anomaly_score,
+                    snapshot=snapshot,
+                    dashboard_uid=config.grafana_dashboard_uid
+                )
+                
+                # 8. Send enriched alert to Slack / PagerDuty
+                send_enriched_alert(
+                    narrative=narrative,
+                    snapshot=snapshot,
+                    anomaly_score=anomaly_score,
+                    slack_webhook_url=config.slack_webhook_url,
+                    pagerduty_routing_key=config.pagerduty_routing_key
+                )
+                
+                logger.info(f"Anomaly alert dispatched. Grafana annotation ID: {annotation_id}")
+        
+        except Exception as e:
+            logger.error(f"Monitoring loop error: {e}", exc_info=True)
+        
+        # Sleep for the remainder of the poll interval
+        elapsed = time.time() - loop_start
+        sleep_time = max(0, config.poll_interval_seconds - elapsed)
+        time.sleep(sleep_time)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This loop is intentionally simple — no async concurrency, no worker pools — because for a single database instance, a synchronous 60-second poll is entirely adequate. If you're monitoring hundreds of databases, you'd run this loop inside a thread pool or distribute it with a task queue like Celery, with each database getting its own monitoring task. The logic inside the loop stays identical.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operational Considerations</h3>
+
+<p class="text-gray-300 leading-relaxed">A few practical points that matter when this system moves from development into production:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LLM API latency and cost.</strong> A single narrative generation call typically returns in two to four seconds and consumes a few hundred to a couple thousand tokens, depending on the size of the context. At 60-second polling intervals with anomaly detection rates well below 1% of polling cycles, the LLM API cost for a typical environment is modest. For cost-sensitive deployments, consider routing only high-severity anomalies (score below -0.4) to the LLM and using a shorter summary prompt for medium-severity events.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model staleness.</strong> The Isolation Forest model trained on 30 days of data will drift as your workload changes — a new application release, seasonal traffic patterns, a schema migration that changes write volume. Schedule retraining at a fixed cadence (weekly works for most environments) and add a staleness check that warns if the model hasn't been retrained in more than 14 days. A model that was accurate three months ago may be generating false positives against a workload it was never trained on.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Secret management.</strong> The monitoring loop above reads API keys from environment variables. In production, pull secrets from a secrets manager (AWS Secrets Manager, Azure Key Vault, HashiCorp Vault) rather than injecting them as environment variables in process configuration files. Database connection strings are particularly sensitive — an attacker who obtains the monitoring loop's connection string has read access to your entire database health history.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Handling monitoring system failures gracefully.</strong> If the AI pipeline fails — LLM API timeout, vector store unavailable, anomaly model file corrupted — the response should be to fall back to raw metric alerting, not to silently drop the alert. Wrap the AI enrichment in a try/except that sends a plain-text alert if the enrichment fails. Monitoring the monitoring system is not optional.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Static thresholds create alert fatigue; context-aware anomaly detection reduces it.** Isolation Forest trained on your workload's history, including temporal features like hour-of-day and day-of-week, distinguishes genuinely anomalous conditions from expected traffic patterns without requiring you to manually tune thresholds for every metric.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLM-generated incident narratives compress diagnosis time.** By synthesizing alert floods, anomaly scores, and similar historical incidents into a structured narrative delivered at alert time, the AI layer hands on-call engineers a prioritized action list rather than a wall of raw numbers — shifting the cognitive burden from pattern recognition to decision execution.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Retrieval-augmented generation makes narratives organization-specific.** Storing resolved incidents as embeddings in pgvector and retrieving the most similar past events at alert time grounds LLM reasoning in your environment's actual history, not just generic database knowledge. The system becomes more accurate as your incident corpus grows.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The feedback loop is what separates a tool from a system.** Tagging health snapshots with incident IDs, capturing post-mortem root causes and resolutions, and periodically asking the LLM to analyze its own low-scored narratives creates a compounding improvement cycle that makes the monitoring system progressively more accurate without requiring manual retraining or prompt engineering on each iteration.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The AI reasoning layer is source-agnostic.** Whether your metrics come from `postgres_exporter`, Azure Monitor Logs, or AWS CloudWatch Performance Insights, the anomaly scoring, narrative generation, and alert delivery pipeline is identical. Cloud-native monitoring is just a data-source adapter; all intelligence lives in the layer above it.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">

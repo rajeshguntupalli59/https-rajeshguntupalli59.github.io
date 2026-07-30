@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 10: Intelligent Automation for DBAs — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 10: Intelligent Automation for DBAs. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -466,15 +470,757 @@ class DatabaseAnomalyDetector:
 
 <p class="text-gray-300 leading-relaxed">When the detector flags an anomaly, the responder takes over. It pulls the anomaly context, enriches it with recent slow query data, active lock chains, and autovacuum status, then asks the LLM to diagnose the situation and recommend a remediation action from a bounded action library.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def diagnose_and_remediate(anomaly_state: dict, db_context: dict,
+                            openai_api_key: str) -&gt; dict:
+    """
+    Use GPT-4 to diagnose a database anomaly and recommend
+    a bounded remediation action.
+    """
+    from openai import OpenAI
+    
+    client = OpenAI(api_key=openai_api_key)
+    
+    DIAGNOSIS_PROMPT = """
+You are a PostgreSQL database reliability engineer. An anomaly detection system has
+flagged abnormal metric patterns. Analyze the context and recommend ONE remediation
+action from the allowed action list.
+
+ALLOWED ACTIONS (respond with exactly one):
+- KILL_IDLE_TRANSACTIONS: Terminate connections idle in transaction &gt; threshold
+- CANCEL_LONG_QUERIES: Cancel queries running longer than threshold (minutes)
+- CHECKPOINT_IMMEDIATE: Issue CHECKPOINT to flush dirty buffers
+- VACUUM_TABLE: Run VACUUM on a specific table (provide schema.table)
+- ALERT_HUMAN: Escalate to on-call; situation requires human judgment
+- NO_ACTION: Anomaly is likely transient; log and monitor
+
+Respond as JSON:
+{
+  "diagnosis": "&lt;two sentence summary of likely root cause&gt;",
+  "action": "&lt;one of the allowed actions above&gt;",
+  "action_parameters": { "&lt;relevant parameters for the action&gt;" },
+  "confidence": &lt;0.0-1.0&gt;,
+  "escalate_if_unresolved_minutes": &lt;integer&gt;
+}
+"""
+    
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": DIAGNOSIS_PROMPT},
+            {"role": "user", "content": json.dumps({
+                "anomaly_state": anomaly_state,
+                "database_context": db_context
+            }, indent=2)}
+        ],
+        temperature=0.1  # Low temperature for consistent structured output
+    )
+    
+    diagnosis = json.loads(response.choices[0].message.content)
+    
+    logger.info(
+        f"Anomaly diagnosis: {diagnosis['diagnosis']} | "
+        f"Action: {diagnosis['action']} | "
+        f"Confidence: {diagnosis['confidence']}"
+    )
+    return diagnosis
+
+
+def execute_remediation(diagnosis: dict, conn, config: dict) -&gt; dict:
+    """
+    Execute the LLM-recommended remediation using a safe, bounded action executor.
+    High-confidence actions execute automatically; low-confidence ones page on-call.
+    """
+    action = diagnosis['action']
+    params = diagnosis.get('action_parameters', {})
+    confidence = diagnosis.get('confidence', 0.0)
+    
+    # Confidence gate: require high confidence for autonomous execution
+    AUTO_EXECUTE_THRESHOLD = config.get('auto_execute_confidence', 0.75)
+    
+    result = {
+        'action_attempted': action,
+        'diagnosis': diagnosis['diagnosis'],
+        'confidence': confidence,
+        'auto_executed': False,
+        'outcome': None
+    }
+    
+    if action == 'ALERT_HUMAN' or confidence &lt; AUTO_EXECUTE_THRESHOLD:
+        send_pagerduty_alert(
+            summary=f"DB anomaly requires human review: {diagnosis['diagnosis']}",
+            details=diagnosis
+        )
+        result['outcome'] = 'escalated_to_human'
+        return result
+    
+    with conn.cursor() as cur:
+        if action == 'KILL_IDLE_TRANSACTIONS':
+            threshold_minutes = params.get('idle_threshold_minutes', 10)
+            cur.execute("""
+                SELECT pg_terminate_backend(pid)
+                FROM pg_stat_activity
+                WHERE state = 'idle in transaction'
+                  AND state_change &lt; NOW() - INTERVAL '%s minutes'
+                  AND pid &lt;&gt; pg_backend_pid()
+            """, (threshold_minutes,))
+            terminated = cur.rowcount
+            result['outcome'] = f'terminated_{terminated}_idle_transactions'
+        
+        elif action == 'CANCEL_LONG_QUERIES':
+            threshold_minutes = params.get('query_threshold_minutes', 30)
+            cur.execute("""
+                SELECT pg_cancel_backend(pid)
+                FROM pg_stat_activity
+                WHERE state = 'active'
+                  AND query_start &lt; NOW() - INTERVAL '%s minutes'
+                  AND pid &lt;&gt; pg_backend_pid()
+                  AND query NOT ILIKE '%%vacuum%%'
+                  AND query NOT ILIKE '%%analyze%%'
+            """, (threshold_minutes,))
+            cancelled = cur.rowcount
+            result['outcome'] = f'cancelled_{cancelled}_long_queries'
+        
+        elif action == 'CHECKPOINT_IMMEDIATE':
+            cur.execute("CHECKPOINT")
+            result['outcome'] = 'checkpoint_issued'
+        
+        elif action == 'VACUUM_TABLE':
+            target = params.get('target_table', '')
+            if '.' in target:
+                schema, table = target.split('.', 1)
+                # Validate existence before executing
+                cur.execute("""
+                    SELECT COUNT(*) FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = %s AND c.relname = %s
+                """, (schema, table))
+                if cur.fetchone()[0] &gt; 0:
+                    cur.execute(f"VACUUM ANALYZE {schema}.{table}")
+                    result['outcome'] = f'vacuum_analyze_completed_{target}'
+                else:
+                    result['outcome'] = f'target_table_not_found_{target}'
+            else:
+                result['outcome'] = 'invalid_table_specification'
+        
+        elif action == 'NO_ACTION':
+            result['outcome'] = 'monitored_transient_anomaly'
+    
+    result['auto_executed'] = True
+    conn.commit()
+    return result</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The confidence gate at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AUTO_EXECUTE_THRESHOLD</code> is the key safety mechanism in this loop. Actions below the threshold go to PagerDuty rather than executing. You tune this threshold based on your risk tolerance — teams new to autonomous remediation often start at 0.90 and lower it over time as they build confidence in the diagnosis quality.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Enriching DB Context for Accurate LLM Diagnosis</h3>
+
+<p class="text-gray-300 leading-relaxed">The quality of LLM diagnosis is directly proportional to the quality of context you provide. A bare anomaly score is nearly useless — the model has no information to reason from. A rich context payload that includes active queries, lock chains, and autovacuum progress gives the model the same information a senior DBA would use to diagnose the situation manually.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL context collector:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Comprehensive diagnostic snapshot for LLM context building
+WITH active_queries AS (
+    SELECT
+        pid,
+        usename,
+        application_name,
+        state,
+        wait_event_type,
+        wait_event,
+        ROUND(EXTRACT(EPOCH FROM (NOW() - query_start))::numeric, 1) AS query_age_seconds,
+        LEFT(query, 200) AS query_excerpt,
+        backend_type
+    FROM pg_stat_activity
+    WHERE state != 'idle'
+      AND pid != pg_backend_pid()
+    ORDER BY query_age_seconds DESC
+    LIMIT 20
+),
+lock_chains AS (
+    SELECT
+        blocking.pid AS blocking_pid,
+        blocking.query AS blocking_query,
+        blocked.pid AS blocked_pid,
+        blocked.query AS blocked_query,
+        ROUND(EXTRACT(EPOCH FROM (NOW() - blocked.query_start))::numeric, 1) AS blocked_seconds
+    FROM pg_stat_activity blocked
+    JOIN pg_stat_activity blocking
+        ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+    LIMIT 10
+),
+vacuum_progress AS (
+    SELECT
+        relid::regclass AS table_name,
+        phase,
+        heap_blks_scanned,
+        heap_blks_total,
+        ROUND(heap_blks_scanned::numeric / NULLIF(heap_blks_total, 0) * 100, 1) AS pct_complete
+    FROM pg_stat_progress_vacuum
+),
+table_bloat_candidates AS (
+    SELECT
+        schemaname || '.' || relname AS table_name,
+        n_dead_tup,
+        ROUND(n_dead_tup::numeric / NULLIF(n_live_tup + n_dead_tup, 0) * 100, 1) AS dead_pct
+    FROM pg_stat_user_tables
+    WHERE n_dead_tup &gt; 10000
+    ORDER BY n_dead_tup DESC
+    LIMIT 5
+)
+SELECT
+    json_build_object(
+        'active_queries', (SELECT json_agg(aq) FROM active_queries aq),
+        'lock_chains', (SELECT json_agg(lc) FROM lock_chains lc),
+        'vacuum_progress', (SELECT json_agg(vp) FROM vacuum_progress vp),
+        'bloat_candidates', (SELECT json_agg(tb) FROM table_bloat_candidates tb),
+        'database_stats', (
+            SELECT json_build_object(
+                'tup_fetched', tup_fetched,
+                'tup_returned', tup_returned,
+                'conflicts', conflicts,
+                'deadlocks', deadlocks,
+                'temp_bytes', temp_bytes,
+                'blks_read', blks_read,
+                'blks_hit', blks_hit
+            )
+            FROM pg_stat_database
+            WHERE datname = current_database()
+        )
+    ) AS diagnostic_context;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Diagnostic snapshot for LLM context in SQL Server environments
+WITH active_requests AS (
+    SELECT TOP 20
+        r.session_id,
+        s.login_name,
+        s.program_name,
+        r.status,
+        r.wait_type,
+        r.wait_time / 1000.0 AS wait_seconds,
+        DATEDIFF(SECOND, r.start_time, GETUTCDATE()) AS query_age_seconds,
+        LEFT(st.text, 200) AS query_excerpt,
+        r.cpu_time,
+        r.logical_reads
+    FROM sys.dm_exec_requests r
+    JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id
+    CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) st
+    WHERE r.session_id != @@SPID
+    ORDER BY query_age_seconds DESC
+),
+blocking_chains AS (
+    SELECT TOP 10
+        r.blocking_session_id AS blocking_session,
+        LEFT(blocking_st.text, 200) AS blocking_query,
+        r.session_id AS blocked_session,
+        LEFT(blocked_st.text, 200) AS blocked_query,
+        DATEDIFF(SECOND, r.start_time, GETUTCDATE()) AS blocked_seconds
+    FROM sys.dm_exec_requests r
+    CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) blocked_st
+    JOIN sys.dm_exec_requests br ON br.session_id = r.blocking_session_id
+    CROSS APPLY sys.dm_exec_sql_text(br.sql_handle) blocking_st
+    WHERE r.blocking_session_id &gt; 0
+),
+index_maintenance_candidates AS (
+    SELECT TOP 5
+        OBJECT_SCHEMA_NAME(ips.object_id) + '.' + OBJECT_NAME(ips.object_id) AS table_name,
+        i.name AS index_name,
+        ROUND(ips.avg_fragmentation_in_percent, 1) AS fragmentation_pct,
+        ips.page_count
+    FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, 'LIMITED') ips
+    JOIN sys.indexes i ON i.object_id = ips.object_id AND i.index_id = ips.index_id
+    WHERE ips.avg_fragmentation_in_percent &gt; 30
+      AND ips.page_count &gt; 500
+    ORDER BY ips.avg_fragmentation_in_percent DESC
+)
+SELECT
+    (SELECT * FROM active_requests FOR JSON PATH) AS active_queries,
+    (SELECT * FROM blocking_chains FOR JSON PATH) AS blocking_chains,
+    (SELECT * FROM index_maintenance_candidates FOR JSON PATH) AS fragmented_indexes,
+    (
+        SELECT
+            version AS sql_server_version,
+            cpu_count,
+            physical_memory_kb / 1024 AS physical_memory_mb,
+            (SELECT SUM(signal_wait_time_ms) FROM sys.dm_os_wait_stats) AS total_signal_waits,
+            (SELECT SUM(waiting_tasks_count) FROM sys.dm_os_wait_stats WHERE wait_type NOT IN (
+                'SLEEP_TASK','BROKER_TO_FLUSH','BROKER_EVENTHANDLER','CHECKPOINT_QUEUE',
+                'DBMIRROR_EVENTS_QUEUE','SQLTRACE_BUFFER_FLUSH','CLR_AUTO_EVENT','DISPATCHER_QUEUE_SEMAPHORE'
+            )) AS meaningful_wait_tasks
+        FROM sys.dm_os_sys_info
+        FOR JSON PATH, WITHOUT_ARRAY_WRAPPER
+    ) AS instance_stats
+FOR JSON PATH, WITHOUT_ARRAY_WRAPPER;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Feed this JSON snapshot directly into the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db_context</code> parameter of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">diagnose_and_remediate</code>. A well-constructed context payload typically reduces LLM hallucination significantly — the model grounds its reasoning in the actual system state rather than constructing plausible-sounding but fictitious diagnoses.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Human-in-the-Loop Guardrails</h3>
+
+<p class="text-gray-300 leading-relaxed">Fully autonomous remediation is appropriate for a narrow class of high-confidence, reversible actions: terminating idle-in-transaction connections, cancelling runaway queries, issuing checkpoints. For anything that modifies schema, changes configuration parameters, or touches replication topology, human approval is non-negotiable.</p>
+
+<p class="text-gray-300 leading-relaxed">Building this into the remediation loop requires a structured approval workflow rather than a simple confidence threshold. The pattern that works well in production is a <strong class="text-white">staged execution model</strong>:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Stage 0 — Detect:</strong> Anomaly or maintenance need identified.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Stage 1 — Diagnose:</strong> LLM produces diagnosis and recommended action with reasoning.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Stage 2 — Gate:</strong> Action classified as auto-execute, approval-required, or escalate.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Stage 3 — Execute or Route:</strong> Auto-execute actions run immediately; approval-required actions post to a Slack channel or ticketing system with a one-click approve/reject button.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Stage 4 — Audit:</strong> Every decision — including the reasoning, the gating decision, and the outcome — is written to an immutable audit log.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import hashlib
+import time
+from enum import Enum
+
+class ActionGate(Enum):
+    AUTO_EXECUTE = "auto_execute"
+    APPROVAL_REQUIRED = "approval_required"
+    ESCALATE = "escalate"
+
+# Classification table — modify based on your risk posture
+ACTION_GATE_MAP = {
+    'KILL_IDLE_TRANSACTIONS': ActionGate.AUTO_EXECUTE,
+    'CANCEL_LONG_QUERIES': ActionGate.AUTO_EXECUTE,
+    'CHECKPOINT_IMMEDIATE': ActionGate.AUTO_EXECUTE,
+    'VACUUM_TABLE': ActionGate.AUTO_EXECUTE,
+    'NO_ACTION': ActionGate.AUTO_EXECUTE,
+    'REINDEX_TABLE': ActionGate.APPROVAL_REQUIRED,
+    'ALTER_CONFIGURATION': ActionGate.APPROVAL_REQUIRED,
+    'PROMOTE_REPLICA': ActionGate.ESCALATE,
+    'DROP_REPLICATION_SLOT': ActionGate.ESCALATE,
+    'ALERT_HUMAN': ActionGate.ESCALATE,
+}
+
+def write_audit_record(audit_conn, event_type: str, payload: dict):
+    """
+    Write an immutable audit record. Use append-only table permissions
+    or write to an external audit sink (S3, WORM storage).
+    """
+    record_hash = hashlib.sha256(
+        json.dumps(payload, sort_keys=True).encode()
+    ).hexdigest()
+    
+    with audit_conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO dba_automation_audit
+                (event_time, event_type, payload, payload_hash)
+            VALUES
+                (NOW(), %s, %s, %s)
+        """, (event_type, json.dumps(payload), record_hash))
+    audit_conn.commit()
+
+
+def post_approval_request(diagnosis: dict, action: str, slack_webhook: str) -&gt; str:
+    """
+    Post an approval request to Slack and return a unique approval token.
+    The token is checked before execution to verify human approval.
+    """
+    import requests
+    
+    approval_token = hashlib.sha256(
+        f"{action}{time.time()}".encode()
+    ).hexdigest()[:12]
+    
+    message = {
+        "blocks": [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        f"*🔴 Database Remediation Approval Required*\n"
+                        f"*Action:* `{action}`\n"
+                        f"*Diagnosis:* {diagnosis['diagnosis']}\n"
+                        f"*Confidence:* {diagnosis['confidence']:.0%}\n"
+                        f"*Approval Token:* `{approval_token}`\n\n"
+                        f"Reply with `/dba-approve {approval_token}` to authorize."
+                    )
+                }
+            }
+        ]
+    }
+    
+    requests.post(slack_webhook, json=message, timeout=5)
+    return approval_token
+
+
+def gated_remediation_pipeline(
+    anomaly_state: dict,
+    db_context: dict,
+    openai_api_key: str,
+    conn,
+    audit_conn,
+    config: dict
+) -&gt; dict:
+    """
+    Full remediation pipeline with gating, audit, and approval routing.
+    """
+    # Stage 1: Diagnose
+    diagnosis = diagnose_and_remediate(anomaly_state, db_context, openai_api_key)
+    
+    write_audit_record(audit_conn, 'diagnosis_produced', {
+        'anomaly_state': anomaly_state,
+        'diagnosis': diagnosis
+    })
+    
+    # Stage 2: Gate
+    action = diagnosis.get('action', 'ALERT_HUMAN')
+    gate = ACTION_GATE_MAP.get(action, ActionGate.ESCALATE)
+    
+    write_audit_record(audit_conn, 'gate_decision', {
+        'action': action,
+        'gate': gate.value,
+        'confidence': diagnosis.get('confidence')
+    })
+    
+    # Stage 3: Route
+    if gate == ActionGate.AUTO_EXECUTE and diagnosis.get('confidence', 0) &gt;= config.get('auto_execute_confidence', 0.75):
+        result = execute_remediation(diagnosis, conn, config)
+        result['gate'] = gate.value
+        write_audit_record(audit_conn, 'action_executed', result)
+        return result
+    
+    elif gate == ActionGate.APPROVAL_REQUIRED:
+        token = post_approval_request(
+            diagnosis, action, config['slack_webhook']
+        )
+        write_audit_record(audit_conn, 'approval_requested', {
+            'action': action,
+            'approval_token': token,
+            'diagnosis': diagnosis
+        })
+        return {
+            'outcome': 'pending_approval',
+            'approval_token': token,
+            'action': action,
+            'gate': gate.value
+        }
+    
+    else:  # ESCALATE or low confidence
+        send_pagerduty_alert(
+            summary=f"DB anomaly escalated: {diagnosis['diagnosis']}",
+            details={**diagnosis, 'anomaly_state': anomaly_state}
+        )
+        write_audit_record(audit_conn, 'escalated_to_human', diagnosis)
+        return {'outcome': 'escalated', 'gate': gate.value}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The approval token pattern deserves attention. Rather than building a full web UI for approvals, this approach uses a Slack slash command handler (a few dozen lines of Flask or FastAPI code) that listens for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/dba-approve <token></code>, validates the token against a pending approvals table, marks it approved, and triggers the execution path. Teams that adopt this workflow typically find that most approval-required actions — index rebuilds during off-hours, configuration changes — get processed within minutes because the approval friction is minimal.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Self-Healing Query Performance</h3>
+
+<p class="text-gray-300 leading-relaxed">Beyond maintenance automation, LLM-assisted automation can close a second class of operational loops: query performance degradation. When a query plan regresses after a statistics update or schema change, the traditional response is a DBA investigating, identifying the plan, and either forcing a hint or updating statistics. With an intelligent automation layer, this loop can run without human involvement for the majority of cases.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern combines two PostgreSQL capabilities: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> for tracking query performance over time, and plan hint infrastructure (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> extension or SQL Server's Query Store) for applying targeted corrections.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Detecting plan regressions in PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify queries whose mean execution time has degraded significantly
+-- compared to their 7-day historical baseline
+WITH baseline AS (
+    SELECT
+        queryid,
+        query,
+        calls,
+        mean_exec_time,
+        stddev_exec_time,
+        rows / NULLIF(calls, 0) AS avg_rows
+    FROM pg_stat_statements
+    WHERE calls &gt; 100  -- Sufficient sample size
+),
+-- In practice, compare against a snapshot table populated by your monitoring agent
+current_vs_baseline AS (
+    SELECT
+        b.queryid,
+        LEFT(b.query, 300) AS query_text,
+        b.mean_exec_time AS current_mean_ms,
+        b.stddev_exec_time,
+        b.calls,
+        -- Deviation from expected: in a real system, compare against stored baseline
+        b.mean_exec_time / NULLIF(b.stddev_exec_time, 0) AS z_score_proxy
+    FROM baseline b
+    WHERE b.mean_exec_time &gt; 500  -- Only care about queries &gt; 500ms
+)
+SELECT *
+FROM current_vs_baseline
+WHERE z_score_proxy &gt; 3  -- More than 3 standard deviations from own mean
+ORDER BY current_mean_ms DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Query Store regression detection:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify regressed queries using Query Store plan comparison
+SELECT TOP 20
+    qsq.query_id,
+    LEFT(qsqt.query_sql_text, 300) AS query_text,
+    qsp.plan_id,
+    qsp.last_force_failure_reason_desc,
+    qsrs.avg_duration / 1000.0 AS avg_duration_ms,
+    qsrs.avg_logical_io_reads,
+    qsrs.count_executions,
+    -- Compare against best historical plan for the same query
+    qsrs_best.avg_duration / 1000.0 AS best_plan_avg_duration_ms,
+    ROUND(
+        (qsrs.avg_duration - qsrs_best.avg_duration) 
+        / NULLIF(qsrs_best.avg_duration, 0) * 100, 1
+    ) AS regression_pct
+FROM sys.query_store_query qsq
+JOIN sys.query_store_query_text qsqt ON qsqt.query_text_id = qsq.query_text_id
+JOIN sys.query_store_plan qsp ON qsp.query_id = qsq.query_id
+JOIN sys.query_store_runtime_stats qsrs ON qsrs.plan_id = qsp.plan_id
+JOIN sys.query_store_runtime_stats_interval qsrsi 
+    ON qsrsi.runtime_stats_interval_id = qsrs.runtime_stats_interval_id
+-- Best historical plan for comparison
+JOIN (
+    SELECT
+        qsp2.query_id,
+        MIN(qsrs2.avg_duration) AS avg_duration
+    FROM sys.query_store_plan qsp2
+    JOIN sys.query_store_runtime_stats qsrs2 ON qsrs2.plan_id = qsp2.plan_id
+    WHERE qsrs2.count_executions &gt; 50
+    GROUP BY qsp2.query_id
+) qsrs_best ON qsrs_best.query_id = qsq.query_id
+WHERE qsrsi.start_time &gt; DATEADD(HOUR, -2, GETUTCDATE())
+  AND qsrs.count_executions &gt; 10
+  AND qsrs.avg_duration &gt; qsrs_best.avg_duration * 1.5  -- 50% regression threshold
+ORDER BY regression_pct DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When a regression is detected, the self-healing loop asks the LLM to analyze the query text and available context, then recommends one of three corrective actions: force a statistics update on the relevant tables, force a specific plan via Query Store plan forcing (SQL Server) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> (PostgreSQL), or escalate for human review if the regression pattern is ambiguous.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>QUERY_REGRESSION_PROMPT = """
+You are a database query performance expert. A query performance regression has been
+detected. Analyze the query and recommend a corrective action.
+
+ALLOWED ACTIONS:
+- UPDATE_STATISTICS: Refresh statistics on specific tables (provide table list)
+- FORCE_PLAN: Force a previously known-good plan (SQL Server Query Store only; provide plan_id)
+- ADD_INDEX_HINT: Suggest a pg_hint_plan hint to guide the planner (PostgreSQL only)
+- ESCALATE_TO_DBA: Regression requires manual investigation
+- MONITOR_ONLY: Regression is minor or likely transient
+
+Respond as JSON:
+{
+  "root_cause_hypothesis": "&lt;one sentence&gt;",
+  "action": "&lt;one of the allowed actions&gt;",
+  "action_parameters": {},
+  "confidence": &lt;0.0-1.0&gt;,
+  "explanation": "&lt;two sentence reasoning&gt;"
+}
+"""
+
+def handle_query_regression(
+    regressed_query: dict,
+    db_platform: str,  # 'postgresql' or 'sqlserver'
+    llm_client,
+    conn,
+    config: dict
+) -&gt; dict:
+    """
+    Orchestrate LLM-assisted query regression remediation.
+    """
+    context = {
+        "platform": db_platform,
+        "query_text": regressed_query['query_text'],
+        "current_avg_ms": regressed_query['avg_duration_ms'],
+        "regression_pct": regressed_query.get('regression_pct'),
+        "execution_count": regressed_query.get('count_executions'),
+        "available_actions": (
+            ["UPDATE_STATISTICS", "ADD_INDEX_HINT", "ESCALATE_TO_DBA", "MONITOR_ONLY"]
+            if db_platform == 'postgresql'
+            else ["UPDATE_STATISTICS", "FORCE_PLAN", "ESCALATE_TO_DBA", "MONITOR_ONLY"]
+        )
+    }
+    
+    response = llm_client.chat.completions.create(
+        model="gpt-4o",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": QUERY_REGRESSION_PROMPT},
+            {"role": "user", "content": json.dumps(context)}
+        ],
+        temperature=0.1
+    )
+    
+    recommendation = json.loads(response.choices[0].message.content)
+    action = recommendation['action']
+    params = recommendation.get('action_parameters', {})
+    
+    with conn.cursor() as cur:
+        if action == 'UPDATE_STATISTICS' and recommendation['confidence'] &gt;= 0.7:
+            tables = params.get('tables', [])
+            for table in tables[:5]:  # Cap to 5 tables per remediation
+                if db_platform == 'postgresql':
+                    cur.execute(f"ANALYZE {table}")
+                else:
+                    cur.execute(f"UPDATE STATISTICS {table}")
+            conn.commit()
+            return {
+                'action_taken': 'update_statistics',
+                'tables': tables,
+                'reasoning': recommendation['explanation']
+            }
+        
+        elif action == 'FORCE_PLAN' and db_platform == 'sqlserver':
+            plan_id = params.get('plan_id')
+            query_id = regressed_query.get('query_id')
+            if plan_id and query_id:
+                cur.execute(
+                    "EXEC sp_query_store_force_plan @query_id=?, @plan_id=?",
+                    (query_id, plan_id)
+                )
+                conn.commit()
+                return {
+                    'action_taken': 'force_plan',
+                    'query_id': query_id,
+                    'plan_id': plan_id,
+                    'reasoning': recommendation['explanation']
+                }
+        
+        # Default: escalate
+        return {
+            'action_taken': 'escalated',
+            'reasoning': recommendation['explanation'],
+            'confidence': recommendation['confidence']
+        }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability for Your Automation Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous systems that operate without visibility become a liability faster than manual processes do. Every automation pipeline built in this chapter requires its own observability stack, and the metrics you track for the automation layer are distinct from database metrics.</p>
+
+<p class="text-gray-300 leading-relaxed">The operational metrics your automation layer should emit:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | Description | Alert Threshold |</p>
+<p class="text-gray-300 leading-relaxed">|--------|-------------|-----------------|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.anomaly_detection.false_positive_rate</code> | Fraction of anomaly alerts that led to NO_ACTION | > 30% over 7 days |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.remediation.auto_execute_rate</code> | Fraction of diagnosed issues auto-executed vs escalated | Informational |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.remediation.resolution_rate</code> | Fraction of auto-executed actions that resolved the anomaly | < 70% triggers review |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.llm.latency_p95_ms</code> | 95th percentile LLM API response time | > 10,000 ms |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.llm.json_parse_failures</code> | Count of malformed LLM responses | > 5 in 1 hour |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.maintenance.actions_executed</code> | Count of maintenance actions completed per window | Informational |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">automation.approval.pending_duration_minutes</code> | Time between approval request and response | > 60 min triggers re-page |</p>
+
+<p class="text-gray-300 leading-relaxed">Tracking false positive rate on your anomaly detection model is especially important during initial rollout. A contamination parameter that's too aggressive produces constant noise; one that's too conservative misses real incidents. The feedback loop is: log every anomaly flag with its outcome (resolved by automation, resolved by human, or was-not-actually-anomalous), then use that labeled data to retrain the Isolation Forest with a better contamination estimate.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def log_automation_metric(metric_name: str, value: float, tags: dict, 
+                           statsd_host: str = 'localhost', statsd_port: int = 8125):
+    """
+    Emit automation metrics to StatsD/Datadog. Replace with your observability stack.
+    """
+    import statsd
+    
+    client = statsd.StatsClient(host=statsd_host, port=statsd_port)
+    tag_string = ','.join(f"{k}:{v}" for k, v in tags.items())
+    full_metric = f"{metric_name}[{tag_string}]"
+    
+    client.gauge(full_metric, value)
+
+
+def record_remediation_outcome(
+    audit_conn,
+    action_token: str,
+    outcome: str,   # 'resolved', 'unresolved', 'false_positive'
+    resolution_minutes: float
+):
+    """
+    Record the outcome of a remediation action for feedback loop retraining.
+    """
+    with audit_conn.cursor() as cur:
+        cur.execute("""
+            UPDATE dba_automation_audit
+            SET outcome = %s,
+                resolved_at = NOW(),
+                resolution_minutes = %s
+            WHERE payload-&gt;&gt;'approval_token' = %s
+               OR payload_hash = %s
+        """, (outcome, resolution_minutes, action_token, action_token))
+    audit_conn.commit()
+    
+    # Emit to metrics pipeline
+    log_automation_metric(
+        'automation.remediation.outcome',
+        1.0,
+        {'outcome': outcome, 'resolution_bucket': (
+            'fast' if resolution_minutes &lt; 5 else
+            'medium' if resolution_minutes &lt; 30 else
+            'slow'
+        )}
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Gradual Autonomy: A Rollout Strategy</h3>
+
+<p class="text-gray-300 leading-relaxed">Organizations that deploy autonomous database operations successfully share a common rollout pattern. They don't flip from manual operations to full autonomy. They move through three phases over several months, building confidence at each stage before expanding automation authority.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 1 — Shadow Mode (Weeks 1–4)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run the entire automation pipeline — detection, diagnosis, action recommendation — but do not execute any actions. Instead, log every recommendation alongside what a human DBA actually did in response to the same condition. At the end of phase 1, compare the LLM's recommendations against the human decisions. Where they agree on diagnosis and action, confidence in the automation is warranted. Where they diverge, investigate whether the LLM lacked context or whether the human DBA was over-conservative.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 2 — Auto-Execute Low-Risk Actions (Weeks 5–12)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Enable autonomous execution for the lowest-risk, fully reversible action categories: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NO_ACTION</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CANCEL_LONG_QUERIES</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM_TABLE</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CHECKPOINT_IMMEDIATE</code>. Keep <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">KILL_IDLE_TRANSACTIONS</code> on approval-required until you've validated the idle threshold configuration against your workload. Monitor false positive rates and resolution rates weekly. Retrain anomaly detection models on the feedback data from phase 1.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 3 — Expand Coverage and Tune (Months 4+)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">As confidence metrics stabilize — false positive rate below 20%, resolution rate above 80% — expand the auto-execute gate to include additional action types. Begin integrating the maintenance scheduling system, replacing fixed cron schedules with the workload-aware window selection model. At this phase, the automation is genuinely reducing DBA toil on routine operations, freeing time for architectural work.</p>
+
+<p class="text-gray-300 leading-relaxed">The governance artifact at each phase is a brief review document — not a bureaucratic gate, but a one-page record of the metrics observed, the incidents where automation performed well, and the incidents where it did not. These documents become the organizational memory that justifies expanding automation authority and protects you when an autonomous action causes an unexpected side effect.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Putting It Together: An Autonomous Operations Blueprint</h3>
+
+<p class="text-gray-300 leading-relaxed">The components built throughout this chapter compose into a coherent autonomous operations system. Here is how the pieces connect in a production deployment:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A["PostgreSQL / SQL Server<br/>pg_stat_statements, pg_stat_user_tables, DMVs"] -->|metrics scrape 60s| B["Prometheus + pg_exporter<br/>90-day retention"]
+    B -->|training data| C["Load Forecast Model<br/>GBM, retrain weekly"]
+    B -->|live query| D["Isolation Forest<br/>Anomaly Detector, retrain weekly"]
+    C -->|next window| E[Maintenance Scheduler]
+    D -->|anomaly event| F["Context Collector<br/>SQL diagnostic snapshot"]
+    E -->|maintenance queue| G["LLM Reasoning Layer<br/>Claude/GPT-4o structured JSON"]
+    F -->|enriched context| G
+    G -->|diagnosis + action| H["Gating Layer<br/>AUTO_EXECUTE / APPROVAL_REQUIRED / ESCALATE"]
+    H --> I[Parameterized Executor]
+    H --> J[Slack/Teams Approval Flow]
+    H --> K[PagerDuty Escalation]
+    J -->|approved| I
+    I --> L["Immutable Audit Log<br/>event, payload, payload_hash, outcome"]
+    L -.outcome feedback.-> C
+    L -.outcome feedback.-> D</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The full autonomous operations blueprint: every path from detection to action passes through the gating layer and terminates in an audit log whose outcomes retrain the upstream models.*</p>
+
+<p class="text-gray-300 leading-relaxed">Each box in this diagram is independently deployable and replaceable. You can swap Prometheus for Datadog, replace the GBM load forecast model with a Prophet time-series model, or substitute a different LLM without touching the gating layer or executor. That modularity is intentional — it means your automation system can evolve as your infrastructure and tooling preferences change.</p>
+
+<p class="text-gray-300 leading-relaxed">A minimal viable deployment of this system requires roughly five persistent processes: the Prometheus scraper (likely already running), the anomaly detector scoring loop (runs every five minutes), the maintenance scheduler (runs hourly), the LLM orchestrator (event-driven, triggered by detector output or scheduler output), and the audit log writer (called inline by the orchestrator). The approval handler is a small webhook endpoint that most teams deploy as a serverless function.</p>
+
+<p class="text-gray-300 leading-relaxed">The total operational surface is small enough that a team of two DBAs can own it, maintain it, and extend it — which is the point. Intelligent automation does not require a dedicated ML platform team. It requires disciplined engineering practices applied to the operational layer that already exists.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Static thresholds fail at scale because they ignore context.** Intelligent automation replaces fixed rules with a three-layer stack — detection, reasoning, and action — where the reasoning layer evaluates system state before deciding what to do and when.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LLMs function best as reasoning and routing engines, not as SQL generators.** Feed them rich, structured context snapshots and a bounded action library; parse their output into parameterized execution calls that never interpolate raw LLM text into database commands.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Confidence gating and human-in-the-loop approval are not optional features for early versions — they are the architecture.** A staged gate (auto-execute, approval-required, escalate) aligned with action risk level allows you to expand automation authority incrementally as empirical confidence grows.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Audit logging with payload hashing makes autonomous operations auditable and defensible.** Every diagnosis, gate decision, and executed action should be written to an append-only audit log with a content hash, giving you a verifiable record of what the system decided and why.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Gradual rollout through shadow mode, low-risk automation, and phased expansion is the proven path to organizational trust.** Running the full pipeline in observation mode first — comparing LLM recommendations against human decisions before any autonomous execution — builds the evidence base that justifies expanding automation authority over time.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">

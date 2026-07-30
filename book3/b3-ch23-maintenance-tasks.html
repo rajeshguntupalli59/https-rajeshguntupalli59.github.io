@@ -6,6 +6,10 @@
   <title>Chapter 23: Self-Managing Maintenance Tasks — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 23: Self-Managing Maintenance Tasks. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -344,6 +348,16 @@ ORDER BY ips.avg_fragmentation_in_percent DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Archival offload</strong>: Detach expired partitions, pg_dump/export them to cold storage, and verify integrity before dropping.</p>
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Tablespace migration</strong>: Move warm partitions to compressed or lower-cost tablespaces based on age rules.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Provision future partition<br/>3-7 days ahead] --> B[Validate constraints<br/>before period goes live]
+    B --> C[Partition ages past<br/>hot-storage window]
+    C --> D[Migrate to warm/cold<br/>tablespace]
+    D --> E[Partition ages past<br/>retention threshold]
+    E --> F[Switch out + export<br/>to cold storage]
+    F --> G[Verify row count]
+    G --> H[Drop staging table]</pre></div>
+<p class="text-gray-300 leading-relaxed">*The four partition-manager responsibilities form one continuous lifecycle per table — every stage writes to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_maintenance_log</code> so a crashed run resumes from the last unconfirmed action.*</p>
+
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> — Autonomous daily partition provisioning for a time-series table:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: provision next 7 days of partitions for an event log table
@@ -454,6 +468,351 @@ BEGIN
     -- async export job (bcp/BACPAC/Azure Blob) before DROP
     PRINT 'Partition switched to staging: ' + @staging_table;
 END</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The async export job that follows the partition switch is a separate process that reads <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_maintenance_log</code> for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PARTITION_SWITCH</code> events not yet marked <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ARCHIVED</code>, exports the staging table to cold storage (Azure Blob, S3, or NFS depending on deployment), verifies the row count against the pre-switch snapshot, and only then issues <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code>. This separation of concerns is deliberate: the partition switch itself cannot fail the main table, and the drop can be retried independently if the export job is interrupted.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tablespace migration</strong> in PostgreSQL completes the partition lifecycle. As partitions age from hot to warm to cold, the autonomous engine moves them across tablespaces defined on progressively lower-cost storage. The migration itself uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET TABLESPACE</code>, which takes an ACCESS EXCLUSIVE lock for the duration of the move — that's exactly why the autonomous engine operates on one partition at a time rather than the parent table: each move is brief and scoped, and the workload gate still governs when it's allowed to run:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: autonomous tablespace migration for aged partitions
+-- Moves partitions older than 90 days to the 'warm_storage' tablespace
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT
+            c.relname         AS partition_name,
+            n.nspname         AS schema_name,
+            t.spcname         AS current_tablespace,
+            -- Extract partition bound from pg_get_expr
+            pg_get_expr(c.relpartbound, c.oid) AS partition_bound
+        FROM pg_class c
+        JOIN pg_namespace n   ON n.oid = c.relnamespace
+        JOIN pg_tablespace t  ON t.oid = c.reltablespace
+        WHERE c.relispartition = TRUE
+          AND c.relname LIKE 'event_log_%'
+          AND t.spcname = 'pg_default'        -- still on hot storage
+          -- Date embedded in name: event_log_YYYY_MM_DD
+          AND TO_DATE(
+              SUBSTRING(c.relname FROM 'event_log_(\d{4}_\d{2}_\d{2})'),
+              'YYYY_MM_DD'
+          ) &lt; CURRENT_DATE - INTERVAL '90 days'
+    LOOP
+        EXECUTE format(
+            'ALTER TABLE %I.%I SET TABLESPACE warm_storage',
+            r.schema_name,
+            r.partition_name
+        );
+
+        INSERT INTO dba_maintenance_log
+            (action, object_name, executed_at, details)
+        VALUES
+            ('TABLESPACE_MIGRATE', r.partition_name, NOW(),
+             format('Moved from %s to warm_storage', r.current_tablespace));
+
+        RAISE NOTICE 'Migrated % to warm_storage', r.partition_name;
+    END LOOP;
+END $$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A complete partition lifecycle manager combines all four responsibilities into a single orchestration loop, typically implemented as a Python daemon with individual method calls for provision, validate, archive, and migrate. Each method is idempotent and logs every action to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_maintenance_log</code>, so a crashed run simply resumes from the last unconfirmed action on the next cycle.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.5 Log and Audit File Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Database engines generate maintenance overhead of their own: transaction log files in SQL Server, WAL segments in PostgreSQL, slow query logs, audit logs, and trace files. An autonomous maintenance engine that manages tables but ignores file-level growth creates a different class of 2 a.m. incident — disk exhaustion from an unmanaged audit log directory.</p>
+
+<p class="text-gray-300 leading-relaxed">The log management layer of the autonomous engine handles three concerns: <strong class="text-white">WAL/log retention policy enforcement</strong>, <strong class="text-white">log file rotation and compression</strong>, and <strong class="text-white">alert escalation when growth rate suggests impending exhaustion</strong>.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL WAL management</strong> is partially handled by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wal_keep_size</code> and replication slot behavior, but both can accumulate unbounded segments under specific failure conditions. An autonomous monitor checks slot lag and kills or drops slots that have grown beyond a safe threshold:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: autonomous replication slot health check
+-- Drops slots that are lagging beyond a configurable WAL retention threshold
+DO $$
+DECLARE
+    r            RECORD;
+    max_lag_gb   CONSTANT NUMERIC := 5.0;   -- configurable threshold
+BEGIN
+    FOR r IN
+        SELECT
+            slot_name,
+            slot_type,
+            active,
+            pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+                / (1024.0^3)    AS lag_gb
+        FROM pg_replication_slots
+        WHERE pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)
+              / (1024.0^3) &gt; max_lag_gb
+    LOOP
+        -- Never drop active slots autonomously — escalate instead
+        IF r.active THEN
+            INSERT INTO dba_maintenance_log
+                (action, object_name, executed_at, details)
+            VALUES
+                ('SLOT_LAG_ALERT', r.slot_name, NOW(),
+                 format('Active slot lag=%.2f GB exceeds threshold=%.2f GB',
+                        r.lag_gb, max_lag_gb));
+
+            RAISE WARNING 'Active replication slot % has %.2f GB lag — '
+                          'human review required', r.slot_name, r.lag_gb;
+        ELSE
+            -- Inactive slot with excessive lag: safe to drop
+            PERFORM pg_drop_replication_slot(r.slot_name);
+
+            INSERT INTO dba_maintenance_log
+                (action, object_name, executed_at, details)
+            VALUES
+                ('SLOT_DROPPED', r.slot_name, NOW(),
+                 format('Inactive slot dropped: lag was %.2f GB', r.lag_gb));
+
+            RAISE NOTICE 'Dropped inactive slot % (lag=%.2f GB)',
+                r.slot_name, r.lag_gb;
+        END IF;
+    END LOOP;
+END $$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server transaction log management</strong> in autonomous systems centers on ensuring log backups run frequently enough under the FULL recovery model to prevent log file expansion. The autonomous engine monitors log space usage via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_log_space_usage</code> and triggers an unscheduled log backup when used log space crosses a threshold, rather than waiting for the next scheduled backup window:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: reactive log backup trigger
+-- Fires an ad-hoc log backup when log space utilization exceeds threshold
+DECLARE @log_used_pct  FLOAT;
+DECLARE @db_name       SYSNAME = DB_NAME();
+DECLARE @backup_path   NVARCHAR(512);
+DECLARE @sql           NVARCHAR(1024);
+
+SELECT @log_used_pct =
+    used_log_space_in_percent
+FROM sys.dm_db_log_space_usage;
+
+IF @log_used_pct &gt; 70.0
+BEGIN
+    SET @backup_path =
+        N'\\backup-share\logs\'
+        + @db_name + N'_log_'
+        + FORMAT(GETUTCDATE(), N'yyyyMMdd_HHmmss')
+        + N'.bak';
+
+    SET @sql = N'BACKUP LOG ' + QUOTENAME(@db_name)
+        + N' TO DISK = ' + QUOTENAME(@backup_path, '''')
+        + N' WITH COMPRESSION, STATS = 10;';
+
+    EXEC sp_executesql @sql;
+
+    INSERT INTO dba_maintenance_log
+        (action, object_name, executed_at, details)
+    VALUES
+        ('LOG_BACKUP_REACTIVE', @db_name, GETUTCDATE(),
+         'Log used ' + CAST(ROUND(@log_used_pct, 1) AS VARCHAR)
+         + '% triggered unscheduled backup to ' + @backup_path);
+END</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Log file compression and rotation for operating-system-level logs (PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_directory</code> output, SQL Server ERRORLOG files) is handled by the Python maintenance daemon, which calls standard OS rotation utilities or implements rotation logic directly. The key autonomous behavior is that the daemon models disk consumption rate and projects time-to-full, alerting when the projection falls below a configurable horizon (for example, fewer than 48 hours to disk exhaustion at current growth rate) before the threshold is actually breached.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.6 Governance, Auditing, and the Human Override Layer</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous maintenance at production scale requires a governance layer that answers three questions at any moment: what did the system do, why did it do it, and how can a human stop it or reverse it? Without complete answers to all three, the autonomous engine is operationally dangerous — not because of what it does in normal operation, but because of what happens the first time it does something unexpected.</p>
+
+<p class="text-gray-300 leading-relaxed">The governance layer has four components: the <strong class="text-white">maintenance audit log</strong>, the <strong class="text-white">action registry with justification capture</strong>, the <strong class="text-white">circuit breaker</strong>, and the <strong class="text-white">dry-run mode</strong>.</p>
+
+<p class="text-gray-300 leading-relaxed">#### The Maintenance Audit Log</p>
+
+<p class="text-gray-300 leading-relaxed">Every autonomous action — every VACUUM FULL, every REINDEX, every partition create or drop, every autovacuum parameter change — writes a structured record to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_maintenance_log</code>. This table was referenced throughout the preceding sections; here is its complete definition:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Shared schema for both PostgreSQL and SQL Server
+-- (PostgreSQL version shown; SQL Server translation uses NVARCHAR and DATETIME2)
+
+CREATE TABLE dba_maintenance_log (
+    log_id          BIGSERIAL PRIMARY KEY,
+    action          VARCHAR(64)     NOT NULL,   -- e.g. 'VACUUM_FULL', 'REINDEX'
+    object_schema   VARCHAR(128),
+    object_name     VARCHAR(256)    NOT NULL,
+    executed_at     TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    duration_ms     INTEGER,                    -- populated on completion
+    rows_affected   BIGINT,
+    status          VARCHAR(16)     NOT NULL DEFAULT 'RUNNING',
+                                                -- RUNNING, COMPLETE, FAILED, SKIPPED
+    justification   TEXT,                       -- why the engine chose this action
+    initiated_by    VARCHAR(64)     NOT NULL DEFAULT 'autonomous_engine',
+    dry_run         BOOLEAN         NOT NULL DEFAULT FALSE,
+    details         TEXT,
+    error_message   TEXT
+);
+
+CREATE INDEX idx_maint_log_action_ts
+    ON dba_maintenance_log (action, executed_at DESC);
+
+CREATE INDEX idx_maint_log_object
+    ON dba_maintenance_log (object_name, executed_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">justification</code> column is what separates a governance-grade audit log from a simple activity log. Every action written by the autonomous engine includes a human-readable explanation of the metric values that triggered it: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"dead_tuple_pct=34.7, bloat_mb=2048, last_vacuum=6h ago, active_sessions=3"</code>. A DBA reviewing the log the next morning can reconstruct exactly what the engine observed and why it acted, without needing to query historical catalog snapshots.</p>
+
+<p class="text-gray-300 leading-relaxed">#### The Circuit Breaker</p>
+
+<p class="text-gray-300 leading-relaxed">The circuit breaker is a single-table, single-row control record that the maintenance engine checks at the start of every decision loop iteration. If the breaker is tripped — either by the engine itself in response to an anomalous condition, or by a human operator — all autonomous actions halt immediately:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: circuit breaker control table
+CREATE TABLE dba_maintenance_circuit_breaker (
+    id              INT PRIMARY KEY DEFAULT 1,
+    enabled         BOOLEAN NOT NULL DEFAULT TRUE,
+    tripped_at      TIMESTAMPTZ,
+    tripped_by      VARCHAR(128),
+    reason          TEXT,
+    CONSTRAINT single_row CHECK (id = 1)
+);
+
+INSERT INTO dba_maintenance_circuit_breaker (id, enabled)
+VALUES (1, TRUE);
+
+-- Human operator trips the breaker:
+-- UPDATE dba_maintenance_circuit_breaker
+-- SET enabled = FALSE, tripped_at = NOW(),
+--     tripped_by = 'dba_oncall', reason = 'Pre-release freeze';
+
+-- Engine checks at loop start:
+-- SELECT enabled FROM dba_maintenance_circuit_breaker WHERE id = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Python maintenance daemon checks this record before every action dispatch. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">enabled = FALSE</code>, the daemon logs a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CIRCUIT_BREAKER_HALT</code> event and sleeps until the next cycle, at which point it checks again. This means a DBA can halt all autonomous maintenance with a single UPDATE statement from any SQL client — no SSH required, no process kill needed.</p>
+
+<p class="text-gray-300 leading-relaxed">The engine also trips its own breaker under two self-protection conditions: if it detects that a previous autonomous action is still running beyond its expected duration (suggesting a lock wait or runaway operation), and if it encounters three consecutive failures on any single object (suggesting a systemic problem requiring human diagnosis).</p>
+
+<p class="text-gray-300 leading-relaxed">#### Dry-Run Mode</p>
+
+<p class="text-gray-300 leading-relaxed">Dry-run mode is the development and validation interface for the autonomous engine. When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dry_run = TRUE</code> is passed to any action method, the engine performs all analysis, writes the full justification record to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_maintenance_log</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dry_run = TRUE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'SKIPPED'</code>, but does not execute the maintenance statement. This mode is used during initial deployment to validate that the engine's decisions match operator intuitions, and during change-freeze periods when the circuit breaker would otherwise need to be tripped entirely.</p>
+
+<p class="text-gray-300 leading-relaxed">The Python dispatcher implements dry-run as a flag threaded through all action methods:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Maintenance dispatcher with dry-run and circuit breaker integration
+
+import psycopg2
+import logging
+from datetime import datetime
+
+logger = logging.getLogger("autonomous_maintenance")
+
+class MaintenanceDispatcher:
+
+    def __init__(self, dsn: str, dry_run: bool = False):
+        self.dsn     = dsn
+        self.dry_run = dry_run
+        self.conn    = psycopg2.connect(dsn)
+        self.conn.autocommit = True
+
+    def _circuit_breaker_enabled(self) -&gt; bool:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT enabled FROM dba_maintenance_circuit_breaker WHERE id = 1"
+            )
+            row = cur.fetchone()
+            return row[0] if row else False
+
+    def _log_action(self, action: str, object_name: str,
+                    justification: str, status: str = "RUNNING",
+                    duration_ms: int = None, error: str = None) -&gt; int:
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO dba_maintenance_log
+                    (action, object_name, executed_at, status,
+                     justification, initiated_by, dry_run, error_message,
+                     duration_ms)
+                VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s, %s)
+                RETURNING log_id
+            """, (action, object_name, status, justification,
+                  "autonomous_engine", self.dry_run, error, duration_ms))
+            return cur.fetchone()[0]
+
+    def _update_log(self, log_id: int, status: str,
+                    duration_ms: int = None, error: str = None):
+        with self.conn.cursor() as cur:
+            cur.execute("""
+                UPDATE dba_maintenance_log
+                SET status = %s, duration_ms = %s, error_message = %s
+                WHERE log_id = %s
+            """, (status, duration_ms, error, log_id))
+
+    def dispatch_vacuum(self, schema: str, table: str, justification: str,
+                        full: bool = False):
+        if not self._circuit_breaker_enabled():
+            logger.warning("Circuit breaker tripped — skipping VACUUM on %s.%s",
+                           schema, table)
+            return
+
+        action  = "VACUUM_FULL" if full else "VACUUM_ANALYZE"
+        stmt    = f"VACUUM {'(FULL, ANALYZE)' if full else 'ANALYZE'} {schema}.{table}"
+        log_id  = self._log_action(action, f"{schema}.{table}", justification)
+
+        if self.dry_run:
+            logger.info("[DRY RUN] Would execute: %s", stmt)
+            self._update_log(log_id, "SKIPPED")
+            return
+
+        start = datetime.utcnow()
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(stmt)
+            elapsed = int((datetime.utcnow() - start).total_seconds() * 1000)
+            self._update_log(log_id, "COMPLETE", duration_ms=elapsed)
+            logger.info("Completed %s on %s.%s in %dms",
+                        action, schema, table, elapsed)
+        except Exception as exc:
+            elapsed = int((datetime.utcnow() - start).total_seconds() * 1000)
+            self._update_log(log_id, "FAILED",
+                             duration_ms=elapsed, error=str(exc))
+            logger.error("FAILED %s on %s.%s: %s", action, schema, table, exc)
+            raise</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern — circuit breaker check, pre-action log entry, dry-run branch, execution with timing, completion update — is applied uniformly to every action type in the dispatcher. A DBA can query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_maintenance_log</code> at any time and see the full history with justifications, durations, and outcomes for every autonomous decision the engine has ever made.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Operator Dashboard Query</p>
+
+<p class="text-gray-300 leading-relaxed">The operational health of the autonomous maintenance engine is summarized by a single dashboard query that DBAs can pin to their monitoring interface:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous maintenance engine: operational summary (last 24 hours)
+SELECT
+    action,
+    status,
+    COUNT(*)                                    AS event_count,
+    AVG(duration_ms)                            AS avg_duration_ms,
+    MAX(duration_ms)                            AS max_duration_ms,
+    SUM(CASE WHEN dry_run THEN 1 ELSE 0 END)    AS dry_run_count,
+    MIN(executed_at)                            AS first_event,
+    MAX(executed_at)                            AS last_event
+FROM dba_maintenance_log
+WHERE executed_at &gt; NOW() - INTERVAL '24 hours'
+GROUP BY action, status
+ORDER BY action, status;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: autonomous maintenance engine summary
+SELECT
+    action,
+    status,
+    COUNT(*)                                         AS event_count,
+    AVG(duration_ms)                                 AS avg_duration_ms,
+    MAX(duration_ms)                                 AS max_duration_ms,
+    SUM(CASE WHEN dry_run = 1 THEN 1 ELSE 0 END)    AS dry_run_count,
+    MIN(executed_at)                                 AS first_event,
+    MAX(executed_at)                                 AS last_event
+FROM dba_maintenance_log
+WHERE executed_at &gt; DATEADD(HOUR, -24, GETUTCDATE())
+GROUP BY action, status
+ORDER BY action, status;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The circuit breaker state, the count of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FAILED</code> status events, and the presence of any <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SLOT_LAG_ALERT</code> or escalation entries in the last 24 hours are the three signals a DBA monitors for autonomous maintenance health. Everything else runs without human attention.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The maintenance decision loop** replaces static cron schedules with a continuous urgency-cost-opportunity model: maintenance fires when object degradation cost exceeds execution cost and the workload gate is open, not because a clock expired.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous VACUUM management** treats autovacuum as a fallback, not the primary mechanism — using dynamic per-table `autovacuum_vacuum_scale_factor` tuning and a workload-gated VACUUM FULL escalation path to keep PostgreSQL tables consistently clean without manual scheduling.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Index lifecycle automation** covers all three phases — creation, fragmentation remediation (REORGANIZE vs. REBUILD/REINDEX CONCURRENTLY based on fragmentation band), and staged retirement through a deferred-drop registry — eliminating index technical debt accumulation over time.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partition lifecycle management** handles provisioning, attachment validation, archival via metadata-only partition switching, and tablespace migration in a single idempotent orchestration loop, reducing multi-hour weekly DBA effort to a background process requiring no human attention during normal operation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The governance layer — audit log, justification capture, circuit breaker, and dry-run mode — is not optional scaffolding**: it is what makes autonomous maintenance safe to deploy in production, giving operators complete visibility into every decision, a single-statement halt mechanism, and a validation path for new environments before live execution begins.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

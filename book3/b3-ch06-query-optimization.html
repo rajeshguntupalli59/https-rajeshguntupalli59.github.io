@@ -6,6 +6,10 @@
   <title>Chapter 6: Autonomous Query Optimization — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 6: Autonomous Query Optimization. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -58,24 +62,11 @@ ALTER SYSTEM SET pg_stat_statements.track_io_timing = on;
 ALTER SYSTEM SET pg_stat_statements.track_planning = on;   -- PG 13+
 SELECT pg_reload_conf();
 
--- Pull the top regressing queries: last 15 min vs prior 15 min
-WITH recent AS (
-    SELECT
-        queryid,
-        query,
-        calls,
-        total_exec_time,
-        mean_exec_time,
-        stddev_exec_time,
-        rows,
-        shared_blks_hit,
-        shared_blks_read,
-        blk_read_time,
-        blk_write_time,
-        NOW() AS snapshot_ts
-    FROM pg_stat_statements
-    WHERE last_call &gt; NOW() - INTERVAL '15 minutes'
-)
+-- pg_stat_statements exposes cumulative counters, not a per-query last-executed
+-- timestamp, so it cannot answer "what regressed in the last 15 minutes" on its
+-- own. Snapshot the view on an interval and diff consecutive snapshots (see the
+-- Python exporter later in this section) to get a windowed rate. This query
+-- pulls the current cumulative ranking, which the exporter then deltas.
 SELECT
     queryid,
     LEFT(query, 120)          AS query_preview,
@@ -83,7 +74,8 @@ SELECT
     ROUND(mean_exec_time::numeric, 2)    AS mean_ms,
     ROUND(stddev_exec_time::numeric, 2)  AS stddev_ms,
     ROUND((shared_blks_read * 8192.0 / 1024 / 1024)::numeric, 2) AS io_mb
-FROM recent
+FROM pg_stat_statements
+WHERE calls &gt; 10
 ORDER BY mean_exec_time DESC
 LIMIT 50;</code></pre>
 
@@ -444,7 +436,38 @@ VALUES (
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
-<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous</h3>
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous Validation and Rollback Feedback Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">None of the remediation actions described above — plan forcing, hint injection, index creation, statistics refresh — are safe to leave unverified. An autonomous optimization system is not a fire-and-forget script; it is a closed loop that measures whether its own actions produced the intended effect, and reverses them when they did not.</p>
+
+<p class="text-gray-300 leading-relaxed">The validation pattern is consistent across action types:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Record a pre-action baseline.</strong> Before executing any change, snapshot the current <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">mean_exec_time</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">calls</code>, and I/O counters for the affected query or queries, alongside the exact action being taken and its rationale.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Apply the change.</strong> Execute the plan force, index creation, hint injection, or statistics refresh, and log it in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba_autonomous_actions</code> audit table with a unique action ID.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Observe the post-action window.</strong> Wait for a defined evaluation window (typically two to three collection intervals) to accumulate enough calls to be statistically meaningful, then re-measure the same metrics.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Compare and decide.</strong> If the post-action metrics show sustained improvement relative to the pre-action baseline, the action is marked confirmed and left in place. If the metrics are unchanged or worse, the action is automatically reverted — the index is dropped, the plan is unforced, the hint is removed, or the statistics target is rolled back — and the audit record is updated with the outcome.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Record pre-action baseline<br/>mean_exec_time, calls, I/O] --> B[Apply change<br/>plan force / index / hint / stats refresh]
+    B --> C[Observe post-action window<br/>2-3 collection intervals]
+    C --> D{Sustained improvement<br/>vs. baseline?}
+    D -->|Yes| E[Mark confirmed, leave in place]
+    D -->|No / worse| F[Auto-revert: drop index,<br/>unforce plan, remove hint, roll back stats]</pre></div>
+<p class="text-gray-300 leading-relaxed">*The autonomous validation and rollback loop applied consistently across every remediation type in this chapter.*</p>
+
+<p class="text-gray-300 leading-relaxed">This loop is what prevents an autonomous optimizer from accumulating stale or counterproductive changes over time. An index created in response to a transient reporting workload that never recurs, or a plan force that was correct at the time but has since become suboptimal as data distributions shifted, both get cleaned up automatically rather than persisting as silent technical debt that only a human audit would eventually catch.</p>
+
+<p class="text-gray-300 leading-relaxed">The evaluation window and improvement threshold are the two parameters that most determine how conservative or aggressive the loop behaves. A short window with a low improvement bar creates noisy, thrashing behavior — the system reverting and reapplying changes as normal variance crosses the threshold. A long window with a high bar makes the system slow to correct clearly bad decisions. Tuning these parameters against the specific workload's variance characteristics, rather than adopting a fixed industry default, is part of operating this system responsibly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous query optimization depends on continuous, structured telemetry — `pg_stat_statements` on PostgreSQL and Query Store on SQL Server — but neither surface alone provides a native notion of "recent" activity; PostgreSQL in particular requires external snapshot-and-diff tooling to compute windowed rates from its cumulative counters.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plan regression detection should combine statistical deviation (mean exceeding a multiple of baseline standard deviation) with a minimum call-volume threshold, so the system does not react to noise from low-frequency queries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> SQL Server's Query Store supports native plan forcing via `sp_query_store_force_plan`; PostgreSQL requires the `pg_hint_plan` extension and a hint table, since the engine has no built-in plan-pinning mechanism.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous index management must validate candidates with a hypothetical-index tool (`HypoPG` on PostgreSQL, missing-index DMVs on SQL Server) before committing to a real `CREATE INDEX`, and must track index usage over time to retire indexes that no longer serve live workloads.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Every autonomous optimization action needs a validation and rollback loop: a recorded pre-action baseline, a defined observation window, and an automatic reversal path when the action does not produce the expected improvement — without this loop, the system accumulates unverified changes as technical debt.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

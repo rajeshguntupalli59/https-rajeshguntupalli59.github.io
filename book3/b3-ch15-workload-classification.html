@@ -6,6 +6,10 @@
   <title>Chapter 15: Intelligent Workload Classification — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 15: Intelligent Workload Classification. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -40,6 +44,20 @@
 <h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 15: Intelligent Workload Classification</h2>
 
 <p class="text-gray-300 leading-relaxed">Autonomous database systems can only act intelligently when they understand *what* they're running. Query tuning, resource allocation, connection routing, and scheduling decisions all depend on knowing whether a given workload is OLTP, analytical, batch, ETL, or something in between — and that classification must happen continuously, at runtime, without human annotation. This chapter builds the full stack of intelligent workload classification: from raw signal extraction through feature engineering, model-based classification, and the downstream control loops that consume those labels to make autonomous decisions. The architecture described here runs in production today, using PostgreSQL's statistics infrastructure and SQL Server's Query Store as primary data sources, augmented by custom instrumentation and ML inference layers that operate with sub-second latency for hot decisions and background model refresh cycles for drift correction.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[pg_stat_statements /<br/>Query Store] --> B[Signal Extraction]
+    B --> C[Feature Engineering<br/>burst coef, plan instability, etc.]
+    C --> D[Classification Model<br/>LightGBM/XGBoost]
+    D --> E{Confidence >= 0.65?}
+    E -->|yes| F[Hysteresis Filter]
+    E -->|no| G[Human Review Queue]
+    F -->|stable 3 intervals| H[Routing & Resource Policy<br/>pool, timeout, work_mem]
+    D -.drift monitored.-> I[Concept Drift Detector]
+    I -->|PSI > 0.2| J[Retraining Pipeline]
+    J -.promotes new model.-> D</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The end-to-end classification loop: raw telemetry becomes feature vectors, a model assigns a workload class, a hysteresis filter prevents thrashing before routing changes are applied, and drift detection keeps the model calibrated over time.*</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -426,6 +444,661 @@ END;
 $$;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Resource Governor workload group assignment
+-- Classification function called by Resource Governor at connection time
+-- Updated dynamically based on classification service output
+
+-- Create/update the classifier function
+CREATE OR ALTER FUNCTION dbo.fn_workload_classifier()
+RETURNS SYSNAME
+WITH SCHEMABINDING
+AS
+BEGIN
+    DECLARE @workload_group SYSNAME;
+    DECLARE @app_name       NVARCHAR(256) = APP_NAME();
+    DECLARE @host_name      NVARCHAR(128) = HOST_NAME();
+    DECLARE @login_name     SYSNAME       = SUSER_SNAME();
+
+    -- Dynamic routing table updated by classification agent
+    SELECT @workload_group = resource_group_name
+    FROM dbo.workload_routing_rules
+    WHERE (app_name_pattern IS NULL OR @app_name LIKE app_name_pattern)
+      AND (login_pattern    IS NULL OR @login_name LIKE login_pattern)
+      AND is_active = 1
+    ORDER BY priority ASC;
+
+    -- Fall back to default if no rule matches
+    IF @workload_group IS NULL
+        SET @workload_group = N'WG_OLTP_MODERATE';
+
+    RETURN @workload_group;
+END;
+GO
+
+-- Supporting routing rules table (populated by classification agent)
+CREATE TABLE IF NOT EXISTS dbo.workload_routing_rules (
+    rule_id             INT IDENTITY PRIMARY KEY,
+    app_name_pattern    NVARCHAR(256) NULL,
+    login_pattern       SYSNAME       NULL,
+    resource_group_name SYSNAME       NOT NULL,
+    priority            INT           NOT NULL DEFAULT 100,
+    is_active           BIT           NOT NULL DEFAULT 1,
+    updated_at          DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+-- Resource Governor groups matching the five-class taxonomy
+ALTER RESOURCE POOL RP_OLTP
+    WITH (MIN_CPU_PERCENT = 20, MAX_CPU_PERCENT = 80,
+          MIN_MEMORY_PERCENT = 10, MAX_MEMORY_PERCENT = 40);
+
+ALTER RESOURCE POOL RP_ANALYTICAL
+    WITH (MIN_CPU_PERCENT = 0,  MAX_CPU_PERCENT = 60,
+          MIN_MEMORY_PERCENT = 20, MAX_MEMORY_PERCENT = 60);
+
+ALTER RESOURCE POOL RP_BATCH
+    WITH (MIN_CPU_PERCENT = 0,  MAX_CPU_PERCENT = 40,
+          MIN_MEMORY_PERCENT = 5,  MAX_MEMORY_PERCENT = 30);
+
+ALTER WORKLOAD GROUP WG_OLTP_POINT
+    WITH (IMPORTANCE = HIGH, REQUEST_MAX_CPU_TIME_SEC = 5,
+          REQUEST_MAX_MEMORY_GRANT_PERCENT = 5,
+          GROUP_MAX_REQUESTS = 500)
+    USING RP_OLTP;
+
+ALTER WORKLOAD GROUP WG_OLTP_MODERATE
+    WITH (IMPORTANCE = MEDIUM, REQUEST_MAX_CPU_TIME_SEC = 30,
+          REQUEST_MAX_MEMORY_GRANT_PERCENT = 10,
+          GROUP_MAX_REQUESTS = 200)
+    USING RP_OLTP;
+
+ALTER WORKLOAD GROUP WG_ANALYTICAL
+    WITH (IMPORTANCE = LOW, REQUEST_MAX_CPU_TIME_SEC = 300,
+          REQUEST_MAX_MEMORY_GRANT_PERCENT = 25,
+          GROUP_MAX_REQUESTS = 20)
+    USING RP_ANALYTICAL;
+
+ALTER WORKLOAD GROUP WG_BATCH_ETL
+    WITH (IMPORTANCE = LOW, REQUEST_MAX_CPU_TIME_SEC = 3600,
+          REQUEST_MAX_MEMORY_GRANT_PERCENT = 20,
+          GROUP_MAX_REQUESTS = 10)
+    USING RP_BATCH;
+
+ALTER RESOURCE GOVERNOR
+    WITH (CLASSIFIER_FUNCTION = dbo.fn_workload_classifier);
+
+ALTER RESOURCE GOVERNOR RECONFIGURE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key design tension here is that Resource Governor applies its classification at connection time, not at query execution time. A connection from a reporting application that also issues occasional OLTP point lookups will be assigned the ANALYTICAL group for the entire session. The mitigation is to route clients through application-layer connection proxies that maintain separate connection pools per workload class, so the Resource Governor classifier function sees clean, purpose-specific connections rather than mixed-use sessions.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dynamic Reclassification and Hysteresis</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Reclassification events — when a query pattern transitions from one workload class to another — can cause resource thrashing if acted upon immediately. A query experiencing a temporary data skew might look ANALYTICAL for a few minutes before settling back to OLTP. Acting on every reclassification signal wastes reconfiguration cycles and destabilizes steady state.</p>
+
+<p class="text-gray-300 leading-relaxed">The solution is a hysteresis filter. A reclassification is only committed to the routing table when the new classification has been stable for a configurable number of consecutive scoring intervals. The following agent implements this pattern:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
+import collections
+from dataclasses import dataclass, field
+from typing import Optional
+
+@dataclass
+class ClassificationState:
+    current_class: str
+    candidate_class: str
+    candidate_streak: int
+    last_changed: float  # epoch seconds
+
+    def should_reclassify(self, new_class: str,
+                          hysteresis_periods: int = 3) -&gt; bool:
+        """
+        Return True only when the new class has been consistently
+        observed for `hysteresis_periods` consecutive scoring intervals.
+        """
+        if new_class == self.current_class:
+            self.candidate_class = new_class
+            self.candidate_streak = 0
+            return False
+
+        if new_class == self.candidate_class:
+            self.candidate_streak += 1
+        else:
+            self.candidate_class = new_class
+            self.candidate_streak = 1
+
+        return self.candidate_streak &gt;= hysteresis_periods
+
+class ReclassificationAgent:
+    def __init__(self, classifier_url: str, pg_dsn: str,
+                 scoring_interval_sec: int = 60,
+                 hysteresis_periods: int = 3):
+        self.classifier_url  = classifier_url
+        self.pg_dsn          = pg_dsn
+        self.interval        = scoring_interval_sec
+        self.hysteresis      = hysteresis_periods
+        self.states: dict[str, ClassificationState] = {}
+
+    def run(self):
+        import requests, psycopg2
+        conn = psycopg2.connect(self.pg_dsn)
+        while True:
+            features = self._fetch_features(conn)
+            if not features:
+                time.sleep(self.interval)
+                continue
+
+            response = requests.post(
+                f"{self.classifier_url}/classify",
+                json=features,
+                timeout=10
+            )
+            classifications = response.json()
+
+            for result in classifications:
+                qid        = result['query_id']
+                new_class  = result['workload_class']
+                confidence = result['confidence']
+
+                # Skip uncertain predictions entirely
+                if confidence == 0.0:
+                    continue
+
+                if qid not in self.states:
+                    self.states[qid] = ClassificationState(
+                        current_class=new_class,
+                        candidate_class=new_class,
+                        candidate_streak=0,
+                        last_changed=time.time()
+                    )
+                    self._apply_routing(conn, qid, new_class)
+                    continue
+
+                state = self.states[qid]
+                if state.should_reclassify(new_class, self.hysteresis):
+                    old_class = state.current_class
+                    state.current_class = new_class
+                    state.candidate_streak = 0
+                    state.last_changed = time.time()
+                    self._apply_routing(conn, qid, new_class)
+                    self._emit_reclassification_event(
+                        conn, qid, old_class, new_class
+                    )
+
+            time.sleep(self.interval)
+
+    def _apply_routing(self, conn, query_id: str, workload_class: str):
+        with conn.cursor() as cur:
+            cur.execute(
+                "CALL assign_workload_resource_group(%s, %s)",
+                (int(query_id), workload_class)
+            )
+        conn.commit()
+
+    def _emit_reclassification_event(self, conn, query_id: str,
+                                     old_class: str, new_class: str):
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO workload_reclassification_log
+                    (query_id, old_class, new_class, event_time)
+                VALUES (%s, %s, %s, now())
+            """, (int(query_id), old_class, new_class))
+        conn.commit()
+
+    def _fetch_features(self, conn) -&gt; list:
+        # Fetch from Redis or directly from pg_stat_statements
+        # Returns list of {query_id, features: {...}} dicts
+        pass</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three consecutive scoring intervals — with a 60-second default interval — means a reclassification event must persist for three minutes before action is taken. This eliminates transient noise while still responding to genuine workload character changes within a few minutes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.5 Concept Drift Detection and Model Refresh</h3>
+
+<p class="text-gray-300 leading-relaxed">Workload classifiers degrade over time. Schema changes, new application releases, data volume growth, and seasonal patterns all shift the underlying feature distributions. A model trained on last quarter's telemetry may produce subtly wrong classifications on today's workload without any obvious failure signal — queries are still classified, resource policies are still applied, but the assignments are increasingly misaligned with actual behavior.</p>
+
+<p class="text-gray-300 leading-relaxed">Detecting this drift without ground-truth labels requires statistical process control applied to the model's own output distribution. Three signals are monitored continuously:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Class distribution drift</strong>: The proportion of queries assigned to each class should be stable over time. A sudden shift — say, ANALYTICAL rising from 15% to 35% without a known schema or application change — indicates either a genuine workload shift or model degradation.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Confidence distribution collapse</strong>: If the average confidence score across all classifications drops below a threshold, the model is encountering feature vectors that it has not seen before. The distribution of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_proba</code> values should be stable; a leftward shift signals drift.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Feature distribution shift</strong>: The input feature distributions themselves can be monitored using a Population Stability Index (PSI) computed between the current 7-day window and the training baseline. PSI > 0.2 on any feature is a trigger for retraining.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import numpy as np
+from scipy import stats
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class DriftReport:
+    feature_name: str
+    psi_score: float
+    ks_statistic: float
+    ks_pvalue: float
+    drift_detected: bool
+
+def compute_psi(baseline: np.ndarray, current: np.ndarray,
+                n_bins: int = 10) -&gt; float:
+    """
+    Population Stability Index.
+    PSI &lt; 0.1  : no significant drift
+    PSI 0.1–0.2: moderate drift, monitor
+    PSI &gt; 0.2  : significant drift, retrain
+    """
+    baseline = baseline[np.isfinite(baseline)]
+    current  = current[np.isfinite(current)]
+    if len(baseline) == 0 or len(current) == 0:
+        return 0.0
+
+    # Build bins from baseline distribution
+    bin_edges = np.percentile(baseline, np.linspace(0, 100, n_bins + 1))
+    bin_edges = np.unique(bin_edges)  # dedup if percentiles collapse
+    if len(bin_edges) &lt; 2:
+        return 0.0
+
+    baseline_counts, _ = np.histogram(baseline, bins=bin_edges)
+    current_counts,  _ = np.histogram(current,  bins=bin_edges)
+
+    # Avoid division by zero with Laplace smoothing
+    baseline_pct = (baseline_counts + 0.5) / (len(baseline) + 0.5 * n_bins)
+    current_pct  = (current_counts  + 0.5) / (len(current)  + 0.5 * n_bins)
+
+    psi = np.sum((current_pct - baseline_pct) * np.log(current_pct / baseline_pct))
+    return float(psi)
+
+def detect_feature_drift(baseline_features: dict[str, np.ndarray],
+                         current_features:  dict[str, np.ndarray],
+                         psi_threshold: float = 0.2) -&gt; list[DriftReport]:
+    reports = []
+    for feature_name in baseline_features:
+        if feature_name not in current_features:
+            continue
+        baseline = baseline_features[feature_name]
+        current  = current_features[feature_name]
+
+        psi = compute_psi(baseline, current)
+        ks_stat, ks_pval = stats.ks_2samp(baseline, current)
+
+        # Drift declared when PSI exceeds threshold OR KS test rejects at 1%
+        drift = psi &gt; psi_threshold or ks_pval &lt; 0.01
+
+        reports.append(DriftReport(
+            feature_name=feature_name,
+            psi_score=psi,
+            ks_statistic=ks_stat,
+            ks_pvalue=ks_pval,
+            drift_detected=drift
+        ))
+    return reports
+
+class DriftMonitor:
+    def __init__(self, redis_client, retraining_trigger_callback):
+        self.redis    = redis_client
+        self.trigger  = retraining_trigger_callback
+        self.baseline: Optional[dict[str, np.ndarray]] = None
+
+    def load_baseline(self, model_version: str):
+        """Load feature statistics captured at training time."""
+        raw = self.redis.get(f"model:baseline_features:{model_version}")
+        if raw:
+            import json
+            data = json.loads(raw)
+            self.baseline = {k: np.array(v) for k, v in data.items()}
+
+    def check(self, current_features: dict[str, np.ndarray],
+              model_version: str):
+        if self.baseline is None:
+            self.load_baseline(model_version)
+        if self.baseline is None:
+            return  # no baseline to compare against
+
+        reports = detect_feature_drift(self.baseline, current_features)
+        drifted = [r for r in reports if r.drift_detected]
+
+        if drifted:
+            # Publish drift report for observability
+            import json
+            drift_summary = {
+                r.feature_name: {'psi': r.psi_score, 'ks_p': r.ks_pvalue}
+                for r in drifted
+            }
+            self.redis.setex(
+                f"model:drift_report:{model_version}",
+                86400,
+                json.dumps(drift_summary)
+            )
+            # Fire retraining if any feature shows significant drift
+            self.trigger(reason="feature_drift", drifted_features=drifted)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Retraining Pipeline</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When drift is detected, the retraining pipeline executes in four stages:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Data extraction</strong>: Pull the last 90 days of feature vectors from the time-series store, filtered to queries with at least 50 executions for statistical reliability.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Pseudo-label generation</strong>: High-confidence predictions from the current model (confidence ≥ 0.85) on the new data become training labels. This is the semi-supervised step — it allows the model to adapt to new query patterns without requiring fresh human annotation.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Model training and validation</strong>: The new model is trained on the combined dataset (original labeled data + pseudo-labeled new data) with a held-out validation set from the most recent 14 days. The new model must exceed the current model's F1 score on the validation set by at least 0.01 before it is promoted.</p>
+
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Shadow deployment</strong>: The new model runs in parallel with the existing model for 24 hours, its classifications logged but not applied. If the classification agreement rate between old and new model drops below 80% on OLTP_POINT queries — the highest-stakes class — the deployment is halted and the divergence is flagged for human review.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import lightgbm as lgb
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import f1_score
+import joblib
+
+def retrain_classifier(
+    labeled_X: np.ndarray,
+    labeled_y: np.ndarray,
+    unlabeled_X: np.ndarray,
+    current_model: lgb.Booster,
+    pseudo_label_threshold: float = 0.85,
+    min_f1_improvement: float = 0.01
+) -&gt; Optional[lgb.Booster]:
+
+    # Stage 2: generate pseudo-labels from current model
+    if len(unlabeled_X) &gt; 0:
+        proba = current_model.predict(unlabeled_X)
+        max_proba = proba.max(axis=1)
+        pseudo_labels = proba.argmax(axis=1)
+
+        high_conf_mask = max_proba &gt;= pseudo_label_threshold
+        pseudo_X = unlabeled_X[high_conf_mask]
+        pseudo_y = pseudo_labels[high_conf_mask]
+
+        combined_X = np.vstack([labeled_X, pseudo_X])
+        combined_y = np.concatenate([labeled_y, pseudo_y])
+    else:
+        combined_X = labeled_X
+        combined_y = labeled_y
+
+    # Stage 3: train and validate
+    X_train, X_val, y_train, y_val = train_test_split(
+        combined_X, combined_y, test_size=0.2,
+        stratify=combined_y, random_state=42
+    )
+
+    params = {
+        'objective':      'multiclass',
+        'num_class':      5,
+        'learning_rate':  0.05,
+        'num_leaves':     63,
+        'min_child_samples': 30,
+        'feature_fraction':  0.8,
+        'bagging_fraction':  0.8,
+        'bagging_freq':      5,
+        'verbose':        -1
+    }
+
+    dtrain = lgb.Dataset(X_train, label=y_train)
+    dval   = lgb.Dataset(X_val,   label=y_val, reference=dtrain)
+
+    new_model = lgb.train(
+        params,
+        dtrain,
+        num_boost_round=500,
+        valid_sets=[dval],
+        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(100)]
+    )
+
+    # Evaluate both models on validation set
+    new_preds     = new_model.predict(X_val).argmax(axis=1)
+    current_preds = current_model.predict(X_val).argmax(axis=1)
+
+    new_f1     = f1_score(y_val, new_preds,     average='weighted')
+    current_f1 = f1_score(y_val, current_preds, average='weighted')
+
+    if new_f1 &lt; current_f1 + min_f1_improvement:
+        return None  # not good enough — keep existing model
+
+    return new_model</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.6 Workload Fingerprinting for Query Plan Stability</h3>
+
+<p class="text-gray-300 leading-relaxed">Classification labels serve a second purpose beyond resource allocation: they anchor query plan stability enforcement. A query classified as OLTP_POINT should never suddenly acquire a parallel plan or a hash join it did not have before — such changes are almost always regressions for this workload type. An ANALYTICAL query, conversely, should be allowed — encouraged — to use new parallel strategies as the optimizer sees them.</p>
+
+<p class="text-gray-300 leading-relaxed">This insight leads to class-specific plan enforcement policies:</p>
+
+<p class="text-gray-300 leading-relaxed">| Workload Class | Plan Enforcement Policy |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| OLTP_POINT | Freeze plan on first stable execution; force via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> or SQL Server plan guide |</p>
+<p class="text-gray-300 leading-relaxed">| OLTP_MODERATE | Soft lock: alert on plan change, auto-test new plan before promoting |</p>
+<p class="text-gray-300 leading-relaxed">| ANALYTICAL | No plan locking; allow optimizer freedom; monitor regression by execution time |</p>
+<p class="text-gray-300 leading-relaxed">| BATCH_ETL | Lock to validated plan for each ETL step; rebuild plan on schema changes |</p>
+<p class="text-gray-300 leading-relaxed">| MAINTENANCE | No plan management; use default optimizer behavior |</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Plan Fingerprinting and Stability Monitoring</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track plan stability per query class
+CREATE TABLE IF NOT EXISTS query_plan_registry (
+    query_id          BIGINT        NOT NULL,
+    workload_class    TEXT          NOT NULL,
+    plan_hash         TEXT          NOT NULL,  -- MD5 of normalized plan JSON
+    plan_json         JSONB         NOT NULL,
+    first_seen        TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    last_seen         TIMESTAMPTZ   NOT NULL DEFAULT now(),
+    execution_count   BIGINT        NOT NULL DEFAULT 1,
+    avg_exec_ms       FLOAT         NOT NULL,
+    is_locked         BOOLEAN       NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (query_id, plan_hash)
+);
+
+-- Procedure called by the classification agent when a new plan hash
+-- is observed for a locked query
+CREATE OR REPLACE PROCEDURE handle_plan_change(
+    p_query_id     BIGINT,
+    p_new_plan_hash TEXT,
+    p_new_plan_json JSONB,
+    p_avg_exec_ms   FLOAT
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_class          TEXT;
+    v_locked_plan    TEXT;
+    v_locked_exec_ms FLOAT;
+    v_regression_pct FLOAT;
+BEGIN
+    SELECT workload_class, plan_hash, avg_exec_ms
+    INTO   v_class, v_locked_plan, v_locked_exec_ms
+    FROM   query_plan_registry
+    WHERE  query_id = p_query_id
+      AND  is_locked = TRUE
+    LIMIT 1;
+
+    IF NOT FOUND THEN
+        -- No locked plan yet; record this as baseline
+        INSERT INTO query_plan_registry
+            (query_id, workload_class, plan_hash, plan_json, avg_exec_ms, is_locked)
+        SELECT p_query_id, workload_class, p_new_plan_hash,
+               p_new_plan_json, p_avg_exec_ms,
+               workload_class IN ('OLTP_POINT', 'BATCH_ETL')
+        FROM   workload_routing_map
+        WHERE  query_id = p_query_id
+        ON CONFLICT DO NOTHING;
+        RETURN;
+    END IF;
+
+    -- If plan changed on a locked class, evaluate regression
+    IF v_locked_plan &lt;&gt; p_new_plan_hash THEN
+        v_regression_pct := (p_avg_exec_ms - v_locked_exec_ms)
+                            / NULLIF(v_locked_exec_ms, 0) * 100;
+
+        INSERT INTO plan_change_alerts
+            (query_id, workload_class, old_plan_hash, new_plan_hash,
+             old_exec_ms, new_exec_ms, regression_pct, detected_at)
+        VALUES
+            (p_query_id, v_class, v_locked_plan, p_new_plan_hash,
+             v_locked_exec_ms, p_avg_exec_ms, v_regression_pct, now());
+
+        -- For OLTP_POINT: immediately flag for plan forcing
+        -- The orchestration layer will apply pg_hint_plan override
+        IF v_class = 'OLTP_POINT' AND v_regression_pct &gt; 10 THEN
+            UPDATE query_plan_registry
+            SET    last_seen = now()
+            WHERE  query_id  = p_query_id
+              AND  plan_hash = v_locked_plan;
+
+            -- Signal orchestration agent to force the locked plan
+            PERFORM pg_notify('plan_regression',
+                json_build_object(
+                    'query_id',   p_query_id,
+                    'plan_hash',  v_locked_plan,
+                    'regression', v_regression_pct
+                )::text
+            );
+        END IF;
+    END IF;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Plan Guide Automation</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create or refresh a plan guide for a regressed OLTP_POINT query
+-- Called by the autonomous agent when a plan regression is detected
+CREATE OR ALTER PROCEDURE dbo.enforce_plan_guide
+    @query_id       INT,
+    @statement_text NVARCHAR(MAX),
+    @plan_handle    VARBINARY(64)   -- handle of the known-good plan
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @guide_name NVARCHAR(256) = N'PG_AUTO_' + CAST(@query_id AS NVARCHAR);
+    DECLARE @hints      NVARCHAR(MAX);
+
+    -- Extract USE PLAN hint XML from the plan handle
+    SELECT @hints = N'OPTION (USE PLAN N'''
+                  + CAST(query_plan AS NVARCHAR(MAX))
+                  + N''')'
+    FROM sys.dm_exec_query_plan(@plan_handle);
+
+    -- Drop existing guide if present
+    IF EXISTS (SELECT 1 FROM sys.plan_guides WHERE name = @guide_name)
+        EXEC sp_control_plan_guide N'DROP', @guide_name;
+
+    -- Create new guide forcing the known-good plan
+    EXEC sp_create_plan_guide
+        @name        = @guide_name,
+        @stmt        = @statement_text,
+        @type        = N'SQL',
+        @module_or_batch = NULL,
+        @params      = NULL,
+        @hints       = @hints;
+
+    -- Record the enforcement action
+    INSERT INTO dbo.autonomous_actions_log
+        (action_type, query_id, detail, performed_at)
+    VALUES
+        ('PLAN_GUIDE_ENFORCED', @query_id,
+         N'Guide: ' + @guide_name, SYSUTCDATETIME());
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The plan guide enforcement path completes the feedback loop: the classifier identifies a query's workload class, the plan registry tracks its execution plan history, and when a regression is detected on a locked class, the autonomous agent restores the known-good plan without waiting for DBA intervention.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">15.7 Observability: Making the Classification System Legible</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous classification system that operates as a black box will not survive contact with production operations teams. DBAs and on-call engineers need to understand why a query was assigned to a particular class, what resource policy is being applied, and what recent reclassification events have occurred. Without this visibility, the system will be disabled at the first sign of unexpected behavior.</p>
+
+<p class="text-gray-300 leading-relaxed">Three observability surfaces are required:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Classification explanation table</strong> — a human-readable record of the dominant features that drove each classification decision.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE IF NOT EXISTS classification_explanations (
+    query_id          BIGINT        NOT NULL PRIMARY KEY,
+    workload_class    TEXT          NOT NULL,
+    confidence        FLOAT         NOT NULL,
+    top_features      JSONB         NOT NULL,  -- {feature: importance_contribution}
+    explanation_text  TEXT          NOT NULL,  -- natural language summary
+    classified_at     TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+
+-- Example of what an explanation record looks like
+-- (inserted by the classification agent, not generated here as a query)
+-- {
+--   "query_id": 1234567,
+--   "workload_class": "ANALYTICAL",
+--   "confidence": 0.91,
+--   "top_features": {
+--     "avg_parallelism": 0.31,
+--     "result_compression": 0.28,
+--     "avg_physical_reads": 0.19
+--   },
+--   "explanation_text": "Classified as ANALYTICAL: high parallelism (avg 6.2 workers),
+--     low result compression (0.003 rows returned per row examined),
+--     elevated physical reads (1240 pages/execution)."
+-- }</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Dashboard view: current classification state for all active queries
+CREATE OR ALTER VIEW dbo.vw_workload_classification_dashboard AS
+SELECT
+    qsq.query_id,
+    LEFT(qsqt.query_sql_text, 120)              AS query_preview,
+    wrm.workload_class,
+    wrm.target_pool,
+    wrm.statement_timeout_ms,
+    wrm.work_mem,
+    wrm.updated_at                               AS last_classified,
+    ce.confidence,
+    ce.explanation_text,
+    -- Recent performance context
+    AVG(qsrs.avg_duration / 1000.0)             AS avg_exec_ms_recent,
+    SUM(qsrs.count_executions)                  AS executions_last_hour,
+    MAX(qsrs.last_execution_time)               AS last_execution
+FROM dbo.workload_routing_map              wrm
+JOIN sys.query_store_query                 qsq  ON wrm.query_id      = qsq.query_id
+JOIN sys.query_store_query_text            qsqt ON qsq.query_text_id = qsqt.query_text_id
+JOIN sys.query_store_plan                  qspp ON qsq.query_id      = qspp.query_id
+JOIN sys.query_store_runtime_stats         qsrs ON qspp.plan_id      = qsrs.plan_id
+LEFT JOIN dbo.classification_explanations  ce   ON wrm.query_id      = ce.query_id
+WHERE qsrs.last_execution_time &gt; DATEADD(HOUR, -1, SYSUTCDATETIME())
+GROUP BY
+    qsq.query_id, qsqt.query_sql_text, wrm.workload_class,
+    wrm.target_pool, wrm.statement_timeout_ms, wrm.work_mem,
+    wrm.updated_at, ce.confidence, ce.explanation_text;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Reclassification history and audit trail</strong> — DBAs need to see the timeline of classification changes for any query and the reason each change was made. This is both an operational tool and an audit record for compliance environments where resource policy decisions must be explainable.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Reclassification history with feature deltas
+CREATE OR ALTER VIEW workload_reclassification_history AS
+SELECT
+    rl.query_id,
+    rl.old_class,
+    rl.new_class,
+    rl.event_time,
+    -- Feature snapshot at time of reclassification
+    ce_new.top_features                              AS features_at_change,
+    ce_new.confidence                                AS confidence_at_change,
+    -- Time in previous class
+    rl.event_time - LAG(rl.event_time) OVER
+        (PARTITION BY rl.query_id ORDER BY rl.event_time) AS time_in_prior_class
+FROM workload_reclassification_log rl
+LEFT JOIN classification_explanations ce_new
+    ON rl.query_id = ce_new.query_id
+ORDER BY rl.event_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The three observability layers — current classification state, feature explanations, and reclassification history — together provide the operational transparency required for DBAs to trust the autonomous system. When something unexpected occurs, the first question — "why did this query get classified as ANALYTICAL?" — has an immediate, data-backed answer in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">classification_explanations</code>. The second question — "when did that change, and what triggered it?" — is answered by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">workload_reclassification_history</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Workload classification requires behavioral fingerprints, not just resource metrics.** Features like result compression ratio, temporal burst coefficient, write amplification, and plan instability carry far more discriminative signal than raw CPU or memory consumption figures. Extracting these features from `pg_stat_statements` and Query Store requires derived computation, not direct column reads.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A five-class taxonomy — OLTP_POINT, OLTP_MODERATE, ANALYTICAL, BATCH_ETL, MAINTENANCE — is sufficient to drive all meaningful autonomous control decisions,** including connection pool routing, resource group assignment, query timeout policy, and plan stability enforcement. Finer-grained taxonomies introduce instability without corresponding control benefit.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hysteresis filtering is non-negotiable in reclassification pipelines.** Acting on every classification signal change causes resource thrashing that is more harmful than a slightly stale classification. Requiring three consecutive scoring intervals of agreement before committing a reclassification balances responsiveness against stability.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Concept drift degrades classifiers silently.** Monitoring the Population Stability Index across all input features and the confidence score distribution of model outputs provides early warning of drift before misclassifications accumulate to operational impact. Semi-supervised pseudo-labeling with a high confidence gate (≥ 0.85) allows continuous model adaptation without requiring ongoing human annotation effort.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous classification systems require layered observability to earn operational trust.** The classification decision itself, the feature contributions that drove it, and the full reclassification history for each query must all be queryable in real time. Without this transparency, operations teams will override or disable the system at the first unexpected outcome, defeating the purpose of autonomy.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

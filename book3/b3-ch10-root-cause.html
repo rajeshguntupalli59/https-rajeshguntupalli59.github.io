@@ -6,6 +6,10 @@
   <title>Chapter 10: Automated Root Cause Analysis — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 10: Automated Root Cause Analysis. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -253,6 +257,20 @@ class CausalGraphBuilder:
         )
         return candidates</code></pre>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    SC[schema_change_event] --> SS[stats_staleness]
+    SS --> PR[plan_regression]
+    PR --> QL[query_latency_spike]
+    PR --> CPU[cpu_spike]
+    AV[autovacuum_blocked] --> TB[table_bloat_increase]
+    TB --> SP[seq_scan_preference]
+    SP --> QL
+    LA[lock_acquisition_spike] --> LW[lock_wait_queue]
+    LW --> QT[query_timeout_increase]
+    WS[wal_writer_stall] --> RL[replication_lag_increase]
+    RL --> SD[standby_query_degradation]</pre></div>
+<p class="text-gray-300 leading-relaxed">*A sample slice of the causal DAG's seeded physical-dependency edges — the topology <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compute_root_causes</code> walks backward through from an observed symptom to its ranked ancestor causes.*</p>
+
 <p class="text-gray-300 leading-relaxed">This graph is rebuilt every 60 seconds during an active incident. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">compute_root_causes</code> method walks backwards from the observed symptom — say, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_latency_spike</code> — through every physical and statistical dependency edge, scoring each ancestor node by the cumulative product of edge weights along the causal path. The highest-scoring ancestor that has an observed event attached to it becomes the top root cause candidate.</p>
 
 <p class="text-gray-300 leading-relaxed">The key architectural decision is separating graph *topology* (which is pre-seeded from engine knowledge and updated slowly) from graph *node state* (which is populated in real time from live telemetry). This means the reasoning structure does not have to be re-derived during an incident — only the evidence layer changes.</p>
@@ -344,7 +362,7 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">This approach handles the common case where a failure mode is already known — it bypasses multi-layer correlation and delivers a diagnosis in one scoring pass. The causal graph is reserved for novel or compound failure modes where the signature library has no strong match.</p>
 
-<p class="text-gray-300 leading-relaxed">The signature library is self-expanding: every confirmed incident where a human DBA records the root cause is automatically converted into a new signature vector and merged into the library via a background reconciliation job. Over 6–12 months of operation, most environments reach 85–90% hit rates on known failure mode signatures, reducing median time-to-diagnosis below 90 seconds for incident types that have been seen before.</p>
+<p class="text-gray-300 leading-relaxed">The signature library is self-expanding: every confirmed incident where a human DBA records the root cause is automatically converted into a new signature vector and merged into the library via a background reconciliation job. Over enough months of operation to accumulate a meaningful incident history, the hit rate against known failure-mode signatures rises and time-to-diagnosis for previously-seen incident types drops substantially — though the actual hit rate and diagnosis latency depend heavily on incident diversity in a given environment and should be measured locally rather than assumed from a generic figure.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -352,7 +370,7 @@ ORDER BY wait_time_ms DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The causal graph and wait event fingerprinting handle the *known* failure space well. What they cannot handle is novel compound failures — situations where three events interact in a way that has never appeared in training data. This is where large language model integration provides genuine value, not as a replacement for structured analysis but as a reasoning layer over structured evidence.</p>
 
-<p class="text-gray-300 leading-relaxed">The pattern is <strong class="text-white">context injection with structured output enforcement</strong>. The ARCA pipeline constructs a detailed incident context object containing the ranked causal candidates from the graph engine, the top wait event signatures, recent configuration changes, active query plans for blocked sessions, and the relevant metric time series. This context is serialized into a structured prompt and submitted to an LLM (Claude 3.5 Sonnet and GPT-4o are both tested in production deployments). The LLM is instructed to reason over the provided evidence, propose a root cause hypothesis, and return a structured JSON response — never free text.</p>
+<p class="text-gray-300 leading-relaxed">The pattern is <strong class="text-white">context injection with structured output enforcement</strong>. The ARCA pipeline constructs a detailed incident context object containing the ranked causal candidates from the graph engine, the top wait event signatures, recent configuration changes, active query plans for blocked sessions, and the relevant metric time series. This context is serialized into a structured prompt and submitted to an LLM — a current-generation, high-capability model from a provider like Anthropic or OpenAI is suitable for this pattern. The LLM is instructed to reason over the provided evidence, propose a root cause hypothesis, and return a structured JSON response — never free text.</p>
 
 <p class="text-gray-300 leading-relaxed">The enforced output schema is:</p>
 
@@ -415,7 +433,7 @@ INCIDENT CONTEXT:
 Return ONLY valid JSON. No explanatory text before or after the JSON object."""
 
 def get_llm_diagnosis(ctx: IncidentContext,
-                      model: str = "claude-opus-4-5") -&gt; dict:
+                      model: str = "&lt;configured-model-id&gt;") -&gt; dict:  # set to your provider's current model
     client = anthropic.Anthropic()
     prompt = build_diagnosis_prompt(ctx)
 
@@ -450,7 +468,17 @@ def get_llm_diagnosis(ctx: IncidentContext,
 
     return diagnosis</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The LLM layer is not on the critical path. The causal graph and signature matching run synchronously and produce</p>
+<p class="text-gray-300 leading-relaxed">The LLM layer is not on the critical path. The causal graph and signature matching run synchronously and produce a diagnosis within the same collection interval that detected the symptom, so any autonomous low-risk action described earlier in this book can proceed without waiting on a network call to an external model. The LLM call is invoked asynchronously, alongside or immediately after the structured diagnosis, specifically for the residual class of incidents the structured methods could not confidently classify — and its output augments the on-call engineer's context rather than gating the system's fast-path response. This ordering matters: an architecture where autonomous remediation waits on an LLM response introduces both unnecessary latency and a new failure mode (a slow or unavailable model API stalling incident response) into what should be the fastest part of the system.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Root cause analysis requires modeling telemetry across at least five distinct signal layers — user-visible symptoms, database execution signals, resource signals, configuration/state signals, and external causation events — because reasoning from a single layer conflates symptoms with causes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A causal graph separates stable topology (physical dependencies seeded from engine internals knowledge) from live node state (real-time telemetry), which lets the reasoning structure persist across incidents while only the evidence changes.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Wait event fingerprinting — matching the observed distribution of wait types against a library of known failure-mode signatures — resolves previously-seen incidents in a single scoring pass and should be tried before falling back to full causal graph traversal.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> LLM-augmented diagnosis belongs off the critical path: it is valuable for novel, compound failures the structured methods can't confidently classify, but it must return schema-enforced structured output, and any action it recommends above a defined risk threshold still requires human approval.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Claims about hit rates, time-to-diagnosis improvements, or other outcome statistics for a system like this should be measured against your own incident history rather than assumed from a generic industry figure — the actual numbers vary enormously with incident diversity and signature library maturity.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

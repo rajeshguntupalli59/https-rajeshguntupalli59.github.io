@@ -6,6 +6,10 @@
   <title>Chapter 32: Graph and Vector: Combining Relationship and Semantic Search — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 32: Graph and Vector: Combining Relationship and Semantic Search. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -58,6 +62,18 @@
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Post-filter by graph, retrieve by vector.</strong> Retrieve top-k semantically similar documents, then apply graph traversal to expand, filter, or re-rank based on structural relationships. A recommendation system might retrieve 50 semantically similar items, then use the user's purchase graph to remove already-purchased items and boost items purchased by structurally similar users.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Graph-guided vector traversal.</strong> Use graph relationships to guide which regions of the vector space to explore. This is the approach taken by graph-aware RAG systems that follow citation or entity linkage graphs to gather context before embedding retrieval.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    subgraph "Pattern 1: Pre-filter by graph"
+        A1[Graph traversal:<br/>candidate entity IDs] --> A2[Vector search<br/>within candidate set]
+    end
+    subgraph "Pattern 2: Post-filter by graph"
+        B1[Vector search:<br/>top-k similar] --> B2[Graph traversal:<br/>filter / expand / re-rank]
+    end
+    subgraph "Pattern 3: Graph-guided traversal"
+        C1[Entity / citation graph] --> C2[Selects regions<br/>of vector space] --> C3[Embedding retrieval]
+    end</pre></div>
+<p class="text-gray-300 leading-relaxed">*The three ways graph structure and vector similarity combine in production retrieval systems.*</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -510,7 +526,512 @@ print(answer)</code></pre>
 <p class="text-gray-300 leading-relaxed">| <10M vectors, shallow relationships (≤2 hops) | PostgreSQL + pgvector + recursive CTEs |</p>
 <p class="text-gray-300 leading-relaxed">| <50M vectors, moderate relationship complexity | Weaviate with cross-references |</p>
 <p class="text-gray-300 leading-relaxed">| Any scale, deep graph traversal (>3 hops) | Neo4j 5.x or Amazon Neptune Analytics |</p>
-<p class="text-gray-300 leading-relaxed">| >500M vectors + complex graphs |</p>
+<p class="text-gray-300 leading-relaxed">| >500M vectors + complex graphs |Separate vector DB (Pinecone/Milvus) + graph DB (Neo4j/Neptune), application-layer orchestration |</p>
+<p class="text-gray-300 leading-relaxed">| Regulated environment, single-vendor preference | Amazon Neptune Analytics (unified) |</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Implementing the Application-Layer Orchestration Pattern</h3>
+
+<p class="text-gray-300 leading-relaxed">When you cannot fit both concerns into a single database, the application layer becomes the join engine. The pattern requires careful attention to consistency, latency, and the ordering of operations.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Application-layer orchestration: Pinecone (vector) + Neo4j (graph)
+
+from pinecone import Pinecone
+from neo4j import GraphDatabase
+from openai import OpenAI
+from dataclasses import dataclass
+from typing import Optional
+import asyncio
+
+@dataclass
+class HybridSearchResult:
+    doc_id: str
+    title: str
+    vector_score: float
+    graph_score: float
+    combined_score: float
+    graph_hops: int
+    structural_context: dict
+
+class HybridSearchOrchestrator:
+    def __init__(
+        self,
+        pinecone_api_key: str,
+        pinecone_index_name: str,
+        neo4j_uri: str,
+        neo4j_auth: tuple,
+    ):
+        self.pc = Pinecone(api_key=pinecone_api_key)
+        self.index = self.pc.Index(pinecone_index_name)
+        self.neo4j_driver = GraphDatabase.driver(neo4j_uri, auth=neo4j_auth)
+        self.openai_client = OpenAI()
+
+    def _get_embedding(self, text: str) -&gt; list[float]:
+        return self.openai_client.embeddings.create(
+            input=text,
+            model="text-embedding-3-small"
+        ).data[0].embedding
+
+    def _vector_search(
+        self,
+        embedding: list[float],
+        top_k: int = 20,
+        namespace: str = "",
+        filter_dict: Optional[dict] = None
+    ) -&gt; list[dict]:
+        """Pinecone vector search returning candidate IDs and scores."""
+        response = self.index.query(
+            vector=embedding,
+            top_k=top_k,
+            namespace=namespace,
+            filter=filter_dict,
+            include_metadata=True
+        )
+        return [
+            {
+                "doc_id": match.id,
+                "vector_score": match.score,
+                "metadata": match.metadata
+            }
+            for match in response.matches
+        ]
+
+    def _graph_score_and_expand(
+        self,
+        seed_doc_ids: list[str],
+        expansion_depth: int = 2
+    ) -&gt; dict[str, dict]:
+        """
+        For each seed document, compute a graph centrality score and
+        expand to neighboring nodes. Returns a dict keyed by doc_id.
+        """
+        cypher = """
+        UNWIND $seed_ids AS seed_id
+        MATCH (d:Document {doc_id: seed_id})
+
+        // Compute in-degree as a structural importance proxy
+        OPTIONAL MATCH (d)&lt;-[:CITES]-(citing:Document)
+        WITH d, seed_id, count(citing) AS citation_count
+
+        // Expand neighbors up to expansion_depth
+        CALL apoc.path.subgraphNodes(d, {
+            relationshipFilter: 'CITES&gt;|RELATED_TO&gt;',
+            maxLevel: $depth,
+            limit: 50
+        })
+        YIELD node AS neighbor
+
+        WITH
+            seed_id,
+            d.title AS title,
+            citation_count,
+            collect(DISTINCT {
+                doc_id: neighbor.doc_id,
+                title: neighbor.title,
+                hops: 1
+            }) AS neighbors
+
+        RETURN
+            seed_id,
+            title,
+            citation_count,
+            neighbors,
+            // Normalize citation count to [0, 1] range using log scale
+            // We use a soft normalization; tune the divisor for your corpus
+            (1.0 - exp(-citation_count / 10.0)) AS graph_score
+        """
+
+        with self.neo4j_driver.session() as session:
+            result = session.run(
+                cypher,
+                seed_ids=seed_doc_ids,
+                depth=expansion_depth
+            )
+            graph_data = {}
+            for record in result:
+                graph_data[record["seed_id"]] = {
+                    "title": record["title"],
+                    "citation_count": record["citation_count"],
+                    "graph_score": record["graph_score"],
+                    "neighbors": record["neighbors"]
+                }
+            return graph_data
+
+    def _fetch_neighbor_vectors(
+        self,
+        neighbor_ids: list[str],
+        query_embedding: list[float]
+    ) -&gt; list[dict]:
+        """Fetch vector scores for graph-expanded nodes not in original results."""
+        if not neighbor_ids:
+            return []
+
+        # Fetch by ID from Pinecone
+        fetch_response = self.index.fetch(ids=neighbor_ids)
+        neighbor_results = []
+        for doc_id, vector_data in fetch_response.vectors.items():
+            if vector_data.values:
+                # Compute cosine similarity manually
+                import numpy as np
+                qv = np.array(query_embedding)
+                dv = np.array(vector_data.values)
+                similarity = float(np.dot(qv, dv) / (np.linalg.norm(qv) * np.linalg.norm(dv)))
+                neighbor_results.append({
+                    "doc_id": doc_id,
+                    "vector_score": similarity,
+                    "metadata": vector_data.metadata or {}
+                })
+        return neighbor_results
+
+    def search(
+        self,
+        query: str,
+        top_k_vector: int = 20,
+        expansion_depth: int = 2,
+        vector_weight: float = 0.6,
+        graph_weight: float = 0.4,
+        final_top_k: int = 10
+    ) -&gt; list[HybridSearchResult]:
+        """
+        Full hybrid search:
+        1. Vector search for seed candidates
+        2. Graph scoring and expansion
+        3. Fetch vector scores for expanded nodes
+        4. Combined scoring and final ranking
+        """
+        # Step 1: Vector search
+        embedding = self._get_embedding(query)
+        vector_results = self._vector_search(embedding, top_k=top_k_vector)
+        seed_ids = [r["doc_id"] for r in vector_results]
+        vector_score_map = {r["doc_id"]: r["vector_score"] for r in vector_results}
+
+        # Step 2: Graph scoring and expansion
+        graph_data = self._graph_score_and_expand(seed_ids, expansion_depth)
+
+        # Collect all neighbor IDs not already in vector results
+        all_neighbor_ids = set()
+        for seed_id, data in graph_data.items():
+            for neighbor in data.get("neighbors", []):
+                n_id = neighbor.get("doc_id")
+                if n_id and n_id not in vector_score_map:
+                    all_neighbor_ids.add(n_id)
+
+        # Step 3: Fetch vector scores for expanded nodes
+        expanded_vector_results = self._fetch_neighbor_vectors(
+            list(all_neighbor_ids), embedding
+        )
+        for r in expanded_vector_results:
+            vector_score_map[r["doc_id"]] = r["vector_score"]
+
+        # Build graph score map from all known nodes
+        graph_score_map: dict[str, float] = {}
+        for seed_id, data in graph_data.items():
+            graph_score_map[seed_id] = data["graph_score"]
+
+        # Step 4: Combined scoring
+        all_candidate_ids = set(vector_score_map.keys())
+        results = []
+
+        for doc_id in all_candidate_ids:
+            v_score = vector_score_map.get(doc_id, 0.0)
+            g_score = graph_score_map.get(doc_id, 0.0)
+            combined = (vector_weight * v_score) + (graph_weight * g_score)
+
+            # Determine graph hops (0 = seed, 1+ = expanded)
+            hops = 0 if doc_id in {r["doc_id"] for r in vector_results} else 1
+
+            g_data = graph_data.get(doc_id, {})
+            results.append(HybridSearchResult(
+                doc_id=doc_id,
+                title=g_data.get("title", "Unknown"),
+                vector_score=v_score,
+                graph_score=g_score,
+                combined_score=combined,
+                graph_hops=hops,
+                structural_context={
+                    "citation_count": g_data.get("citation_count", 0),
+                    "neighbor_count": len(g_data.get("neighbors", []))
+                }
+            ))
+
+        results.sort(key=lambda x: x.combined_score, reverse=True)
+        return results[:final_top_k]
+
+    def close(self):
+        self.neo4j_driver.close()
+
+
+# Usage
+orchestrator = HybridSearchOrchestrator(
+    pinecone_api_key="your-key",
+    pinecone_index_name="research-docs",
+    neo4j_uri="bolt://localhost:7687",
+    neo4j_auth=("neo4j", "password")
+)
+
+results = orchestrator.search(
+    query="statin therapy and cognitive decline risk factors",
+    top_k_vector=20,
+    expansion_depth=2,
+    vector_weight=0.65,
+    graph_weight=0.35,
+    final_top_k=10
+)
+
+for r in results:
+    print(f"[{r.graph_hops} hops] {r.title}")
+    print(f"  Vector: {r.vector_score:.4f} | Graph: {r.graph_score:.4f} | Combined: {r.combined_score:.4f}")
+    print(f"  Citations: {r.structural_context['citation_count']}")
+
+orchestrator.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Two implementation details here deserve attention. First, the graph score uses a log-normalized citation count rather than raw citation count. Raw citation count creates a rich-get-richer dynamic where the most-cited papers dominate regardless of semantic relevance. The formula <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">1.0 - exp(-citation_count / 10.0)</code> maps zero citations to a graph score of 0 and asymptotically approaches 1 as citations grow, with a reasonable inflection point around 10 citations for most academic corpora. Adjust the divisor based on the citation distribution of your specific dataset.</p>
+
+<p class="text-gray-300 leading-relaxed">Second, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_fetch_neighbor_vectors</code> step introduces a latency cost: a Pinecone <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">fetch</code> call for potentially hundreds of IDs. Whether this is acceptable depends on your latency budget. If the latency budget is tight, consider capping expansion to 1 hop, limiting neighbors per seed to the top 5 by graph edge weight, or pre-materializing graph-neighbor embeddings into a secondary index.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">SQL Server Compatibility: Graph Tables and Vector Search</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server 2017 introduced native graph table support (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS NODE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE TABLE AS EDGE</code>), and SQL Server 2025 (and Azure SQL Database's preview features) added vector similarity functions. This combination allows graph-vector hybrid queries within a single SQL Server instance, following the same pattern as the PostgreSQL + pgvector approach but using T-SQL syntax.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server
+-- Graph tables combined with vector similarity search
+
+-- Node tables
+CREATE TABLE dbo.Documents (
+    doc_id      UNIQUEIDENTIFIER DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
+    title       NVARCHAR(500) NOT NULL,
+    content     NVARCHAR(MAX),
+    embedding   VARBINARY(MAX),   -- stored as binary; cast for similarity functions
+    created_at  DATETIME2 DEFAULT SYSUTCDATETIME(),
+    $node_id    -- implicit SQL Server graph node column
+) AS NODE;
+
+CREATE TABLE dbo.Authors (
+    author_id   UNIQUEIDENTIFIER DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
+    name        NVARCHAR(200),
+    institution NVARCHAR(200),
+    $node_id
+) AS NODE;
+
+-- Edge tables
+CREATE TABLE dbo.Cites (
+    citation_date   DATE,
+    $edge_id,       -- implicit edge columns
+    $from_id,
+    $to_id
+) AS EDGE;
+
+CREATE TABLE dbo.AuthoredBy (
+    $edge_id,
+    $from_id,
+    $to_id
+) AS EDGE;
+
+-- Graph-vector hybrid query using MATCH syntax (SQL Server graph)
+-- and VECTOR_DISTANCE (available in SQL Server 2025 / Azure SQL)
+
+-- Step 1: Find semantically similar documents using vector search
+-- Step 2: Use MATCH to traverse citation graph from those seeds
+-- Step 3: Re-rank by combined score
+
+DECLARE @query_embedding VARBINARY(MAX) = &lt;your_embedding_binary&gt;;
+DECLARE @hop_depth INT = 2;
+DECLARE @top_k INT = 10;
+
+WITH VectorSeeds AS (
+    SELECT TOP (@top_k)
+        doc_id,
+        title,
+        embedding,
+        VECTOR_DISTANCE('cosine', embedding, @query_embedding) AS cosine_distance
+    FROM dbo.Documents
+    ORDER BY VECTOR_DISTANCE('cosine', embedding, @query_embedding) ASC
+),
+
+-- One-hop expansion via SQL Server MATCH clause
+OneHopExpansion AS (
+    SELECT DISTINCT
+        cited.doc_id        AS expanded_doc_id,
+        seed.doc_id         AS origin_doc_id,
+        1                   AS hop_count
+    FROM VectorSeeds seed
+    JOIN dbo.Documents AS citing
+        ON seed.doc_id = citing.doc_id
+    JOIN dbo.Cites AS c
+        ON TRUE
+    JOIN dbo.Documents AS cited
+        ON TRUE
+    WHERE MATCH(citing-(c)-&gt;cited)
+),
+
+-- Two-hop expansion
+TwoHopExpansion AS (
+    SELECT DISTINCT
+        cited2.doc_id       AS expanded_doc_id,
+        one.origin_doc_id,
+        2                   AS hop_count
+    FROM OneHopExpansion one
+    JOIN dbo.Documents AS intermediate
+        ON one.expanded_doc_id = intermediate.doc_id
+    JOIN dbo.Cites AS c2
+        ON TRUE
+    JOIN dbo.Documents AS cited2
+        ON TRUE
+    WHERE MATCH(intermediate-(c2)-&gt;cited2)
+),
+
+AllCandidates AS (
+    SELECT doc_id AS candidate_id, 0 AS min_hops
+    FROM VectorSeeds
+    UNION ALL
+    SELECT expanded_doc_id, 1 FROM OneHopExpansion
+    UNION ALL
+    SELECT expanded_doc_id, 2 FROM TwoHopExpansion
+),
+
+Deduped AS (
+    SELECT candidate_id, MIN(min_hops) AS min_hops
+    FROM AllCandidates
+    GROUP BY candidate_id
+)
+
+SELECT TOP 20
+    d.doc_id,
+    d.title,
+    ROUND(1.0 - VECTOR_DISTANCE('cosine', d.embedding, @query_embedding), 4) AS semantic_score,
+    dj.min_hops                                                                AS graph_hops,
+    ROUND(
+        (1.0 - VECTOR_DISTANCE('cosine', d.embedding, @query_embedding))
+        * POWER(0.85, CAST(dj.min_hops AS FLOAT)),
+        4
+    )                                                                          AS combined_score
+FROM Deduped dj
+JOIN dbo.Documents d ON d.doc_id = dj.candidate_id
+ORDER BY combined_score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SQL Server <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">MATCH</code> clause follows the ASCII-art arrow syntax <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">(from_node-(edge)->to_node)</code>, which is unique to SQL Server's graph implementation. Unlike Cypher, it cannot express variable-length path traversal in a single clause — hence the explicit one-hop and two-hop CTE expansion above. For deeper traversal, this approach becomes repetitive. SQL Server 2022 introduced <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHORTEST_PATH</code> which handles variable-length traversal more cleanly:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2022+: Variable-length path with SHORTEST_PATH
+
+SELECT
+    source.doc_id       AS source_doc_id,
+    target.doc_id       AS target_doc_id,
+    COUNT(edge.$edge_id) AS path_length
+FROM dbo.Documents AS source,
+     dbo.Cites FOR PATH AS edge,
+     dbo.Documents FOR PATH AS target
+WHERE MATCH(SHORTEST_PATH(source(-(edge)-&gt;target)+))
+  AND source.doc_id IN (SELECT doc_id FROM VectorSeeds)
+HAVING COUNT(edge.$edge_id) &lt;= 3</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHORTEST_PATH</code> finds the minimum hop count between source and target, which is preferable to the manual CTE expansion when you want the true graph distance rather than a fixed-depth expansion.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Evaluating Hybrid Retrieval Quality</h3>
+
+<p class="text-gray-300 leading-relaxed">Adding graph traversal to a vector search pipeline should be justified by measurable retrieval quality improvement. The standard evaluation framework applies: build a test set of queries with human-labeled relevant documents, compute Precision@k and NDCG@k for pure vector search, then recompute after adding graph expansion.</p>
+
+<p class="text-gray-300 leading-relaxed">A useful heuristic to check before running a full evaluation: compute the overlap between your graph-expanded candidate set and the human-labeled relevant set. If the graph expansion surfaces relevant documents that vector search missed, the architecture is earning its complexity. If the overlap is near zero — graph expansion consistently surfaces documents that human raters do not find relevant — your graph edges may not encode the right relationships for the retrieval task.</p>
+
+<p class="text-gray-300 leading-relaxed">The graph connectivity metric from the Neo4j example earlier (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">graph_connectivity</code>) can serve as a proxy relevance signal during development. Documents with zero graph connectivity in a well-constructed knowledge graph are either orphans (data quality problem) or highly specialized documents with narrow applicability. High-connectivity documents are structurally central and tend to be more broadly relevant. Track this distribution in your test set before tuning score weights.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Offline evaluation: compare pure vector vs. graph-vector hybrid retrieval
+
+from sklearn.metrics import ndcg_score
+import numpy as np
+
+def evaluate_retrieval(
+    test_queries: list[dict],  # [{"query": str, "relevant_ids": list[str]}]
+    searcher_fn,               # callable(query) -&gt; list[str] of doc_ids
+    k: int = 10
+) -&gt; dict:
+    """
+    Compute Precision@k and NDCG@k over a labeled test set.
+
+    test_queries: list of dicts with 'query' and 'relevant_ids' keys
+    searcher_fn: function that takes a query string and returns ordered list of doc_ids
+    k: cutoff rank
+    """
+    precisions = []
+    ndcg_scores = []
+
+    for item in test_queries:
+        query = item["query"]
+        relevant = set(item["relevant_ids"])
+
+        retrieved = searcher_fn(query)[:k]
+
+        # Precision@k
+        hits = sum(1 for doc_id in retrieved if doc_id in relevant)
+        precisions.append(hits / k)
+
+        # NDCG@k: binary relevance
+        relevance_true = np.array([[1 if doc_id in relevant else 0
+                                    for doc_id in retrieved]])
+        # Ideal ranking: all relevant docs at top
+        ideal = np.array([[1] * min(len(relevant), k) +
+                          [0] * max(0, k - len(relevant))])
+        if relevance_true.sum() &gt; 0:
+            ndcg_scores.append(ndcg_score(ideal, relevance_true, k=k))
+        else:
+            ndcg_scores.append(0.0)
+
+    return {
+        f"precision_at_{k}": np.mean(precisions),
+        f"ndcg_at_{k}": np.mean(ndcg_scores),
+        "n_queries": len(test_queries)
+    }
+
+# Compare strategies
+def pure_vector_search(query: str) -&gt; list[str]:
+    # Returns doc_ids from vector-only search
+    ...
+
+def hybrid_search(query: str) -&gt; list[str]:
+    # Returns doc_ids from graph+vector hybrid search
+    ...
+
+# Load your labeled test set
+test_set = [
+    {"query": "statin drug interactions elderly", "relevant_ids": ["doc_001", "doc_045", "doc_102"]},
+    # ... more test cases
+]
+
+vector_metrics = evaluate_retrieval(test_set, pure_vector_search, k=10)
+hybrid_metrics = evaluate_retrieval(test_set, hybrid_search, k=10)
+
+print("Pure Vector Search:")
+print(f"  Precision@10: {vector_metrics['precision_at_10']:.4f}")
+print(f"  NDCG@10:      {vector_metrics['ndcg_at_10']:.4f}")
+
+print("\nGraph-Vector Hybrid Search:")
+print(f"  Precision@10: {hybrid_metrics['precision_at_10']:.4f}")
+print(f"  NDCG@10:      {hybrid_metrics['ndcg_at_10']:.4f}")
+
+improvement = (hybrid_metrics['ndcg_at_10'] - vector_metrics['ndcg_at_10']) / vector_metrics['ndcg_at_10'] * 100
+print(f"\nNDCG@10 improvement: {improvement:+.1f}%")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this evaluation before committing to the hybrid architecture. If the improvement is under a few percentage points in NDCG@10, the operational complexity of maintaining a graph database alongside your vector store is likely not justified. If you see meaningful gains — particularly on queries that require structural disambiguation — the hybrid approach is paying for itself.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Graph and vector search solve orthogonal retrieval problems.** Vector similarity finds semantically proximate content; graph traversal finds structurally related content. Many production AI applications require both, and the combination surfaces results that neither approach finds alone.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Three integration patterns cover most production needs:** pre-filter by graph then rank by vector, post-retrieve by vector then expand by graph, and graph-guided RAG where entity relationships shape what context the LLM receives. Choose the pattern based on whether structural constraints are known before or after the semantic query.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL + pgvector + recursive CTEs is a viable graph-vector stack** for shallow relationship graphs (one to two hops) and data volumes below the tens of millions. It eliminates operational complexity at the cost of expressiveness for deep traversal queries.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Native graph-vector engines (Neo4j 5.x, Weaviate, Amazon Neptune Analytics) reduce application-layer complexity** but impose scale ceilings and operational learning curves. Evaluate them when your graph queries exceed two hops or when application-layer orchestration between two separate systems creates unacceptable latency or consistency challenges.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Measure before you build.** Graph expansion should be justified by Precision@k and NDCG@k improvements on a labeled test set. If the graph structure of your data does not encode relationships that are semantically meaningful for your retrieval task, adding a graph layer adds latency and operational burden without improving answer quality.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

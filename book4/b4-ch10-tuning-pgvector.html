@@ -6,6 +6,10 @@
   <title>Chapter 10: Tuning pgvector for High-Throughput Workloads — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 10: Tuning pgvector for High-Throughput Workloads. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -472,6 +476,292 @@ auth_file = /etc/pgbouncer/userlist.txt
 log_pooler_errors = 1
 stats_period = 60</code></pre>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — using SET LOCAL to safely set ef_search per transaction
+# Works correctly with PgBouncer transaction-mode pooling
+
+import asyncpg
+import asyncio
+
+async def vector_search(
+    pool: asyncpg.Pool,
+    query_vector: list[float],
+    tenant_id: int,
+    ef_search: int = 100,
+    limit: int = 10
+) -&gt; list[dict]:
+    """
+    Thread-safe vector search that sets ef_search per transaction.
+    SET LOCAL is scoped to the transaction and safe with connection pooling.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # SET LOCAL: reverts automatically when transaction ends
+            await conn.execute(f"SET LOCAL hnsw.ef_search = {ef_search}")
+
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    content,
+                    embedding &lt;=&gt; $1::vector AS score
+                FROM embeddings
+                WHERE tenant_id = $2
+                ORDER BY score
+                LIMIT $3
+                """,
+                str(query_vector),
+                tenant_id,
+                limit
+            )
+
+    return [dict(r) for r in rows]
+
+
+async def main():
+    pool = await asyncpg.create_pool(
+        dsn="postgresql://app_user:password@pgbouncer_host:6432/vectordb",
+        min_size=5,
+        max_size=20,
+        command_timeout=10.0   # fail fast on slow vector queries
+    )
+
+    # Concurrent search simulation
+    query_vec = [0.1] * 1536  # replace with real embedding
+    tasks = [
+        vector_search(pool, query_vec, tenant_id=1, ef_search=100)
+        for _ in range(50)
+    ]
+    results = await asyncio.gather(*tasks)
+    print(f"Completed {len(results)} parallel searches")
+    await pool.close()
+
+asyncio.run(main())</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring Query Latency Under Load</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Under concurrent load, vector query latency has a different distribution than OLTP queries. The p99 can be 5–10× the median because HNSW traversal depth varies with the query vector's position in the graph. Monitor percentiles, not averages:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Requires pg_stat_statements extension
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Find slow vector queries
+SELECT
+    left(query, 80)                          AS query_preview,
+    calls,
+    round(mean_exec_time::numeric, 2)        AS avg_ms,
+    round(min_exec_time::numeric, 2)         AS min_ms,
+    round(max_exec_time::numeric, 2)         AS max_ms,
+    round(stddev_exec_time::numeric, 2)      AS stddev_ms,
+    round(total_exec_time::numeric, 2)       AS total_ms,
+    round(100.0 * total_exec_time /
+          sum(total_exec_time) OVER (), 1)   AS pct_total_time
+FROM pg_stat_statements
+WHERE query ILIKE '%&lt;=&gt;%'          -- vector distance operator
+   OR query ILIKE '%&lt;#&gt;%'         -- negative inner product
+   OR query ILIKE '%&lt;+&gt;%'         -- L1 distance
+ORDER BY total_exec_time DESC
+LIMIT 20;
+
+-- Real-time active vector queries
+SELECT
+    pid,
+    now() - pg_stat_activity.query_start AS duration,
+    state,
+    wait_event_type,
+    wait_event,
+    left(query, 120) AS query
+FROM pg_stat_activity
+WHERE query ILIKE '%&lt;=&gt;%'
+  AND state != 'idle'
+ORDER BY duration DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Recall Measurement and Regression Testing</h3>
+
+<p class="text-gray-300 leading-relaxed">Recall—the fraction of true nearest neighbors returned by the approximate index—is the metric that distinguishes a production-grade pgvector deployment from one that silently returns wrong answers. Measure it continuously as your data grows and your embedding model changes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — recall measurement harness for pgvector HNSW
+
+import psycopg2
+import numpy as np
+import time
+from typing import Any
+
+def measure_recall(
+    conn_string: str,
+    test_vectors: list[np.ndarray],
+    k: int = 10,
+    ef_search: int = 100
+) -&gt; dict[str, Any]:
+    """
+    Measures recall@k by comparing HNSW results to exact brute-force results.
+    test_vectors: list of query vectors
+    Returns: recall@k, avg latency (ms), p99 latency (ms)
+    """
+    conn = psycopg2.connect(conn_string)
+    cur = conn.cursor()
+
+    recalls = []
+    latencies = []
+
+    for qvec in test_vectors:
+        vec_str = '[' + ','.join(f'{v:.6f}' for v in qvec) + ']'
+
+        # Ground truth: exact brute-force (seqscan)
+        cur.execute("SET enable_indexscan = OFF")
+        cur.execute(
+            f"SELECT id FROM embeddings ORDER BY embedding &lt;=&gt; %s::vector LIMIT %s",
+            (vec_str, k)
+        )
+        exact_ids = set(row[0] for row in cur.fetchall())
+        cur.execute("SET enable_indexscan = ON")
+
+        # Approximate: HNSW with ef_search
+        cur.execute(f"SET hnsw.ef_search = {ef_search}")
+        start = time.perf_counter()
+        cur.execute(
+            f"SELECT id FROM embeddings ORDER BY embedding &lt;=&gt; %s::vector LIMIT %s",
+            (vec_str, k)
+        )
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        approx_ids = set(row[0] for row in cur.fetchall())
+
+        recall = len(exact_ids & approx_ids) / k
+        recalls.append(recall)
+        latencies.append(elapsed_ms)
+
+    cur.close()
+    conn.close()
+
+    latencies_arr = np.array(latencies)
+    return {
+        "recall_at_k":      round(np.mean(recalls), 4),
+        "k":                k,
+        "ef_search":        ef_search,
+        "n_queries":        len(test_vectors),
+        "avg_latency_ms":   round(np.mean(latencies_arr), 2),
+        "p50_latency_ms":   round(np.percentile(latencies_arr, 50), 2),
+        "p99_latency_ms":   round(np.percentile(latencies_arr, 99), 2),
+    }
+
+
+# Sweep ef_search values to find the recall/latency Pareto frontier
+def recall_latency_sweep(
+    conn_string: str,
+    test_vectors: list[np.ndarray],
+    ef_search_values: list[int] = [20, 40, 60, 100, 150, 200],
+    k: int = 10
+) -&gt; list[dict]:
+    results = []
+    for ef in ef_search_values:
+        result = measure_recall(conn_string, test_vectors, k=k, ef_search=ef)
+        results.append(result)
+        print(
+            f"ef_search={ef:4d} | recall={result['recall_at_k']:.4f} "
+            f"| avg={result['avg_latency_ms']:6.1f}ms "
+            f"| p99={result['p99_latency_ms']:6.1f}ms"
+        )
+    return results</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this sweep after every schema migration, embedding model change, or significant data volume increase. Plot recall vs. latency and choose the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> value that sits at the knee of the curve—typically where doubling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> yields less than 1% additional recall.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability: Exposing pgvector Metrics to Prometheus</h3>
+
+<p class="text-gray-300 leading-relaxed">Production deployments need vector-specific metrics beyond what <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> provides. The following shows how to instrument a pgvector deployment with a lightweight Prometheus exporter:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — custom Prometheus metrics for pgvector
+# Extend prometheus_postgres_exporter or run as a sidecar
+
+from prometheus_client import Gauge, Histogram, start_http_server
+import psycopg2
+import time
+
+# Define metrics
+INDEX_SIZE_BYTES = Gauge(
+    'pgvector_index_size_bytes',
+    'HNSW or IVFFlat index size in bytes',
+    ['index_name', 'table_name']
+)
+TABLE_ROW_COUNT = Gauge(
+    'pgvector_table_row_count',
+    'Approximate row count in embedding table',
+    ['table_name']
+)
+QUERY_RECALL_ESTIMATE = Gauge(
+    'pgvector_recall_estimate',
+    'Estimated recall from last recall measurement',
+    ['table_name', 'ef_search']
+)
+VECTOR_QUERY_LATENCY = Histogram(
+    'pgvector_query_latency_seconds',
+    'Latency of vector similarity queries',
+    ['table_name'],
+    buckets=[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]
+)
+
+def collect_pgvector_metrics(conn_string: str) -&gt; None:
+    conn = psycopg2.connect(conn_string)
+    cur = conn.cursor()
+
+    # Index sizes
+    cur.execute("""
+        SELECT
+            i.relname  AS index_name,
+            t.relname  AS table_name,
+            pg_relation_size(i.oid) AS index_bytes
+        FROM pg_index x
+        JOIN pg_class i ON i.oid = x.indexrelid
+        JOIN pg_class t ON t.oid = x.indrelid
+        JOIN pg_am a   ON a.oid  = i.relam
+        WHERE a.amname IN ('hnsw', 'ivfflat')
+    """)
+    for row in cur.fetchall():
+        INDEX_SIZE_BYTES.labels(
+            index_name=row[0], table_name=row[1]
+        ).set(row[2])
+
+    # Row counts (use reltuples for speed on large tables)
+    cur.execute("""
+        SELECT relname, reltuples
+        FROM pg_class
+        WHERE relname IN ('embeddings', 'embeddings_hv')
+          AND relkind = 'r'
+    """)
+    for row in cur.fetchall():
+        TABLE_ROW_COUNT.labels(table_name=row[0]).set(row[1])
+
+    cur.close()
+    conn.close()
+
+
+def metrics_loop(conn_string: str, interval_seconds: int = 30) -&gt; None:
+    start_http_server(9187)  # standard postgres_exporter port
+    while True:
+        try:
+            collect_pgvector_metrics(conn_string)
+        except Exception as e:
+            print(f"Metrics collection error: {e}")
+        time.sleep(interval_seconds)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Pair these custom metrics with standard PostgreSQL dashboards in Grafana. Set alerts on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector_index_size_bytes</code> growing more than 20% per day (indicates write amplification issues) and on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector_recall_estimate</code> dropping below your SLA threshold (typically 0.95 for RAG applications).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **IVFFlat vs. HNSW is a build-vs-query tradeoff**: IVFFlat builds faster and uses less memory but degrades in recall as data distribution drifts; HNSW maintains recall more reliably at the cost of a larger, slower-to-build index. Choose based on whether your embedding distribution is stable and how often you can afford to rebuild.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parallel HNSW builds are a force multiplier**: Setting `max_parallel_maintenance_workers` before `CREATE INDEX` can reduce build time by 4–8× on multi-core hardware. This is the single highest-ROI configuration change for large-scale deployments.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Bulk load outside the index**: Dropping the HNSW index before mass insertion and rebuilding afterward is dramatically faster than inserting through a live index—often 10–50× faster for batches over 100K rows. Use `COPY` instead of `INSERT` for the data load itself.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid filtering requires architectural choices**: PostgreSQL's planner cannot pre-filter inside HNSW traversal. Use partial indexes for small tenant counts, table partitioning for larger ones, or application-layer oversampling with post-filter when filter predicates are dynamic and unpredictable.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Recall degrades silently without measurement**: Index parameter changes, data volume growth, and embedding model updates all affect recall without raising errors. Build a continuous recall measurement harness and treat recall regression the same way you treat a test suite failure—as a deployment blocker until investigated.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

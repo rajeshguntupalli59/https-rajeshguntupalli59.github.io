@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 21: Advanced Architecture Patterns — The DBA Handbook</title>
   <meta name="description" content="The DBA Handbook Chapter 21: Advanced Architecture Patterns. PostgreSQL and SQL Server — a practical DBA guide by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -19,8 +23,8 @@
       <div class="flex items-center gap-1 text-xs">
         <a href="../index.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Home</a>
         <a href="../products.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Products</a>
-        <a href="../book.html"     class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Book</a>
-        <a href="index.html"       class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Chapters</a>
+        <a href="../book.html"      class="px-3 py-1.5 text-white bg-gray-800 rounded-md">Books</a>
+        <a href="index.html"        class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Chapters</a>
         <a href="../blog/index.html" class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">Blog</a>
         <a href="../about.html"    class="px-3 py-1.5 text-gray-400 hover:text-white hover:bg-gray-800/60 rounded-md transition">About</a>
         <a href="../products.html"
@@ -298,6 +302,23 @@ ORDER BY __$seqval;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The practical middle ground most production systems land on is <strong class="text-white">active-passive with fast failover and read-local routing</strong>. Writes always go to the primary region. Reads are served from the nearest replica. Replication is synchronous (or semi-synchronous) to at least one replica to bound data loss in a failover. This balances consistency, availability, and operational complexity reasonably well.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    subgraph RegionA["Primary Region"]
+        Primary[("Primary\naccepts all writes")]
+    end
+    subgraph RegionB["Secondary Region (sync)"]
+        SyncStandby[("Sync Standby\nzero-RPO failover target")]
+    end
+    subgraph RegionC["Tertiary Region (async)"]
+        AsyncStandby[("Async Standby\nDR / read-local")]
+    end
+    Primary -->|"synchronous replication"| SyncStandby
+    Primary -->|"asynchronous replication"| AsyncStandby
+    UsersA["Users near Region A/B"] --> Primary
+    UsersC["Users near Region C"] -->|local reads| AsyncStandby</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Figure: Active-passive multi-region topology — synchronous replication to a nearby region bounds data loss on failover, while an asynchronous replica serves local reads and disaster recovery further away.*</p>
+
 <p class="text-gray-300 leading-relaxed">A topic that becomes urgent at multi-region scale is connection management. Connections to a database carry state — open transactions, session settings, prepared statements. When a failover occurs, those connections become invalid. Applications must handle connection pool invalidation and reconnection gracefully. PgBouncer in front of PostgreSQL and SQL Server's transparent network name (via Windows Server Failover Clustering or the AG listener) both abstract the connection endpoint so applications don't need to know which server is currently primary.</p>
 
 <p class="text-gray-300 leading-relaxed">Monitoring in multi-region setups requires watching replication lag from multiple vantage points. A replica that's 5 seconds behind the primary is fine under normal load. A replica that's 5 minutes behind because network conditions degraded undetected is a problem you want to know about before a failover forces you to discover it.</p>
@@ -385,16 +406,148 @@ ORDER BY ag.name, ar.replica_server_name;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Designing for Observability: Metrics, Tracing, and the Feedback Loop</h3>
 
-<p class="text-gray-300 leading-relaxed">Architecture isn't complete at design time — it evolves as you learn how it actually behaves under real load. Observability is what gives you that learning loop. A system</p>
+<p class="text-gray-300 leading-relaxed">Architecture isn't complete at design time — it evolves as you learn how it actually behaves under real load. Observability is what gives you that learning loop. A system you can't observe is a system you can't improve, and architecture decisions made without feedback from production tend to calcify into technical debt.</p>
+
+<p class="text-gray-300 leading-relaxed">Database observability has three layers that work together:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Metrics</strong> tell you what's happening numerically over time. Connection count, cache hit rate, transaction throughput, replication lag, lock wait time, I/O utilization — these are time-series numbers you collect on a fixed interval and chart or alert against. Prometheus with postgres_exporter is the standard open-source stack for PostgreSQL metrics. SQL Server ships with its own DMV-based metrics infrastructure that integrates naturally with SQL Server Management Studio, Azure Monitor, and third-party tools like Datadog or SolarWinds.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Logs</strong> tell you what happened in narrative form. Slow query logs, error logs, connection logs, autovacuum logs — these are discrete events with context you can query after the fact. Structured logging (JSON output rather than free-form text) makes logs far more useful because they become queryable data rather than strings to grep through.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Traces</strong> tell you how a request moved through your system. A distributed trace follows a single request from the application through the connection pool through the database query and back, with timing at each hop. This is where you find latency problems that don't show up in aggregate metrics — a query that's fast on average but occasionally spikes because it's waiting for a lock, or a request that's slow because it's making 200 individual database roundtrips instead of one well-constructed query.</p>
+
+<p class="text-gray-300 leading-relaxed">Wiring these three layers together creates an actionable observability stack. When an alert fires on a metrics threshold (average query latency exceeded 100ms for 5 minutes), you pivot to logs to identify the slow queries responsible, then use traces to understand which application paths are generating those queries and why.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Enable pg_stat_statements for query-level metrics
+-- (requires adding pg_stat_statements to shared_preload_libraries in postgresql.conf)
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Top 20 queries by total execution time since last reset
+SELECT
+    LEFT(query, 100)                        AS query_preview,
+    calls,
+    ROUND(total_exec_time::NUMERIC, 2)      AS total_ms,
+    ROUND(mean_exec_time::NUMERIC, 2)       AS mean_ms,
+    ROUND(stddev_exec_time::NUMERIC, 2)     AS stddev_ms,
+    ROUND(min_exec_time::NUMERIC, 2)        AS min_ms,
+    ROUND(max_exec_time::NUMERIC, 2)        AS max_ms,
+    rows,
+    ROUND(100.0 * shared_blks_hit /
+        NULLIF(shared_blks_hit + shared_blks_read, 0), 2) AS cache_hit_pct
+FROM pg_stat_statements
+WHERE calls &gt; 10
+ORDER BY total_exec_time DESC
+LIMIT 20;
+
+-- Identify queries with high variance (occasional spikes)
+SELECT
+    LEFT(query, 100)                        AS query_preview,
+    calls,
+    ROUND(mean_exec_time::NUMERIC, 2)       AS mean_ms,
+    ROUND(stddev_exec_time::NUMERIC, 2)     AS stddev_ms,
+    ROUND(max_exec_time::NUMERIC, 2)        AS max_ms,
+    ROUND(stddev_exec_time / NULLIF(mean_exec_time, 0), 2) AS coefficient_of_variation
+FROM pg_stat_statements
+WHERE calls &gt; 50
+  AND mean_exec_time &gt; 5
+ORDER BY coefficient_of_variation DESC
+LIMIT 20;
+
+-- Current blocking chains (useful for trace-level debugging of lock waits)
+WITH RECURSIVE lock_chain AS (
+    SELECT
+        blocked.pid                         AS blocked_pid,
+        blocked.query                       AS blocked_query,
+        blocking.pid                        AS blocking_pid,
+        blocking.query                      AS blocking_query,
+        1                                   AS depth
+    FROM pg_stat_activity blocked
+    JOIN pg_stat_activity blocking
+        ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
+    WHERE blocked.wait_event_type = 'Lock'
+    UNION ALL
+    SELECT
+        lc.blocked_pid,
+        lc.blocked_query,
+        blocking.pid,
+        blocking.query,
+        lc.depth + 1
+    FROM lock_chain lc
+    JOIN pg_stat_activity blocking
+        ON blocking.pid = ANY(pg_blocking_pids(lc.blocking_pid))
+    WHERE lc.depth &lt; 10
+)
+SELECT * FROM lock_chain ORDER BY depth, blocking_pid;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Top queries by total CPU time using Query Store
+-- (Query Store must be enabled on the database)
+SELECT TOP 20
+    SUBSTRING(qt.query_sql_text, 1, 100)    AS query_preview,
+    rs.count_executions,
+    ROUND(rs.avg_duration / 1000.0, 2)      AS avg_duration_ms,
+    ROUND(rs.max_duration / 1000.0, 2)      AS max_duration_ms,
+    ROUND(rs.avg_cpu_time / 1000.0, 2)      AS avg_cpu_ms,
+    ROUND(rs.avg_logical_io_reads, 0)       AS avg_logical_reads,
+    ROUND(rs.avg_rowcount, 0)               AS avg_rows,
+    rs.last_execution_time
+FROM sys.query_store_runtime_stats rs
+JOIN sys.query_store_plan qp
+    ON qp.plan_id = rs.plan_id
+JOIN sys.query_store_query q
+    ON q.query_id = qp.query_id
+JOIN sys.query_store_query_text qt
+    ON qt.query_text_id = q.query_text_id
+WHERE rs.last_execution_time &gt; DATEADD(HOUR, -24, GETUTCDATE())
+ORDER BY rs.avg_cpu_time * rs.count_executions DESC;
+
+-- Queries with high execution time variance (spike candidates)
+SELECT TOP 20
+    SUBSTRING(qt.query_sql_text, 1, 100)    AS query_preview,
+    rs.count_executions,
+    ROUND(rs.avg_duration / 1000.0, 2)      AS avg_duration_ms,
+    ROUND(rs.stdev_duration / 1000.0, 2)    AS stddev_duration_ms,
+    ROUND(rs.max_duration / 1000.0, 2)      AS max_duration_ms,
+    ROUND(
+        rs.stdev_duration / NULLIF(rs.avg_duration, 0),
+        2
+    )                                       AS coefficient_of_variation
+FROM sys.query_store_runtime_stats rs
+JOIN sys.query_store_plan qp ON qp.plan_id = rs.plan_id
+JOIN sys.query_store_query q ON q.query_id = qp.query_id
+JOIN sys.query_store_query_text qt
+    ON qt.query_text_id = q.query_text_id
+WHERE rs.count_executions &gt; 50
+  AND rs.avg_duration &gt; 5000   -- more than 5ms average
+ORDER BY coefficient_of_variation DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The feedback loop observability enables is what makes architecture durable. You design based on your best understanding of the workload, deploy, observe what actually happens, and revise. Partitioning strategies that looked good on paper may need adjustment when real access patterns emerge. Materialized view refresh intervals that seemed conservative may turn out to be too aggressive or not aggressive enough. Connection pool sizes set at deployment may need tuning as the application fleet grows.</p>
+
+<p class="text-gray-300 leading-relaxed">Building observability in from the start — not bolting it on after performance problems surface — is the difference between an architecture you control and one that surprises you.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partitioning, replication, and sharding solve different problems** — storage performance, read scale, and write scale respectively. Match the tool to the actual bottleneck before adding architectural complexity you don't need.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **CQRS and read/write splitting exist on a spectrum**: from simple read replicas all the way to separate OLAP stores. The right point on that spectrum depends on your read/write ratio, acceptable replication lag, and the analytical complexity of your read workload.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **CDC and event sourcing make your database a first-class event producer**: logical replication slots in PostgreSQL and CDC tables in SQL Server give downstream systems a reliable change stream, but both require active monitoring for consumer lag to avoid runaway WAL or log retention.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Multi-region HA design must start with explicit RTO and RPO targets**: synchronous replication is required for zero RPO, automated failover is required for aggressive RTO, and every architectural tradeoff — active-passive vs. active-active, connection pooling topology, DNS failover strategy — should be evaluated against those two numbers.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability is a first-class architectural component**, not an afterthought: wiring together metrics (pg_stat_statements, Query Store), structured logs, and distributed traces creates the feedback loop that lets you validate architectural decisions against real production behavior and evolve the design over time.</li>
     </div>
     <div class="mt-14 bg-blue-950/40 border border-blue-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-blue-600 hover:bg-blue-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 flex justify-between text-xs">

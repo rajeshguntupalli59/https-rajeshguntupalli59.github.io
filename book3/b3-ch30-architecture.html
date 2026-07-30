@@ -6,6 +6,10 @@
   <title>Chapter 30: Designing Fully Autonomous Database Architectures — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 30: Designing Fully Autonomous Database Architectures. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -447,6 +451,543 @@ class IndexBloatAgent:
 
 <p class="text-gray-300 leading-relaxed">The following Patroni configuration demonstrates bounded autonomy in action — automatic failover is enabled, but switchover (planned) requires explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">patronictl</code> invocation, and minimum lag threshold prevents a significantly behind replica from becoming primary:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># patroni.yml — autonomous failover policy configuration
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576      # 1MB — replica must be within 1MB of primary WAL
+    master_start_timeout: 300             # wait 5 minutes before assuming primary is dead
+    synchronous_mode: true                # require at least one synchronous replica
+    synchronous_mode_strict: false        # allow failover even if no sync replica available
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The following Python wrapper demonstrates how the autonomous controller layers policy evaluation over Patroni's built-in logic, adding pre-flight checks before a failover is permitted to proceed:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+import logging
+import subprocess
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class PatroniFailoverPolicy:
+    """
+    Policy wrapper around Patroni's autonomous failover.
+    Adds pre-flight validation before allowing failover to proceed.
+    """
+    patroni_api: str
+    policy: dict
+    logger: logging.Logger = None
+
+    def __post_init__(self):
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    def get_cluster_state(self) -&gt; dict:
+        resp = requests.get(f"{self.patroni_api}/cluster", timeout=5)
+        resp.raise_for_status()
+        return resp.json()
+
+    def get_replica_lag_bytes(self, member_name: str) -&gt; Optional[int]:
+        cluster = self.get_cluster_state()
+        for member in cluster.get("members", []):
+            if member["name"] == member_name:
+                return member.get("lag", None)
+        return None
+
+    def best_replica_for_promotion(self) -&gt; Optional[str]:
+        """
+        Select the replica with the smallest replication lag
+        that satisfies all policy constraints.
+        """
+        cluster = self.get_cluster_state()
+        candidates = [
+            m for m in cluster.get("members", [])
+            if m["role"] == "replica"
+            and m["state"] == "streaming"
+            and (m.get("lag") or 0) &lt;= self.policy["max_lag_bytes_for_promotion"]
+        ]
+        if not candidates:
+            return None
+        return min(candidates, key=lambda m: m.get("lag") or 0)["name"]
+
+    def execute_failover(self, candidate: str) -&gt; bool:
+        """
+        Issue a controlled failover to the named candidate via patronictl.
+        Returns True on success, False on refusal.
+        """
+        max_lag = self.policy["max_lag_bytes_for_promotion"]
+        lag = self.get_replica_lag_bytes(candidate)
+        if lag is None or lag &gt; max_lag:
+            self.logger.error(
+                f"Failover refused: candidate {candidate} lag {lag} "
+                f"exceeds policy maximum {max_lag}"
+            )
+            return False
+
+        cmd = [
+            "patronictl", "-c", "/etc/patroni/patroni.yml",
+            "failover", "--master", "current-primary",
+            "--candidate", candidate,
+            "--force"
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            self.logger.info(
+                f"Autonomous failover to {candidate} succeeded"
+            )
+            return True
+        else:
+            self.logger.error(
+                f"Failover command failed: {result.stderr}"
+            )
+            return False
+
+    def evaluate_and_act(self):
+        cluster = self.get_cluster_state()
+        primary_healthy = any(
+            m["role"] == "master" and m["state"] == "running"
+            for m in cluster.get("members", [])
+        )
+        if primary_healthy:
+            return  # no action needed
+
+        self.logger.warning("Primary unhealthy — evaluating failover candidates")
+        candidate = self.best_replica_for_promotion()
+        if candidate:
+            self.execute_failover(candidate)
+        else:
+            self.logger.error(
+                "No eligible failover candidate — escalating to human"
+            )
+            # Trigger PagerDuty / Slack escalation via the central alert bus</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server Always On Availability Groups, the equivalent autonomous failover mechanism is the Flexible Failover Policy, which evaluates failure condition levels against the AlwaysOn health session (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_server_diagnostics</code>). SQL Server's built-in automatic failover is triggered by the Windows Server Failover Cluster detecting that the SQL Server resource has failed. The ADE adds a layer above this by monitoring extended events and health session outputs to detect degraded-but-not-failed conditions — such as secondary lag approaching the RTO threshold — and initiating a planned switchover before the situation becomes a forced failover.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — monitoring AG replica health for pre-emptive switchover decisions:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous pre-failover health assessment for Always On AG
+SELECT
+    ag.name                                    AS ag_name,
+    ars.role_desc,
+    ars.operational_state_desc,
+    ars.connected_state_desc,
+    ars.synchronization_health_desc,
+    adc.database_name,
+    drs.synchronization_state_desc,
+    drs.log_send_queue_size,                   -- bytes not yet sent to secondary
+    drs.log_send_rate,                         -- bytes/sec current send rate
+    drs.redo_queue_size,                       -- bytes applied but not hardened
+    drs.redo_rate,
+    CASE
+        WHEN drs.log_send_rate &gt; 0
+        THEN CAST(drs.log_send_queue_size * 1.0 / drs.log_send_rate AS INT)
+        ELSE NULL
+    END                                        AS estimated_lag_seconds,
+    drs.last_hardened_time,
+    drs.last_received_time
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar
+    ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars
+    ON ar.replica_id = ars.replica_id
+JOIN sys.availability_databases_cluster adc
+    ON ag.group_id = adc.group_id
+JOIN sys.dm_hadr_database_replica_states drs
+    ON adc.group_database_id = drs.group_database_id
+   AND ars.replica_id = drs.replica_id
+ORDER BY ag.name, ars.role_desc, adc.database_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">estimated_lag_seconds</code> for a synchronous-commit secondary exceeds the policy threshold, the autonomous controller escalates rather than acts: a synchronous-commit secondary that is lagging is itself a warning sign of a network or I/O problem on that replica, and forcing a failover to it would likely result in a longer outage than investigating the root cause.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection Fabric Autonomy</strong></p>
+
+<p class="text-gray-300 leading-relaxed">HAProxy and PgBouncer are the standard connection routing layer for PostgreSQL. The autonomous architecture makes the HAProxy backend configuration dynamic — when Patroni triggers a leader change, a Consul-template or a custom HAProxy Data Plane API call updates the routing rules within seconds, with no human involvement:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Autonomous HAProxy backend update triggered by Patroni's on_role_change callback
+# This script is invoked by Patroni on every role transition
+
+ACTION=$1       # "on_start", "on_stop", "on_role_change"
+ROLE=$2         # "master", "replica"
+MEMBER_HOST=$4  # hostname of the node changing roles
+
+HAPROXY_API="http://haproxy-controller:5555"
+AUTH="admin:$HAPROXY_ADMIN_PASSWORD"
+
+if [ "$ROLE" = "master" ]; then
+    # Enable this backend as the read-write primary
+    curl -s -u "$AUTH" -X PUT \
+        "${HAPROXY_API}/v2/services/haproxy/runtime/servers/pg_primary/primary_backend/state" \
+        -H "Content-Type: application/json" \
+        -d '{"admin_state": "ready"}' &gt; /dev/null
+
+    # Drain all other backends from the primary pool (they become replicas)
+    curl -s -u "$AUTH" -X PUT \
+        "${HAPROXY_API}/v2/services/haproxy/runtime/servers/pg_replicas/${MEMBER_HOST}/state" \
+        -H "Content-Type: application/json" \
+        -d '{"admin_state": "drain"}' &gt; /dev/null
+fi</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, the equivalent is the AG Listener — a virtual network name that always resolves to the current primary. The autonomous layer monitors listener resolution latency and AG health, and when the listener is pointing to a degraded primary, triggers the switchover rather than waiting for the application to time out.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Adaptive Query Optimization Without Human Intervention</h3>
+
+<p class="text-gray-300 leading-relaxed">Query plan instability is one of the most persistent sources of unplanned latency spikes. A statistics update, a table growth milestone, a new query pattern from a deployment — any of these can cause the planner to choose a dramatically suboptimal plan. The autonomous architecture detects plan regressions and responds before they become user-visible.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL</strong> does not have built-in plan forcing, but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_hint_plan</code> provides it. The autonomous controller maintains a plan registry table. When a query's p99 latency exceeds a threshold, it compares the current execution plan against the historical best-performing plan. If regression is confirmed, it injects a hint:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Plan regression detection: compare current vs. historical best execution plan
+WITH recent_executions AS (
+    SELECT
+        queryid,
+        query,
+        calls,
+        mean_exec_time,
+        stddev_exec_time,
+        total_exec_time
+    FROM pg_stat_statements
+    WHERE calls &gt; 100
+),
+plan_baseline AS (
+    SELECT
+        queryid,
+        baseline_mean_ms,
+        baseline_plan_hash,
+        hint_text
+    FROM autonomous_plan_registry
+    WHERE is_active = TRUE
+)
+SELECT
+    r.queryid,
+    LEFT(r.query, 120)                             AS query_preview,
+    r.mean_exec_time                               AS current_mean_ms,
+    p.baseline_mean_ms,
+    ROUND(r.mean_exec_time / NULLIF(p.baseline_mean_ms, 0), 2) AS regression_ratio,
+    p.hint_text,
+    CASE
+        WHEN r.mean_exec_time &gt; p.baseline_mean_ms * 2.0 THEN 'REGRESSED'
+        WHEN r.mean_exec_time &gt; p.baseline_mean_ms * 1.3 THEN 'DEGRADED'
+        ELSE 'NOMINAL'
+    END AS plan_health
+FROM recent_executions r
+JOIN plan_baseline p USING (queryid)
+WHERE r.mean_exec_time &gt; p.baseline_mean_ms * 1.3
+ORDER BY regression_ratio DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server</strong> provides Query Store with built-in plan forcing — the ADE queries the Query Store for regressed plans and forces the last-known-good plan automatically:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous Query Store plan regression remediation for SQL Server
+-- Identifies regressed queries and forces the best-performing historical plan
+
+WITH plan_stats AS (
+    SELECT
+        qsq.query_id,
+        qsp.plan_id,
+        qsq.query_sql_text,
+        qsrs.avg_duration         / 1000.0  AS avg_duration_ms,
+        qsrs.avg_logical_io_reads,
+        qsrs.count_executions,
+        qsp.is_forced_plan,
+        qsp.force_failure_count,
+        RANK() OVER (
+            PARTITION BY qsq.query_id
+            ORDER BY qsrs.avg_duration ASC
+        )                                   AS plan_rank
+    FROM sys.query_store_query          qsq
+    JOIN sys.query_store_plan           qsp  ON qsq.query_id  = qsp.query_id
+    JOIN sys.query_store_runtime_stats  qsrs ON qsp.plan_id   = qsrs.plan_id
+    JOIN sys.query_store_runtime_stats_interval qsrsi
+         ON qsrs.runtime_stats_interval_id = qsrsi.runtime_stats_interval_id
+    WHERE qsrsi.start_time &gt;= DATEADD(HOUR, -24, GETUTCDATE())
+      AND qsrs.count_executions &gt;= 50
+),
+best_plans AS (
+    SELECT query_id, plan_id AS best_plan_id, avg_duration_ms AS best_avg_ms
+    FROM plan_stats WHERE plan_rank = 1
+),
+current_plans AS (
+    SELECT
+        ps.query_id,
+        ps.plan_id              AS current_plan_id,
+        ps.avg_duration_ms      AS current_avg_ms,
+        ps.query_sql_text,
+        bp.best_plan_id,
+        bp.best_avg_ms,
+        ROUND(ps.avg_duration_ms / NULLIF(bp.best_avg_ms, 0), 2) AS regression_ratio
+    FROM plan_stats ps
+    JOIN best_plans bp ON ps.query_id = bp.query_id
+    WHERE ps.plan_rank &gt; 1                          -- not the best plan
+      AND ps.avg_duration_ms &gt; bp.best_avg_ms * 2   -- more than 2x slower
+      AND ps.is_forced_plan = 0                     -- not already forced
+)
+SELECT
+    query_id,
+    LEFT(query_sql_text, 150)   AS query_preview,
+    current_avg_ms,
+    best_avg_ms,
+    regression_ratio,
+    best_plan_id,
+    -- The autonomous controller executes this statement to force the best plan:
+    'EXEC sp_query_store_force_plan @query_id = ' + CAST(query_id AS VARCHAR)
+    + ', @plan_id = ' + CAST(best_plan_id AS VARCHAR) + ';' AS remediation_sql
+FROM current_plans
+ORDER BY regression_ratio DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remediation_sql</code> column is executed by the autonomous controller only when confidence is high: the regression ratio must exceed 2.0, the query must have at least 50 recent executions to establish statistical validity, and the action must not be attempted on a plan that has previously had <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">force_failure_count > 0</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">The Autonomous Learning Loop: Turning Incidents Into Policy</h3>
+
+<p class="text-gray-300 leading-relaxed">Every autonomous action — successful or not — is an event that should improve the system's future behavior. This requires a feedback architecture that connects action outcomes back to the policy engine.</p>
+
+<p class="text-gray-300 leading-relaxed">The action log table is the foundation:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE autonomous_action_log (
+    action_id        BIGSERIAL PRIMARY KEY,
+    action_type      TEXT NOT NULL,
+    target_resource  TEXT NOT NULL,
+    trigger_signals  JSONB NOT NULL,
+    parameters       JSONB NOT NULL,
+    decision_source  TEXT NOT NULL,    -- 'threshold_rule' | 'state_machine' | 'llm_synthesis'
+    confidence       NUMERIC(4,3),
+    executed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    outcome          TEXT,             -- 'success' | 'failure' | 'partial' | 'escalated'
+    outcome_detail   JSONB,
+    resolved_at      TIMESTAMPTZ,
+    human_reviewed   BOOLEAN DEFAULT FALSE,
+    human_feedback   TEXT,             -- 'correct' | 'incorrect' | 'unnecessary'
+    policy_version   TEXT NOT NULL
+);
+
+CREATE INDEX ON autonomous_action_log (action_type, executed_at DESC);
+CREATE INDEX ON autonomous_action_log USING GIN (trigger_signals);
+CREATE INDEX ON autonomous_action_log (outcome, human_feedback)
+    WHERE human_reviewed = TRUE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.autonomous_action_log (
+    action_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
+    action_type      NVARCHAR(100)  NOT NULL,
+    target_resource  NVARCHAR(500)  NOT NULL,
+    trigger_signals  NVARCHAR(MAX)  NOT NULL,   -- JSON
+    parameters       NVARCHAR(MAX)  NOT NULL,   -- JSON
+    decision_source  NVARCHAR(50)   NOT NULL,
+    confidence       DECIMAL(4,3),
+    executed_at      DATETIMEOFFSET NOT NULL DEFAULT SYSUTCDATETIME(),
+    outcome          NVARCHAR(20),
+    outcome_detail   NVARCHAR(MAX),             -- JSON
+    resolved_at      DATETIMEOFFSET,
+    human_reviewed   BIT DEFAULT 0,
+    human_feedback   NVARCHAR(20),
+    policy_version   NVARCHAR(50)   NOT NULL
+);
+
+CREATE INDEX IX_action_log_type_time
+    ON dbo.autonomous_action_log (action_type, executed_at DESC);
+CREATE INDEX IX_action_log_outcome_feedback
+    ON dbo.autonomous_action_log (outcome, human_feedback)
+    WHERE human_reviewed = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The learning loop operates on a weekly cadence. The controller queries the action log for actions that were marked <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">human_feedback = 'incorrect'</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">'unnecessary'</code>, groups them by trigger signal pattern, and generates candidate policy refinements. These refinements are surfaced to a human policy reviewer — not applied automatically. The learning loop trains human judgment, not just the system:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def generate_policy_refinement_candidates(conn, policy_version: str) -&gt; list[dict]:
+    """
+    Analyze the action log for patterns of incorrect or unnecessary autonomous actions.
+    Returns a list of candidate policy refinements for human review.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT
+                action_type,
+                decision_source,
+                AVG(confidence)::NUMERIC(4,3)     AS avg_confidence_when_wrong,
+                COUNT(*)                          AS wrong_action_count,
+                JSONB_AGG(trigger_signals)        AS signal_examples
+            FROM autonomous_action_log
+            WHERE human_reviewed = TRUE
+              AND human_feedback IN ('incorrect', 'unnecessary')
+              AND policy_version = %s
+            GROUP BY action_type, decision_source
+            HAVING COUNT(*) &gt;= 3
+            ORDER BY wrong_action_count DESC
+        """, (policy_version,))
+
+        candidates = []
+        for row in cur.fetchall():
+            action_type, source, avg_conf, count, examples = row
+            candidates.append({
+                "action_type": action_type,
+                "decision_source": source,
+                "avg_confidence_when_wrong": float(avg_conf),
+                "wrong_action_count": count,
+                "signal_examples": examples,
+                "suggested_refinement": (
+                    f"Consider raising confidence threshold for '{action_type}' "
+                    f"from current level (avg wrong at {avg_conf:.2f}) "
+                    f"or restricting trigger conditions based on {count} "
+                    f"observed incorrect activations."
+                )
+            })
+        return candidates</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This output is pushed to a weekly review dashboard where the senior DBA team reviews patterns, adjusts confidence thresholds, adds exclusion conditions, and increments the policy version. Over time, the wrong-action rate falls toward zero — not because the AI becomes perfect, but because the policy envelope is progressively tightened around the conditions where the AI has demonstrated reliability.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability for Autonomy: Watching the Watcher</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous system introduces a new observability problem: the system must be observable not just at the database layer but at the autonomy layer itself. What decisions has the controller made? How confident was it? How often is it escalating? Is the decision loop completing within its latency budget?</p>
+
+<p class="text-gray-300 leading-relaxed">The following metrics form the minimum viable observability surface for the autonomous controller itself:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Controller health metrics to expose via Prometheus:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from prometheus_client import Counter, Histogram, Gauge, start_http_server
+import time
+
+# Decision loop metrics
+decisions_total = Counter(
+    'autonomous_controller_decisions_total',
+    'Total autonomous decisions made',
+    ['action_type', 'decision_source', 'outcome']
+)
+
+decision_confidence = Histogram(
+    'autonomous_controller_decision_confidence',
+    'Confidence score distribution for autonomous decisions',
+    ['action_type'],
+    buckets=[0.5, 0.6, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.99, 1.0]
+)
+
+escalations_total = Counter(
+    'autonomous_controller_escalations_total',
+    'Decisions escalated to human due to low confidence or high impact',
+    ['action_type', 'reason']
+)
+
+decision_loop_latency = Histogram(
+    'autonomous_controller_loop_latency_seconds',
+    'Time for one full observe-orient-decide-act cycle to complete',
+    buckets=[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+)
+
+policy_violations_total = Counter(
+    'autonomous_controller_policy_violations_total',
+    'Actions attempted outside policy boundaries (blocked before execution)',
+    ['action_type', 'violation_type']
+)
+
+controller_health = Gauge(
+    'autonomous_controller_health',
+    'Overall health of the autonomous controller (1=healthy, 0=degraded)',
+)
+
+# Expose on port 9200 for Prometheus scraping
+start_http_server(9200)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">escalations_total</code> metric is particularly telling. A rising escalation rate is a leading indicator that either the policy confidence thresholds are too conservative for the current operational environment (the system is being too cautious) or that the system is encountering a new class of anomaly it was not designed to handle. Both interpretations require human attention, but for different reasons.</p>
+
+<p class="text-gray-300 leading-relaxed">A Grafana dashboard built on these metrics should display:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Decision throughput (decisions per hour, broken down by action type)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Confidence score distribution over time</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Escalation rate as a percentage of total decisions</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Policy violation count (should trend toward zero as policies mature)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Loop latency percentiles (p50, p95, p99)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Outcome success rate by action type</li>
+
+<p class="text-gray-300 leading-relaxed">When <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">outcome_success_rate</code> for a given action type falls below 90%, the autonomous controller should automatically disable that action type and log a structured alert. A system that repeatedly takes ineffective action is worse than a system that escalates conservatively.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Deployment Strategy: Crawl, Walk, Run</h3>
+
+<p class="text-gray-300 leading-relaxed">No organization deploys a fully autonomous database architecture on day one. The path to autonomy is incremental, and the deployment strategy must match organizational risk tolerance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 1 — Observe Only (Weeks 1–4)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Deploy the observability pipeline: Prometheus exporters, Grafana dashboards, structured log aggregation. Configure the decision engine in dry-run mode — it evaluates decisions and logs what it would have done, but takes no action. Review the dry-run log daily. This phase answers: does the decision engine produce sensible outputs for your specific workload?</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 2 — Automate the Safe (Weeks 5–12)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Enable autonomous action for a narrow set of low-risk, fully reversible actions: adjusting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> within a bounded range, killing idle-in-transaction connections older than the policy threshold, refreshing statistics on tables with high modification counts. Human review of the action log is weekly. This phase answers: does the system behave correctly in production?</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 3 — Automate the Consequential (Months 4–6)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Enable index remediation, query plan forcing, and connection pool resizing. All actions of this type require confidence ≥ 0.90 and are subject to the maintenance window policy. Human review transitions from weekly to monthly exception review. This phase answers: can the system handle the full operational surface without constant supervision?</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 4 — Automate the High-Stakes (Month 7 and beyond)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Enable failover automation, scaling actions (node addition, volume expansion), and query cancellation for long-running transactions. These actions have the strictest confidence thresholds and the richest pre-flight checklists. The learning loop is mature enough that the human review burden is minimal. This phase is never complete — new query patterns, new infrastructure, new failure modes always generate new learning opportunities.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">End-to-End Example: A Complete Autonomous Response to a Replication Crisis</h3>
+
+<p class="text-gray-300 leading-relaxed">To make the architecture concrete, trace the path of a single incident through every layer of the autonomous system. At 02:47 UTC, the PostgreSQL primary begins experiencing unusually high write amplification due to a bulk import job. Replication lag on the secondary begins to climb.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:47:15</strong> — The Prometheus scrape captures <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication.write_lag</code> rising above 5 seconds. The normalized signal computes a z-score of +2.8, which crosses the DEGRADED threshold.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:47:30</strong> — The state machine transitions the cluster from NOMINAL to DEGRADED. The decision engine queries the policy for DEGRADED state actions.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:47:31</strong> — The policy engine identifies two candidate actions within the DEGRADED action space: (1) throttle the bulk import job by reducing its <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_parallel_workers</code> setting, (2) temporarily redirect read traffic away from the lagging replica to prevent stale reads. Both are within the maintenance window.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:47:45</strong> — The decision engine evaluates both actions. Action 1 confidence: 0.82 (the bulk import query signature matches the active-session pattern in the historical action log). Action 2 confidence: 0.94 (connection-routing adjustments have a high historical success rate). Both exceed the DEGRADED-state threshold of 0.75.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:47:46</strong> — The action dispatcher executes Action 2 first (higher confidence, no workload impact). HAProxy is updated via the Data Plane API to remove the lagging replica from the read pool. The action is logged.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:47:52</strong> — The action dispatcher executes Action 1. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cancel_backend()</code> is sent to the bulk import session's parallel workers, reducing them from 8 to 2. This is achieved via a policy-controlled administrative function granted to the autonomous controller's database role.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:49:10</strong> — Replication lag begins declining. By 02:51, it has returned below 1 second. The z-score falls below 1.0.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:51:30</strong> — The state machine transitions from DEGRADED to RECOVERING. The policy for RECOVERING state triggers: restore the lagging replica to the read pool (Action 2 reversal). HAProxy is updated. Parallel workers are restored to default (Action 1 reversal). Both reversals are logged with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">outcome = 'success'</code>.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">02:52:00</strong> — The state machine transitions to NOMINAL. Total autonomous incident duration: 4 minutes and 45 seconds. No human was contacted. The action log records six entries: two primary actions, two reversals, two state transitions. The morning review queue shows the incident summary with full signal trace and action rationale for human awareness.</p>
+
+<p class="text-gray-300 leading-relaxed">This is what a mature autonomous architecture looks like in operation — not dramatic AI reasoning, but disciplined, policy-bounded closed-loop control executing faster and more consistently than any on-call rotation could.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant Prometheus
+    participant DecisionEngine as Decision Engine
+    participant PolicyEngine as Policy Engine
+    participant Dispatcher as Action Dispatcher
+    participant HAProxy
+    participant Postgres as PostgreSQL Primary
+
+    Prometheus->>DecisionEngine: write_lag rising (z-score +2.8)
+    DecisionEngine->>DecisionEngine: State: NOMINAL to DEGRADED
+    DecisionEngine->>PolicyEngine: Request candidate actions for DEGRADED
+    PolicyEngine-->>DecisionEngine: Throttle import (0.82), reroute reads (0.94)
+    DecisionEngine->>Dispatcher: Execute both (confidence exceeds 0.75 threshold)
+    Dispatcher->>HAProxy: Remove lagging replica from read pool
+    Dispatcher->>Postgres: pg_cancel_backend() on import workers
+    Postgres-->>Prometheus: Lag declining
+    Prometheus->>DecisionEngine: Lag normalized, z-score below 1.0
+    DecisionEngine->>DecisionEngine: State: DEGRADED to RECOVERING to NOMINAL
+    Dispatcher->>HAProxy: Restore replica to read pool
+    Dispatcher->>Postgres: Restore parallel worker count</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The closed-loop sequence from the replication-crisis walkthrough: telemetry drives a state transition, the policy engine proposes bounded actions, and the dispatcher executes and later reverses them as conditions normalize.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomy is architecture, not automation.** Individual scripts and alerts do not constitute an autonomous system. The four pillars — continuous observability, closed-loop control, bounded autonomy, and graceful degradation — must be designed into the system's structure from the beginning, not added as layers on top of a reactive foundation.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The policy envelope is the trust boundary.** Every autonomous agent operates within an explicitly defined action space, confidence threshold, and rollback procedure. The system is never given permission to do anything; it is given permission to do specific things under specific conditions. Expanding the policy envelope is a deliberate, reviewed act, informed by the action log's outcome history.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The learning loop converts incidents into policy refinements.** The autonomous action log is not an audit trail — it is a training dataset. Human review of incorrect and unnecessary actions, aggregated over weeks, produces candidate policy refinements that progressively tighten the system's behavior around conditions it has demonstrated it can handle reliably.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Observability must extend to the autonomous layer itself.** The decision engine, the policy evaluator, and the action dispatcher are all first-class components that must expose metrics, publish structured logs, and participate in alerting. A controller that silently malfunctions is more dangerous than a manually operated system with noisy alerts.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Deploy incrementally by risk tier, not by component.** The crawl-walk-run deployment strategy ensures that each phase produces a production-validated answer to a specific question about system behavior before the next phase expands autonomous authority. Organizations that attempt full autonomy without the foundation of Phase 1 and Phase 2 experience exactly the kind of autonomous-action failures that erode organizational trust in the entire approach.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

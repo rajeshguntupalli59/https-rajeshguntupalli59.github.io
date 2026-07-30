@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 14: AI for Compliance and Auditing — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 14: AI for Compliance and Auditing. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -162,10 +166,10 @@ SELECT
     CASE WHEN EXISTS (
         SELECT 1 FROM sys.columns c
         WHERE c.object_id = o.object_id
-          AND c.name LIKE '%ssn%' OR c.name LIKE '%social_security%'
+          AND (c.name LIKE '%ssn%' OR c.name LIKE '%social_security%'
           OR c.name LIKE '%credit_card%' OR c.name LIKE '%card_number%'
           OR c.name LIKE '%cvv%' OR c.name LIKE '%date_of_birth%'
-          OR c.name LIKE '%passport%'
+          OR c.name LIKE '%passport%')
     ) THEN 1 ELSE 0 END AS contains_likely_pii
 FROM sys.database_permissions p
 JOIN sys.objects o ON p.major_id = o.object_id
@@ -398,15 +402,655 @@ WHERE o.is_ms_shipped = 0
 
 <p class="text-gray-300 leading-relaxed">The snapshots feed a Python process that generates embeddings and computes semantic drift:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from openai import OpenAI
+import numpy as np
+from scipy.spatial.distance import cosine
+
+openai_client = OpenAI()
+
+def embed_schema_definitions(definitions: list[str], batch_size: int = 100) -&gt; np.ndarray:
+    """
+    Generate embeddings for schema definition strings using OpenAI's embedding model.
+    Returns a 2D numpy array of shape (n_definitions, embedding_dim).
+    """
+    all_embeddings = []
+    
+    for i in range(0, len(definitions), batch_size):
+        batch = definitions[i:i + batch_size]
+        response = openai_client.embeddings.create(
+            model="text-embedding-3-large",
+            input=batch
+        )
+        batch_embeddings = [item.embedding for item in response.data]
+        all_embeddings.extend(batch_embeddings)
+    
+    return np.array(all_embeddings)
+
+
+def detect_schema_drift(baseline_df, current_df, distance_threshold: float = 0.15) -&gt; list[dict]:
+    """
+    Compare current schema snapshot against baseline using embedding similarity.
+    Returns a list of drift findings sorted by semantic distance (most drifted first).
+    """
+    baseline_embeddings = embed_schema_definitions(baseline_df['full_definition'].tolist())
+    current_embeddings = embed_schema_definitions(current_df['full_definition'].tolist())
+    
+    findings = []
+    
+    for i, (_, current_row) in enumerate(current_df.iterrows()):
+        current_vec = current_embeddings[i]
+        
+        # Find the most similar object in the baseline
+        distances = [cosine(current_vec, baseline_embeddings[j]) 
+                    for j in range(len(baseline_df))]
+        
+        min_distance = min(distances)
+        closest_baseline_idx = np.argmin(distances)
+        closest_baseline = baseline_df.iloc[closest_baseline_idx]
+        
+        if min_distance &gt; distance_threshold:
+            findings.append({
+                'object_name': current_row['object_name'],
+                'object_type': current_row['object_type'],
+                'current_definition': current_row['full_definition'],
+                'closest_baseline_match': closest_baseline['object_name'],
+                'semantic_distance': min_distance,
+                'is_new_object': min_distance &gt; 0.5,  # Very high distance = likely entirely new
+                'risk_flag': _assess_pii_risk(current_row['full_definition'])
+            })
+    
+    return sorted(findings, key=lambda x: x['semantic_distance'], reverse=True)
+
+
+def _assess_pii_risk(definition_text: str) -&gt; str:
+    """Simple heuristic PII risk assessment based on column name patterns."""
+    high_risk_patterns = [
+        'ssn', 'social_security', 'tax_id', 'ein', 'credit_card', 'card_number',
+        'pan', 'cvv', 'routing_number', 'account_number', 'passport', 'license_number',
+        'date_of_birth', 'dob', 'salary', 'compensation', 'medical', 'diagnosis'
+    ]
+    definition_lower = definition_text.lower()
+    for pattern in high_risk_patterns:
+        if pattern in definition_lower:
+            return 'HIGH'
+    medium_risk_patterns = [
+        'email', 'phone', 'address', 'zip', 'postal', 'ip_address', 'device_id',
+        'user_id', 'customer_id', 'national_id', 'gender', 'ethnicity', 'religion'
+    ]
+    for pattern in medium_risk_patterns:
+        if pattern in definition_lower:
+            return 'MEDIUM'
+    return 'LOW'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When the drift detection run completes, the findings list feeds back into an LLM call that produces a compliance-focused summary:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def generate_drift_report(findings: list[dict], framework: str = "PCI-DSS") -&gt; str:
+    """
+    Use Claude to produce a compliance-focused narrative from schema drift findings.
+    """
+    client = anthropic.Anthropic()
+
+    findings_text = json.dumps(findings[:20], indent=2, default=str)  # top 20 most drifted
+
+    prompt = f"""You are a compliance officer reviewing a schema drift report for {framework}.
+
+The following schema objects have changed or appeared since the last approved baseline snapshot.
+Each entry includes the object's current definition, its closest match in the baseline, the 
+semantic distance (0 = identical, 1 = completely different), and a PII risk flag.
+
+Drift findings:
+{findings_text}
+
+Write a concise compliance risk summary that:
+1. Groups findings by risk tier (CRITICAL, HIGH, MEDIUM, LOW)
+2. Calls out any new columns or tables with HIGH PII risk flags specifically
+3. Notes any privilege changes that may represent least-privilege violations
+4. Recommends which findings require immediate remediation before the next audit window
+5. Suggests which findings are likely benign (e.g., new indexes, renamed audit columns)
+
+Address this to a DBA team lead. Be direct and specific. Use the actual object names from the data."""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.content[0].text</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This gives your compliance team a structured, plain-language drift report each morning without requiring them to manually diff SQL object definitions. Objects that need sign-off before the next audit cycle are flagged explicitly, turning a passive snapshot comparison into an active compliance workflow.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated PII Discovery and Column Classification</h3>
+
+<p class="text-gray-300 leading-relaxed">Before you can enforce access controls or retention policies on sensitive data, you need to know where that data lives. In large, long-lived databases — particularly those that have evolved through multiple teams and application generations — PII can be scattered across dozens of tables in columns with non-obvious names. A column named <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">external_ref_code</code> in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments</code> table might contain Social Security Numbers left over from a legacy integration. Manual PII discovery audits are expensive and error-prone. AI-assisted discovery makes this tractable at scale.</p>
+
+<p class="text-gray-300 leading-relaxed">The classification pipeline operates in two stages. The first stage uses the column name, table name, data type, and any available column comments to generate an initial classification using an LLM. The second stage samples actual data values from flagged columns (in a privacy-preserving way) to validate or upgrade the classification.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def classify_columns_by_metadata(columns: list[dict]) -&gt; list[dict]:
+    """
+    First-pass PII classification using column metadata only (no data access).
+    Each column dict should have: schema, table, column_name, data_type, column_comment.
+    """
+    client = anthropic.Anthropic()
+
+    # Batch columns to reduce API calls
+    batch_size = 30
+    classified = []
+
+    for i in range(0, len(columns), batch_size):
+        batch = columns[i:i + batch_size]
+
+        column_list = "\n".join([
+            f"- {c['schema']}.{c['table']}.{c['column_name']} "
+            f"(type: {c['data_type']}, comment: {c.get('column_comment', 'none')})"
+            for c in batch
+        ])
+
+        response = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=2048,
+            messages=[{
+                "role": "user",
+                "content": f"""Classify each database column below for PII sensitivity.
+For each column, return a JSON array entry with:
+- "column": the full column identifier (schema.table.column)
+- "pii_category": one of: NONE, FINANCIAL, HEALTH, IDENTITY, CONTACT, BEHAVIORAL, CREDENTIAL
+- "confidence": HIGH, MEDIUM, or LOW
+- "reasoning": one sentence explaining the classification
+
+Columns to classify:
+{column_list}
+
+Return only a valid JSON array. No markdown."""
+            }]
+        )
+
+        try:
+            batch_results = json.loads(response.content[0].text)
+            classified.extend(batch_results)
+        except json.JSONDecodeError:
+            # Fallback: mark as requiring manual review
+            for col in batch:
+                classified.append({
+                    "column": f"{col['schema']}.{col['table']}.{col['column_name']}",
+                    "pii_category": "UNKNOWN",
+                    "confidence": "LOW",
+                    "reasoning": "Automated classification failed; manual review required."
+                })
+
+    return classified
+
+
+def validate_pii_with_data_sample(conn, column_info: dict, sample_size: int = 50) -&gt; dict:
+    """
+    Second-pass validation: sample actual values for columns with MEDIUM confidence
+    and use pattern matching + LLM to confirm or revise classification.
+    
+    IMPORTANT: This function should only run in environments where sampling is
+    permitted under your data governance policy. Use anonymized or masked values
+    wherever possible.
+    """
+    schema = column_info['schema']
+    table = column_info['table']
+    column = column_info['column_name']
+
+    # PostgreSQL version: sample with row-level hashing to avoid exposing raw values
+    # to the LLM where possible
+    sample_query_pg = f"""
+    SELECT 
+        -- Return only structural fingerprint, not raw values
+        LENGTH(CAST({column} AS TEXT)) AS value_length,
+        -- Pattern detection without exposing values
+        (CAST({column} AS TEXT) ~ '^[0-9]{{3}}-[0-9]{{2}}-[0-9]{{4}}$') AS matches_ssn_pattern,
+        (CAST({column} AS TEXT) ~ '^[0-9]{{15,16}}$') AS matches_pan_pattern,
+        (CAST({column} AS TEXT) ~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{{2,}}$') AS matches_email,
+        (CAST({column} AS TEXT) ~ '^\\+?[0-9]{{10,15}}$') AS matches_phone
+    FROM {schema}.{table}
+    WHERE {column} IS NOT NULL
+    ORDER BY RANDOM()
+    LIMIT {sample_size}
+    """
+
+    # Execute and aggregate pattern match results
+    # (implementation uses your existing database connection)
+    # Returns aggregated counts, not individual values
+
+    # The validation result upgrades or downgrades confidence
+    return {
+        "column": f"{schema}.{table}.{column}",
+        "validation_method": "pattern_sampling",
+        "sample_size": sample_size
+        # Populated by actual query execution in production
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The metadata-first approach means that even when direct data sampling is restricted by policy (as it should be in production HIPAA or PCI environments), you still get an initial classification pass. High-confidence classifications feed directly into your access control audit; medium and low confidence classifications queue for data steward review.</p>
+
+<p class="text-gray-300 leading-relaxed">Once classified, the column inventory becomes the foundation for automated access control validation. Any role with access to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FINANCIAL</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IDENTITY</code> classified columns that is not in the approved access matrix becomes a finding in the next compliance scan.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Generating Audit-Ready Compliance Reports with RAG</h3>
+
+<p class="text-gray-300 leading-relaxed">The artifacts produced so far — anomaly findings, schema drift reports, PII classifications, access control violations — are useful for internal remediation. But compliance audits also require formal documentation: evidence packages that demonstrate controls are operating effectively over a defined period.</p>
+
+<p class="text-gray-300 leading-relaxed">Assembling that documentation manually is one of the most time-consuming parts of an audit cycle. A RAG pipeline that has indexed your policy documents, prior audit reports, and current findings can generate structured audit evidence packages automatically.</p>
+
+<p class="text-gray-300 leading-relaxed">The RAG setup requires three components: a document store containing your compliance policies and prior audit artifacts, an embedding index over that store, and a generation model that uses retrieved context to produce structured report sections.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from openai import OpenAI
+import chromadb
+from chromadb.utils import embedding_functions
+
+def setup_compliance_rag_store(policy_docs: list[dict]) -&gt; chromadb.Collection:
+    """
+    Build a ChromaDB vector store from compliance policy documents and prior reports.
+    Each doc dict should have: 'id', 'content', 'metadata' (source, framework, version).
+    """
+    chroma_client = chromadb.Client()
+    openai_ef = embedding_functions.OpenAIEmbeddingFunction(
+        model_name="text-embedding-3-large"
+    )
+
+    collection = chroma_client.get_or_create_collection(
+        name="compliance_policies",
+        embedding_function=openai_ef
+    )
+
+    collection.add(
+        documents=[doc['content'] for doc in policy_docs],
+        ids=[doc['id'] for doc in policy_docs],
+        metadatas=[doc['metadata'] for doc in policy_docs]
+    )
+
+    return collection
+
+
+def generate_audit_evidence_section(
+    collection: chromadb.Collection,
+    control_id: str,
+    control_description: str,
+    evidence_data: dict
+) -&gt; str:
+    """
+    Generate a formal audit evidence section for a specific control using RAG.
+    Retrieves relevant policy text and prior audit language to maintain consistency.
+    """
+    # Retrieve relevant policy passages
+    results = collection.query(
+        query_texts=[f"{control_id}: {control_description}"],
+        n_results=5,
+        include=['documents', 'metadatas']
+    )
+
+    policy_context = "\n\n".join([
+        f"[{results['metadatas'][0][i]['source']} - {results['metadatas'][0][i]['framework']}]\n"
+        f"{results['documents'][0][i]}"
+        for i in range(len(results['documents'][0]))
+    ])
+
+    client = anthropic.Anthropic()
+
+    prompt = f"""You are writing a formal audit evidence section for a SOC 2 / compliance audit package.
+
+Control: {control_id} - {control_description}
+
+Relevant policy language retrieved from your document store:
+{policy_context}
+
+Evidence gathered from the database environment:
+{json.dumps(evidence_data, indent=2, default=str)}
+
+Write a formal audit evidence section that:
+1. States the control objective in one sentence
+2. Describes the testing procedure performed (reference the actual queries/checks used)
+3. Summarizes the evidence obtained with specific counts and dates
+4. States whether the control is EFFECTIVE, PARTIALLY EFFECTIVE, or INEFFECTIVE
+5. If partially effective or ineffective, lists specific exceptions found
+6. Cites the policy document sections that define the control requirement
+
+Use formal audit language. Be precise about dates, counts, and specific findings.
+This text will appear verbatim in the audit package delivered to external auditors."""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.content[0].text</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An example invocation for the access control evidence section might look like:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>access_control_evidence = {
+    "control_id": "PCI-7.2.1",
+    "scan_date": "2025-01-15",
+    "scan_period_start": "2024-10-15",
+    "scan_period_end": "2025-01-15",
+    "total_roles_evaluated": 47,
+    "roles_with_cardholder_access": 6,
+    "approved_roles_in_matrix": 5,
+    "exceptions_found": [
+        {
+            "role": "reporting_svc",
+            "table": "payment_accounts",
+            "privilege": "SELECT",
+            "first_detected": "2024-12-03",
+            "status": "NOT IN APPROVED ACCESS MATRIX"
+        }
+    ],
+    "remediation_status": "Exception ticket #INC-4821 opened 2024-12-04, pending role review"
+}
+
+evidence_text = generate_audit_evidence_section(
+    collection=compliance_collection,
+    control_id="PCI-7.2.1",
+    control_description="Restrict access to cardholder data to least privilege",
+    evidence_data=access_control_evidence
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The generated text matches the formal register that auditors expect, references the specific policy language from your document store for consistency, and correctly characterizes the control as partially effective given the exception found. What used to take a compliance analyst several hours per control now takes seconds — and the LLM-generated draft still benefits from human review before submission, but that review is an editing task rather than a writing task.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Privilege Escalation and Insider Threat Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">Beyond routine compliance checks, AI-driven auditing can target higher-severity patterns that traditional rule-based systems miss. Privilege escalation — where a database principal gradually accumulates permissions beyond what their role justifies — is a canonical example. It often happens incrementally: a developer gets temporary <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INSERT</code> access for a migration, the temporary grant is never revoked, and three months later that same account is used in a data exfiltration event.</p>
+
+<p class="text-gray-300 leading-relaxed">Detecting privilege escalation requires temporal reasoning across the audit log. The pattern to identify is: cumulative permission grants to a principal over a rolling window that, viewed individually, each seem reasonable but collectively produce an over-privileged state.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Detect roles whose effective permissions have grown significantly
+-- in the past 90 days compared to the previous 90-day period
+WITH current_period AS (
+    SELECT 
+        grantee,
+        COUNT(DISTINCT table_schema || '.' || table_name) AS accessible_tables,
+        COUNT(DISTINCT privilege_type) AS distinct_privileges,
+        BOOL_OR(privilege_type = 'DELETE') AS has_delete,
+        BOOL_OR(is_grantable = 'YES') AS can_grant_others
+    FROM information_schema.role_table_grants
+    WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
+    GROUP BY grantee
+),
+historical AS (
+    -- Pull from your schema_snapshots table captured previously
+    SELECT
+        grantee_role AS grantee,
+        COUNT(DISTINCT schema_name || '.' || object_name) AS accessible_tables_hist
+    FROM compliance_schema.schema_snapshots
+    WHERE snapshot_time BETWEEN NOW() - INTERVAL '180 days' AND NOW() - INTERVAL '90 days'
+      AND object_type = 'PRIVILEGE'
+    GROUP BY grantee_role
+)
+SELECT 
+    c.grantee,
+    h.accessible_tables_hist AS tables_90_days_ago,
+    c.accessible_tables AS tables_now,
+    c.accessible_tables - COALESCE(h.accessible_tables_hist, 0) AS net_new_tables,
+    c.has_delete,
+    c.can_grant_others,
+    ROUND(
+        (c.accessible_tables - COALESCE(h.accessible_tables_hist, 0))::numeric 
+        / NULLIF(h.accessible_tables_hist, 0) * 100, 1
+    ) AS pct_increase
+FROM current_period c
+LEFT JOIN historical h ON c.grantee = h.grantee
+WHERE c.accessible_tables &gt; COALESCE(h.accessible_tables_hist, 0)
+  AND (c.accessible_tables - COALESCE(h.accessible_tables_hist, 0)) &gt;= 3
+ORDER BY pct_increase DESC NULLS LAST, net_new_tables DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent privilege growth detection for SQL Server
+WITH current_period AS (
+    SELECT
+        dp.name AS grantee,
+        COUNT(DISTINCT o.object_id) AS accessible_tables,
+        COUNT(DISTINCT p.permission_name) AS distinct_privileges,
+        MAX(CASE WHEN p.permission_name = 'DELETE' THEN 1 ELSE 0 END) AS has_delete,
+        MAX(CASE WHEN p.state = 'W' THEN 1 ELSE 0 END) AS can_grant_others
+    FROM sys.database_permissions p
+    JOIN sys.objects o ON p.major_id = o.object_id
+    JOIN sys.database_principals dp ON p.grantee_principal_id = dp.principal_id
+    WHERE o.type = 'U'
+      AND p.state IN ('G', 'W')
+    GROUP BY dp.name
+),
+historical AS (
+    SELECT
+        grantee_name AS grantee,
+        COUNT(DISTINCT object_name) AS accessible_tables_hist
+    FROM compliance_tracking.schema_snapshots
+    WHERE snapshot_time BETWEEN DATEADD(DAY, -180, GETUTCDATE()) 
+                            AND DATEADD(DAY, -90, GETUTCDATE())
+      AND object_type = 'PRIVILEGE'
+    GROUP BY grantee_name
+)
+SELECT
+    c.grantee,
+    h.accessible_tables_hist AS tables_90_days_ago,
+    c.accessible_tables AS tables_now,
+    c.accessible_tables - ISNULL(h.accessible_tables_hist, 0) AS net_new_tables,
+    c.has_delete,
+    c.can_grant_others,
+    ROUND(
+        CAST(c.accessible_tables - ISNULL(h.accessible_tables_hist, 0) AS FLOAT)
+        / NULLIF(h.accessible_tables_hist, 0) * 100, 1
+    ) AS pct_increase
+FROM current_period c
+LEFT JOIN historical h ON c.grantee = h.grantee
+WHERE c.accessible_tables &gt; ISNULL(h.accessible_tables_hist, 0)
+  AND (c.accessible_tables - ISNULL(h.accessible_tables_hist, 0)) &gt;= 3
+ORDER BY pct_increase DESC, net_new_tables DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These queries surface roles whose table access has grown materially. Feed the results to an LLM alongside the grant history from your audit log, and you get a contextual explanation of how each role reached its current privilege level — including the specific grant events that crossed risk thresholds.</p>
+
+<p class="text-gray-300 leading-relaxed">For insider threat patterns specifically, the combination of temporal privilege analysis and behavioral anomaly scoring is particularly powerful. A session where a user with recently elevated privileges accesses tables outside their historical pattern during off-hours scores high on both dimensions. Neither dimension alone is definitively suspicious; the combination is.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def score_insider_threat_risk(
+    session_features: dict,
+    privilege_growth: dict,
+    baseline_behavior: dict
+) -&gt; dict:
+    """
+    Combine privilege growth metrics with behavioral anomaly score
+    to produce a composite insider threat risk score.
+    """
+    client = anthropic.Anthropic()
+
+    prompt = f"""You are a database security analyst evaluating insider threat risk.
+
+Session details:
+{json.dumps(session_features, indent=2, default=str)}
+
+Privilege growth for this principal over the past 90 days:
+{json.dumps(privilege_growth, indent=2, default=str)}
+
+Historical baseline behavior for this principal:
+{json.dumps(baseline_behavior, indent=2, default=str)}
+
+Evaluate the composite risk and provide:
+1. An overall risk score: CRITICAL, HIGH, MEDIUM, or LOW
+2. The primary risk indicators driving the score (list up to 3)
+3. Whether this pattern is more consistent with: accidental misconfiguration, 
+   legitimate business change, or potentially malicious activity
+4. The single most important action a security team should take in the next 24 hours
+5. Whether this warrants immediate escalation to the security team (yes/no and why)
+
+Be concise. Use specific values from the data provided."""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return {
+        "principal": session_features.get("database_user"),
+        "session_id": session_features.get("session_id"),
+        "analysis": response.content[0].text,
+        "generated_at": datetime.utcnow().isoformat()
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Retention Policy Enforcement with AI-Assisted Classification</h3>
+
+<p class="text-gray-300 leading-relaxed">Data retention is a compliance requirement that most database teams handle through scheduled purge jobs or partition drops. The compliance risk isn't just that data is retained too long — it's that the wrong data is being purged, or that the retention classification itself is wrong. GDPR's right to erasure, for instance, applies to personal data but not necessarily to anonymized aggregates derived from it. Getting that boundary wrong in either direction is a compliance failure.</p>
+
+<p class="text-gray-300 leading-relaxed">AI assists here by classifying records for retention eligibility before they are purged, identifying when a purge job is about to delete records that may be subject to a legal hold, and flagging tables where mixed-retention-class data is co-located (making clean purges impossible without row-level filtering).</p>
+
+<p class="text-gray-300 leading-relaxed">The following query identifies tables that likely contain mixed retention classes — that is, both long-lived operational records and short-lived transactional records in the same table, which creates enforcement complexity:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with high temporal variance in record creation dates,
+-- which may indicate mixed retention class data co-located in one table
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS table_size,
+    -- Check if a likely timestamp column exists
+    (SELECT column_name 
+     FROM information_schema.columns c 
+     WHERE c.table_schema = schemaname 
+       AND c.table_name = tablename
+       AND c.data_type IN ('timestamp with time zone', 'timestamp without time zone', 'date')
+       AND c.column_name ~* '(created|inserted|recorded|timestamp|date)'
+     LIMIT 1
+    ) AS likely_timestamp_column,
+    n_live_tup AS estimated_row_count
+FROM pg_stat_user_tables
+WHERE n_live_tup &gt; 10000  -- Only tables with meaningful row counts
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+LIMIT 50;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Equivalent mixed retention class detection for SQL Server
+SELECT TOP 50
+    SCHEMA_NAME(t.schema_id) AS schemaname,
+    t.name AS tablename,
+    -- Human-readable size
+    CAST(
+        (SUM(a.total_pages) * 8) / 1024.0 AS DECIMAL(10,2)
+    ) AS size_mb,
+    -- Find a likely timestamp column
+    (SELECT TOP 1 c.name 
+     FROM sys.columns c
+     WHERE c.object_id = t.object_id
+       AND TYPE_NAME(c.user_type_id) IN ('datetime', 'datetime2', 'date', 'datetimeoffset')
+       AND (c.name LIKE '%creat%' OR c.name LIKE '%insert%' 
+            OR c.name LIKE '%record%' OR c.name LIKE '%timestamp%')
+    ) AS likely_timestamp_column,
+    SUM(p.rows) AS estimated_row_count
+FROM sys.tables t
+JOIN sys.partitions p ON t.object_id = p.object_id AND p.index_id IN (0, 1)
+JOIN sys.allocation_units a ON p.partition_id = a.container_id
+WHERE t.is_ms_shipped = 0
+GROUP BY t.schema_id, t.object_id, t.name
+HAVING SUM(p.rows) &gt; 10000
+ORDER BY SUM(a.total_pages) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once you have the candidate table list and their timestamp columns, you can compute actual temporal distributions and pass them to an LLM for retention policy guidance:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def assess_retention_complexity(
+    table_name: str,
+    temporal_distribution: dict,
+    applicable_frameworks: list[str]
+) -&gt; dict:
+    """
+    Use Claude to assess retention complexity for a table given its data distribution
+    and the compliance frameworks that apply.
+    """
+    client = anthropic.Anthropic()
+
+    prompt = f"""You are a data governance specialist advising on database retention policies.
+
+Table: {table_name}
+Temporal distribution of records:
+{json.dumps(temporal_distribution, indent=2)}
+
+Applicable compliance frameworks: {', '.join(applicable_frameworks)}
+
+Assess:
+1. Whether this table shows signs of mixed retention class data (explain what you see)
+2. The recommended retention period range based on the frameworks listed
+3. Whether a row-level retention filter is needed or if the whole table can be purged uniformly
+4. Any legal hold considerations that should be checked before any purge runs
+5. A risk rating for the current retention situation: HIGH, MEDIUM, or LOW
+
+Reference specific framework requirements where relevant (e.g., GDPR Article 5(1)(e), 
+HIPAA 45 CFR 164.530(j))."""
+
+    response = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1000,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return {
+        "table": table_name,
+        "retention_assessment": response.content[0].text,
+        "frameworks_evaluated": applicable_frameworks
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The output of this pipeline is a retention complexity register: a per-table assessment of whether uniform or row-level purge logic is needed, which framework requirements apply, and what risk the current state represents. This register feeds both your DBA team (who implements the purge logic) and your compliance team (who documents the retention controls for auditors).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operationalizing AI Compliance: Architecture and Governance</h3>
+
+<p class="text-gray-300 leading-relaxed">Implementing these capabilities in isolation is straightforward. Operationalizing them as a continuous compliance system requires attention to architecture and governance concerns that go beyond the Python snippets.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Policy documents / regulatory text] --> B[LLM translation<br/>policy to executable SQL checks]
+    B --> C[Scheduled compliance scans]
+    C --> D[Audit log anomaly detection<br/>Isolation Forest]
+    C --> E[Schema drift detection<br/>embedding similarity]
+    C --> F[PII column classification]
+    D --> G[LLM explanation layer]
+    E --> G
+    F --> G
+    G --> H[Human review queue]
+    H -->|approved| I[Remediation: revoke grants, purge, ticket]
+    H --> J[RAG audit evidence generator]
+    J --> K[Auditor-ready evidence package]
+    G -.append-only log.-> L[AI call audit trail]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The continuous compliance system this chapter builds: policy is compiled into checks once, scans run continuously, and every AI-generated finding passes through human review before remediation or before entering the formal audit package.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data sensitivity boundaries.</strong> The PII classification and data sampling steps involve sending schema metadata and potentially column value patterns to external AI APIs. Your organization's data classification policy may prohibit sending even anonymized samples of certain data classes outside the perimeter. At minimum, define which AI calls are permissible: schema metadata (column names, types, table names) is generally low risk; actual data values, even hashed, require explicit approval. For the most sensitive environments, deploy a locally hosted model (Ollama with a quantized Llama or Mistral model) for the classification and explanation steps, and reserve external API calls for non-sensitive metadata only.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Audit the auditor.</strong> The AI compliance system itself must be auditable. Log every LLM call that produces a compliance finding: the prompt, the model version, the response, and the timestamp. When an auditor asks "how was this exception identified?", you need to be able to show the complete chain of evidence — including what the AI model was told and what it produced. Store these call logs in an append-only table with the same rigor you apply to your primary audit logs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Human review gates.</strong> AI-generated findings should feed a human review queue before they drive automated remediation actions (like revoking grants). The detection pipeline can operate fully autonomously; the remediation pipeline should not. Build explicit approval steps for any action that modifies database permissions or purges data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Baseline management.</strong> The anomaly detection models and embedding-based drift detectors require periodic baseline updates. As your application evolves, what was anomalous six months ago may be normal today. Schedule quarterly baseline recertification: a human reviewer signs off that the current schema, access patterns, and privilege assignments represent the approved state, and that approved state becomes the new baseline for the next quarter's drift detection.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model versioning.</strong> LLM outputs are not fully deterministic. The same prompt sent to different model versions may produce different risk ratings or different SQL queries. Pin model versions in your compliance pipeline and treat model upgrades as changes that require re-validation of your check library. The fact that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">claude-opus-4-5</code> classified a finding as HIGH risk while a newer model version might classify it as MEDIUM is not grounds for ignoring the finding — it is grounds for human adjudication.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Policy-to-check translation** eliminates the manual bottleneck of converting regulatory language into database queries. LLMs can generate the initial SQL skeleton for compliance checks in seconds; your role shifts to validating and parameterizing those checks against your actual environment rather than authoring them from scratch.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anomaly detection on audit logs requires both a statistical model and an explanation layer.** Isolation forest scores are useful signals but not actionable on their own. The combination of a trained anomaly model for rapid scoring with LLM-generated explanations that reference actual session data produces findings that on-call DBAs can act on immediately without deep forensic expertise.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding-based schema drift detection captures semantic significance that string-diff tools miss.** A new column named `customer_tax_id` and a new index on `created_at` both represent schema changes, but they carry very different compliance weights. Semantic distance scoring surfaces the changes that matter for compliance while suppressing noise from benign structural adjustments.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI-assisted audit evidence generation converts remediation artifacts into auditor-ready documentation.** The same compliance data that drives your internal remediation workflow can feed a RAG pipeline that produces formal audit evidence sections in the register expected by external auditors, turning a multi-week evidence assembly process into a continuous automated workflow.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Governance of the AI compliance system is itself a compliance requirement.** Logging AI calls, pinning model versions, enforcing human review gates before automated remediation, and managing data sensitivity boundaries around what gets sent to external APIs are not optional engineering hygiene — they are the controls that make AI-driven compliance defensible when an auditor asks how your findings were produced.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">

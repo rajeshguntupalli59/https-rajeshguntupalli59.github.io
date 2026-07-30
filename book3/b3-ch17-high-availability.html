@@ -6,6 +6,10 @@
   <title>Chapter 17: Zero-Touch High Availability — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 17: Zero-Touch High Availability. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -432,7 +436,334 @@ ORDER BY drs.log_send_queue_size DESC;</code></pre>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Autonomous Runbook Execution and Post-Failover Validation</h3>
 
-<p class="text-gray-300 leading-relaxed">The final layer of zero-touch HA is not the failover itself — it is the automated validation that follows. A failover that succeeds technically but leaves the system in a degraded or undiscovered state is a failure in the autonomous contract. Post-fail</p>
+<p class="text-gray-300 leading-relaxed">The final layer of zero-touch HA is not the failover itself — it is the automated validation that follows. A failover that succeeds technically but leaves the system in a degraded or undiscovered state is a failure in the autonomous contract. Post-failover validation is the system's self-assessment: it must confirm that the new primary is healthy, that replication has resumed, that connections are routed correctly, that any dependent services have reconnected, and that the cluster is in a state where a second failover — if required — could succeed.</p>
+
+<p class="text-gray-300 leading-relaxed">Autonomous runbook execution treats the post-failover sequence as a directed acyclic graph of checks, each with a pass/fail condition, a timeout, and an escalation policy:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>[1] New primary responds on port 5432
+    → PASS: continue
+    → FAIL after 10s: re-evaluate candidate replicas, attempt second promotion
+
+[2] pg_stat_replication shows at least one active replica
+    → PASS: continue
+    → FAIL after 60s: alert, degrade RPO guarantee flag in DCS
+
+[3] Application connection count matches pre-failover baseline (±20%)
+    → PASS: continue
+    → FAIL after 30s: check pgBouncer pool health, force pool reconnect
+
+[4] Write throughput returns to baseline (±30%)
+    → PASS: mark failover complete
+    → FAIL after 120s: escalate to on-call — performance anomaly on new primary
+
+[5] Former primary rejoins as replica
+    → PASS within 300s: full cluster health restored
+    → FAIL after 300s: quarantine former primary, alert for manual inspection</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This runbook is implemented as an orchestration script that reads cluster state at each step rather than assuming the previous step's side effects persist:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import httpx
+import psycopg2
+import time
+import logging
+from enum import Enum
+from typing import Callable, Optional
+
+logger = logging.getLogger("failover_validator")
+
+class CheckResult(Enum):
+    PASS = "PASS"
+    FAIL = "FAIL"
+    TIMEOUT = "TIMEOUT"
+
+def run_check_with_timeout(
+    check_fn: Callable[[], bool],
+    timeout_seconds: int,
+    poll_interval: int = 5,
+    name: str = "check",
+) -&gt; CheckResult:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() &lt; deadline:
+        try:
+            if check_fn():
+                logger.info(f"[{name}] PASS")
+                return CheckResult.PASS
+        except Exception as e:
+            logger.warning(f"[{name}] exception during check: {e}")
+        time.sleep(poll_interval)
+    logger.error(f"[{name}] TIMEOUT after {timeout_seconds}s")
+    return CheckResult.TIMEOUT
+
+def check_primary_reachable(dsn: str) -&gt; bool:
+    conn = psycopg2.connect(dsn, connect_timeout=5)
+    cur = conn.cursor()
+    cur.execute("SELECT pg_is_in_recovery()")
+    is_replica = cur.fetchone()[0]
+    conn.close()
+    return not is_replica  # True only if this node believes it is primary
+
+def check_replication_active(dsn: str, min_replicas: int = 1) -&gt; bool:
+    conn = psycopg2.connect(dsn, connect_timeout=5)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT count(*) FROM pg_stat_replication WHERE state = 'streaming'"
+    )
+    count = cur.fetchone()[0]
+    conn.close()
+    return count &gt;= min_replicas
+
+def check_patroni_cluster_complete(patroni_url: str, expected_members: int) -&gt; bool:
+    r = httpx.get(f"{patroni_url}/cluster", timeout=5.0)
+    if r.status_code != 200:
+        return False
+    data = r.json()
+    running = [m for m in data["members"] if m.get("state") == "running"]
+    return len(running) &gt;= expected_members
+
+def execute_post_failover_runbook(
+    new_primary_dsn: str,
+    patroni_url: str,
+    expected_cluster_size: int,
+    escalation_fn: Callable[[str], None],
+):
+    steps = [
+        (
+            "primary_reachable",
+            lambda: check_primary_reachable(new_primary_dsn),
+            10,
+            True,   # fatal if fails — cannot continue without primary
+        ),
+        (
+            "replication_active",
+            lambda: check_replication_active(new_primary_dsn),
+            60,
+            False,  # non-fatal — alert but continue
+        ),
+        (
+            "cluster_complete",
+            lambda: check_patroni_cluster_complete(patroni_url, expected_cluster_size),
+            300,
+            False,
+        ),
+    ]
+
+    for name, fn, timeout, is_fatal in steps:
+        result = run_check_with_timeout(fn, timeout_seconds=timeout, name=name)
+        if result != CheckResult.PASS:
+            escalation_fn(
+                f"Post-failover check '{name}' returned {result.value}. "
+                f"Manual inspection required."
+            )
+            if is_fatal:
+                logger.critical(
+                    f"Fatal check '{name}' failed — halting runbook. "
+                    f"Cluster may be in unsafe state."
+                )
+                return
+
+    logger.info("Post-failover runbook complete. Cluster health validated.")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The escalation function passed into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">execute_post_failover_runbook</code> is deliberately abstract — in practice it dispatches to a PagerDuty API, a Slack webhook, or an incident management system. The point is that escalation is the *last resort* in the autonomous contract: the runbook exhausts every automated recovery option before producing a human-visible alert.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, an equivalent post-failover validation script runs T-SQL checks against the DMVs and posts results to a centralized monitoring table that the operator controller reads:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Post-failover health summary for autonomous AG validation
+-- Insert into a shared audit table read by the orchestration layer
+INSERT INTO dba.ag_failover_audit (
+    failover_time,
+    new_primary,
+    ag_name,
+    replica_count_healthy,
+    max_redo_queue_kb,
+    validation_status
+)
+SELECT
+    SYSDATETIMEOFFSET()                                        AS failover_time,
+    SERVERNAME                                                 AS new_primary,
+    ag.name                                                    AS ag_name,
+    SUM(CASE WHEN ars.synchronization_health_desc = 'HEALTHY'
+             THEN 1 ELSE 0 END)                                AS replica_count_healthy,
+    MAX(drs.redo_queue_size)                                   AS max_redo_queue_kb,
+    CASE
+        WHEN SUM(CASE WHEN ars.synchronization_health_desc = 'HEALTHY'
+                      THEN 1 ELSE 0 END) &gt;= 2
+         AND MAX(drs.redo_queue_size) &lt; 102400   -- under 100MB redo backlog
+        THEN 'VALIDATED'
+        ELSE 'DEGRADED'
+    END                                                        AS validation_status
+FROM sys.availability_groups ag
+JOIN sys.availability_replicas ar
+    ON ag.group_id = ar.group_id
+JOIN sys.dm_hadr_availability_replica_states ars
+    ON ar.replica_id = ars.replica_id
+JOIN sys.dm_hadr_database_replica_states drs
+    ON ar.replica_id = drs.replica_id
+WHERE ag.name = 'ProductionAG'
+GROUP BY ag.name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dba.ag_failover_audit</code> table becomes the authoritative record of every failover event: what triggered it, when it occurred, who became primary, how long reintegration took, and whether post-failover validation passed. This table is read by the automated reporting layer to produce post-incident summaries without human authorship — the system describes what happened to itself.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.7 Split-Brain Prevention: Fencing, STONITH, and Consensus Guarantees</h3>
+
+<p class="text-gray-300 leading-relaxed">Every automated HA system faces one adversarial scenario that cannot be resolved by checking metrics: the network partition where both the primary and a promoted replica believe they are the authoritative write endpoint. This is split-brain, and it is the failure mode that turns an HA system into a data consistency catastrophe.</p>
+
+<p class="text-gray-300 leading-relaxed">Zero-touch HA does not just detect split-brain — it prevents it architecturally. The prevention mechanisms operate at three levels.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 1: DCS-enforced leader exclusivity.</strong> In Patroni, the leadership key in etcd is held by exactly one node at a time. A replica cannot become primary without acquiring the key. A primary that loses DCS connectivity pauses writes (via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pause</code> state) rather than continuing to serve writes without a valid lease. The DCS is the arbiter — no DCS connection, no primary designation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 2: STONITH (Shoot The Other Node In The Head).</strong> When a replica is promoted, it must ensure the former primary cannot continue accepting writes. STONITH accomplishes this by issuing a fencing command — typically a power cycle or network isolation command — through an out-of-band management interface (IPMI, AWS EC2 stop-instance API, Azure VM deallocate). The promotion is not considered complete until the fencing operation confirms the former primary is offline.</p>
+
+<p class="text-gray-300 leading-relaxed">In cloud environments, STONITH is implemented through the provider's control plane API:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+import logging
+
+logger = logging.getLogger("stonith")
+
+def fence_instance(instance_id: str, region: str) -&gt; bool:
+    """
+    Hard fence an EC2 instance by stopping it via the AWS API.
+    Called by the Patroni custom_bootstrap script when a replica is promoted
+    and the former primary's DCS lease has not been gracefully released.
+    Used as a STONITH mechanism to guarantee the former primary cannot write.
+    """
+    ec2 = boto3.client("ec2", region_name=region)
+    try:
+        response = ec2.stop_instances(
+            InstanceIds=[instance_id],
+            Force=True   # Force=True bypasses graceful shutdown
+        )
+        state = response["StoppingInstances"][0]["CurrentState"]["Name"]
+        logger.info(f"Fencing {instance_id}: instance state is now '{state}'")
+        return state in ("stopping", "stopped")
+    except Exception as e:
+        logger.critical(
+            f"STONITH FAILED for {instance_id}: {e}. "
+            f"Human intervention required — potential split-brain."
+        )
+        return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If STONITH fails — if the fencing operation cannot reach the management API, or the API returns an error — the autonomous system must not complete the promotion. Instead, it must halt the election, relinquish the DCS key if it was acquired, and generate a critical alert. A failed fence is worse than a failed failover: a failed failover leaves you with no primary; a failed fence with a completed promotion leaves you with two primaries.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 3: PostgreSQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recovery_min_apply_delay</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_ctl promote</code> sequencing.</strong> When Patroni issues the promotion command, it does so only after confirming the fencing operation succeeded and the DCS key is held. The sequencing is:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>1. Acquire DCS leadership key
+2. Confirm fencing of former primary (API acknowledgment)
+3. Execute pg_ctl promote on the winning replica
+4. Update DCS with new primary's connection information
+5. Signal HAProxy health endpoint change (Patroni REST /primary returns 200)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Step 2 must complete before step 3. This is not a best-effort sequence — it is enforced in Patroni's promotion code path. Any HA framework that promotes first and fences second is architecturally unsafe.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">sequenceDiagram
+    participant DCS as DCS (etcd/Consul)
+    participant Replica as Candidate Replica
+    participant Fence as Fencing API (IPMI/Cloud)
+    participant OldPrimary as Former Primary
+    participant Proxy as HAProxy/pgBouncer
+
+    Replica->>DCS: Acquire leadership key
+    DCS-->>Replica: Key granted
+    Replica->>Fence: Fence former primary
+    Fence->>OldPrimary: Power cycle / network isolate
+    Fence-->>Replica: Fence confirmed
+    Replica->>Replica: pg_ctl promote
+    Replica->>DCS: Update primary connection info
+    DCS-->>Proxy: /primary health check returns 200
+    Proxy->>Replica: Route write traffic</pre></div>
+<p class="text-gray-300 leading-relaxed">*Promotion only proceeds after the fence is confirmed — a failed fence halts the sequence rather than risking dual primaries.*</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server in WSFC, the equivalent fencing mechanism is the cluster's quorum vote. When a partition occurs and a node loses quorum, WSFC takes that node offline rather than allowing it to continue as a split-brain primary. The quorum configuration — <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Node Majority</code> for odd-node clusters, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Node and File Share Majority</code> for even-node clusters — must be reviewed as part of any zero-touch HA deployment because misconfigured quorum is the most common cause of split-brain in production WSFC environments.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.8 Observable Failover: The Audit Trail That Explains Itself</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous system that cannot explain its own decisions is unauditable and, in regulated environments, non-compliant. Zero-touch HA must generate a structured, timestamped, causal audit trail for every failover event: what signals triggered the decision, what threshold was crossed, what actions were taken in what sequence, and what the outcome of each action was.</p>
+
+<p class="text-gray-300 leading-relaxed">The audit trail is not a log file — it is a structured database record that can be queried, compared across failover events, and used to improve the decision logic over time. Each failover event is a first-class entity:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL schema for autonomous failover audit
+CREATE TABLE ha.failover_events (
+    event_id            BIGSERIAL PRIMARY KEY,
+    event_time          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    trigger_signal      TEXT NOT NULL,         -- e.g., 'TCP_HEALTH_CHECK_FAILED'
+    trigger_details     JSONB,                 -- raw signal data at decision time
+    former_primary      TEXT NOT NULL,
+    new_primary         TEXT NOT NULL,
+    candidate_set       JSONB,                 -- all replicas evaluated, with LSN
+    winning_candidate   TEXT NOT NULL,
+    fence_attempted     BOOLEAN NOT NULL,
+    fence_succeeded     BOOLEAN,
+    promotion_time      TIMESTAMPTZ,
+    haproxy_switch_time TIMESTAMPTZ,
+    first_client_conn   TIMESTAMPTZ,
+    replication_resumed TIMESTAMPTZ,
+    total_downtime_ms   INTEGER,
+    validation_status   TEXT,
+    escalated           BOOLEAN NOT NULL DEFAULT FALSE,
+    escalation_reason   TEXT
+);
+
+-- Index for post-incident analysis
+CREATE INDEX ON ha.failover_events (event_time DESC);
+CREATE INDEX ON ha.failover_events (former_primary, event_time DESC);
+
+-- View for SLA reporting: downtime per calendar month
+CREATE VIEW ha.monthly_ha_summary AS
+SELECT
+    date_trunc('month', event_time)         AS month,
+    count(*)                                AS failover_count,
+    avg(total_downtime_ms)                  AS avg_downtime_ms,
+    max(total_downtime_ms)                  AS max_downtime_ms,
+    sum(total_downtime_ms) / 1000.0         AS total_downtime_seconds,
+    count(*) FILTER (WHERE escalated)       AS escalated_count,
+    count(*) FILTER (
+        WHERE validation_status = 'VALIDATED'
+    )                                       AS clean_failovers
+FROM ha.failover_events
+GROUP BY date_trunc('month', event_time)
+ORDER BY month DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">trigger_details</code> JSONB column stores the raw signal values at the moment the decision was made — the replication lag in bytes, the seconds since the last heartbeat, the HAProxy health check response count. This is the evidence record that answers the post-incident question: "Why did the system fail over at 03:47?" The answer is not "because Patroni said so" — it is a structured document showing that replication lag was 2.3 MB (above the 1 MB threshold), the last heartbeat was 38 seconds ago (above the 30-second TTL), and TCP connectivity had failed three consecutive checks in the preceding 6 seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">The equivalent SQL Server audit table captures the same causal chain but reads from DMV snapshots captured at the time of the operator's reconciliation loop:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: failover audit schema in the DBA utility database
+CREATE TABLE dba.ag_failover_events (
+    event_id              BIGINT IDENTITY(1,1) PRIMARY KEY,
+    event_time            DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    ag_name               NVARCHAR(128)  NOT NULL,
+    former_primary        NVARCHAR(128)  NOT NULL,
+    new_primary           NVARCHAR(128)  NOT NULL,
+    trigger_signal        NVARCHAR(256)  NOT NULL,
+    send_queue_at_trigger BIGINT,        -- log_send_queue_size KB at trigger time
+    redo_queue_at_trigger BIGINT,        -- redo_queue_size KB at trigger time
+    failover_type         NVARCHAR(64),  -- 'AUTOMATIC' or 'FORCED'
+    data_loss_detected    BIT            NOT NULL DEFAULT 0,
+    validation_status     NVARCHAR(32),
+    total_downtime_ms     INT,
+    operator_version      NVARCHAR(64),  -- operator image version that performed failover
+    notes                 NVARCHAR(MAX)
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">operator_version</code> column is subtle but important: it records which version of the Kubernetes operator or Patroni daemon executed the failover. When a failover behaves unexpectedly — too slow, incorrect candidate selection, fence failure — the operator version is the first variable to investigate. Autonomous systems evolve, and their audit trails must capture the version of the autonomous agent that made each decision, not just the decision itself.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Zero-touch failover requires a multi-signal decision matrix, not a single trip-wire.** Autonomous HA systems act on the aggregate of TCP connectivity, replication lag, replica quorum, and process health signals — preventing failover storms from transient network events while catching real outages with high confidence.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Patroni's DCS lease and SQL Server's WSFC quorum serve identical architectural roles:** they externalize leadership state into a shared, durable medium so that no individual node can unilaterally claim primary status. Any HA framework that does not anchor leadership in external consensus is architecturally unsafe for autonomous operation.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Traffic rerouting speed is determined by the health-check stack, not DNS.** The combination of HAProxy's interval-based health checks against the Patroni REST endpoint, pgBouncer's `query_wait_timeout`, and `on-marked-down shutdown-sessions` delivers sub-10-second connection rerouting without application code changes or DNS TTL dependency.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Split-brain prevention is non-negotiable and must be enforced by sequencing:** acquire consensus key, confirm fencing, then promote. An HA system that promotes first and fences later — or that treats fencing as optional — exposes the cluster to dual-primary data corruption. Failed fencing must halt the promotion, not ignore the error.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The failover audit trail is as important as the failover itself.** A structured, queryable record of every trigger signal, candidate evaluation, fencing outcome, and validation result turns an autonomous HA system from a black box into an accountable agent — one that can explain its decisions to post-incident reviews, compliance auditors, and the next iteration of its own decision logic.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

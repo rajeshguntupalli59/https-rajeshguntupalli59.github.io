@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 4: AI-Assisted Query Tuning — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 4: AI-Assisted Query Tuning. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -440,15 +444,520 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed">The following GitHub Actions workflow shows how to wire this into a standard application deployment pipeline. It assumes you're using a staging PostgreSQL instance that mirrors production schema and has representative data (or at least a realistic subset).</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># .github/workflows/query-analysis.yml
+name: AI Query Performance Gate
+
+on:
+  pull_request:
+    paths:
+      - 'migrations/**'
+      - 'app/queries/**'
+      - '**/*.sql'
+
+jobs:
+  analyze-queries:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: testdb
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+        options: &gt;-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install anthropic psycopg2-binary
+
+      - name: Apply schema migrations
+        env:
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/testdb
+        run: |
+          # Apply baseline schema + all migrations in PR
+          psql $DATABASE_URL -f schema/baseline.sql
+          for f in migrations/*.sql; do psql $DATABASE_URL -f "$f"; done
+
+      - name: Run AI query analysis
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DATABASE_URL: postgresql://postgres:testpass@localhost:5432/testdb
+        run: |
+          python scripts/ci_query_analysis.py \
+            --query-dir app/queries/ \
+            --database-url $DATABASE_URL \
+            --output-file query_analysis_report.json \
+            --fail-on-severity critical
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: query-analysis-report
+          path: query_analysis_report.json
+
+      - name: Comment PR with findings
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('query_analysis_report.json', 'utf8'));
+
+            if (report.findings.length === 0) {
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: '✅ **AI Query Analysis**: No performance concerns detected in modified queries.'
+              });
+              return;
+            }
+
+            let body = '## 🔍 AI Query Performance Analysis\n\n';
+            for (const finding of report.findings) {
+              const icon = finding.severity === 'critical' ? '🚨' :
+                           finding.severity === 'high' ? '⚠️' : 'ℹ️';
+              body += `### ${icon} ${finding.severity.toUpperCase()}: \`${finding.query_file}\`\n\n`;
+              body += `**Root Cause:** ${finding.root_cause}\n\n`;
+              if (finding.index_suggestions.length &gt; 0) {
+                body += `**Suggested Indexes:**\n\`\`\`sql\n${finding.index_suggestions.join('\n')}\n\`\`\`\n\n`;
+              }
+              if (finding.rewritten_query) {
+                body += `**Suggested Rewrite:**\n\`\`\`sql\n${finding.rewritten_query}\n\`\`\`\n\n`;
+              }
+              body += `*AI Confidence: ${finding.confidence}*\n\n---\n\n`;
+            }
+            body += `&gt; ⚠️ These recommendations are AI-generated and require DBA review before implementation.`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The Python script invoked in the workflow (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ci_query_analysis.py</code>) needs to extract queries from the query directory, obtain execution plans from the staging database, and run the AI analysis:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+ci_query_analysis.py
+Analyze SQL queries in a directory against a staging database using AI.
+Exits with code 1 if --fail-on-severity threshold is met.
+"""
+
+import argparse
+import json
+import os
+import sys
+import glob
+import psycopg2
+from pathlib import Path
+
+# Import the functions defined earlier in this chapter
+from query_analysis import analyze_slow_query, QueryAnalysisRequest
+
+SEVERITY_RANK = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
+
+def extract_queries_from_file(filepath: str) -&gt; list[str]:
+    """
+    Extract individual SQL statements from a .sql file.
+    Simple semicolon splitting — for production use a proper SQL parser.
+    """
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    statements = [s.strip() for s in content.split(';') if s.strip()]
+    # Only analyze SELECT statements — DDL and DML have different analysis paths
+    return [s for s in statements if s.upper().lstrip().startswith('SELECT')]
+
+def get_plan_for_query(conn_string: str, query: str) -&gt; str | None:
+    """Get EXPLAIN output. Returns None if query cannot be explained."""
+    try:
+        conn = psycopg2.connect(conn_string)
+        cursor = conn.cursor()
+        # Use EXPLAIN without ANALYZE for CI — we don't want to execute against
+        # potentially empty staging tables, and ANALYZE requires real data.
+        cursor.execute(f"EXPLAIN (FORMAT TEXT, VERBOSE) {query}")
+        plan_rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return "\n".join(row[0] for row in plan_rows)
+    except Exception as e:
+        return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--query-dir', required=True)
+    parser.add_argument('--database-url', required=True)
+    parser.add_argument('--output-file', required=True)
+    parser.add_argument('--fail-on-severity', default='critical',
+                        choices=['critical', 'high', 'medium', 'low'])
+    args = parser.parse_args()
+
+    sql_files = glob.glob(os.path.join(args.query_dir, '**/*.sql'), recursive=True)
+    findings = []
+    max_severity_seen = None
+
+    for filepath in sql_files:
+        queries = extract_queries_from_file(filepath)
+        for query in queries:
+            plan = get_plan_for_query(args.database_url, query)
+            if plan is None:
+                continue  # Skip queries that can't be explained (parameterized, etc.)
+
+            request = QueryAnalysisRequest(
+                query_text=query,
+                execution_plan=plan,
+                database_type="postgresql"
+            )
+            result = analyze_slow_query(request)
+
+            # Only record medium and above in CI output
+            if SEVERITY_RANK.get(result.severity, 0) &gt;= SEVERITY_RANK['medium']:
+                findings.append({
+                    'query_file': os.path.relpath(filepath),
+                    'severity': result.severity,
+                    'root_cause': result.root_cause,
+                    'recommendations': result.recommendations,
+                    'rewritten_query': result.rewritten_query,
+                    'index_suggestions': result.index_suggestions,
+                    'confidence': result.confidence
+                })
+
+                if max_severity_seen is None or \
+                   SEVERITY_RANK[result.severity] &gt; SEVERITY_RANK[max_severity_seen]:
+                    max_severity_seen = result.severity
+
+    report = {'findings': findings, 'total_queries_analyzed': len(sql_files)}
+    with open(args.output_file, 'w') as f:
+        json.dump(report, f, indent=2)
+
+    # Exit non-zero if we hit the severity threshold
+    if max_severity_seen and \
+       SEVERITY_RANK[max_severity_seen] &gt;= SEVERITY_RANK[args.fail_on_severity]:
+        print(f"FAIL: Found {max_severity_seen} severity query issues. "
+              f"See {args.output_file} for details.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"PASS: {len(findings)} findings recorded. "
+          f"No issues at or above '{args.fail_on_severity}' severity.")
+    sys.exit(0)
+
+if __name__ == '__main__':
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An important architectural note: in CI, you're analyzing query plans against a staging database with potentially different data volumes than production. The optimizer may make different choices on small datasets. A sequential scan that looks fine on a ten-thousand-row staging table will be catastrophic on the hundred-million-row production table. You have two mitigation strategies:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET enable_seqscan = off</code> in CI</strong> to force index usage and catch cases where no suitable index exists, even if the planner would choose a seq scan on small data.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Inject production-representative row counts via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET (n_distinct = ...)</code> and manual <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE</code> with injected statistics</strong> so the planner reasons about production-scale cardinalities even with limited staging data.</p>
+
+<p class="text-gray-300 leading-relaxed">Both approaches have tradeoffs. The first generates false positives for legitimate small-table scans. The second is operationally complex but produces more production-faithful plans. For most teams, starting with option one and refining over time is the pragmatic path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Production Guardrails: Preventing Regressions</h3>
+
+<p class="text-gray-300 leading-relaxed">The single most dangerous failure mode in AI-assisted query tuning is implementing an AI recommendation that improves one query's performance while regressing several others. This happens through index contention (a new index speeds up reads but slows writes and competes with existing indexes for buffer cache), plan instability (a query hint that works on today's data distribution breaks after next month's statistics refresh), and semantic errors in rewritten queries (an LLM confidently rewrites a query that returns different results — a correctness bug, not just a performance issue).</p>
+
+<p class="text-gray-300 leading-relaxed">A disciplined production deployment process for AI-generated recommendations requires three gates.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[AI-generated recommendation] --> B{Gate 1: Semantic equivalence verified?}
+    B -->|no| X[Reject / send back to AI]
+    B -->|yes| C{Gate 2: Index impact acceptable?}
+    C -->|no| X
+    C -->|yes| D[Gate 3: Controlled rollout]
+    D --> E[Deploy with CONCURRENTLY / feature flag]
+    E --> F[Monitor 24h+: duration, cache pressure, replication lag]
+    F -->|regression| G[Roll back / force prior plan]
+    F -->|stable| H[Mark implemented]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The three-gate guardrail process: no AI recommendation reaches production without equivalence verification, impact simulation, and monitored rollout.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gate 1: Semantic equivalence verification.</strong> For any AI-suggested query rewrite, verify the rewritten query produces identical results on a representative dataset before anything reaches production. This can be automated:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def verify_query_equivalence(
+    original_query: str,
+    rewritten_query: str,
+    conn_string: str,
+    sample_params: list[dict]
+) -&gt; bool:
+    """
+    Execute both queries with sample parameters and compare result sets.
+    Returns True only if all result sets match exactly.
+    """
+    conn = psycopg2.connect(conn_string)
+    cursor = conn.cursor()
+
+    for params in sample_params:
+        try:
+            cursor.execute(original_query, params)
+            original_rows = set(tuple(row) for row in cursor.fetchall())
+
+            cursor.execute(rewritten_query, params)
+            rewritten_rows = set(tuple(row) for row in cursor.fetchall())
+
+            if original_rows != rewritten_rows:
+                print(f"Result mismatch with params {params}")
+                print(f"  Original row count: {len(original_rows)}")
+                print(f"  Rewritten row count: {len(rewritten_rows)}")
+                symmetric_diff = original_rows.symmetric_difference(rewritten_rows)
+                print(f"  Differing rows (up to 5): {list(symmetric_diff)[:5]}")
+                cursor.close()
+                conn.close()
+                return False
+
+        except Exception as e:
+            print(f"Query execution error during equivalence check: {e}")
+            cursor.close()
+            conn.close()
+            return False
+
+    cursor.close()
+    conn.close()
+    return True</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This function is straightforward but worth calling out: set comparison is order-insensitive, which is correct for verifying query semantics since SQL result sets are fundamentally unordered. If your query has an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ORDER BY</code>, you'll need to compare ordered lists instead.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gate 2: Index impact simulation.</strong> Before creating an AI-suggested index in production, estimate its impact on write throughput and table bloat. PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_size_pretty</code> and index size estimation queries give you the storage cost. For write impact, a useful rule of thumb: each additional index on a high-write table adds roughly proportional overhead to every INSERT, UPDATE, and DELETE that touches indexed columns. You can measure this precisely on staging with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgbench</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sysbench</code> before and after index creation.</p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server provides <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_details</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_db_missing_index_group_stats</code> natively, which already incorporate an impact score. Comparing AI suggestions against this view is a useful sanity check — if the AI recommends an index that SQL Server's own missing index DMV also recommends with a high impact score, confidence in that recommendation increases considerably.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Estimate size of a proposed index before creating it
+-- Use hypopg extension for hypothetical index planning
+CREATE EXTENSION IF NOT EXISTS hypopg;
+
+-- Add a hypothetical index
+SELECT hypopg_create_index(
+    'CREATE INDEX ON orders (status, created_at) INCLUDE (customer_id, order_id)'
+);
+
+-- Check if the optimizer would use it
+EXPLAIN SELECT order_id, customer_id
+FROM orders
+WHERE status = 'pending'
+  AND created_at &gt;= NOW() - INTERVAL '30 days';
+
+-- Clean up hypothetical indexes
+SELECT hypopg_reset();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hypopg</code> extension is one of the most underused tools in the PostgreSQL DBA's arsenal for exactly this purpose. It lets you test whether the optimizer would actually choose a proposed index without paying the cost of creating it. Combining <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hypopg</code> with AI index suggestions creates a tight feedback loop: AI proposes, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">hypopg</code> validates, DBA decides.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Use Database Engine Tuning Advisor output or check missing index DMVs
+-- to cross-validate AI-suggested indexes
+SELECT
+    mid.statement AS table_name,
+    mid.equality_columns,
+    mid.inequality_columns,
+    mid.included_columns,
+    migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans)
+        AS improvement_measure,
+    migs.user_seeks,
+    migs.user_scans,
+    migs.last_user_seek
+FROM sys.dm_db_missing_index_details mid
+JOIN sys.dm_db_missing_index_groups mig
+    ON mid.index_handle = mig.index_handle
+JOIN sys.dm_db_missing_index_group_stats migs
+    ON mig.index_group_handle = migs.group_handle
+WHERE migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) &gt; 1000
+ORDER BY improvement_measure DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gate 3: Controlled rollout with regression monitoring.</strong> When an AI recommendation passes gates 1 and 2, deploy it with a rollback plan and active monitoring. For index creation, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> in PostgreSQL avoids table locks. For query rewrites, deploy behind a feature flag so the old query path remains available. Monitor key metrics for at least 24 hours post-deployment: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> for the specific query's average duration, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code> for cache pressure changes, and replication lag if the change affects a primary with replicas.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, index creation with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE = ON</code> minimizes blocking, and Query Store provides before/after plan comparison natively — an underappreciated feature that maps directly to AI recommendation validation. After implementing a change, Query Store's forced plan capability lets you roll back to the previous plan in seconds if metrics degrade.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Use Query Store to compare plans before and after AI recommendation
+-- Find a query in Query Store by partial text match
+SELECT
+    qsq.query_id,
+    qsqt.query_sql_text,
+    qsp.plan_id,
+    qsp.last_execution_time,
+    qsrs.avg_duration / 1000.0 AS avg_duration_ms,
+    qsrs.avg_logical_io_reads,
+    qsp.is_forced_plan
+FROM sys.query_store_query qsq
+JOIN sys.query_store_query_text qsqt
+    ON qsq.query_text_id = qsqt.query_text_id
+JOIN sys.query_store_plan qsp
+    ON qsq.query_id = qsp.query_id
+JOIN sys.query_store_runtime_stats qsrs
+    ON qsp.plan_id = qsrs.plan_id
+WHERE qsqt.query_sql_text LIKE '%orders%pending%'
+ORDER BY qsrs.last_execution_time DESC;
+
+-- If the new plan regresses, force the old plan immediately:
+EXEC sys.sp_query_store_force_plan
+    @query_id = 42,    -- replace with actual query_id
+    @plan_id  = 17;    -- replace with the known-good plan_id</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Prompt Engineering for Query Optimization</h3>
+
+<p class="text-gray-300 leading-relaxed">The quality of AI analysis is directly proportional to the quality of the prompt. Generic prompts yield generic advice. Prompts that embed context, constrain the output format, and direct the model's attention to specific diagnostic signals yield actionable, specific recommendations. The following principles summarize what works in practice for query optimization prompts.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Principle 1: Establish role and scope immediately.</strong> LLMs perform better when told explicitly what kind of expert they are playing and what scope of action is available. "You are a PostgreSQL DBA with expertise in query optimization for OLTP workloads on tables with hundreds of millions of rows. You cannot change application code. You can suggest indexes, statistics updates, query rewrites, and configuration changes scoped to the session or query level." This framing prevents the model from suggesting application-level architectural changes when you need a 30-minute fix.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Principle 2: Give the model a diagnostic framework.</strong> Rather than asking "what's wrong with this query?", walk the model through the framework you'd use yourself: "First identify whether the problem is a scan/seek mismatch, a cardinality estimation error, a join order problem, or a memory grant issue. Then identify the specific plan node causing the bottleneck. Then suggest fixes in order of implementation risk." Structured prompts produce structured reasoning.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Principle 3: Provide comparative context.</strong> When a query has regressed compared to a prior plan, include both plans. "The following query previously executed in 50ms. After last week's index rebuild, it now takes 3.2 seconds. Here are both execution plans. Identify what changed and why the new plan is worse." Regression analysis is one of the strongest use cases for LLMs because it leverages the model's ability to diff two structured documents.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Principle 4: Request explicit uncertainty acknowledgment.</strong> Ask the model to flag cases where it cannot determine the root cause from available information, and to specify what additional information would resolve the ambiguity. This turns "I don't know" from a silent failure into actionable diagnostic guidance: "I cannot determine whether the nested loop join is appropriate without knowing the expected row count from the filter on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">order_status</code>. Please provide <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT COUNT(*) FROM orders WHERE status = 'pending'</code>."</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Principle 5: Constrain output format strictly.</strong> Unstructured natural language output from an LLM is hard to parse programmatically and inconsistent across runs. Requiring JSON output with a defined schema — as shown in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">analyze_slow_query()</code> earlier — makes the output machine-readable, diffable, and auditable. Include the exact JSON schema in the prompt and validate against it in code.</p>
+
+<p class="text-gray-300 leading-relaxed">The following prompt template synthesizes these principles and can be adapted for most query optimization scenarios:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>QUERY_TUNING_PROMPT_TEMPLATE = """
+You are a {db_type} performance engineer specializing in {workload_type} workloads.
+Your goal is to identify the root cause of poor query performance and suggest specific, 
+implementable improvements. You cannot modify application code or database server configuration 
+(only session-level settings). You CAN suggest: indexes, statistics updates, query rewrites, 
+and query hints.
+
+DIAGNOSTIC FRAMEWORK:
+1. Identify the most expensive plan node (highest actual rows × cost ratio)
+2. Check for cardinality estimation errors (large actual vs. estimated row differences)
+3. Identify join order problems (small tables driving large table lookups)
+4. Check for implicit type conversions preventing index use
+5. Look for missing index seeks on high-selectivity filter columns
+
+CONTEXT:
+- Database version: {db_version}
+- Table sizes: {table_sizes}
+- Observed duration: {observed_duration_ms}ms (expected: &lt;{target_duration_ms}ms)
+- Execution frequency: {calls_per_hour} calls/hour
+- Prior plan available: {has_prior_plan}
+
+QUERY:
+{query_text}
+
+EXECUTION PLAN:
+{execution_plan}
+
+{prior_plan_section}
+
+SCHEMA (relevant tables and indexes):
+{schema_context}
+
+OUTPUT REQUIREMENTS:
+Respond ONLY with valid JSON matching this exact schema. Do not include explanation outside the JSON.
+{{
+  "primary_bottleneck_node": "name of the most expensive plan node",
+  "root_cause": "one-sentence description of the primary performance problem",
+  "root_cause_evidence": "specific lines from the plan that support this diagnosis",
+  "severity": "critical|high|medium|low",
+  "severity_rationale": "why this severity level",
+  "recommendations": [
+    {{
+      "type": "index|rewrite|statistics|hint|configuration",
+      "description": "what to do and why",
+      "implementation_risk": "low|medium|high",
+      "expected_improvement": "qualitative description"
+    }}
+  ],
+  "index_suggestions": ["CREATE INDEX ... SQL statements"],
+  "rewritten_query": "improved SQL or null",
+  "rewrite_correctness_notes": "any caveats about semantic equivalence of rewrite",
+  "missing_context": "what additional information would improve this analysis, or null",
+  "confidence": "high|medium|low"
+}}
+"""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This template is longer than the earlier simple prompt, but the added structure pays dividends: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rewrite_correctness_notes</code> surfaces semantic equivalence caveats the model itself identifies, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">missing_context</code> drives the next diagnostic step, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">implementation_risk</code> on each recommendation helps DBAs prioritize.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Evaluating AI Recommendation Quality Over Time</h3>
+
+<p class="text-gray-300 leading-relaxed">Any production AI system needs evaluation — a feedback loop that tells you whether the recommendations are actually helping, degrading, or simply irrelevant. For query tuning specifically, you have a natural ground truth: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> and Query Store track actual query performance before and after changes.</p>
+
+<p class="text-gray-300 leading-relaxed">Build a simple evaluation table alongside your recommendations table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+CREATE TABLE query_tuning_outcomes (
+    id SERIAL PRIMARY KEY,
+    recommendation_id INTEGER REFERENCES query_tuning_recommendations(id),
+    implemented_at TIMESTAMPTZ NOT NULL,
+    implemented_by TEXT NOT NULL,
+    change_description TEXT,
+    -- Performance metrics captured before and after
+    pre_avg_duration_ms NUMERIC,
+    post_avg_duration_ms NUMERIC,
+    pre_calls_per_hour INTEGER,
+    post_calls_per_hour INTEGER,
+    -- Outcome assessment
+    outcome TEXT CHECK (outcome IN (
+        'improved',       -- query measurably faster
+        'regressed',      -- query measurably slower
+        'no_change',      -- no measurable difference
+        'wrong_advice',   -- recommendation was semantically incorrect
+        'inapplicable'    -- could not be implemented as suggested
+    )),
+    outcome_notes TEXT,
+    measured_at TIMESTAMPTZ DEFAULT NOW()
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Populate this table after each recommendation is implemented and given time to accumulate statistics. A weekly query against this table gives you the most important operational metric for your AI query tuning pipeline:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Recommendation quality summary: last 90 days
+SELECT
+    r.ai_confidence,
+    r.severity,
+    o.outcome,
+    COUNT(*) AS recommendation_count,
+    AVG(
+        CASE WHEN o.outcome = 'improved'
+        THEN (o.pre_avg_duration_ms - o.post_avg_duration_ms) / o.pre_avg_duration_ms * 100
+        ELSE NULL END
+    ) AS avg_improvement_pct
+FROM query_tuning_recommendations r
+JOIN query_tuning_outcomes o ON r.id = o.recommendation_id
+WHERE o.implemented_at &gt;= NOW() - INTERVAL '90 days'
+GROUP BY r.ai_confidence, r.severity, o.outcome
+ORDER BY r.severity, r.ai_confidence, o.outcome;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">What you're looking for in this output: high-confidence recommendations should convert to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">improved</code> outcomes at a higher rate than low-confidence ones — if they don't, the model's confidence calibration is off and you should either adjust your prompt to discourage overconfident outputs, or add a post-processing step that downgrades confidence when the plan evidence is ambiguous. Severity <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">critical</code> recommendations that convert to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">no_change</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">regressed</code> outcomes indicate the model is pattern-matching on plan shapes without understanding data context — a signal to enrich your prompts with more schema and statistics context.</p>
+
+<p class="text-gray-300 leading-relaxed">Over time, this feedback loop also reveals systematic gaps. If the model consistently misses a particular query anti-pattern that your DBA team catches manually, that pattern is a candidate for a few-shot example in your prompt: a curated library of "here is a plan with this pattern, here is the correct diagnosis" examples that steers the model toward better pattern recognition on your specific workload.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI query analysis accelerates triage but requires DBA validation.** LLMs excel at pattern recognition in execution plans, translating optimizer decisions into plain language, and generating concrete index and rewrite suggestions — but they cannot execute queries, access live statistics, or guarantee semantic correctness of rewrites. Every AI recommendation must pass human review before reaching production.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prompt quality determines analysis quality.** Generic prompts produce generic advice. Effective query analysis prompts establish a diagnostic framework, provide rich context (schema, row counts, prior plans, observed duration), constrain output to a strict JSON schema, and explicitly request uncertainty acknowledgment when the evidence is insufficient.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate the pipeline, not the implementation.** The right place for automation is collection, analysis, and surfacing of recommendations — not automatic index creation or query deployment. The `review_status` workflow pattern (pending → approved → implemented) maintains human control while eliminating the manual work of identifying what to analyze.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Use `hypopg` and Query Store to validate before committing.** PostgreSQL's `hypopg` extension tests whether the optimizer would actually use a proposed index without creating it. SQL Server's Query Store provides native before/after plan comparison and one-command plan forcing for rollbacks. Both tools bridge the gap between AI suggestion and production confidence.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Measure outcomes to improve the system over time.** Tracking actual performance deltas against AI recommendation outcomes — segmented by the model's stated confidence level — reveals whether the model's confidence calibration is accurate and surfaces systematic blind spots in its analysis. This feedback loop transforms the pipeline from a static tool into one that improves with operational experience.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">

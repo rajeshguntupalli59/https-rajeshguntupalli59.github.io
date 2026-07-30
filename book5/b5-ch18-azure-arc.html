@@ -6,6 +6,10 @@
   <title>Chapter 18: Azure Arc-Enabled SQL Server: Hybrid Cloud — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 18: Azure Arc-Enabled SQL Server: Hybrid Cloud. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -312,7 +316,7 @@ Perf
 | project TimeGenerated, Computer, AvgCPU
 | order by AvgCPU desc</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Best Practices Assessment</strong> is an Arc-specific capability that runs scheduled SQL Server configuration assessments and reports findings to Log Analytics. It checks roughly 400 rules covering security configuration, performance settings, availability configuration, and deprecated features. Unlike ad-hoc assessment tools, this runs on a schedule (weekly by default, configurable to daily) and trends results over time.</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Best Practices Assessment</strong> is an Arc-specific capability that runs scheduled SQL Server configuration assessments and reports findings to Log Analytics. It checks a broad set of rules covering security configuration, performance settings, availability configuration, and deprecated features — consult current Microsoft documentation for the exact rule count and categories, since these are added to over time. Unlike ad-hoc assessment tools, this runs on a schedule (weekly by default, configurable to daily) and trends results over time.</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable Best Practices Assessment on Arc SQL Server
 az sql server-arc assessment create \
@@ -441,7 +445,7 @@ WHERE a.name = 'ArcDefenderAudit';</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Defender for SQL alerts surface in Azure Security Center (now Microsoft Defender for Cloud) under the same dashboard as Azure SQL alerts. A DBA managing 200 on-premises instances previously had no centralized security alert surface for SQL injection attempts. With Arc, a brute-force attack against an on-premises SQL Server in a Chicago data center triggers the same Defender for Cloud alert workflow as an attack against an Azure SQL Database in East US.</p>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gotcha:</strong> Defender for SQL charges per instance per month (approximately $15/vCore/month as of 2024, check current pricing). For shops with large SQL Server estates, enabling Defender at subscription scope without an instance count audit first produces unexpected billing. Run the count before enabling:</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gotcha:</strong> Defender for SQL is billed per protected instance per month — check current Azure pricing for your region and tier before enabling it broadly. For shops with large SQL Server estates, enabling Defender at subscription scope without an instance count audit first produces unexpected billing. Run the count before enabling:</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Count Arc SQL instances before enabling Defender
 az sql server-arc list \
@@ -521,7 +525,504 @@ az policy assignment create \
   --policy "require-sql-2019-or-later" \
   --scope "/subscriptions/&lt;subscription-id&gt;"</code></pre>
 
-<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy remediation tasks</strong> handle non-compliant resources automatically where possible. For example, a policy requiring TDE on all Arc SQL</p>
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy remediation tasks</strong> handle non-compliant resources automatically where possible. For example, a policy requiring TDE on all Arc SQLServer databases can include a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">deployIfNotExists</code> effect that triggers a remediation task to enable TDE without manual DBA intervention:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create remediation task for non-compliant Arc SQL instances
+az policy remediation create \
+  --name "remediate-defender-arcsql" \
+  --policy-assignment "require-defender-arcsql" \
+  --resource-group rg-arc-sqlserver-prod \
+  --resource-discovery-mode ReEvaluateCompliance
+
+# Monitor remediation task progress
+az policy remediation show \
+  --name "remediate-defender-arcsql" \
+  --resource-group rg-arc-sqlserver-prod \
+  --query "{Status:properties.provisioningState, Succeeded:properties.resourceCounts.compliant, Failed:properties.resourceCounts.noncompliant}"
+
+# List all non-compliant Arc SQL resources across subscription
+az policy state list \
+  --subscription &lt;subscription-id&gt; \
+  --filter "complianceState eq 'NonCompliant' and resourceType eq 'Microsoft.AzureArcData/sqlServerInstances'" \
+  --query "[].{Resource:resourceId, Policy:policyDefinitionName, State:complianceState}" \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Guest Configuration policies</strong> extend enforcement into the OS and SQL Server configuration layer. Unlike standard Azure Policy which validates ARM resource properties, Guest Configuration runs inside the machine and can audit or enforce settings like SQL Server service account configuration, SQL Server error log retention, and SQL Agent job configurations. These policies deploy a Guest Configuration agent to the Arc-connected machine and run DSC-based configuration checks.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># List available Guest Configuration policy definitions for SQL Server
+az policy definition list \
+  --query "[?contains(displayName, 'SQL') && policyType=='BuiltIn' && contains(metadata.category, 'Guest Configuration')].{Name:displayName, Id:name}" \
+  --output table
+
+# Assign Guest Configuration policy for SQL Server service account validation
+az policy assignment create \
+  --name "gc-sql-service-account" \
+  --display-name "SQL Server services should not use SA account" \
+  --policy "/providers/Microsoft.Authorization/policyDefinitions/&lt;definition-id&gt;" \
+  --scope "/subscriptions/&lt;subscription-id&gt;/resourceGroups/rg-arc-sqlserver-prod" \
+  --mi-system-assigned \
+  --location eastus2
+
+# Guest Configuration policies require a managed identity on the assignment
+# Grant the assignment's managed identity the necessary role
+ASSIGNMENT_PRINCIPAL=$(az policy assignment show \
+  --name "gc-sql-service-account" \
+  --scope "/subscriptions/&lt;subscription-id&gt;/resourceGroups/rg-arc-sqlserver-prod" \
+  --query identity.principalId -o tsv)
+
+az role assignment create \
+  --assignee $ASSIGNMENT_PRINCIPAL \
+  --role "Guest Configuration Resource Contributor" \
+  --scope "/subscriptions/&lt;subscription-id&gt;/resourceGroups/rg-arc-sqlserver-prod"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.6 Arc as a Migration Bridge</h3>
+
+<p class="text-gray-300 leading-relaxed">Arc is frequently positioned as a permanent hybrid management solution, but its most underappreciated use case is as a <strong class="text-white">migration bridge</strong> — a way to bring Azure governance and tooling to an on-premises instance before migrating it to Azure SQL Managed Instance, Azure SQL Database, or SQL Server on Azure VMs. This section addresses that phased migration pattern.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The migration bridge pattern works in three phases:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Phase 1: Onboard           Phase 2: Assess            Phase 3: Migrate
+─────────────────────      ─────────────────────      ─────────────────
+Install Arc agent      →   Run BPA assessments    →   Execute migration
+Connect to ARM             Evaluate Defender alerts    Decommission Arc resource
+Establish monitoring       Size MI/DB targets          Retain audit history
+Configure alerts           Address blockers            in Log Analytics</code></pre>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Phase 1: Onboard<br/>Install Arc agent, connect to ARM,<br/>establish monitoring] --> B[Phase 2: Assess<br/>Run BPA, evaluate Defender alerts,<br/>size migration targets]
+    B --> C[Phase 3: Migrate<br/>Execute migration,<br/>decommission Arc resource]
+    C --> D[Log Analytics retains<br/>audit history post-migration]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Arc used as a migration bridge: governance and assessment tooling attach to the on-premises instance before it is retired in favor of a native Azure SQL target.*</p>
+
+<p class="text-gray-300 leading-relaxed">During Phase 2, Arc provides two migration-critical capabilities: <strong class="text-white">Azure Migrate integration</strong> and the <strong class="text-white">SQL Server assessment reports</strong> that identify migration blockers.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create Azure Migrate project for hybrid SQL assessment
+az migrate project create \
+  --resource-group rg-arc-sqlserver-prod \
+  --project-name migrate-sql-2024 \
+  --location eastus2
+
+# Arc-connected SQL Server instances appear automatically in Azure Migrate
+# when the subscription and workspace are linked. View discovered instances:
+az migrate machine list \
+  --resource-group rg-arc-sqlserver-prod \
+  --project-name migrate-sql-2024 \
+  --output table
+
+# The SQL Server migration extension provides target recommendation
+az sql server-arc migration-assessment create \
+  --name SQLPROD01 \
+  --resource-group rg-arc-sqlserver-prod \
+  --target-type ManagedInstance \
+  --workspace-id $WORKSPACE_ID</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The migration assessment identifies blockers such as linked servers (not supported in Azure SQL Database), cross-database queries (requires Managed Instance or Elastic Pools), CLR assemblies using unsafe or external access, distributed transactions, SQL Server Agent jobs using unsupported subsystems, and Windows Authentication without Azure AD federation configured.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Maintaining Arc connectivity during a rolling migration</strong> helps when you have multiple databases on a single instance and migrate them one at a time:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Track database migration status across hybrid fleet
+-- Create a tracking table in a DBA management database (on-prem)
+CREATE TABLE dba.MigrationTracker (
+    InstanceName        NVARCHAR(128) NOT NULL,
+    DatabaseName        NVARCHAR(128) NOT NULL,
+    ArcResourceId       NVARCHAR(500) NULL,
+    MigrationTarget     NVARCHAR(200) NULL, -- e.g., 'mi-prod.database.windows.net'
+    MigrationStatus     NVARCHAR(50)  NOT NULL DEFAULT 'Pending',
+        -- Pending, Assessing, InProgress, Cutover, Complete
+    AssessmentDate      DATETIME2 NULL,
+    MigrationStartDate  DATETIME2 NULL,
+    CutoverDate         DATETIME2 NULL,
+    BlockerCount        INT NULL,
+    Notes               NVARCHAR(MAX) NULL,
+    ModifiedBy          NVARCHAR(128) NOT NULL DEFAULT SUSER_SNAME(),
+    ModifiedDate        DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_MigrationTracker PRIMARY KEY (InstanceName, DatabaseName)
+);
+GO
+
+-- Populate with current databases
+INSERT INTO dba.MigrationTracker (InstanceName, DatabaseName)
+SELECT 
+    @@SERVERNAME,
+    name
+FROM sys.databases
+WHERE name NOT IN ('master', 'model', 'msdb', 'tempdb')
+AND state_desc = 'ONLINE';
+GO
+
+-- Query migration status
+SELECT 
+    InstanceName,
+    MigrationStatus,
+    COUNT(*) AS DatabaseCount,
+    MIN(AssessmentDate) AS EarliestAssessment,
+    MAX(CutoverDate) AS LatestCutover
+FROM dba.MigrationTracker
+GROUP BY InstanceName, MigrationStatus
+ORDER BY InstanceName, MigrationStatus;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">After migration, clean up Arc resources</strong> for instances that have been fully migrated:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Verify no remaining databases before disconnecting Arc
+az sql db-arc list \
+  --server-name SQLPROD01 \
+  --resource-group rg-arc-sqlserver-prod \
+  --output table
+
+# Disconnect the Arc SQL Server extension first
+az connectedmachine extension delete \
+  --machine-name SQLPROD01 \
+  --resource-group rg-arc-sqlserver-prod \
+  --name WindowsAgent.SqlServer \
+  --yes
+
+# Disconnect the machine from Arc
+# (Run this on the host itself OR remotely via ARM)
+az connectedmachine delete \
+  --name SQLPROD01 \
+  --resource-group rg-arc-sqlserver-prod \
+  --yes
+
+# Or from the host, run the agent disconnect command:
+# azcmagent disconnect --service-principal-id &lt;id&gt; --service-principal-secret &lt;secret&gt;
+
+# Retain Log Analytics data per your retention policy
+# The workspace data persists independently of Arc resource deletion</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gotcha:</strong> Deleting the Arc connected machine resource in ARM does not uninstall the Arc agent from the host OS. The agent continues running but in a disconnected state. On decommissioned hosts this is harmless; on hosts that will be repurposed, uninstall the agent explicitly using <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Add/Remove Programs</code> on Windows or the package manager on Linux before reprovisioning.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.7 Azure AD Authentication for Arc SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">One of the more transformative capabilities Arc enables for on-premises SQL Server is <strong class="text-white">Azure Active Directory (Azure AD) authentication</strong>, which Microsoft now calls Microsoft Entra ID authentication. Traditionally, on-premises SQL Server relied on Windows Authentication against local Active Directory, or SQL authentication. Arc-enabled SQL Server 2022 can authenticate users directly against Azure AD without requiring Azure AD Connect or AD Federation Services — the Arc agent handles the token validation.</p>
+
+<p class="text-gray-300 leading-relaxed">This matters for hybrid environments where:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Remote workers lack VPN access to on-premises AD but have Azure AD credentials</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Azure-native applications need to connect to on-premises SQL Server using managed identities</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> You want unified audit trails across Azure SQL and on-premises SQL Server</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Prerequisites for Azure AD auth on Arc SQL Server:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. SQL Server 2022 (Azure AD auth is not available for earlier versions via Arc)</p>
+<p class="text-gray-300 leading-relaxed">2. Arc Connected Machine Agent version 1.13 or later</p>
+<p class="text-gray-300 leading-relaxed">3. Azure AD admin assigned to the SQL Server instance</p>
+<p class="text-gray-300 leading-relaxed">4. Outbound connectivity to Azure AD endpoints</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Set Azure AD admin for Arc SQL Server instance
+az sql server-arc ad-admin create \
+  --name SQLPROD01 \
+  --resource-group rg-arc-sqlserver-prod \
+  --display-name "SQL Arc Admins" \
+  --object-id &lt;azure-ad-group-object-id&gt; \
+  --type Group
+
+# Verify AD admin assignment
+az sql server-arc ad-admin show \
+  --name SQLPROD01 \
+  --resource-group rg-arc-sqlserver-prod</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once configured, create Azure AD logins using T-SQL syntax:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2022: Create Azure AD logins on Arc-connected instance
+-- Connect as sysadmin first
+
+-- Create login for an Azure AD user
+CREATE LOGIN [dbadmin@contoso.com]
+FROM EXTERNAL PROVIDER;
+GO
+
+-- Create login for an Azure AD group
+CREATE LOGIN [SQL-DBAs@contoso.com]
+FROM EXTERNAL PROVIDER;
+GO
+
+-- Create login for an Azure managed identity
+-- Useful when Azure Functions or App Service needs to connect to on-prem SQL via Arc
+CREATE LOGIN [my-azure-function-app]
+FROM EXTERNAL PROVIDER;
+GO
+
+-- Grant server-level permissions
+ALTER SERVER ROLE [sysadmin] ADD MEMBER [SQL-DBAs@contoso.com];
+GO
+
+-- Create database user mapped to the Azure AD login
+USE [HRDB];
+GO
+
+CREATE USER [dbadmin@contoso.com] FROM LOGIN [dbadmin@contoso.com];
+GO
+
+ALTER ROLE [db_datareader] ADD MEMBER [dbadmin@contoso.com];
+ALTER ROLE [db_datawriter] ADD MEMBER [dbadmin@contoso.com];
+GO
+
+-- Verify Azure AD logins
+SELECT 
+    name,
+    type_desc,
+    authentication_type_desc,
+    create_date,
+    is_disabled
+FROM sys.server_principals
+WHERE type IN ('E', 'X')  -- E = External User, X = External Group
+ORDER BY create_date DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connecting to Arc SQL Server using Azure AD authentication:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python: Connect to Arc-enabled SQL Server using Azure AD token
+# Uses azure-identity and pyodbc
+
+import pyodbc
+from azure.identity import DefaultAzureCredential
+import struct
+
+def get_azure_ad_token():
+    """Acquire Azure AD token for SQL Server authentication."""
+    credential = DefaultAzureCredential()
+    # Resource ID for SQL Server
+    token = credential.get_token("https://database.windows.net/.default")
+    return token.token
+
+def connect_arc_sql_server(server_name: str, database: str) -&gt; pyodbc.Connection:
+    """
+    Connect to Arc-enabled SQL Server using Azure AD authentication.
+    server_name: FQDN or IP of on-premises SQL Server
+    database: Target database name
+    """
+    token = get_azure_ad_token()
+    
+    # Convert token to bytes for ODBC access token attribute
+    token_bytes = token.encode('utf-16-le')
+    token_struct = struct.pack(f'&lt;I{len(token_bytes)}s', 
+                               len(token_bytes), 
+                               token_bytes)
+    
+    connection_string = (
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"SERVER={server_name};"
+        f"DATABASE={database};"
+        f"Encrypt=yes;"
+        f"TrustServerCertificate=no;"
+    )
+    
+    conn = pyodbc.connect(
+        connection_string,
+        attrs_before={1256: token_struct}  # SQL_COPT_SS_ACCESS_TOKEN
+    )
+    return conn
+
+# Usage
+conn = connect_arc_sql_server("sqlprod01.corp.contoso.com", "HRDB")
+cursor = conn.cursor()
+cursor.execute("SELECT SYSTEM_USER, USER_NAME(), @@SERVERNAME")
+row = cursor.fetchone()
+print(f"Logged in as: {row[0]}, User: {row[1]}, Server: {row[2]}")
+conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Gotcha:</strong> Azure AD authentication on Arc SQL Server 2022 requires the SQL Server certificate to be trusted by clients. Self-signed certificates generated during SQL Server installation will cause connection failures with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TrustServerCertificate=no</code>. Either issue a certificate from an enterprise CA or update clients to trust the self-signed certificate during a transition period — but do not leave <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TrustServerCertificate=yes</code> in production connection strings permanently.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.8 Operational Runbooks for Arc-Managed SQL Server</h3>
+
+<p class="text-gray-300 leading-relaxed">Managing an Arc-connected SQL Server fleet requires operational procedures that account for both the Azure control plane and the on-premises SQL Server layer. This section documents runbook patterns for the most common operational scenarios.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Runbook: Arc agent health check and remediation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Arc agent connectivity issues are the most common operational problem. The agent can lose connectivity due to proxy changes, certificate expiration, service account password rotation, or network policy changes. Detect and remediate with this pattern:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# arc-agent-health-check.sh
+# Run from Azure Cloud Shell or from a jumpbox with Azure CLI access
+
+RESOURCE_GROUP="rg-arc-sqlserver-prod"
+SUBSCRIPTION_ID="&lt;subscription-id&gt;"
+
+echo "=== Arc Agent Health Check: $(date) ==="
+
+# List all Arc machines and their connectivity status
+az connectedmachine list \
+  --resource-group $RESOURCE_GROUP \
+  --query "[].{Name:name, Status:properties.status, LastHeartbeat:properties.lastStatusChange, AgentVersion:properties.agentVersion}" \
+  --output table
+
+# Find machines that haven't reported in over 30 minutes
+STALE_THRESHOLD=$(date -u -d "30 minutes ago" '+%Y-%m-%dT%H:%M:%SZ')
+echo ""
+echo "=== Machines with stale heartbeat (&gt; 30 min) ==="
+az connectedmachine list \
+  --resource-group $RESOURCE_GROUP \
+  --query "[?properties.lastStatusChange &lt; '$STALE_THRESHOLD'].{Name:name, LastHeartbeat:properties.lastStatusChange, Status:properties.status}" \
+  --output table
+
+# Check agent version - identify outdated agents
+echo ""
+echo "=== Agent versions in fleet ==="
+az connectedmachine list \
+  --resource-group $RESOURCE_GROUP \
+  --query "[].{Name:name, AgentVersion:properties.agentVersion}" \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On the host side, diagnose agent connectivity issues:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Diagnose-ArcAgent.ps1
+# Run on the Arc-connected host when connectivity issues are reported
+
+# Check agent service status
+Get-Service -Name "himds" | Select-Object Name, Status, StartType
+Get-Service -Name "GCArcService" | Select-Object Name, Status, StartType
+
+# Check agent connectivity
+& "C:\Program Files\AzureConnectedMachineAgent\azcmagent.exe" check
+
+# Common output codes:
+# OK       - All endpoints reachable
+# FAILED   - Cannot reach Azure endpoints (proxy/firewall issue)
+# WARNING  - Partial connectivity
+
+# View agent logs
+Get-Content "C:\ProgramData\AzureConnectedMachineAgent\Log\himds.log" -Tail 100
+
+# Test specific endpoint connectivity
+$endpoints = @(
+    "management.azure.com",
+    "login.microsoftonline.com",
+    "guestnotificationservice.azure.com"
+)
+
+foreach ($endpoint in $endpoints) {
+    $result = Test-NetConnection -ComputerName $endpoint -Port 443 -WarningAction SilentlyContinue
+    Write-Host "$endpoint : $(if($result.TcpTestSucceeded){'REACHABLE'}else{'UNREACHABLE'})"
+}
+
+# Restart agent if connectivity checks pass but agent shows disconnected
+if ((& "C:\Program Files\AzureConnectedMachineAgent\azcmagent.exe" check) -match "OK") {
+    Restart-Service -Name "himds" -Force
+    Start-Sleep -Seconds 15
+    Get-Service -Name "himds" | Select-Object Name, Status
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Runbook: Bulk license type audit and correction</strong></p>
+
+<p class="text-gray-300 leading-relaxed">In large estates, license types accumulate errors over time as servers are onboarded by different teams. This runbook identifies and corrects inconsistencies:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# audit-arc-license-types.sh
+
+RESOURCE_GROUP="rg-arc-sqlserver-prod"
+
+echo "=== Arc SQL License Type Audit ==="
+
+# Export all instances with their current license types
+az sql server-arc list \
+  --resource-group $RESOURCE_GROUP \
+  --query "[].{Name:name, LicenseType:properties.licenseType, Edition:properties.edition, Version:properties.version, vCores:properties.vCores}" \
+  --output table
+
+# Count by license type
+echo ""
+echo "=== License Type Summary ==="
+az sql server-arc list \
+  --resource-group $RESOURCE_GROUP \
+  --query "[].properties.licenseType" \
+  --output tsv | sort | uniq -c | sort -rn
+
+# Identify PAYG instances that should be Azure Hybrid Benefit
+# (instances with 'Production' tag but PAYG license type - common misconfiguration)
+echo ""
+echo "=== Potential AHB Candidates (Production tagged, PAYG licensed) ==="
+az sql server-arc list \
+  --resource-group $RESOURCE_GROUP \
+  --query "[?tags.Environment=='Production' && properties.licenseType=='PAYG'].{Name:name, LicenseType:properties.licenseType}" \
+  --output table
+
+# Correct license type for specific instances (requires approval workflow in production)
+# Example: Update a single instance to LicenseIncluded (ESU scenario)
+# az sql server-arc update \
+#   --name SQLLEGACY01 \
+#   --resource-group $RESOURCE_GROUP \
+#   --license-type LicenseIncluded</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Runbook: Forced Best Practices Assessment and report export</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Before a major SQL Server upgrade or migration, trigger an on-demand BPA run and export results:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Trigger immediate BPA assessment on all Arc SQL instances in resource group
+for instance in $(az sql server-arc list \
+  --resource-group rg-arc-sqlserver-prod \
+  --query "[].name" --output tsv); do
+  
+  echo "Triggering assessment for $instance..."
+  az sql server-arc assessment create \
+    --name $instance \
+    --resource-group rg-arc-sqlserver-prod \
+    --workspace-id $WORKSPACE_ID
+  
+  echo "Assessment triggered for $instance"
+done</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Then extract results from Log Analytics:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>// KQL: Export full BPA findings for pre-migration report
+SqlAssessment_CL
+| where TimeGenerated &gt; ago(24h)
+| where IsRuleInWarningState_b == true
+| project
+    AssessmentTimestamp = TimeGenerated,
+    ServerName = Computer,
+    Category = Category_s,
+    Severity = Severity_s,
+    RuleId = RuleId_s,
+    RuleName = RuleName_s,
+    Description = Description_s,
+    Recommendation = Recommendation_s,
+    AffectedObjects = AffectedObjects_s
+| order by Severity asc, Category asc, ServerName asc</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">18.9 Limitations and When Not to Use Arc</h3>
+
+<p class="text-gray-300 leading-relaxed">Arc solves real problems, but it is not the right tool in every scenario. Understanding the limitations prevents over-engineering.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Arc does not provide real-time query performance insights equivalent to Query Store UI in SSMS.</strong> The data that flows to Log Analytics has ingestion latency — typically two to five minutes, sometimes longer under high telemetry load. For active performance troubleshooting of an in-flight incident, DBAs still connect directly to the SQL Server instance using SSMS, Azure Data Studio, or direct T-SQL queries against DMVs. Arc is a fleet management and governance layer, not a low-latency diagnostic tool.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Arc agent overhead is minimal but not zero.</strong> The Connected Machine Agent and SQL Server extension consume approximately 200-400 MB of memory on the host and generate periodic CPU spikes during telemetry collection windows. On memory-constrained legacy servers (32 GB or less) running large SQL workloads, this overhead should be evaluated before mass rollout.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connectivity dependency is real.</strong> If an Arc-connected instance loses outbound internet access, it continues running SQL Server normally — Arc has no operational dependency on Azure connectivity. However, policy evaluations stop updating, Defender alerts stop flowing, monitoring gaps appear in Log Analytics, and BPA assessments fail silently. Design monitoring for Arc agent connectivity as a separate health signal.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Arc is not a replication or high availability solution.</strong> It provides no data-layer capabilities. DBAs who encounter Arc for the first time sometimes conflate it with Azure SQL Managed Instance Link (which does provide replication). Arc manages metadata; Managed Instance Link synchronizes data. These are complementary, not competing.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Sovereign cloud and regulatory constraints</strong> affect Arc deployments. Arc endpoints route through Azure's commercial cloud by default. Organizations subject to data sovereignty regulations in jurisdictions where Azure Government, Azure China, or Azure Germany regions apply must configure Arc to use the appropriate sovereign cloud endpoints — and some highly regulated industries prohibit any management-plane data leaving specific geographic boundaries, which Arc's current architecture does not accommodate.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Configure Arc for Azure Government cloud
+# (Must be done before connecting the agent)
+& "C:\Program Files\AzureConnectedMachineAgent\azcmagent.exe" config set cloud "AzureUSGovernment"
+
+# Or for Azure China
+& "C:\Program Files\AzureConnectedMachineAgent\azcmagent.exe" config set cloud "AzureChinaCloud"
+
+# Verify cloud configuration
+& "C:\Program Files\AzureConnectedMachineAgent\azcmagent.exe" config list</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Arc projects on-premises SQL Server into Azure Resource Manager as a first-class resource**, enabling unified RBAC, tagging, policy enforcement, and monitoring through the same Azure portal and API surface used for Azure SQL services — without moving any data or changing SQL Server's operational behavior.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Onboarding uses an outbound-only HTTPS connection** via the Connected Machine Agent; no inbound firewall rules are required. At-scale onboarding through configuration management tools (Ansible, SCCM, GPO) is the production approach, and license type configuration at onboarding time prevents billing discrepancies.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure Monitor, Log Analytics KQL queries, Defender for SQL, and Best Practices Assessment** all extend to Arc-connected instances under the same frameworks used for Azure SQL, eliminating parallel monitoring and security toolchains for hybrid fleets — though Arc telemetry has ingestion latency unsuitable for real-time incident diagnostics.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Arc serves as a migration bridge**, not just a permanent hybrid solution: its integration with Azure Migrate and SQL Server assessment reporting surfaces migration blockers, tracks per-database migration status, and preserves historical audit data in Log Analytics that persists after the Arc resource is decommissioned.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure AD authentication for Arc SQL Server 2022 enables token-based authentication** from Azure-native workloads and remote users without AD Federation Services or Azure AD Connect, but requires properly trusted certificates on the SQL Server host — self-signed certificates must be addressed before enabling this capability in production.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">

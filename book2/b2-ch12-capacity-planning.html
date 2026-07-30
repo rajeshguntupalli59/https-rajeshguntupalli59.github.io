@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 12: AI-Driven Capacity Planning — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 12: AI-Driven Capacity Planning. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -483,15 +487,1092 @@ produce a structured capacity planning report.
 
 ## Input Data</code></pre>
 <p class="text-gray-300 leading-relaxed">{json.dumps(context, indent=2, default=str)}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+## Required Output Structure
+
+1. **Executive Summary** (2-3 sentences: current state, biggest risk, recommended action)
+
+2. **Growth Analysis** (What's driving growth? Is the rate accelerating, 
+   decelerating, or stable? What's the dominant contributing factor?)
+
+3. **Risk Assessment** (Which threshold will be breached first and when? 
+   What are the operational consequences if it's missed? 
+   Quantify the risk in terms of time-to-action required.)
+
+4. **Top Table Growth Concerns** (Flag any tables showing anomalous growth 
+   that warrants investigation before treating them as normal capacity growth)
+
+5. **Recommended Actions** (Numbered list, prioritized by urgency:
+   - Immediate actions (within 1 week)
+   - Short-term actions (within 30 days)  
+   - Strategic actions (30-90 days)
+   Each action should include: what to do, why, and expected impact)
+
+6. **Procurement Guidance** (If hardware or storage procurement is needed: 
+   minimum viable addition, recommended addition with growth buffer, 
+   latest procurement-safe date assuming 4-week lead time)
+
+Be specific and direct. Avoid vague language like "consider monitoring" 
+or "may want to review". Use the actual numbers from the data provided."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=2000,
+        messages=[
+            {"role": "user", "content": user_prompt}
+        ],
+        system=system_prompt
+    )
+
+    return message.content[0].text
+
+
+def get_top_growing_tables_postgres(conn_string: str, days: int = 30) -&gt; list:
+    """Identify the tables growing fastest over the specified period."""
+    query = """
+        WITH size_history AS (
+            SELECT
+                table_name,
+                collected_at,
+                table_bytes,
+                LAG(table_bytes) OVER (
+                    PARTITION BY table_name ORDER BY collected_at
+                ) AS prev_bytes
+            FROM table_size_metrics
+            WHERE collected_at &gt;= NOW() - INTERVAL '%(days)s days'
+        )
+        SELECT
+            table_name,
+            MAX(table_bytes)                    AS current_bytes,
+            MAX(table_bytes) - MIN(table_bytes) AS growth_bytes,
+            ROUND(
+                (MAX(table_bytes) - MIN(table_bytes))::numeric /
+                NULLIF(MIN(table_bytes), 0) * 100,
+                1
+            )                                   AS growth_pct
+        FROM size_history
+        GROUP BY table_name
+        HAVING MIN(table_bytes) &gt; 104857600  -- Only tables &gt; 100MB
+        ORDER BY growth_bytes DESC
+        LIMIT 10
+    """
+    import psycopg2
+    with psycopg2.connect(conn_string) as conn:
+        df = pd.read_sql(query, conn, params={'days': days})
+    return df.to_dict('records')
+
+
+def get_top_growing_tables_sqlserver(conn_string: str, days: int = 30) -&gt; list:
+    """SQL Server equivalent: identify fastest-growing tables."""
+    query = """
+        WITH size_history AS (
+            SELECT
+                table_name,
+                collected_at,
+                table_bytes,
+                LAG(table_bytes) OVER (
+                    PARTITION BY table_name ORDER BY collected_at
+                ) AS prev_bytes
+            FROM dbo.table_size_metrics
+            WHERE collected_at &gt;= DATEADD(DAY, -%(days)s, GETUTCDATE())
+        )
+        SELECT TOP 10
+            table_name,
+            MAX(table_bytes)                     AS current_bytes,
+            MAX(table_bytes) - MIN(table_bytes)  AS growth_bytes,
+            ROUND(
+                CAST(MAX(table_bytes) - MIN(table_bytes) AS FLOAT) /
+                NULLIF(MIN(table_bytes), 0) * 100,
+                1
+            )                                    AS growth_pct
+        FROM size_history
+        GROUP BY table_name
+        HAVING MIN(table_bytes) &gt; 104857600
+        ORDER BY growth_bytes DESC
+    """
+    import pyodbc
+    with pyodbc.connect(conn_string) as conn:
+        df = pd.read_sql(query, conn, params={'days': days})
+    return df.to_dict('records')</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The output from this function—when fed real forecast data—reads like a senior DBA wrote it, with specific dates, actionable recommendations tied to actual numbers, and a procurement timeline that maps to real lead times. For teams supporting dozens of databases, this automation compresses what would otherwise be a week of manual reporting into minutes.</p>
+
+<p class="text-gray-300 leading-relaxed">One critical design principle: the LLM is always working from data you've computed and validated. It's not being asked to estimate storage growth from scratch—that would produce hallucinated numbers. It's being asked to interpret, prioritize, and communicate results that your statistical models have already produced. This division of labor plays to the strengths of both approaches.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Anomaly Detection in Capacity Metrics</h3>
+
+<p class="text-gray-300 leading-relaxed">Forecasting predicts smooth trends. Anomaly detection catches the discontinuities—the moments when something fundamentally changes in a way that invalidates your forecast model. A runaway ETL job that populates a table with 500GB of duplicate data in four hours isn't a capacity planning problem; it's an operational emergency that your forecasting pipeline should escalate immediately.</p>
+
+<p class="text-gray-300 leading-relaxed">For capacity metrics, isolation forests and CUSUM (Cumulative Sum Control Chart) algorithms work well together. Isolation forests catch point anomalies and small clusters—individual hours or days where growth is far outside normal ranges. CUSUM catches sustained shifts in the mean—cases where the growth rate has changed persistently, which is the signal that your forecast model needs to be retrained.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import numpy as np
+import pandas as pd
+from sklearn.ensemble import IsolationForest
+from scipy import stats
+from typing import List, Tuple
+import warnings
+
+
+def detect_growth_anomalies(
+    df: pd.DataFrame,
+    contamination: float = 0.02
+) -&gt; pd.DataFrame:
+    """
+    Apply Isolation Forest to hourly growth deltas to detect anomalous
+    growth events. Returns the dataframe with anomaly flags added.
+    
+    Args:
+        df: DataFrame with 'ds' (datetime) and 'y' (size in GB) columns
+        contamination: Expected fraction of anomalous points (default 2%)
+    """
+    df = df.copy().sort_values('ds').reset_index(drop=True)
+
+    # Compute hourly growth delta
+    df['growth_gb'] = df['y'].diff().fillna(0)
+    df['growth_pct'] = (df['y'].diff() / df['y'].shift(1) * 100).fillna(0)
+
+    # Clip extreme negative values (backups, truncations) separately
+    df['is_shrinkage'] = df['growth_gb'] &lt; -0.1  # More than 100MB decrease
+
+    # Feature matrix for isolation forest
+    features = df[['growth_gb', 'growth_pct']].copy()
+    features = features.replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    iso_forest = IsolationForest(
+        contamination=contamination,
+        n_estimators=200,
+        random_state=42
+    )
+    df['anomaly_score'] = iso_forest.fit_transform(features)[:, 0]
+    df['is_anomaly'] = iso_forest.predict(features) == -1
+
+    return df
+
+
+def cusum_changepoint_detection(
+    series: pd.Series,
+    threshold_sigma: float = 3.0
+) -&gt; List[int]:
+    """
+    CUSUM detection for sustained shifts in growth rate.
+    Returns indices where significant changepoints are detected.
+    """
+    values = series.values
+    mean = np.mean(values[:30])   # Bootstrap from first 30 observations
+    std = np.std(values[:30]) + 1e-8  # Avoid division by zero
+
+    cusum_pos = np.zeros(len(values))
+    cusum_neg = np.zeros(len(values))
+    changepoints = []
+
+    k = 0.5  # Allowance parameter (half sigma)
+
+    for i in range(1, len(values)):
+        cusum_pos[i] = max(0, cusum_pos[i-1] + (values[i] - mean)/std - k)
+        cusum_neg[i] = max(0, cusum_neg[i-1] - (values[i] - mean)/std - k)
+
+        if cusum_pos[i] &gt; threshold_sigma or cusum_neg[i] &gt; threshold_sigma:
+            changepoints.append(i)
+            # Reset after detection to avoid cascading flags
+            cusum_pos[i] = 0
+            cusum_neg[i] = 0
+            # Update baseline for next segment
+            if i + 10 &lt; len(values):
+                mean = np.mean(values[i:i+10])
+
+    return changepoints
+
+
+def analyze_anomalies_with_llm(
+    anomalies: pd.DataFrame,
+    changepoints: List[int],
+    df: pd.DataFrame,
+    database_name: str
+) -&gt; str:
+    """
+    Send detected anomalies to LLM for root cause hypothesis generation.
+    """
+    import anthropic
+
+    client = anthropic.Anthropic()
+
+    anomaly_details = []
+    for _, row in anomalies.iterrows():
+        anomaly_details.append({
+            "timestamp": row['ds'].strftime('%Y-%m-%d %H:%M'),
+            "size_gb": round(row['y'], 2),
+            "growth_in_period_gb": round(row['growth_gb'], 2),
+            "growth_pct": round(row['growth_pct'], 2),
+            "anomaly_score": round(row['anomaly_score'], 3)
+        })
+
+    changepoint_details = []
+    for cp_idx in changepoints:
+        if cp_idx &lt; len(df):
+            pre_mean = df['growth_gb'].iloc[max(0, cp_idx-24):cp_idx].mean()
+            post_mean = df['growth_gb'].iloc[cp_idx:cp_idx+24].mean()
+            changepoint_details.append({
+                "timestamp": df['ds'].iloc[cp_idx].strftime('%Y-%m-%d %H:%M'),
+                "pre_changepoint_growth_gb_per_hr": round(pre_mean, 3),
+                "post_changepoint_growth_gb_per_hr": round(post_mean, 3),
+                "magnitude_change_pct": round(
+                    (post_mean - pre_mean) / (abs(pre_mean) + 1e-8) * 100, 1
+                )
+            })
+
+    prompt = f"""A capacity anomaly detection system has flagged the following 
+events in the database '{database_name}'. Analyze each anomaly and changepoint,
+provide likely root cause hypotheses, and indicate which events require 
+immediate investigation versus routine review.
+
+## Point Anomalies (unusual single-period growth events):</code></pre>
+<p class="text-gray-300 leading-relaxed">{json.dumps(anomaly_details, indent=2)}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+## Sustained Changepoints (persistent shifts in growth rate):</code></pre>
+<p class="text-gray-300 leading-relaxed">{json.dumps(changepoint_details, indent=2)}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+For each event, provide:
+1. Most likely root cause (be specific: ETL job, index rebuild, 
+   application deployment, data load, etc.)
+2. Urgency level: IMMEDIATE / INVESTIGATE_WITHIN_24H / ROUTINE_REVIEW
+3. Recommended diagnostic query or action to confirm/rule out each hypothesis
+4. Whether this event should trigger a forecast model retrain
+
+Keep responses concise and technically precise."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return message.content[0].text</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The combination of automated detection and LLM-generated root cause hypotheses is particularly powerful during on-call situations. When you're paged at 2 AM for an anomalous storage spike, getting a structured list of hypotheses—"Most likely cause: daily ETL job loading event data into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_events</code> table. Secondary hypothesis: runaway application log insert loop. Recommended diagnostic: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT relname, n_live_tup FROM pg_stat_user_tables ORDER BY n_live_tup DESC LIMIT 10</code>"—is substantially more useful than a raw alert saying "storage growth exceeded 3σ."</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Automated Reporting and Alerting Infrastructure</h3>
+
+<p class="text-gray-300 leading-relaxed">With forecasting and anomaly detection in place, you need a reporting layer that delivers the right information to the right stakeholder at the right time. A VP of Engineering doesn't need per-table growth statistics—they need a one-paragraph summary with a traffic light status. A DBA on call needs the specific anomaly details and diagnostic queries. A finance team approving next year's infrastructure budget needs a 12-month projection with confidence intervals and cost implications.</p>
+
+<p class="text-gray-300 leading-relaxed">The reporting system should generate these different views from the same underlying data, triggered on different schedules and delivered through different channels.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import smtplib
+import json
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+from datetime import datetime
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import io
+import anthropic
+from typing import Optional
+
+
+def generate_executive_summary(
+    databases_status: list,
+    llm_client: anthropic.Anthropic
+) -&gt; str:
+    """
+    Generate a brief executive summary across all monitored databases.
+    For weekly leadership digest.
+    """
+    critical_count = sum(
+        1 for db in databases_status
+        if db.get('highest_risk_level') == 'CRITICAL'
+    )
+    warning_count = sum(
+        1 for db in databases_status
+        if db.get('highest_risk_level') == 'WARNING'
+    )
+
+    prompt = f"""Generate a 3-sentence executive summary of database capacity status 
+for a weekly leadership report. 
+
+Status across {len(databases_status)} production databases:
+- {critical_count} database(s) require immediate capacity action
+- {warning_count} database(s) are trending toward capacity limits within 60 days
+- Database details:
+
+{json.dumps(databases_status, indent=2, default=str)}
+
+Tone: Direct, non-alarmist, focused on business risk and required decisions.
+Format: Plain text, no headers or bullets. Three sentences maximum."""
+
+    message = llm_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=300,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return message.content[0].text
+
+
+def create_forecast_chart(
+    forecast: pd.DataFrame,
+    historical: pd.DataFrame,
+    capacity_gb: float,
+    database_name: str,
+    thresholds: dict
+) -&gt; bytes:
+    """
+    Generate a forecast chart and return it as PNG bytes for email embedding.
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+
+    # Historical data
+    ax.plot(
+        historical['ds'], historical['y'],
+        color='#2563EB', linewidth=1.5,
+        label='Actual size (GB)', zorder=3
+    )
+
+    # Forecast
+    future_mask = forecast['ds'] &gt; historical['ds'].max()
+    future_fc = forecast[future_mask]
+
+    ax.plot(
+        future_fc['ds'], future_fc['yhat'],
+        color='#7C3AED', linewidth=1.5,
+        linestyle='--', label='Forecast (median)', zorder=3
+    )
+    ax.fill_between(
+        future_fc['ds'],
+        future_fc['yhat_lower'],
+        future_fc['yhat_upper'],
+        alpha=0.2, color='#7C3AED', label='90% confidence interval'
+    )
+
+    # Threshold lines
+    for threshold_pct, info in thresholds.items():
+        threshold_gb = capacity_gb * float(threshold_pct.rstrip('pct')) / 100
+        color = '#DC2626' if '90' in threshold_pct else '#F59E0B'
+        ax.axhline(
+            y=threshold_gb, color=color, linewidth=1,
+            linestyle=':', alpha=0.7,
+            label=f'{threshold_pct} capacity ({threshold_gb:.0f} GB)'
+        )
+
+    ax.set_xlabel('Date', fontsize=11)
+    ax.set_ylabel('Database Size (GB)', fontsize=11)
+    ax.set_title(
+        f'{database_name} — 90-Day Storage Forecast',
+        fontsize=13, fontweight='bold'
+    )
+    ax.legend(loc='upper left', fontsize=9)
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%b %d'))
+    ax.xaxis.set_major_locator(mdates.WeekdayLocator(interval=2))
+    plt.xticks(rotation=45)
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=150, bbox_inches='tight')
+    plt.close()
+    buf.seek(0)
+    return buf.read()
+
+
+def send_capacity_alert(
+    smtp_config: dict,
+    recipients: dict,  # {'dba': [...], 'leadership': [...], 'finance': [...]}
+    database_name: str,
+    alert_level: str,  # 'WARNING' or 'CRITICAL'
+    analysis_text: str,
+    chart_bytes: bytes,
+    forecast_milestones: dict,
+    current_utilization_pct: float
+) -&gt; None:
+    """
+    Send tiered capacity alerts to appropriate stakeholder groups.
+    """
+    color_map = {'WARNING': '#F59E0B', 'CRITICAL': '#DC2626'}
+    alert_color = color_map.get(alert_level, '#6B7280')
+
+    # Build HTML report
+    html_body = f"""
+    &lt;html&gt;&lt;body style="font-family: Arial, sans-serif; max-width: 800px;"&gt;
+    &lt;div style="background: {alert_color}; color: white; padding: 16px; 
+                border-radius: 8px 8px 0 0;"&gt;
+        &lt;h2 style="margin:0"&gt;⚠ Capacity {alert_level}: {database_name}&lt;/h2&gt;
+        &lt;p style="margin:4px 0 0"&gt;
+            Generated {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}
+        &lt;/p&gt;
+    &lt;/div&gt;
+    
+    &lt;div style="padding: 20px; border: 1px solid #E5E7EB; 
+                border-top: none; border-radius: 0 0 8px 8px;"&gt;
+        
+        &lt;h3&gt;Current Status&lt;/h3&gt;
+        &lt;p&gt;Current utilization: &lt;strong&gt;{current_utilization_pct:.1f}%&lt;/strong&gt;&lt;/p&gt;
+        
+        &lt;h3&gt;Forecast Summary&lt;/h3&gt;
+        &lt;table style="width:100%; border-collapse: collapse;"&gt;
+        &lt;tr style="background: #F9FAFB;"&gt;
+            &lt;th style="padding:8px; border:1px solid #E5E7EB; text-align:left"&gt;
+                Threshold
+            &lt;/th&gt;
+            &lt;th style="padding:8px; border:1px solid #E5E7EB; text-align:left"&gt;
+                Projected Breach Date
+            &lt;/th&gt;
+            &lt;th style="padding:8px; border:1px solid #E5E7EB; text-align:left"&gt;
+                Pessimistic Scenario
+            &lt;/th&gt;
+        &lt;/tr&gt;"""
+
+    for threshold, info in forecast_milestones.items():
+        if info.get('within_forecast_window'):
+            html_body += f"""
+        &lt;tr&gt;
+            &lt;td style="padding:8px; border:1px solid #E5E7EB"&gt;{threshold}&lt;/td&gt;
+            &lt;td style="padding:8px; border:1px solid #E5E7EB"&gt;
+                {info['breach_date']}
+            &lt;/td&gt;
+            &lt;td style="padding:8px; border:1px solid #E5E7EB"&gt;
+                {info.get('pessimistic_date', 'N/A')}
+            &lt;/td&gt;
+        &lt;/tr&gt;"""
+        else:
+            html_body += f"""
+        &lt;tr&gt;
+            &lt;td style="padding:8px; border:1px solid #E5E7EB"&gt;{threshold}&lt;/td&gt;
+            &lt;td colspan="2" style="padding:8px; border:1px solid #E5E7EB"&gt;
+                Not within 90-day forecast window
+            &lt;/td&gt;
+        &lt;/tr&gt;"""
+
+    html_body += f"""
+        &lt;/table&gt;
+        
+        &lt;h3&gt;Analysis and Recommendations&lt;/h3&gt;
+        &lt;div style="background:#F9FAFB; padding:16px; border-radius:4px; 
+                    white-space: pre-wrap; font-size: 13px;"&gt;
+{analysis_text}
+        &lt;/div&gt;
+        
+        &lt;br&gt;
+        &lt;img src="cid:forecast_chart" style="max-width:100%; border-radius:4px;"&gt;
+    &lt;/div&gt;
+    &lt;/body&gt;&lt;/html&gt;"""
+
+    # Determine recipients based on alert level
+    to_list = recipients['dba']
+    if alert_level == 'CRITICAL':
+        to_list = to_list + recipients.get('leadership', [])
+
+    msg = MIMEMultipart('related')
+    msg['Subject'] = (
+        f"[{alert_level}] Capacity Alert: {database_name} — "
+        f"{current_utilization_pct:.0f}% utilized"
+    )
+    msg['From'] = smtp_config['from_address']
+    msg['To'] = ', '.join(to_list)
+
+    msg.attach(MIMEText(html_body, 'html'))
+
+    chart_attachment = MIMEImage(chart_bytes, name='forecast.png')
+    chart_attachment.add_header('Content-ID', '&lt;forecast_chart&gt;')
+    chart_attachment.add_header(
+        'Content-Disposition', 'inline', filename='forecast.png'
+    )
+    msg.attach(chart_attachment)
+
+    with smtplib.SMTP(smtp_config['host'], smtp_config['port']) as server:
+        if smtp_config.get('use_tls'):
+            server.starttls()
+        if smtp_config.get('username'):
+            server.login(smtp_config['username'], smtp_config['password'])
+        server.sendmail(smtp_config['from_address'], to_list, msg.as_string())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The tiering strategy here is worth examining in detail. DBAs receive all alerts, including warnings, because they need lead time to plan remediation. Leadership receives only critical alerts—those where a capacity breach is within 30 days—because drowning them in warnings degrades the signal. Finance teams receive a monthly digest that aggregates projected capacity needs across all systems and ties them to procurement decisions. Each group gets the information they can act on, formatted appropriately for their context.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating Capacity Planning with Change Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Capacity forecasts exist in isolation from operational reality unless they're connected to your change management and deployment pipelines. A common failure mode is an accurate capacity forecast that nobody acts on because the procurement process and the technical alert exist in separate organizational silos. Bridging this gap requires integrating capacity predictions with ticketing systems and CI/CD pipelines.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical pattern is to run capacity assessments as part of your deployment approval workflow. When a team wants to deploy a new feature that will likely increase database write volume, the capacity planning system should automatically evaluate whether current capacity can absorb the projected additional load. If it can't, the deployment ticket is automatically annotated with the capacity risk before it reaches the deployment queue.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import requests
+from typing import Optional
+import anthropic
+import json
+
+
+def assess_deployment_capacity_impact(
+    deployment_description: str,
+    affected_databases: list,
+    current_forecasts: dict,
+    estimated_traffic_increase_pct: Optional[float] = None
+) -&gt; dict:
+    """
+    Assess whether a planned deployment poses capacity risk and
+    return a structured risk assessment for integration into 
+    deployment approval workflows.
+    
+    Args:
+        deployment_description: Free-text description of what's being deployed
+        affected_databases: List of database names affected
+        current_forecasts: Dict of {db_name: forecast_milestones}
+        estimated_traffic_increase_pct: Optional estimated workload increase
+    
+    Returns:
+        Risk assessment dict suitable for JIRA/ServiceNow annotation
+    """
+    client = anthropic.Anthropic()
+
+    # Build assessment prompt
+    forecast_summaries = {}
+    for db in affected_databases:
+        if db in current_forecasts:
+            forecast_summaries[db] = current_forecasts[db]
+
+    prompt = f"""A deployment is being submitted for capacity impact assessment.
+
+## Deployment Description
+{deployment_description}
+
+## Affected Databases
+{json.dumps(affected_databases)}
+
+## Current Capacity Forecasts for Affected Databases</code></pre>
+<p class="text-gray-300 leading-relaxed">{json.dumps(forecast_summaries, indent=2, default=str)}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+## Estimated Traffic/Workload Increase
+{f'{estimated_traffic_increase_pct}% increase in write workload' 
+ if estimated_traffic_increase_pct 
+ else 'Not provided by requestor'}
+
+## Your Task
+Assess the capacity risk of this deployment. Return a structured JSON response 
+with the following fields:
+- risk_level: "NONE" | "LOW" | "MEDIUM" | "HIGH" | "BLOCKING"
+- risk_summary: One sentence description of the primary risk
+- time_to_capacity_concern_days: Estimated days to capacity issue if deployment 
+  proceeds (null if no concern)
+- recommended_action: "PROCEED" | "PROCEED_WITH_MONITORING" | 
+  "DEFER_PENDING_CAPACITY_REVIEW" | "BLOCK"  
+- rationale: 2-3 sentences explaining the assessment
+- required_capacity_addition_gb: How much additional storage to provision 
+  before deployment (null if not required)
+- monitoring_recommendations: List of specific metrics to monitor 
+  post-deployment
+
+Return only valid JSON, no markdown formatting."""
+
+    message = client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=800,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    try:
+        assessment = json.loads(message.content[0].text)
+    except json.JSONDecodeError:
+        # Fallback if LLM returns non-JSON
+        assessment = {
+            "risk_level": "UNKNOWN",
+            "risk_summary": "Automated assessment failed to parse",
+            "recommended_action": "PROCEED_WITH_MONITORING",
+            "rationale": message.content[0].text[:500]
+        }
+
+    return assessment
+
+
+def annotate_jira_ticket(
+    jira_base_url: str,
+    ticket_key: str,
+    assessment: dict,
+    auth_token: str
+) -&gt; bool:
+    """
+    Add capacity assessment results as a comment and label on a JIRA ticket.
+    """
+    # Map risk level to JIRA label
+    label_map = {
+        "NONE": "capacity-ok",
+        "LOW": "capacity-low-risk",
+        "MEDIUM": "capacity-medium-risk",
+        "HIGH": "capacity-high-risk",
+        "BLOCKING": "capacity-blocking"
+    }
+    label = label_map.get(assessment.get('risk_level', 'UNKNOWN'), 
+                          "capacity-unknown")
+
+    comment_body = f"""
+*Automated Capacity Impact Assessment*
+
+*Risk Level:* {assessment.get('risk_level', 'UNKNOWN')}
+*Recommended Action:* {assessment.get('recommended_action', 'UNKNOWN')}
+
+*Summary:* {assessment.get('risk_summary', '')}
+
+*Rationale:* {assessment.get('rationale', '')}
+
+{f"*Required Capacity Addition:* {assessment.get('required_capacity_addition_gb')} GB before deployment" 
+ if assessment.get('required_capacity_addition_gb') else ''}
+
+*Post-Deployment Monitoring:*
+{chr(10).join(f'- {item}' for item in assessment.get('monitoring_recommendations', []))}
+
+_This assessment was generated automatically by the capacity planning system._
+    """.strip()
+
+    # Add comment
+    comment_response = requests.post(
+        f"{jira_base_url}/rest/api/3/issue/{ticket_key}/comment",
+        json={"body": comment_body},
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+    )
+
+    # Add label
+    label_response = requests.put(
+        f"{jira_base_url}/rest/api/3/issue/{ticket_key}",
+        json={"update": {"labels": [{"add": label}]}},
+        headers={
+            "Authorization": f"Bearer {auth_token}",
+            "Content-Type": "application/json"
+        }
+    )
+
+    return (comment_response.status_code in (200, 201) and
+            label_response.status_code == 204)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern transforms capacity planning from a periodic exercise into a continuous feedback loop embedded in the deployment process. When a team sees their JIRA ticket annotated with "HIGH risk: deployment will accelerate 80% storage threshold breach from 47 days to 19 days," they have concrete information to act on before the deployment, not after.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Table-Level Growth Attribution</h3>
+
+<p class="text-gray-300 leading-relaxed">Database-level forecasts tell you when you'll need more space, but they don't tell you why. Table-level attribution is the diagnostic layer that identifies which tables are driving growth, which ones are candidates for archiving or partitioning, and which ones exhibit anomalous growth patterns that warrant investigation before they become a capacity crisis.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Track table-level size trends over time
+-- Run on a schedule and persist results for trend analysis
+
+WITH table_sizes AS (
+    SELECT
+        schemaname,
+        tablename,
+        pg_total_relation_size(quote_ident(schemaname) || '.' || 
+                               quote_ident(tablename)) AS total_bytes,
+        pg_relation_size(quote_ident(schemaname) || '.' || 
+                         quote_ident(tablename))       AS table_bytes,
+        pg_indexes_size(quote_ident(schemaname) || '.' || 
+                        quote_ident(tablename))        AS index_bytes,
+        pg_total_relation_size(quote_ident(schemaname) || '.' || 
+                               quote_ident(tablename))
+            - pg_relation_size(quote_ident(schemaname) || '.' || 
+                               quote_ident(tablename))
+            - pg_indexes_size(quote_ident(schemaname) || '.' || 
+                              quote_ident(tablename))  AS toast_bytes,
+        s.n_live_tup,
+        s.n_dead_tup,
+        ROUND(s.n_dead_tup::numeric / 
+              NULLIF(s.n_live_tup + s.n_dead_tup, 0) * 100, 1) AS bloat_pct,
+        s.last_vacuum,
+        s.last_autovacuum,
+        s.last_analyze
+    FROM pg_tables t
+    JOIN pg_stat_user_tables s 
+        ON s.schemaname = t.schemaname 
+       AND s.relname = t.tablename
+    WHERE t.schemaname NOT IN ('pg_catalog', 'information_schema')
+)
+SELECT
+    NOW()               AS snapshot_time,
+    schemaname,
+    tablename,
+    total_bytes,
+    table_bytes,
+    index_bytes,
+    toast_bytes,
+    n_live_tup,
+    n_dead_tup,
+    bloat_pct,
+    last_vacuum,
+    last_autovacuum,
+    pg_size_pretty(total_bytes) AS human_readable_size
+FROM table_sizes
+WHERE total_bytes &gt; 1048576  -- Tables larger than 1MB
+ORDER BY total_bytes DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: comprehensive table-level size attribution
+SELECT
+    GETUTCDATE()                                         AS snapshot_time,
+    s.name                                               AS schema_name,
+    t.name                                               AS table_name,
+    SUM(a.total_pages) * 8 * 1024                        AS total_bytes,
+    SUM(a.used_pages) * 8 * 1024                         AS used_bytes,
+    SUM(
+        CASE WHEN i.index_id IN (0, 1)
+             THEN a.total_pages ELSE 0 END
+    ) * 8 * 1024                                         AS heap_or_clustered_bytes,
+    SUM(
+        CASE WHEN i.index_id &gt; 1
+             THEN a.total_pages ELSE 0 END
+    ) * 8 * 1024                                         AS nonclustered_index_bytes,
+    -- Row count only from data pages
+    MAX(CASE WHEN i.index_id IN (0,1) THEN p.rows END)  AS row_count,
+    ROUND(
+        CAST(SUM(a.total_pages) - SUM(a.used_pages) AS FLOAT) /
+        NULLIF(SUM(a.total_pages), 0) * 100,
+        1
+    )                                                    AS unused_space_pct,
+    (SELECT last_user_update
+     FROM sys.dm_db_index_usage_stats ius
+     WHERE ius.database_id = DB_ID()
+       AND ius.object_id = t.object_id
+       AND ius.index_id &lt;= 1)                            AS last_data_change
+FROM
+    sys.tables t
+    JOIN sys.schemas s ON s.schema_id = t.schema_id
+    JOIN sys.indexes i ON i.object_id = t.object_id
+    JOIN sys.partitions p ON p.object_id = t.object_id
+                          AND p.index_id = i.index_id
+    JOIN sys.allocation_units a ON a.container_id = p.partition_id
+WHERE
+    t.is_ms_shipped = 0
+GROUP BY
+    s.name, t.name, t.object_id
+HAVING
+    SUM(a.total_pages) * 8 * 1024 &gt; 1048576  -- Tables larger than 1MB
+ORDER BY
+    total_bytes DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With per-table snapshots accumulating over time, you can calculate growth velocity and rank tables by their contribution to overall storage growth. The LLM layer adds value here by categorizing tables based on their names and growth patterns—identifying likely audit tables, event logs, or staging tables that are good archiving candidates—without requiring you to document every table's purpose manually.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def attribute_growth_to_tables(
+    current_snapshot: pd.DataFrame,
+    prior_snapshot: pd.DataFrame,
+    total_growth_gb: float,
+    llm_client: anthropic.Anthropic
+) -&gt; str:
+    """
+    Compare two table-level snapshots, compute growth attribution,
+    and use LLM to generate archiving and optimization recommendations.
+    """
+    merged = current_snapshot.merge(
+        prior_snapshot[['tablename', 'total_bytes']],
+        on='tablename',
+        suffixes=('_current', '_prior')
+    )
+    merged['growth_bytes'] = (
+        merged['total_bytes_current'] - merged['total_bytes_prior']
+    )
+    merged['growth_gb'] = merged['growth_bytes'] / (1024 ** 3)
+    merged['growth_contribution_pct'] = (
+        merged['growth_bytes'] / (total_growth_gb * 1024 ** 3) * 100
+    ).round(1)
+
+    # Top contributors
+    top_growers = (
+        merged[merged['growth_bytes'] &gt; 0]
+        .sort_values('growth_bytes', ascending=False)
+        .head(15)
+    )[['tablename', 'growth_gb', 'growth_contribution_pct',
+       'bloat_pct', 'n_live_tup']].to_dict('records')
+
+    # Tables with high bloat (vacuum candidates)
+    high_bloat = merged[merged['bloat_pct'] &gt; 20][
+        ['tablename', 'bloat_pct', 'total_bytes_current']
+    ].to_dict('records')
+
+    prompt = f"""Analyze the following table-level storage growth data and 
+provide specific archiving and optimization recommendations.
+
+## Top Growing Tables (last measurement period)</code></pre>
+<p class="text-gray-300 leading-relaxed">{json.dumps(top_growers, indent=2, default=str)}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+## Tables with High Dead-Tuple Bloat (vacuum candidates)</code></pre>
+<p class="text-gray-300 leading-relaxed">{json.dumps(high_bloat, indent=2, default=str)}</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>
+For each category of tables, identify:
+1. **Likely table purpose** based on naming conventions 
+   (e.g., audit/logging, event data, staging, reference data)
+2. **Archiving suitability**: Is this a candidate for time-based partitioning 
+   and archiving? What retention policy would be reasonable?
+3. **Immediate optimization opportunity**: Is the growth due to bloat 
+   (requires VACUUM/REINDEX) or genuine data accumulation?
+4. **Estimated reclaim potential**: How much space could be recovered 
+   through archiving or vacuum operations?
+
+Format as a prioritized recommendation list. Be specific about table names 
+and estimated impacts."""
+
+    message = llm_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return message.content[0].text</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operationalizing the Full Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">All the components above—metric collection, forecasting, anomaly detection, LLM analysis, and alerting—need to be assembled into a running pipeline that operates continuously without manual intervention. The orchestration layer is deliberately simple: a Python scheduler with clearly defined jobs, each with its own retry logic and failure alerting.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A["Metric collection<br/>every 15 min"] --> B[TimescaleDB / Azure Monitor store]
+    B --> C["Forecast refresh<br/>Prophet, every 6h"]
+    B --> D["Anomaly detection<br/>Isolation Forest + CUSUM, hourly"]
+    C --> E[Capacity milestones]
+    D -->|anomaly found| F[LLM root-cause hypothesis]
+    E --> G[LLM analysis + weekly report]
+    F --> G
+    G --> H[Tiered alerts: DBA / leadership / finance]
+    E --> I["Deployment gate<br/>polls JIRA/ServiceNow, every 5 min"]
+    I --> J[LLM capacity-risk assessment]
+    J --> K[Ticket annotated: PROCEED / DEFER / BLOCK]
+    D -.confirmed anomaly.-> C</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The five scheduled jobs that make up the capacity planning pipeline: collection feeds both forecasting and anomaly detection, and confirmed anomalies feed back into the next forecast cycle.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import schedule
+import time
+import logging
+import traceback
+from datetime import datetime
+from typing import Callable
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(name)s: %(message)s'
+)
+logger = logging.getLogger('capacity_planner')
+
+
+def safe_job(job_fn: Callable, job_name: str) -&gt; Callable:
+    """Wrap a job function with error handling and alerting."""
+    def wrapper():
+        try:
+            logger.info(f"Starting job: {job_name}")
+            start = time.time()
+            job_fn()
+            elapsed = time.time() - start
+            logger.info(f"Completed job: {job_name} in {elapsed:.1f}s")
+        except Exception as e:
+            logger.error(
+                f"Job failed: {job_name}\n{traceback.format_exc()}"
+            )
+            # In production: send failure alert via PagerDuty/Slack
+    return wrapper
+
+
+def collect_metrics_job():
+    """Run metric collection across all monitored databases."""
+    # Implementation calls collect_postgres_metrics() and
+    # collect_sqlserver_metrics() for each configured host
+    pass
+
+
+def refresh_forecasts_job():
+    """Retrain Prophet models and update milestone estimates."""
+    # Loads recent history, fits models, stores updated forecasts
+    # Triggers alerts if milestone dates have moved materially
+    pass
+
+
+def anomaly_detection_job():
+    """Run isolation forest on recent growth data."""
+    # Detects anomalies in last 24h, calls LLM for analysis
+    # if any anomalies found above severity threshold
+    pass
+
+
+def weekly_report_job():
+    """Generate and distribute weekly capacity digest."""
+    # Calls generate_capacity_analysis() for each database
+    # Calls generate_executive_summary() for leadership digest
+    # Sends emails via send_capacity_alert()
+    pass
+
+
+def deployment_gate_job():
+    """Poll deployment queue for pending capacity assessments."""
+    # Checks JIRA/ServiceNow for tickets awaiting capacity review
+    # Calls assess_deployment_capacity_impact() for each
+    # Annotates tickets via annotate_jira_ticket()
+    pass
+
+
+# Schedule all jobs
+schedule.every(15).minutes.do(safe_job(collect_metrics_job, "metric-collection"))
+schedule.every(6).hours.do(safe_job(refresh_forecasts_job, "forecast-refresh"))
+schedule.every(1).hours.do(safe_job(anomaly_detection_job, "anomaly-detection"))
+schedule.every().monday.at("07:00").do(safe_job(weekly_report_job, "weekly-report"))
+schedule.every(5).minutes.do(safe_job(deployment_gate_job, "deployment-gate"))
+
+if __name__ == "__main__":
+    logger.info("Capacity planning pipeline started")
+    # Run all jobs once at startup to populate initial state
+    collect_metrics_job()
+    refresh_forecasts_job()
+
+    while True:
+        schedule.run_pending()
+        time.sleep(30)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The forecast refresh frequency deserves attention. Running the full Prophet model fit every six hours means your milestones are always based on the most recent data, including any anomalies detected in the prior cycle. If a major growth anomaly was detected and classified as genuine (not a one-time event), the next forecast cycle will incorporate it into the model's baseline, and your milestone dates will shift accordingly. This feedback loop between anomaly detection and forecasting is what makes the system adaptive rather than static.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Handling Multi-Database Fleet Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Individual database capacity planning scales to small environments. Production fleets of dozens or hundreds of databases require a fleet-level view that aggregates individual forecasts into a unified risk dashboard and enables cross-database comparison. The fundamental challenge is that databases at different stages of their lifecycle have very different risk profiles: a brand-new database at 5% utilization is not interesting; a database at 72% utilization with an accelerating growth curve is your most urgent problem.</p>
+
+<p class="text-gray-300 leading-relaxed">The prioritization score below combines current utilization, forecast velocity, and proximity to threshold breach into a single number that lets you sort databases by how urgently they need attention.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def compute_capacity_priority_score(
+    current_utilization_pct: float,
+    days_to_80pct_breach: Optional[float],
+    days_to_90pct_breach: Optional[float],
+    growth_acceleration: float,  # positive = growth rate increasing
+    anomaly_score: float         # from isolation forest (-1 to 0 range)
+) -&gt; float:
+    """
+    Compute a 0-100 priority score for a single database.
+    Higher scores indicate more urgent capacity attention needed.
+    
+    Components:
+    - Utilization score (0-40 points): Current % of capacity used
+    - Urgency score (0-35 points): Proximity to threshold breach
+    - Acceleration score (0-15 points): Is growth accelerating?
+    - Anomaly score (0-10 points): Recent anomalous activity
+    """
+    # Utilization component (40 points max)
+    if current_utilization_pct &gt;= 90:
+        util_score = 40
+    elif current_utilization_pct &gt;= 80:
+        util_score = 30 + (current_utilization_pct - 80) * 1.0
+    elif current_utilization_pct &gt;= 70:
+        util_score = 20 + (current_utilization_pct - 70) * 1.0
+    else:
+        util_score = current_utilization_pct * 0.28
+
+    # Urgency component (35 points max)
+    # Based on days until 80% threshold breach
+    urgency_score = 0.0
+    if days_to_80pct_breach is not None:
+        if days_to_80pct_breach &lt;= 14:
+            urgency_score = 35
+        elif days_to_80pct_breach &lt;= 30:
+            urgency_score = 25 + (30 - days_to_80pct_breach) / 16 * 10
+        elif days_to_80pct_breach &lt;= 60:
+            urgency_score = 15 + (60 - days_to_80pct_breach) / 30 * 10
+        elif days_to_80pct_breach &lt;= 90:
+            urgency_score = 5 + (90 - days_to_80pct_breach) / 30 * 10
+    elif days_to_90pct_breach is not None and days_to_90pct_breach &lt;= 30:
+        urgency_score = 20
+
+    # Acceleration component (15 points max)
+    # growth_acceleration &gt; 0 means growth rate is increasing
+    accel_score = min(15, max(0, growth_acceleration * 15))
+
+    # Anomaly component (10 points max)
+    # anomaly_score from isolation forest: more negative = more anomalous
+    anomaly_component = min(10, max(0, abs(min(0, anomaly_score)) * 10))
+
+    return round(util_score + urgency_score + accel_score + anomaly_component, 1)
+
+
+def generate_fleet_capacity_dashboard(
+    all_database_metrics: list,
+    llm_client: anthropic.Anthropic
+) -&gt; dict:
+    """
+    Aggregate per-database metrics into a fleet-level capacity dashboard.
+    Returns structured data suitable for rendering in Grafana or a web UI.
+    """
+    scored = []
+    for db in all_database_metrics:
+        score = compute_capacity_priority_score(
+            current_utilization_pct=db['utilization_pct'],
+            days_to_80pct_breach=db.get('days_to_80pct'),
+            days_to_90pct_breach=db.get('days_to_90pct'),
+            growth_acceleration=db.get('growth_acceleration', 0),
+            anomaly_score=db.get('latest_anomaly_score', 0)
+        )
+        scored.append({**db, 'priority_score': score})
+
+    scored.sort(key=lambda x: x['priority_score'], reverse=True)
+
+    critical = [d for d in scored if d['priority_score'] &gt;= 70]
+    warning  = [d for d in scored if 40 &lt;= d['priority_score'] &lt; 70]
+    healthy  = [d for d in scored if d['priority_score'] &lt; 40]
+
+    # Ask LLM to synthesize fleet-level insights
+    fleet_prompt = f"""You are reviewing capacity planning data for a fleet of 
+{len(scored)} production databases. Provide a brief fleet-level capacity 
+assessment.
+
+Critical databases (score ≥ 70): {len(critical)}
+Warning databases (score 40-69): {len(warning)}
+Healthy databases (score &lt; 40): {len(healthy)}
+
+Top 5 most urgent databases:
+{json.dumps(scored[:5], indent=2, default=str)}
+
+Provide:
+1. One-paragraph fleet health summary (for a daily ops standup)
+2. The single most urgent cross-cutting action the DBA team should take today
+3. Any pattern you notice across the critical databases that suggests a 
+   systemic cause rather than individual database issues"""
+
+    message = llm_client.messages.create(
+        model="claude-opus-4-5",
+        max_tokens=600,
+        messages=[{"role": "user", "content": fleet_prompt}]
+    )
+
+    return {
+        "generated_at": datetime.now().isoformat(),
+        "fleet_size": len(scored),
+        "critical_count": len(critical),
+        "warning_count": len(warning),
+        "healthy_count": len(healthy),
+        "top_priority_databases": scored[:10],
+        "fleet_narrative": message.content[0].text,
+        "all_databases": scored
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The fleet-level LLM synthesis is particularly useful for recognizing systemic patterns. If five databases across a microservices architecture are all showing accelerating growth simultaneously, that's more likely a platform-level event—a shared event bus starting to retain messages, a common logging framework becoming more verbose—than five independent coincidences. A human reviewing five individual alerts might miss this; the LLM reviewing all five together will likely surface it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Forecast with calibrated uncertainty, not just point estimates.** A storage forecast is only operationally useful when it includes confidence intervals. Prophet's Bayesian intervals give you the pessimistic and optimistic scenarios that procurement decisions actually require—plan to the pessimistic bound, not the median.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Separate the statistical and interpretive layers.** Time-series models (Prophet, LightGBM) handle pattern recognition and forecasting; LLMs handle interpretation, communication, and recommendation generation. Asking an LLM to forecast from raw data risks hallucinated numbers; asking it to explain and contextualize validated forecast output plays to its genuine strengths.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embed capacity assessment in deployment workflows.** The most effective capacity planning systems are not periodic reporting exercises—they are gates in the deployment process that surface capacity risk before features ship, when teams still have room to adjust plans or provision resources proactively.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Anomaly detection and forecasting must feed each other.** A sustained growth anomaly that goes undetected will corrupt your forecast model, causing it to underestimate future consumption. CUSUM changepoint detection identifies when the growth regime has shifted, triggering model retrains that keep your milestones accurate.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Fleet-level scoring enables triage at scale.** When managing dozens of databases, a composite priority score that combines utilization, forecast velocity, growth acceleration, and anomaly signals lets you sort by urgency instantly—directing engineering attention to the systems that genuinely need it rather than the ones that generated the most recent alert.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">

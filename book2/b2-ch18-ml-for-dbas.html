@@ -1,4 +1,4 @@
-﻿<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
@@ -6,6 +6,10 @@
   <title>Chapter 18: Building ML Models for DBA Work — The AI-Powered DBA</title>
   <meta name="description" content="The AI-Powered DBA Chapter 18: Building ML Models for DBA Work. AI and AIOps for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -389,15 +393,720 @@ def train_capacity_forecast_model(conn_string: str, datname: str,
 
 <p class="text-gray-300 leading-relaxed">The architecture that works in practice for DBA operations is a lightweight FastAPI scoring service running on your monitoring infrastructure, receiving metric snapshots from your collection agents and returning predictions that Prometheus or your alerting system can consume.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import joblib
+import numpy as np
+import pandas as pd
+from typing import Dict, List, Optional
+import logging
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from fastapi.responses import PlainTextResponse
+
+app = FastAPI(title="DBA ML Scoring Service", version="1.0.0")
+logger = logging.getLogger(__name__)
+
+# Prometheus metrics for the scoring service itself
+PREDICTIONS_TOTAL    = Counter("dba_ml_predictions_total",
+                                "Total scoring requests", ["database", "model"])
+ANOMALY_SCORE_GAUGE  = Gauge("dba_ml_anomaly_score",
+                              "Current anomaly score", ["database"])
+ANOMALY_FLAG_GAUGE   = Gauge("dba_ml_anomaly_flag",
+                              "1 if anomaly detected, 0 otherwise", ["database"])
+INFERENCE_LATENCY    = Histogram("dba_ml_inference_seconds",
+                                  "Model inference latency", ["model"])
+
+# Model registry — loaded at startup
+MODEL_REGISTRY: Dict[str, dict] = {}
+
+@app.on_event("startup")
+async def load_models():
+    import os, glob
+    model_dir = os.environ.get("DBA_MODEL_DIR", "/opt/dba_models")
+    for model_file in glob.glob(f"{model_dir}/*_anomaly_detector.pkl"):
+        datname = os.path.basename(model_file).replace("_anomaly_detector.pkl", "")
+        MODEL_REGISTRY[datname] = joblib.load(model_file)
+        logger.info(f"Loaded anomaly model for: {datname}")
+
+class MetricSnapshot(BaseModel):
+    datname: str
+    numbackends: float
+    cache_hit_ratio: float
+    rollback_ratio: float
+    temp_pressure: float
+    write_amplification: float
+    numbackends_zscore: float
+    cache_hit_ratio_zscore: float
+    xact_commit_delta: float
+    blks_read_delta: float
+    hour_sin: float
+    hour_cos: float
+    dow_sin: float
+    dow_cos: float
+
+class AnomalyPrediction(BaseModel):
+    datname: str
+    anomaly_score: float
+    is_anomaly: bool
+    confidence: str
+    recommended_action: Optional[str]
+
+@app.post("/score/anomaly", response_model=AnomalyPrediction)
+async def score_anomaly(snapshot: MetricSnapshot):
+    datname = snapshot.datname
+
+    if datname not in MODEL_REGISTRY:
+        raise HTTPException(status_code=404,
+                            detail=f"No model found for database: {datname}")
+
+    model_data = MODEL_REGISTRY[datname]
+    pipeline   = model_data["pipeline"]
+    threshold  = model_data["threshold"]
+    feat_cols  = model_data["feature_columns"]
+
+    X = np.array([[getattr(snapshot, col) for col in feat_cols]])
+
+    with INFERENCE_LATENCY.labels(model="isolation_forest").time():
+        score = pipeline.named_steps["model"].score_samples(
+            pipeline.named_steps["scaler"].transform(X)
+        )[0]
+
+    is_anomaly = score &lt; threshold
+    score_normalized = float(score)
+
+    PREDICTIONS_TOTAL.labels(database=datname, model="anomaly").inc()
+    ANOMALY_SCORE_GAUGE.labels(database=datname).set(score_normalized)
+    ANOMALY_FLAG_GAUGE.labels(database=datname).set(1 if is_anomaly else 0)
+
+    # Confidence tiers for operator guidance
+    if score &lt; threshold * 1.5:
+        confidence = "HIGH"
+        action = "Immediate investigation recommended: check wait events and active queries"
+    elif score &lt; threshold * 1.2:
+        confidence = "MEDIUM"
+        action = "Monitor closely: review pg_stat_activity for blocking or long-running queries"
+    else:
+        confidence = "LOW"
+        action = None
+
+    return AnomalyPrediction(
+        datname=datname,
+        anomaly_score=score_normalized,
+        is_anomaly=is_anomaly,
+        confidence=confidence if is_anomaly else "NORMAL",
+        recommended_action=action
+    )
+
+@app.get("/metrics", response_class=PlainTextResponse)
+async def prometheus_metrics():
+    return generate_latest()
+
+@app.post("/reload/{datname}")
+async def reload_model(datname: str):
+    """Hot-reload a retrained model without service restart."""
+    import os
+    model_path = f"{os.environ.get('DBA_MODEL_DIR', '/opt/dba_models')}/{datname}_anomaly_detector.pkl"
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=404, detail=f"Model file not found: {model_path}")
+    MODEL_REGISTRY[datname] = joblib.load(model_path)
+    logger.info(f"Reloaded model for {datname}")
+    return {"status": "reloaded", "datname": datname}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/reload/{datname}</code> endpoint is the detail that makes this deployable in practice. When your nightly retraining job produces a new model, it writes the file and calls this endpoint rather than requiring a full service restart — critical for keeping the scoring service available during routine model updates.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Containerizing the Scoring Service</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The scoring service should run as a container alongside your monitoring stack. A minimal Dockerfile:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libpq-dev && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY scoring_service.py .
+
+ENV DBA_MODEL_DIR=/opt/dba_models
+
+VOLUME ["/opt/dba_models"]
+
+EXPOSE 8080
+
+CMD ["uvicorn", "scoring_service:app", "--host", "0.0.0.0", "--port", "8080", \
+     "--workers", "2", "--log-level", "info"]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The model directory is a mounted volume so that the retraining pipeline on the host can write updated model files without rebuilding the container image.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Integrating Predictions into Operational Workflows</h3>
+
+<p class="text-gray-300 leading-relaxed">A scoring service that fires predictions into the void is an academic exercise. The value emerges when predictions connect directly to the operational actions your team already takes: alerting, runbook automation, query admission control, and capacity management workflows.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Raw telemetry snapshots] --> B[Feature engineering job]
+    B --> C[Feature store]
+    C --> D[Training job<br/>Isolation Forest / Prophet / GBM]
+    D --> E[MLflow model registry]
+    E --> F[FastAPI scoring service]
+    F --> G[Prometheus /metrics]
+    G --> H[Alertmanager rules]
+    F --> I[Query admission control]
+    H --> J[DBA response + incident confirmation]
+    J --> K[prediction_log feedback]
+    K --> L[Drift check: precision/recall + PSI]
+    L -->|drift detected| D
+    C -.weekly PSI check.-> L</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The full model lifecycle this chapter builds: telemetry becomes features, features train a registered model, the model serves predictions that drive alerts and admission control, and confirmed outcomes flow back into drift detection that triggers retraining.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Wiring Predictions into Prometheus Alertmanager</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Because the scoring service exposes a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/metrics</code> endpoint in Prometheus format, your existing Prometheus scrape configuration picks it up without modification:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># prometheus.yml — add to scrape_configs
+scrape_configs:
+  - job_name: "dba_ml_scoring"
+    scrape_interval: 30s
+    static_configs:
+      - targets: ["dba-scoring-service:8080"]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Then define alert rules that treat the ML anomaly flag as a first-class alerting signal, combined with traditional metric thresholds to reduce false positives:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># dba_ml_alerts.yml
+groups:
+  - name: dba_ml_anomaly_alerts
+    rules:
+      - alert: DatabaseAnomalyDetected
+        expr: |
+          dba_ml_anomaly_flag == 1
+          AND dba_ml_anomaly_score &lt; -0.15
+        for: 2m
+        labels:
+          severity: warning
+          team: dba
+        annotations:
+          summary: "ML anomaly detected on {{ $labels.database }}"
+          description: &gt;
+            The anomaly detection model has flagged {{ $labels.database }}
+            with a score of {{ $value | humanize }}. Review pg_stat_activity
+            and recent wait event distribution before escalating.
+
+      - alert: DatabaseAnomalyHighConfidence
+        expr: |
+          dba_ml_anomaly_flag == 1
+          AND dba_ml_anomaly_score &lt; -0.25
+        for: 1m
+        labels:
+          severity: critical
+          team: dba
+        annotations:
+          summary: "High-confidence anomaly on {{ $labels.database }}"
+          description: &gt;
+            Score {{ $value | humanize }} is well below the anomaly threshold.
+            Immediate investigation warranted. Check for lock storms,
+            replication lag, or runaway autovacuum.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">for: 2m</code> clause on the warning-level alert prevents single-snapshot spikes from generating noise. The critical alert fires after just one minute because a high-confidence score that persists even briefly is genuinely urgent.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL-Side Query Admission Control</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For query classification models — where you have trained a model to predict whether an incoming query will be fast, slow, or catastrophically slow — the natural integration point is a connection pooler like PgBouncer or a custom middleware layer that intercepts queries before they reach the database.</p>
+
+<p class="text-gray-300 leading-relaxed">A simpler approach that works without middleware is a PostgreSQL function that your application can call before executing a high-risk query:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: advisory-based query admission control function
+CREATE OR REPLACE FUNCTION dba_ml.check_query_admission(
+    p_query_fingerprint TEXT,
+    p_estimated_rows    BIGINT,
+    p_table_names       TEXT[]
+)
+RETURNS TABLE (
+    allowed         BOOLEAN,
+    risk_tier       TEXT,
+    recommendation  TEXT
+)
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_score          NUMERIC;
+    v_active_slow    INTEGER;
+    v_db_load        NUMERIC;
+BEGIN
+    -- Check current database load from real-time metrics
+    SELECT COUNT(*) INTO v_active_slow
+    FROM pg_stat_activity
+    WHERE state = 'active'
+      AND query_start &lt; NOW() - INTERVAL '30 seconds'
+      AND query NOT ILIKE '%pg_stat_activity%';
+
+    SELECT COALESCE(AVG(EXTRACT(EPOCH FROM (NOW() - query_start))), 0)
+    INTO v_db_load
+    FROM pg_stat_activity
+    WHERE state = 'active';
+
+    -- Simple heuristic risk scoring until ML model is integrated
+    -- (replace v_score with HTTP call to scoring service in production)
+    v_score := 0.0;
+
+    IF p_estimated_rows &gt; 10000000 THEN v_score := v_score + 0.4; END IF;
+    IF v_active_slow &gt; 5           THEN v_score := v_score + 0.3; END IF;
+    IF v_db_load &gt; 60              THEN v_score := v_score + 0.2; END IF;
+    IF p_table_names && ARRAY['orders','transactions','events']
+                                   THEN v_score := v_score + 0.1; END IF;
+
+    RETURN QUERY
+    SELECT
+        v_score &lt; 0.7 AS allowed,
+        CASE
+            WHEN v_score &lt; 0.3 THEN 'LOW'
+            WHEN v_score &lt; 0.7 THEN 'MEDIUM'
+            ELSE 'HIGH'
+        END AS risk_tier,
+        CASE
+            WHEN v_score &gt;= 0.7 THEN
+                'Query deferred: ' || v_active_slow ||
+                ' slow queries active. Retry in 60s or add LIMIT clause.'
+            WHEN v_score &gt;= 0.3 THEN
+                'Query allowed with caution: monitor for lock contention.'
+            ELSE NULL
+        END AS recommendation;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent using Resource Governor integration
+-- Create a classifier function that routes queries by ML risk tier
+CREATE OR ALTER FUNCTION dba_ml.fn_workload_classifier()
+RETURNS SYSNAME
+WITH SCHEMABINDING
+AS
+BEGIN
+    DECLARE @workload_group SYSNAME = 'default';
+    DECLARE @active_slow    INT;
+    DECLARE @app_name       NVARCHAR(128) = APP_NAME();
+
+    -- Check for batch workloads that should be throttled during peak
+    SELECT @active_slow = COUNT(*)
+    FROM sys.dm_exec_requests r
+    WHERE r.wait_time &gt; 30000   -- waiting more than 30 seconds
+      AND r.status = 'suspended';
+
+    IF @active_slow &gt; 10
+        SET @workload_group = 'throttled_batch';
+    ELSE IF @app_name LIKE '%ReportingService%'
+        SET @workload_group = 'reporting';
+    ELSE
+        SET @workload_group = 'default';
+
+    RETURN @workload_group;
+END;
+GO
+
+-- Apply the classifier to Resource Governor
+ALTER RESOURCE GOVERNOR WITH (CLASSIFIER_FUNCTION = dba_ml.fn_workload_classifier);
+ALTER RESOURCE GOVERNOR RECONFIGURE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SQL Server Resource Governor integration is particularly powerful because it enforces CPU and memory limits at the engine level without requiring application changes — the classifier function runs transparently for every new connection.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Retraining Pipelines and Model Drift Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">A model trained once and never updated is a liability. Database workloads change — applications are updated, data volumes grow, access patterns shift with business cycles. A model trained on your Q1 workload may be dangerously miscalibrated by Q3. You need automated retraining and, more importantly, automated detection of when a deployed model has drifted from reality.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scheduled Retraining with Airflow</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
+from datetime import datetime, timedelta
+import requests
+
+DEFAULT_ARGS = {
+    "owner": "dba-team",
+    "retries": 2,
+    "retry_delay": timedelta(minutes=10),
+    "email_on_failure": True,
+    "email": ["dba-alerts@yourcompany.com"],
+}
+
+def retrain_anomaly_model(datname: str, **context):
+    from train_models import train_anomaly_detector
+    import os
+
+    pipeline, threshold = train_anomaly_detector(
+        pg_conn_string=os.environ["PG_CONN_STRING"],
+        datname=datname,
+        training_days=45
+    )
+    # Signal the scoring service to hot-reload
+    scoring_service_url = os.environ["SCORING_SERVICE_URL"]
+    response = requests.post(f"{scoring_service_url}/reload/{datname}", timeout=30)
+    response.raise_for_status()
+    return {"threshold": threshold, "datname": datname}
+
+def check_model_drift(datname: str, **context):
+    """
+    Compare recent false positive and false negative rates against baseline.
+    If drift is detected, alert the DBA team before the next scheduled retrain.
+    """
+    from sqlalchemy import create_engine, text
+    import os, pandas as pd
+
+    engine = create_engine(os.environ["PG_CONN_STRING"])
+
+    # Pull prediction history from the last 7 days
+    df = pd.read_sql("""
+        SELECT scored_at, anomaly_score, is_anomaly, was_confirmed_incident
+        FROM dba_ml.prediction_log
+        WHERE datname = %(datname)s
+          AND scored_at &gt;= NOW() - INTERVAL '7 days'
+          AND was_confirmed_incident IS NOT NULL
+    """, engine, params={"datname": datname})
+
+    if len(df) &lt; 20:
+        print("Insufficient labeled samples for drift detection — skipping")
+        return
+
+    precision = df[df["is_anomaly"]]["was_confirmed_incident"].mean()
+    recall    = df[df["was_confirmed_incident"]]["is_anomaly"].mean()
+
+    # Alert if precision drops below 50% or recall below 70%
+    if precision &lt; 0.50:
+        raise ValueError(f"Model precision {precision:.2%} below threshold — "
+                         f"too many false positives. Retraining urgently.")
+    if recall &lt; 0.70:
+        raise ValueError(f"Model recall {recall:.2%} below threshold — "
+                         f"missing real incidents. Retraining urgently.")
+
+    print(f"Drift check passed: precision={precision:.2%}, recall={recall:.2%}")
+
+with DAG(
+    dag_id="dba_ml_weekly_retrain",
+    default_args=DEFAULT_ARGS,
+    schedule_interval="0 3 * * 0",   # Sunday 3 AM
+    start_date=datetime(2024, 1, 1),
+    catchup=False,
+    tags=["dba", "ml", "anomaly"]
+) as dag:
+
+    for db in ["production_db", "analytics_db", "reporting_db"]:
+        drift_check = PythonOperator(
+            task_id=f"drift_check_{db}",
+            python_callable=check_model_drift,
+            op_kwargs={"datname": db}
+        )
+        retrain = PythonOperator(
+            task_id=f"retrain_{db}",
+            python_callable=retrain_anomaly_model,
+            op_kwargs={"datname": db}
+        )
+        drift_check &gt;&gt; retrain</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">prediction_log</code> table referenced in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">check_model_drift</code> is the piece most teams skip, and it is the piece that enables everything else. Every time the scoring service fires a prediction, it should write that prediction — score, flag, timestamp — to a log table. Your incident response process should close the loop by marking confirmed incidents in that table. Even if it takes a few weeks to establish that discipline, the labeled data it accumulates transforms your drift detection from guesswork into measurement.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Population Stability Index for Feature Drift</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Beyond prediction accuracy, you should monitor whether the *input feature distributions* have drifted — a signal that something has changed even before you have enough labeled outcomes to measure accuracy degradation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import numpy as np
+import pandas as pd
+
+def population_stability_index(expected: np.ndarray,
+                                actual: np.ndarray,
+                                buckets: int = 10) -&gt; float:
+    """
+    PSI &lt; 0.10: No significant change
+    PSI 0.10-0.25: Moderate change — investigate
+    PSI &gt; 0.25: Major shift — retrain immediately
+    """
+    # Create bins from the expected (training) distribution
+    breakpoints = np.percentile(expected, np.linspace(0, 100, buckets + 1))
+    breakpoints[0]  = -np.inf
+    breakpoints[-1] =  np.inf
+
+    expected_counts = np.histogram(expected, bins=breakpoints)[0]
+    actual_counts   = np.histogram(actual,   bins=breakpoints)[0]
+
+    # Avoid division by zero
+    expected_pct = np.where(expected_counts == 0, 0.0001,
+                            expected_counts / len(expected))
+    actual_pct   = np.where(actual_counts   == 0, 0.0001,
+                            actual_counts   / len(actual))
+
+    psi = np.sum((actual_pct - expected_pct) * np.log(actual_pct / expected_pct))
+    return float(psi)
+
+def run_psi_check(engine, datname: str, training_end_date: str) -&gt; dict:
+    """
+    Compare training-period feature distributions against the last 7 days.
+    Returns a dict of {feature: psi_score} for monitoring.
+    """
+    training_df = pd.read_sql("""
+        SELECT numbackends, cache_hit_ratio, rollback_ratio, temp_pressure
+        FROM dba_ml.pg_feature_store
+        WHERE datname = %(datname)s
+          AND captured_at &lt; %(end)s
+    """, engine, params={"datname": datname, "end": training_end_date})
+
+    current_df = pd.read_sql("""
+        SELECT numbackends, cache_hit_ratio, rollback_ratio, temp_pressure
+        FROM dba_ml.pg_feature_store
+        WHERE datname = %(datname)s
+          AND captured_at &gt;= NOW() - INTERVAL '7 days'
+    """, engine, params={"datname": datname})
+
+    psi_results = {}
+    for col in ["numbackends", "cache_hit_ratio", "rollback_ratio", "temp_pressure"]:
+        psi = population_stability_index(
+            training_df[col].dropna().values,
+            current_df[col].dropna().values
+        )
+        psi_results[col] = psi
+        if psi &gt; 0.25:
+            print(f"WARNING: Major feature drift in {col} (PSI={psi:.3f}) "
+                  f"for {datname} — schedule immediate retrain")
+        elif psi &gt; 0.10:
+            print(f"NOTICE: Moderate feature drift in {col} (PSI={psi:.3f}) "
+                  f"for {datname}")
+
+    return psi_results</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running PSI checks weekly alongside the retraining DAG gives you early warning when workload patterns shift substantially — often days before prediction accuracy measurably degrades.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building a Feedback Loop with Incident Correlation</h3>
+
+<p class="text-gray-300 leading-relaxed">The prediction log and drift detection machinery are only as useful as the incident data that flows back into them. Building a lightweight feedback loop — connecting your alerting system to the prediction log — closes the cycle and makes the model progressively more useful over time.</p>
+
+<p class="text-gray-300 leading-relaxed">The simplest implementation uses a webhook from your alerting system (PagerDuty, OpsGenie, or Alertmanager) to write confirmed incidents back to PostgreSQL:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from fastapi import FastAPI, Request
+import psycopg2
+from datetime import datetime
+
+@app.post("/feedback/incident")
+async def record_incident(request: Request):
+    """
+    Called by alerting webhook when a DBA confirms an incident.
+    Links the incident to the closest preceding anomaly prediction.
+    """
+    body = await request.json()
+    datname       = body.get("database")
+    incident_time = datetime.fromisoformat(body.get("incident_time"))
+    confirmed     = body.get("confirmed", True)
+
+    with psycopg2.connect(os.environ["PG_CONN_STRING"]) as conn:
+        with conn.cursor() as cur:
+            # Find the closest anomaly prediction within ±30 minutes
+            cur.execute("""
+                UPDATE dba_ml.prediction_log
+                SET was_confirmed_incident = %s,
+                    feedback_received_at   = NOW()
+                WHERE datname = %s
+                  AND scored_at BETWEEN %s - INTERVAL '30 minutes'
+                                    AND %s + INTERVAL '30 minutes'
+                  AND is_anomaly = TRUE
+                  AND was_confirmed_incident IS NULL
+            """, (confirmed, datname, incident_time, incident_time))
+            rows_updated = cur.rowcount
+        conn.commit()
+
+    return {"status": "recorded", "predictions_linked": rows_updated}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Over time, this feedback loop produces a labeled dataset that you can use to shift from unsupervised to semi-supervised anomaly detection — incorporating actual incident labels to tighten the decision boundary and reduce false positives in your specific environment.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">A Complete End-to-End Example: Detecting Lock Storm Precursors</h3>
+
+<p class="text-gray-300 leading-relaxed">To make the techniques concrete, consider building a model specifically designed to detect the early signatures of a lock storm — the situation where one blocking query cascades into dozens of waiting sessions, eventually requiring intervention.</p>
+
+<p class="text-gray-300 leading-relaxed">Lock storms are ideal for ML because they have precursor signatures detectable 2–5 minutes before the cascade becomes visible to application users. Human operators typically react after the storm is already underway. A model trained to recognize those precursors can alert — or even automatically terminate the blocking query — before users are affected.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Collecting lock precursor features</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture lock chain depth and blocking session characteristics
+-- Run every 15 seconds into a dedicated table
+CREATE TABLE dba_ml.lock_precursor_snapshots (
+    snapshot_id         BIGSERIAL PRIMARY KEY,
+    captured_at         TIMESTAMPTZ DEFAULT NOW(),
+    max_lock_chain_depth INTEGER,
+    blocking_sessions    INTEGER,
+    blocked_sessions     INTEGER,
+    oldest_lock_age_sec  NUMERIC,
+    avg_wait_age_sec     NUMERIC,
+    top_blocker_query_hash BIGINT,
+    top_blocker_duration_sec NUMERIC
+);
+
+-- Stored procedure to populate it
+CREATE OR REPLACE PROCEDURE dba_ml.capture_lock_snapshot()
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO dba_ml.lock_precursor_snapshots (
+        max_lock_chain_depth,
+        blocking_sessions,
+        blocked_sessions,
+        oldest_lock_age_sec,
+        avg_wait_age_sec,
+        top_blocker_query_hash,
+        top_blocker_duration_sec
+    )
+    WITH lock_tree AS (
+        SELECT
+            pid,
+            pg_blocking_pids(pid) AS blocked_by,
+            EXTRACT(EPOCH FROM (NOW() - query_start)) AS query_age_sec,
+            query_id
+        FROM pg_stat_activity
+        WHERE cardinality(pg_blocking_pids(pid)) &gt; 0
+    ),
+    blocking_sessions AS (
+        SELECT
+            pid,
+            EXTRACT(EPOCH FROM (NOW() - query_start)) AS query_age_sec,
+            query_id
+        FROM pg_stat_activity
+        WHERE pid IN (SELECT UNNEST(blocked_by) FROM lock_tree)
+    )
+    SELECT
+        (SELECT MAX(cardinality(blocked_by)) FROM lock_tree)          AS max_lock_chain_depth,
+        (SELECT COUNT(*) FROM blocking_sessions)                       AS blocking_sessions,
+        (SELECT COUNT(*) FROM lock_tree)                               AS blocked_sessions,
+        (SELECT MAX(query_age_sec) FROM blocking_sessions)             AS oldest_lock_age_sec,
+        (SELECT AVG(query_age_sec) FROM lock_tree)                     AS avg_wait_age_sec,
+        (SELECT query_id FROM blocking_sessions
+         ORDER BY query_age_sec DESC LIMIT 1)                          AS top_blocker_query_hash,
+        (SELECT MAX(query_age_sec) FROM blocking_sessions)             AS top_blocker_duration_sec;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server lock precursor data collection
+INSERT INTO dba_ml.lock_precursor_snapshots (
+    captured_at,
+    max_lock_chain_depth,
+    blocking_sessions,
+    blocked_sessions,
+    oldest_lock_age_sec,
+    avg_wait_age_sec
+)
+SELECT
+    SYSUTCDATETIME(),
+    MAX(chain.depth)              AS max_lock_chain_depth,
+    COUNT(DISTINCT r.blocking_session_id) AS blocking_sessions,
+    COUNT(DISTINCT r.session_id)           AS blocked_sessions,
+    MAX(DATEDIFF(SECOND, s2.last_request_start_time, GETUTCDATE())) AS oldest_lock_age_sec,
+    AVG(CAST(r.wait_time AS FLOAT) / 1000.0) AS avg_wait_age_sec
+FROM sys.dm_exec_requests r
+JOIN sys.dm_exec_sessions s2
+    ON s2.session_id = r.blocking_session_id
+CROSS APPLY (
+    SELECT 1 AS depth  -- Simplified; recursive CTE for full chain depth in production
+) chain
+WHERE r.blocking_session_id &gt; 0;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With several weeks of lock precursor snapshots — including windows leading up to and through known lock storms — you can train a gradient boosting classifier:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.metrics import classification_report
+import pandas as pd
+import numpy as np
+
+def train_lock_storm_predictor(df: pd.DataFrame,
+                                lookahead_minutes: int = 5) -&gt; dict:
+    """
+    Train a classifier to predict lock storms N minutes before they occur.
+    df must include a 'lock_storm_occurred' label for each snapshot.
+    """
+    df = df.sort_values("captured_at").copy()
+
+    # Shift the label backward: predict storm N minutes in advance
+    shift_periods = lookahead_minutes * 4   # Assuming 15-second intervals
+    df["target"] = df["lock_storm_occurred"].shift(-shift_periods).fillna(0).astype(int)
+
+    FEATURES = [
+        "max_lock_chain_depth", "blocking_sessions", "blocked_sessions",
+        "oldest_lock_age_sec", "avg_wait_age_sec", "top_blocker_duration_sec",
+        # Derived momentum features
+        "blocking_sessions_delta", "blocked_sessions_delta",
+        "oldest_lock_age_slope"
+    ]
+
+    # Compute momentum features
+    df["blocking_sessions_delta"] = df["blocking_sessions"].diff().fillna(0)
+    df["blocked_sessions_delta"]  = df["blocked_sessions"].diff().fillna(0)
+    df["oldest_lock_age_slope"]   = df["oldest_lock_age_sec"].diff().fillna(0)
+
+    df = df.dropna(subset=FEATURES)
+    X = df[FEATURES].values
+    y = df["target"].values
+
+    # Time-series cross-validation — never train on future data
+    tscv = TimeSeriesSplit(n_splits=5)
+    model = GradientBoostingClassifier(
+        n_estimators=300,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        min_samples_leaf=10,
+        random_state=42
+    )
+
+    cv_reports = []
+    for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+        model.fit(X[train_idx], y[train_idx])
+        preds = model.predict(X[val_idx])
+        report = classification_report(y[val_idx], preds, output_dict=True)
+        cv_reports.append(report)
+        print(f"Fold {fold+1}: precision={report['1']['precision']:.3f}, "
+              f"recall={report['1']['recall']:.3f}")
+
+    # Final fit on all data
+    model.fit(X, y)
+
+    return {
+        "model": model,
+        "features": FEATURES,
+        "cv_reports": cv_reports,
+        "feature_importances": dict(zip(FEATURES,
+                                        model.feature_importances_.tolist()))
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TimeSeriesSplit</code> usage is non-negotiable for this type of model. Using standard random cross-validation on time-series data leaks future information into training folds and produces optimistic accuracy estimates that will not hold up in production. Always validate temporal models with temporal splits.</p>
+
+<p class="text-gray-300 leading-relaxed">Once trained, the lock storm predictor integrates into the scoring service alongside the anomaly detector, and its output can drive an automated response: capturing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code> for forensics, sending a targeted Slack alert with the top blocker's query text, or — if your operations team agrees — automatically terminating the blocking session via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_terminate_backend()</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Custom ML models built on your own telemetry outperform generic AI for quantitative database operations problems** because they encode the specific patterns, seasonality, and workload characteristics unique to your environment — patterns that no public training set can capture.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feature engineering is the highest-leverage investment in your ML pipeline**: raw metric values carry limited signal, but derived features — rolling z-scores, rate-of-change deltas, cyclical time encodings, and cross-metric interaction terms — are what separate models that detect real incidents from models that generate noise.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Deployment architecture determines whether a model has operational value**: a FastAPI scoring service with a Prometheus metrics endpoint, hot-reload capability, and integration into Alertmanager connects ML predictions directly to the workflows your team already uses, without requiring new tooling or operational habits.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Retraining pipelines must include drift detection, not just scheduled retraining**: monitoring prediction accuracy via a closed-loop feedback log and running Population Stability Index checks on input feature distributions gives you early warning when your model is becoming miscalibrated — often before accuracy metrics visibly degrade.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Lock storm prediction exemplifies the class of problems where ML provides asymmetric operational value**: by detecting precursor signatures 2–5 minutes before a cascade becomes user-visible, a well-trained classifier shifts your team from reactive incident response to proactive prevention — a transition that threshold-based alerting alone cannot achieve.</li>
     </div>
     <div class="mt-14 bg-violet-950/40 border border-violet-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
         <p class="text-xs text-gray-400">EXPLAIN visualizer · Index advisor · Slow query dashboard · PostgreSQL + SQL Server</p>
       </div>
-      <a href="https://rajeshguntupalli59.github.io/query-optimizer/"
+      <a href="https://queryoptimizer.lemonsqueezy.com/checkout/buy/50cb7c74-b67d-4058-ba70-4f108cc9f686"
          class="shrink-0 px-6 py-3 bg-violet-600 hover:bg-violet-500 text-white font-semibold rounded-xl text-sm transition">
-        Download Free
+        Buy Now — $149
       </a>
     </div>
     <div class="mt-8 text-xs">
