@@ -6,6 +6,10 @@
   <title>Chapter 17: Azure SQL Security: TDE, Always Encrypted, Ledger — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 17: Azure SQL Security: TDE, Always Encrypted, Ledger. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -103,7 +107,7 @@ az sql db tde show \
   --server "prod-sql-server" \
   --database "prod-app-db"</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The output of that last command will show <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"state": "Enabled"</code> when TDE is active. During the initial encryption scan — which runs as a background process — you'll see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"state": "Enabling"</code>. On a 2TB database, that scan can take 6–12 hours. Queries continue running during this window, but you'll see elevated I/O and some query latency increase, typically 5–15% on write-heavy workloads.</p>
+<p class="text-gray-300 leading-relaxed">The output of that last command will show <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"state": "Enabled"</code> when TDE is active. During the initial encryption scan — which runs as a background process — you'll see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">"state": "Enabling"</code>. The scan duration scales with database size and can run for hours on multi-terabyte databases. Queries continue running during this window, but expect elevated I/O and some added query latency on write-heavy workloads until the scan completes — measure it against your own workload rather than assuming a fixed overhead.</p>
 
 <p class="text-gray-300 leading-relaxed">#### Key Rotation</p>
 
@@ -439,8 +443,390 @@ az sql db ledger-digest-uploads show \
 
 <p class="text-gray-300 leading-relaxed">The combination creates defense in depth: TDE ensures backups are useless without your Key Vault key. Always Encrypted ensures DBAs see ciphertext on sensitive columns. Ledger ensures that even if someone does gain write access, any modification is detectable.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    App[Client application] -->|encrypts sensitive columns<br/>before sending| AE[Always Encrypted<br/>client-side crypto]
+    AE -->|ciphertext only| Engine[Database engine<br/>never sees plaintext]
+    Engine -->|writes pages| TDE[TDE<br/>encrypts data + backup files at rest]
+    Engine -->|row changes| Ledger[Ledger<br/>hash-chains every modification]
+    Ledger -->|periodic digest| External[(Immutable external storage<br/>Blob WORM / Confidential Ledger)]</pre></div>
+<p class="text-gray-300 leading-relaxed">*Each layer defends against a different attacker: TDE stops storage theft, Always Encrypted stops privileged-user data exposure, and Ledger makes any tampering with historical data provable — none of the three substitutes for the others.*</p>
+
 <p class="text-gray-300 leading-relaxed">#### Terraform: Provisioning a Secured Azure SQL Database</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># terraform/azure_sql_secure.tf
+# Provisions Azure SQL with TDE (CMK), auditing, and threat protection
+
+terraform {
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~&gt; 3.80"
+    }
+  }
+}
+
+resource "azurerm_resource_group" "prod" {
+  name     = "rg-prod-eastus"
+  location = "East US"
+}
+
+# Key Vault for TDE and Always Encrypted keys
+resource "azurerm_key_vault" "sql_security" {
+  name                        = "prod-sqlsecurity-kv"
+  resource_group_name         = azurerm_resource_group.prod.name
+  location                    = azurerm_resource_group.prod.location
+  tenant_id                   = data.azurerm_client_config.current.tenant_id
+  sku_name                    = "premium"
+  soft_delete_retention_days  = 90
+  purge_protection_enabled    = true
+
+  network_acls {
+    default_action = "Deny"
+    bypass         = "AzureServices"
+    ip_rules       = var.allowed_ip_ranges
+  }
+}
+
+# SQL Server with system-assigned managed identity
+resource "azurerm_mssql_server" "prod" {
+  name                         = "prod-sql-server"
+  resource_group_name          = azurerm_resource_group.prod.name
+  location                     = azurerm_resource_group.prod.location
+  version                      = "12.0"
+  administrator_login          = var.sql_admin_login
+  administrator_login_password = var.sql_admin_password
+  minimum_tls_version          = "1.2"
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  azuread_administrator {
+    login_username = var.aad_admin_username
+    object_id      = var.aad_admin_object_id
+  }
+}
+
+# Grant SQL Server managed identity access to Key Vault
+resource "azurerm_key_vault_access_policy" "sql_server" {
+  key_vault_id = azurerm_key_vault.sql_security.id
+  tenant_id    = data.azurerm_client_config.current.tenant_id
+  object_id    = azurerm_mssql_server.prod.identity[0].principal_id
+
+  key_permissions = [
+    "Get", "WrapKey", "UnwrapKey", "List"
+  ]
+}
+
+# TDE protector key in Key Vault
+resource "azurerm_key_vault_key" "tde_protector" {
+  name         = "sql-tde-protector"
+  key_vault_id = azurerm_key_vault.sql_security.id
+  key_type     = "RSA-HSM"
+  key_size     = 2048
+
+  key_opts = ["wrapKey", "unwrapKey"]
+
+  depends_on = [azurerm_key_vault_access_policy.sql_server]
+}
+
+# Set the TDE protector on the SQL Server
+resource "azurerm_mssql_server_transparent_data_encryption" "prod" {
+  server_id        = azurerm_mssql_server.prod.id
+  key_vault_key_id = azurerm_key_vault_key.tde_protector.id
+}
+
+# Production database
+resource "azurerm_mssql_database" "prod_app" {
+  name           = "prod-app-db"
+  server_id      = azurerm_mssql_server.prod.id
+  collation      = "SQL_Latin1_General_CP1_CI_AS"
+  sku_name       = "GP_Gen5_4"
+  max_size_gb    = 256
+  zone_redundant = true
+
+  threat_detection_policy {
+    state                      = "Enabled"
+    email_account_admins       = "Enabled"
+    retention_days             = 90
+  }
+
+  depends_on = [azurerm_mssql_server_transparent_data_encryption.prod]
+}
+
+# Storage account for audit logs with immutable policy
+resource "azurerm_storage_account" "audit" {
+  name                     = "prodsqlauditlogs"
+  resource_group_name      = azurerm_resource_group.prod.name
+  location                 = azurerm_resource_group.prod.location
+  account_tier             = "Standard"
+  account_replication_type = "GRS"
+  min_tls_version          = "TLS1_2"
+
+  blob_properties {
+    versioning_enabled = true
+  }
+}
+
+resource "azurerm_storage_container" "audit_logs" {
+  name                  = "sqlauditlogs"
+  storage_account_name  = azurerm_storage_account.audit.name
+  container_access_type = "private"
+}
+
+# Server-level auditing to immutable storage
+resource "azurerm_mssql_server_extended_auditing_policy" "prod" {
+  server_id                               = azurerm_mssql_server.prod.id
+  storage_endpoint                        = azurerm_storage_account.audit.primary_blob_endpoint
+  storage_account_access_key              = azurerm_storage_account.audit.primary_access_key
+  storage_account_access_key_is_secondary = false
+  retention_in_days                       = 90
+  log_monitoring_enabled                  = true
+}
+
+data "azurerm_client_config" "current" {}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Operational Monitoring and Alerting for Security Features</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying TDE, Always Encrypted, and Ledger is only half the work. The features need ongoing monitoring because several failure modes are silent until they become critical.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Key Vault Access Failures</p>
+
+<p class="text-gray-300 leading-relaxed">The most operationally dangerous failure mode with CMK-based TDE is losing Key Vault access. Azure SQL will enter an inaccessible state — all connections refused — if it cannot reach the Key Vault key. This can happen due to:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Key Vault network rules blocking the SQL Server managed identity</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The managed identity's access policy being accidentally deleted</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The key being disabled or deleted in Key Vault</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Key Vault going into a soft-delete state</li>
+
+<p class="text-gray-300 leading-relaxed">Set up Azure Monitor alerts on the Key Vault diagnostic logs before going live:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable Key Vault diagnostic logging
+az monitor diagnostic-settings create \
+  --name "keyvault-to-loganalytics" \
+  --resource "/subscriptions/&lt;sub-id&gt;/resourceGroups/rg-prod-eastus/providers/Microsoft.KeyVault/vaults/prod-sqlsecurity-kv" \
+  --workspace "/subscriptions/&lt;sub-id&gt;/resourceGroups/rg-prod-eastus/providers/Microsoft.OperationalInsights/workspaces/prod-law" \
+  --logs '[{"category": "AuditEvent", "enabled": true}]' \
+  --metrics '[{"category": "AllMetrics", "enabled": true}]'
+
+# Create an alert for failed Key Vault operations from the SQL Server identity
+az monitor scheduled-query create \
+  --name "SQL-KeyVault-Access-Failure" \
+  --resource-group "rg-prod-eastus" \
+  --scopes "/subscriptions/&lt;sub-id&gt;/resourceGroups/rg-prod-eastus/providers/Microsoft.OperationalInsights/workspaces/prod-law" \
+  --condition "count 'Placeholder' &gt; 0" \
+  --condition-query "AzureDiagnostics
+    | where ResourceType == 'VAULTS'
+    | where ResourceId contains 'prod-sqlsecurity-kv'
+    | where ResultType == 'Unauthorized' or ResultType == 'Forbidden'
+    | where CallerIPAddress != ''
+    | where TimeGenerated &gt; ago(5m)" \
+  --evaluation-frequency "5m" \
+  --window-size "5m" \
+  --severity 1 \
+  --action-groups "/subscriptions/&lt;sub-id&gt;/resourceGroups/rg-prod-eastus/providers/Microsoft.Insights/actionGroups/prod-oncall"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Ledger Verification on a Schedule</p>
+
+<p class="text-gray-300 leading-relaxed">Ledger verification should run on a schedule, not just during audits. A daily verification job catches tampering early. Wrap <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_verify_database_ledger</code> in an Azure SQL elastic job or a simple Azure Function with a timer trigger:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Stored procedure to run verification and log results
+-- Deploy this in your admin/DBA database or a monitoring schema
+
+CREATE OR ALTER PROCEDURE dbo.usp_VerifyLedgerIntegrity
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @DigestJSON NVARCHAR(MAX);
+    DECLARE @VerificationResult NVARCHAR(500);
+    DECLARE @ErrorMessage NVARCHAR(1000);
+
+    BEGIN TRY
+        -- Retrieve the most recent stored digest from your audit table
+        -- In production this would pull from Azure Blob or Confidential Ledger
+        SELECT TOP 1 @DigestJSON = DigestJSON
+        FROM dbo.LedgerDigestArchive
+        ORDER BY CapturedAt DESC;
+
+        IF @DigestJSON IS NULL
+        BEGIN
+            INSERT INTO dbo.LedgerVerificationLog (RunTime, Status, Message)
+            VALUES (SYSUTCDATETIME(), 'WARNING', 'No stored digest found for verification.');
+            RETURN;
+        END
+
+        -- Run verification
+        EXEC sp_verify_database_ledger @DigestJSON;
+
+        INSERT INTO dbo.LedgerVerificationLog (RunTime, Status, Message)
+        VALUES (SYSUTCDATETIME(), 'SUCCESS', 'Ledger verification passed.');
+
+    END TRY
+    BEGIN CATCH
+        SET @ErrorMessage = ERROR_MESSAGE();
+
+        INSERT INTO dbo.LedgerVerificationLog (RunTime, Status, Message)
+        VALUES (SYSUTCDATETIME(), 'FAILURE', @ErrorMessage);
+
+        -- Re-raise so the calling agent job marks the step as failed
+        -- and triggers an alert
+        THROW;
+    END CATCH
+END;
+GO
+
+-- Supporting tables
+CREATE TABLE dbo.LedgerDigestArchive (
+    ArchiveID    INT IDENTITY PRIMARY KEY,
+    DigestJSON   NVARCHAR(MAX) NOT NULL,
+    CapturedAt   DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    BlockID      INT           NOT NULL,
+    StoredBy     NVARCHAR(128) NOT NULL DEFAULT SYSTEM_USER
+);
+
+CREATE TABLE dbo.LedgerVerificationLog (
+    LogID     INT IDENTITY PRIMARY KEY,
+    RunTime   DATETIME2    NOT NULL,
+    Status    NVARCHAR(20) NOT NULL,  -- SUCCESS, FAILURE, WARNING
+    Message   NVARCHAR(1000) NULL
+);
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Azure Defender for SQL</p>
+
+<p class="text-gray-300 leading-relaxed">Azure Defender for SQL (now part of Microsoft Defender for Cloud) provides threat detection on top of the base security features — anomalous query patterns, SQL injection attempts, unusual data access volumes. Enable it at the server level and configure alert routing to your security team's channel, not just the DBA team:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Enable Microsoft Defender for SQL on the server
+az sql server microsoft-support-auditing-policy update \
+  --resource-group "rg-prod-eastus" \
+  --server "prod-sql-server" \
+  --state Enabled
+
+az security pricing create \
+  --name "SqlServers" \
+  --tier "Standard"
+
+# Set security contact for Defender alerts
+az security contact create \
+  --name "security-team-contact" \
+  --email "security-alerts@yourcompany.com" \
+  --phone "+1-555-0100" \
+  --alert-notifications "On" \
+  --alerts-to-admins "On"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.7 Migration Scenarios: Adding Security to Existing Databases</h3>
+
+<p class="text-gray-300 leading-relaxed">Enabling these features on a greenfield database is straightforward. Adding them to an existing production database — with live application traffic — requires careful sequencing.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Adding Always Encrypted to an Existing Table</p>
+
+<p class="text-gray-300 leading-relaxed">The challenge: existing plaintext data must be encrypted in-place, or you must shadow-copy the data through an encryption pass. Azure SQL provides the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... ALTER COLUMN</code> path with Always Encrypted, but it requires an offline migration window on older configurations, or can use the in-place encryption available with enclave-enabled Always Encrypted.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- With enclave-enabled Always Encrypted, encrypt existing plaintext columns
+-- WITHOUT taking the table offline (online encryption, available with VBS enclave)
+
+-- First, verify the server has enclave enabled
+SELECT 
+    SERVERPROPERTY('EnabledSecureEnclaveType') AS EnclaveType;
+-- Should return: VBS
+
+-- Verify the CEK is enclave-enabled
+SELECT 
+    cek.name,
+    cekv.enclave_computations_allowed
+FROM sys.column_encryption_keys cek
+JOIN sys.column_encryption_key_values cekv
+    ON cek.column_encryption_key_id = cekv.column_encryption_key_id
+WHERE cek.name = 'CEK_PII_Data';
+
+-- Perform online encryption of an existing column
+-- This requires an enclave-enabled connection (Enclave Attestation Url in connection string)
+ALTER TABLE dbo.CustomerPII
+ALTER COLUMN SSN CHAR(11) COLLATE Latin1_General_BIN2
+    ENCRYPTED WITH (
+        COLUMN_ENCRYPTION_KEY = CEK_PII_Data,
+        ENCRYPTION_TYPE = DETERMINISTIC,
+        ALGORITHM = 'AEAD_AES_256_CBC_HMAC_SHA_256'
+    ) NOT NULL
+WITH (ONLINE = ON);
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WITH (ONLINE = ON)</code> clause for Always Encrypted column encryption is only available with enclave-enabled configurations. Without it, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER COLUMN</code> operation takes a schema modification lock that blocks reads and writes for the duration of the re-encryption scan. On a table with tens of millions of rows, that lock duration makes the classic path impractical during business hours.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Converting a Regular Table to a Ledger Table</p>
+
+<p class="text-gray-300 leading-relaxed">Once created without ledger enabled, a regular SQL table cannot be converted to a ledger table in-place. There is no <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... SET LEDGER = ON</code>. The migration path is:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Create the new ledger table with the same schema</p>
+<p class="text-gray-300 leading-relaxed">2. Insert the existing data from the old table (this seeds the ledger with the historical state)</p>
+<p class="text-gray-300 leading-relaxed">3. Swap application traffic to the new table</p>
+<p class="text-gray-300 leading-relaxed">4. Optionally drop or archive the old table</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Migration: regular AccountBalance to ledger AccountBalance
+-- Step 1: Create ledger version alongside the existing table
+CREATE TABLE dbo.AccountBalance_Ledger_New (
+    AccountID       INT             NOT NULL,
+    CustomerName    NVARCHAR(100)   NOT NULL,
+    Balance         DECIMAL(18,2)   NOT NULL,
+    LastModified    DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+)
+WITH (
+    SYSTEM_VERSIONING = ON,
+    LEDGER = ON
+);
+GO
+
+-- Step 2: Migrate existing data in batches to avoid log pressure
+DECLARE @BatchSize INT = 10000;
+DECLARE @Offset INT = 0;
+DECLARE @Rows INT = 1;
+
+WHILE @Rows &gt; 0
+BEGIN
+    INSERT INTO dbo.AccountBalance_Ledger_New
+        (AccountID, CustomerName, Balance, LastModified)
+    SELECT 
+        AccountID, CustomerName, Balance, LastModified
+    FROM dbo.AccountBalance
+    ORDER BY AccountID
+    OFFSET @Offset ROWS
+    FETCH NEXT @BatchSize ROWS ONLY;
+
+    SET @Rows = @@ROWCOUNT;
+    SET @Offset += @BatchSize;
+
+    -- Brief pause to reduce I/O pressure during business hours
+    WAITFOR DELAY '00:00:00.100';
+END;
+GO
+
+-- Step 3: Rename tables in a single transaction to minimize cutover window
+BEGIN TRANSACTION;
+    EXEC sp_rename 'dbo.AccountBalance', 'dbo.AccountBalance_Old';
+    EXEC sp_rename 'dbo.AccountBalance_Ledger_New', 'dbo.AccountBalance';
+COMMIT;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note that the data inserted during migration appears in the ledger as a batch of INSERT operations performed by the migration login. The ledger will correctly show that all initial rows were written at migration time by a specific principal — which is accurate and acceptable for audit purposes. Document the migration event in your compliance records so auditors understand the ledger history starts at the migration timestamp.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **TDE encrypts data at rest and satisfies storage-layer compliance requirements, but it provides zero protection against a privileged database user or compromised credentials.** Use Customer-Managed Keys via Azure Key Vault when your compliance framework requires key ownership, and set up Key Vault access failure alerts before the first day of production traffic — losing access to the CMK makes the database completely inaccessible.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Always Encrypted moves the encryption boundary to the client application, ensuring the database engine never sees plaintext on sensitive columns.** The operational constraints — no range queries on classic Always Encrypted, mandatory BIN2 collation on string columns, and size expansion of every encrypted value — must be evaluated against your query patterns before committing to the schema. Secure Enclaves lift the range query restriction at the cost of an attestation handshake on each new connection.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure SQL Ledger provides cryptographic proof of data integrity, not data confidentiality.** A tamper-evident audit trail is only meaningful if the digest is stored in immutable external storage (Azure Blob WORM policy or Azure Confidential Ledger) that the database owner cannot modify — otherwise a sophisticated attacker who compromises the database can also reconstruct the digest chain.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The three features protect different threat vectors and are intended to be layered, not chosen between.** TDE covers storage-layer attackers, Always Encrypted covers insider threats and credential compromise, and Ledger covers retrospective tampering with historical records. A production system facing multiple compliance requirements will frequently need all three active simultaneously.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Migration to these features on existing production databases requires careful sequencing.** Always Encrypted column encryption without Secure Enclaves requires a schema modification lock that can block reads and writes for hours on large tables; enclave-enabled `ALTER COLUMN ... WITH (ONLINE = ON)` is the production-safe path. Ledger tables cannot be altered in-place from regular tables — plan for a create-migrate-rename cutover with batched data movement to control transaction log growth.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
