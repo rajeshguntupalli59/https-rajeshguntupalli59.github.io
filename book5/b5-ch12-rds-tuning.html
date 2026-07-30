@@ -6,6 +6,10 @@
   <title>Chapter 12: Parameter Groups, Option Groups, and Tuning on RDS — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 12: Parameter Groups, Option Groups, and Tuning on RDS. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -373,6 +377,392 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed">The following SQL gives you a quick view of which parameters are currently in effect on an RDS PostgreSQL instance, cross-referenced against what you'd expect from your parameter group — useful for validating that dynamic changes took hold:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check effective parameter values and their sources
+SELECT
+    name,
+    setting,
+    unit,
+    source,
+    reset_val,
+    pending_restart
+FROM pg_settings
+WHERE source NOT IN ('default', 'client')
+  AND name IN (
+    'work_mem',
+    'maintenance_work_mem',
+    'effective_cache_size',
+    'max_connections',
+    'shared_buffers',
+    'checkpoint_completion_target',
+    'random_page_cost',
+    'log_min_duration_statement',
+    'max_parallel_workers_per_gather',
+    'autovacuum_vacuum_cost_delay'
+  )
+ORDER BY name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">source</code> column is particularly informative. A value showing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">configuration file</code> came from your parameter group. A value showing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">override</code> means RDS itself applied it, superseding your parameter group setting — this is how you discover that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> is being managed outside your group. A value showing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">session</code> means a session-level <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET</code> command is overriding the group setting for that connection, which can be a source of confusing inconsistency when a developer has embedded <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET work_mem = '1GB'</code> in application startup code.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.6 RDS MySQL and Aurora MySQL Parameter Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">MySQL on RDS follows the same structural model but with engine-specific parameters and a few MySQL-specific operational constraints that differ from PostgreSQL behavior.</p>
+
+<p class="text-gray-300 leading-relaxed">The most impactful parameters for RDS MySQL 8.0 OLTP workloads:</p>
+
+<p class="text-gray-300 leading-relaxed">| Parameter | Recommended Value | Apply Type |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_buffer_pool_size</code> | 75% of RAM | Static |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_log_file_size</code> | 1–2 GB | Static |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_flush_log_at_trx_commit</code> | 1 (default, safest) | Dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_io_capacity</code> | 3000–6000 for gp3 | Dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_io_capacity_max</code> | 2× <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_io_capacity</code> | Dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> | Instance-class dependent | Static |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_cache_type</code> | 0 (disabled in 8.0) | Static |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">slow_query_log</code> | 1 | Dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">long_query_time</code> | 1 | Dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_queries_not_using_indexes</code> | 1 | Dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">binlog_format</code> | ROW (required for RDS replicas) | Dynamic |</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_buffer_pool_size</code> situation on RDS MySQL is different from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> on PostgreSQL. RDS does expose <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_buffer_pool_size</code> as a settable parameter, and the formula <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{DBInstanceClassMemory*3/4}</code> is the default expression — but you can override this with a concrete value in your parameter group. However, changing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_buffer_pool_size</code> is a static parameter requiring a reboot on MySQL 5.7 and earlier. MySQL 8.0 supports online buffer pool resizing via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_buffer_pool_chunk_size</code>, and RDS 8.0 exposes this as a dynamic operation through the parameter group.</p>
+
+<p class="text-gray-300 leading-relaxed">For Aurora MySQL specifically, the cluster parameter group governs replication-related settings like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">binlog_format</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aurora_parallel_query</code>, while the instance parameter group governs memory and execution settings. A common misconfiguration in Aurora MySQL is enabling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aurora_parallel_query</code> at the cluster level but failing to set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aurora_disable_hash_join=0</code> at the instance level, resulting in parallel query being enabled but hash join being unavailable, which limits its effectiveness for analytical workloads.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Aurora MySQL cluster parameter group with parallel query enabled
+aws rds create-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name prod-aurora-mysql80-cluster \
+  --db-parameter-group-family aurora-mysql8.0 \
+  --description "Aurora MySQL 8.0 cluster parameters" \
+  --region us-east-1
+
+aws rds modify-db-cluster-parameter-group \
+  --db-cluster-parameter-group-name prod-aurora-mysql80-cluster \
+  --parameters \
+    "ParameterName=aurora_parallel_query,ParameterValue=ON,ApplyMethod=pending-reboot" \
+    "ParameterName=binlog_format,ParameterValue=ROW,ApplyMethod=immediate" \
+    "ParameterName=character_set_server,ParameterValue=utf8mb4,ApplyMethod=immediate" \
+    "ParameterName=collation_server,ParameterValue=utf8mb4_unicode_ci,ApplyMethod=immediate" \
+  --region us-east-1
+
+# Aurora MySQL instance parameter group
+aws rds create-db-parameter-group \
+  --db-parameter-group-name prod-aurora-mysql80-instance \
+  --db-parameter-group-family aurora-mysql8.0 \
+  --description "Aurora MySQL 8.0 instance parameters" \
+  --region us-east-1
+
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name prod-aurora-mysql80-instance \
+  --parameters \
+    "ParameterName=aurora_disable_hash_join,ParameterValue=0,ApplyMethod=immediate" \
+    "ParameterName=innodb_io_capacity,ParameterValue=4000,ApplyMethod=immediate" \
+    "ParameterName=innodb_io_capacity_max,ParameterValue=8000,ApplyMethod=immediate" \
+    "ParameterName=slow_query_log,ParameterValue=1,ApplyMethod=immediate" \
+    "ParameterName=long_query_time,ParameterValue=1,ApplyMethod=immediate" \
+    "ParameterName=log_queries_not_using_indexes,ParameterValue=1,ApplyMethod=immediate" \
+  --region us-east-1</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One MySQL-specific tuning concern on RDS: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> default for each instance class is set by the formula <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">{DBInstanceClassMemory/12582880}</code>. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7g.4xlarge</code> with 128 GB of RAM, this evaluates to roughly 10,000 connections — a value that seems generous until you realize that MySQL's threading model means each connection allocates per-thread buffers, and 10,000 active connections at even minimal memory per thread can exhaust instance RAM. Set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> explicitly and pair it with RDS Proxy for applications with connection-heavy patterns.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.7 RDS SQL Server Parameter Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server on RDS uses parameter groups less extensively than MySQL or PostgreSQL, because SQL Server's traditional configuration is managed through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> rather than a flat configuration file. RDS exposes the most critical SQL Server configuration knobs through the parameter group system, but many settings that an on-premises DBA would manage through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> are handled differently on RDS.</p>
+
+<p class="text-gray-300 leading-relaxed">The key parameter group settings for RDS SQL Server:</p>
+
+<p class="text-gray-300 leading-relaxed">| Parameter | Notes |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds.force_ssl</code> | Enforces TLS for all connections |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max degree of parallelism</code> | Maps directly to MAXDOP; apply type is dynamic |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost threshold for parallelism</code> | Tune alongside MAXDOP; default 5 is usually too low |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory (MB)</code> | Set to leave ~10% of RAM for OS and RDS agent |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">min server memory (MB)</code> | Set to a floor that prevents excessive memory release |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">optimize for ad hoc workloads</code> | Enable for OLTP workloads to reduce plan cache bloat |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">remote query timeout (s)</code> | Set appropriately for linked server or distributed queries |</p>
+
+<p class="text-gray-300 leading-relaxed">On self-managed SQL Server, you'd run:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Self-managed SQL Server: configure MAXDOP and cost threshold
+EXEC sp_configure 'show advanced options', 1;
+RECONFIGURE;
+
+EXEC sp_configure 'max degree of parallelism', 4;
+EXEC sp_configure 'cost threshold for parallelism', 50;
+RECONFIGURE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">On RDS SQL Server, the same configuration happens through the parameter group. But you can also still call <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> on RDS SQL Server for parameters that RDS exposes through it — the parameter group values and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> values interact, with the parameter group acting as the persistent layer. If you change MAXDOP via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_configure</code> directly, that change may not survive an instance restart because the parameter group value takes precedence at startup. Use the parameter group as the source of truth for any setting it covers.</p>
+
+<p class="text-gray-300 leading-relaxed">RDS SQL Server also supports a set of SQL-level configurations that you manage directly in T-SQL, without going through parameter groups, because they are database-scoped or session-scoped rather than instance-scoped:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Database-scoped configurations (SQL Server 2016+, available on RDS)
+ALTER DATABASE SCOPED CONFIGURATION SET MAXDOP = 4;
+ALTER DATABASE SCOPED CONFIGURATION SET LEGACY_CARDINALITY_ESTIMATION = OFF;
+ALTER DATABASE SCOPED CONFIGURATION SET PARAMETER_SNIFFING = ON;
+ALTER DATABASE SCOPED CONFIGURATION SET QUERY_OPTIMIZER_HOTFIXES = ON;
+
+-- Check current database-scoped configurations
+SELECT
+    name,
+    value,
+    value_for_secondary
+FROM sys.database_scoped_configurations
+ORDER BY name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Database-scoped configurations survive restarts because they are stored in the database metadata, not in instance-level configuration. These give you a useful layer of per-database tuning that complements the instance-level parameter group — particularly valuable when you host multiple databases on a single RDS SQL Server instance with different workload characteristics.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.8 Using RDS Performance Insights with Parameter Tuning</h3>
+
+<p class="text-gray-300 leading-relaxed">Parameter tuning in isolation is guesswork. The feedback loop that makes tuning effective on RDS is Performance Insights, AWS's built-in query analysis tool that shows database load broken down by wait events, SQL statements, and sessions over time.</p>
+
+<p class="text-gray-300 leading-relaxed">Performance Insights is enabled at the instance level and requires that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> (for PostgreSQL) or its MySQL/SQL Server equivalent is active. For PostgreSQL, you must include <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_preload_libraries</code> — a static parameter requiring a reboot — before Performance Insights can surface per-query statistics.</p>
+
+<p class="text-gray-300 leading-relaxed">Once enabled, Performance Insights gives you:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A timeline of **Average Active Sessions (AAS)** — the primary metric showing how loaded the database is relative to its vCPU count</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Breakdown by **wait event** — where sessions are spending time (I/O, lock waits, CPU, network)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Top SQL** by load contribution — which queries are consuming the most database time</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Historical data up to two years with the paid tier</li>
+
+<p class="text-gray-300 leading-relaxed">The practical tuning workflow using Performance Insights looks like this:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Establish a Performance Insights baseline over a representative period (at minimum, a full business cycle)</p>
+<p class="text-gray-300 leading-relaxed">2. Identify the dominant wait events during peak load</p>
+<p class="text-gray-300 leading-relaxed">3. Cross-reference with top SQL statements to find the highest-impact queries</p>
+<p class="text-gray-300 leading-relaxed">4. Apply parameter changes targeting the observed bottleneck</p>
+<p class="text-gray-300 leading-relaxed">5. Compare Performance Insights before and after the change over equivalent load periods</p>
+
+<p class="text-gray-300 leading-relaxed">For example: if your Performance Insights view shows <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">io/datafileread</code> as the dominant wait event and the top SQL statements are full-table scans on large tables, the parameter tuning response is to lower <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">random_page_cost</code> (already done in your baseline) and verify <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> is set high enough that the planner understands available memory, then focus on index coverage for those specific queries. Raising <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> won't help <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">io/datafileread</code> — it addresses CPU-sort and hash-join pressure, which shows up as CPU wait or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BufferIO</code> events.</p>
+
+<p class="text-gray-300 leading-relaxed">You can pull Performance Insights data programmatically for automated analysis:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import boto3
+from datetime import datetime, timedelta, timezone
+
+def get_top_sql_by_load(
+    instance_id: str,
+    region: str,
+    lookback_hours: int = 24
+) -&gt; list:
+    """
+    Retrieve top SQL statements by average active sessions
+    from Performance Insights.
+    """
+    pi = boto3.client('pi', region_name=region)
+    rds = boto3.client('rds', region_name=region)
+
+    # Get the DBI resource identifier (required by Performance Insights API)
+    instance = rds.describe_db_instances(
+        DBInstanceIdentifier=instance_id
+    )['DBInstances'][0]
+    dbi_resource_id = instance['DbiResourceId']
+
+    end_time = datetime.now(timezone.utc)
+    start_time = end_time - timedelta(hours=lookback_hours)
+
+    response = pi.get_resource_metrics(
+        ServiceType='RDS',
+        Identifier=dbi_resource_id,
+        MetricQueries=[
+            {
+                'Metric': 'db.load.avg',
+                'GroupBy': {
+                    'Group': 'db.sql',
+                    'Dimensions': ['db.sql.statement'],
+                    'Limit': 10
+                }
+            }
+        ],
+        StartTime=start_time,
+        EndTime=end_time,
+        PeriodInSeconds=3600
+    )
+
+    results = []
+    for metric_list in response.get('MetricList', []):
+        for key in metric_list.get('Keys', []):
+            dimensions = key.get('Dimensions', {})
+            sql_text = dimensions.get('db.sql.statement', 'N/A')
+            # Sum the load values across the time window
+            data_points = metric_list.get('DataPoints', [])
+            total_load = sum(
+                dp.get('Value', 0) for dp in data_points
+                if dp.get('Key') == key
+            )
+            results.append({
+                'sql': sql_text[:200],  # Truncate for display
+                'total_aas': round(total_load, 3)
+            })
+
+    return sorted(results, key=lambda x: x['total_aas'], reverse=True)
+
+if __name__ == '__main__':
+    top_sql = get_top_sql_by_load(
+        instance_id='prod-postgres-primary',
+        region='us-east-1',
+        lookback_hours=24
+    )
+    for rank, entry in enumerate(top_sql, 1):
+        print(f"{rank}. AAS={entry['total_aas']:.3f} | {entry['sql'][:100]}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This script gives you a programmatic version of the Performance Insights top-SQL view, which you can integrate into alerting pipelines or daily operational reports without requiring console access.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server on RDS, Performance Insights surfaces SQL Server wait statistics — the same wait types you'd examine through <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_os_wait_stats</code> on a self-managed instance, but presented in a time-series interface without requiring DMV access. The common SQL Server wait types you'll tune around:</p>
+
+<p class="text-gray-300 leading-relaxed">| Wait Type | Likely Cause | Parameter Response |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PAGEIOLATCH_SH</code> | Buffer pool pressure, reads hitting disk | Increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max server memory</code>, review <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> equivalent |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LCK_M_*</code> | Lock contention | Application query changes, not parameter tuning |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXCONSUMER</code> | Parallel query coordination overhead | Reduce MAXDOP or increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost threshold for parallelism</code> |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WRITELOG</code> | Log write latency | Move to io1/io2 storage, increase IOPS provisioning |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SOS_SCHEDULER_YIELD</code> | CPU pressure, long-running queries competing | MAXDOP tuning, query-level optimization |</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> case illustrates the interplay between Performance Insights and parameter tuning directly. If you see high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CXPACKET</code> wait time in Performance Insights and the top SQL statements are short OLTP transactions (not the analytical queries that should benefit from parallelism), the response is to raise the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost threshold for parallelism</code> parameter from the default value of 5 to something in the range of 40–75. This forces the optimizer to only use parallelism for queries with a high estimated cost, eliminating wasted parallel worker overhead on simple lookups.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.9 Parameter Group Change Management in Production</h3>
+
+<p class="text-gray-300 leading-relaxed">The riskiest moment in RDS parameter group management is applying a static parameter change to a production instance, because it requires a restart. A Multi-AZ instance will failover, causing a brief outage (typically under 60 seconds for DNS cutover). A Single-AZ instance will have a hard restart with a longer outage. Either way, you're making a conscious decision to introduce a disruption, and you need a disciplined process around it.</p>
+
+<p class="text-gray-300 leading-relaxed">A production-grade parameter change workflow:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 1: Document the current state.</strong></p>
+<p class="text-gray-300 leading-relaxed">Before changing anything, export the current parameter group values.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>aws rds describe-db-parameters \
+  --db-parameter-group-name prod-postgres16-oltp \
+  --query "Parameters[?Source=='user']" \
+  --output json &gt; param-group-backup-$(date +%Y%m%d).json</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Source=='user'</code> filter returns only parameters you've explicitly set, not the full catalog of engine defaults. This is your rollback artifact.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 2: Apply changes to a staging instance first.</strong></p>
+<p class="text-gray-300 leading-relaxed">Create a copy of the parameter group, apply the changes, associate it with a staging instance that mirrors production's instance class and data volume, and run representative workloads. For static parameter changes, restart the staging instance and verify the application behaves correctly before touching production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 3: Schedule the production change.</strong></p>
+<p class="text-gray-300 leading-relaxed">Static parameter changes in production should happen during a maintenance window, with the application team aware that a brief failover will occur. For Multi-AZ deployments, the failover is automatic and transparent to the application if the application handles transient connection drops (using retry logic and connection pooling). For Single-AZ, the outage duration depends on instance size — larger instances take longer to restart.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 4: Validate the change took effect.</strong></p>
+<p class="text-gray-300 leading-relaxed">After restart, confirm that the static parameters are active:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: verify static parameters applied after restart
+SELECT name, setting, source, pending_restart
+FROM pg_settings
+WHERE pending_restart = true;
+-- Should return 0 rows after a successful restart</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: verify instance-level configuration
+SELECT name, value_in_use, description
+FROM sys.configurations
+WHERE name IN (
+    'max degree of parallelism',
+    'cost threshold for parallelism',
+    'max server memory (MB)',
+    'optimize for ad hoc workloads'
+)
+ORDER BY name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Step 5: Monitor Performance Insights for 24–48 hours.</strong></p>
+<p class="text-gray-300 leading-relaxed">Compare AAS and wait event distribution against your pre-change baseline. A parameter change that looks reasonable in theory can increase load in practice — for example, raising <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> above the instance's connection handling capacity can increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPU</code> wait if the additional connections generate more concurrent query load than the instance can absorb.</p>
+
+<p class="text-gray-300 leading-relaxed">For teams managing many RDS instances, AWS Systems Manager Parameter Store (not to be confused with RDS parameter groups, despite the naming collision) is useful for storing the canonical parameter values for each tier in your fleet. Your Terraform modules read from SSM Parameter Store to populate parameter group values, creating a single source of truth that spans both the infrastructure code and operational documentation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">12.10 Monitoring Parameter Group Effectiveness</h3>
+
+<p class="text-gray-300 leading-relaxed">Tuning parameters without closing the feedback loop is not tuning — it's configuration editing. The monitoring layer that tells you whether your parameter changes produced the intended result includes Performance Insights (covered in 12.8), CloudWatch RDS metrics, and engine-level views.</p>
+
+<p class="text-gray-300 leading-relaxed">The core CloudWatch metrics to monitor in relation to parameter changes:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | What It Reflects | Related Parameters |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadIOPS</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WriteIOPS</code> | Disk I/O activity | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">random_page_cost</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">effective_cache_size</code> |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ReadLatency</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WriteLatency</code> | Storage latency | Storage type and IOPS provisioning |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CPUUtilization</code> | Total CPU demand | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, MAXDOP, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeableMemory</code> | Available RAM | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DatabaseConnections</code> | Active connection count | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>, RDS Proxy |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DiskQueueDepth</code> | Storage queue depth | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_io_capacity</code>, checkpoint parameters |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SwapUsage</code> | Memory pressure overflow | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> set too high, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> too high |</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SwapUsage</code> is the canary in the coal mine for over-aggressive memory parameter tuning. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SwapUsage</code> climbs after you raise <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">work_mem</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code>, the instance is swapping to satisfy memory allocations, which will degrade performance far more than conservative memory settings would have. Set a CloudWatch alarm on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SwapUsage > 0</code> for production RDS instances — swap should never be in use on a properly sized and tuned instance.</p>
+
+<p class="text-gray-300 leading-relaxed">A CloudWatch alarm for swap in Terraform:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>resource "aws_cloudwatch_metric_alarm" "rds_swap_usage" {
+  alarm_name          = "rds-${var.instance_id}-swap-usage"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 2
+  metric_name         = "SwapUsage"
+  namespace           = "AWS/RDS"
+  period              = 300
+  statistic           = "Average"
+  threshold           = 0
+  alarm_description   = "RDS instance is using swap - possible memory pressure from parameter tuning"
+  alarm_actions       = [var.sns_topic_arn]
+
+  dimensions = {
+    DBInstanceIdentifier = var.instance_id
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond CloudWatch, query the engine directly for validation. On PostgreSQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_bgwriter</code> tells you about checkpoint behavior relative to your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoint_completion_target</code> setting:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: checkpoint and buffer statistics
+SELECT
+    checkpoints_timed,
+    checkpoints_req,
+    checkpoint_write_time,
+    checkpoint_sync_time,
+    buffers_checkpoint,
+    buffers_clean,
+    buffers_backend,
+    buffers_alloc,
+    stats_reset
+FROM pg_stat_bgwriter;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoints_req</code> (checkpoints forced by WAL fill rather than scheduled) relative to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">checkpoints_timed</code> means WAL is filling faster than the checkpoint cycle. The response is to increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_wal_size</code> (available in the RDS parameter group for PostgreSQL 9.5+), which gives the checkpoint process more runway before forced flushes.</p>
+
+<p class="text-gray-300 leading-relaxed">A high <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">buffers_backend</code> relative to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">buffers_checkpoint</code> means backends are writing dirty buffers directly to disk because the background writer can't keep up. Tune <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_lru_maxpages</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bgwriter_delay</code> to be more aggressive.</p>
+
+<p class="text-gray-300 leading-relaxed">On MySQL, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SHOW ENGINE INNODB STATUS</code> and the information schema tables provide equivalent feedback:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- MySQL: InnoDB buffer pool efficiency
+SELECT
+    pool_id,
+    pool_size,
+    free_buffers,
+    database_pages,
+    old_database_pages,
+    modified_db_pages,
+    pending_reads,
+    pending_write_lrus,
+    pending_write_flush_list,
+    pages_read,
+    pages_created,
+    pages_written
+FROM information_schema.innodb_buffer_pool_stats;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">free_buffers</code> value consistently near zero means the buffer pool is full and pages are being evicted frequently — the signal that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_buffer_pool_size</code> may be undersized for the working set. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modified_db_pages</code> is consistently high relative to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pool_size</code>, the background flush threads aren't keeping up, and raising <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">innodb_io_capacity</code> may help.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Parameter groups are the configuration interface for RDS, but they are not omnipotent.** AWS enforces hard limits on what can be modified — OS-level tuning, superuser access, and certain engine internals are outside the parameter group system entirely. Effective RDS tuning starts by understanding these boundaries.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Static parameters require restarts; dynamic parameters do not.** This distinction governs every production change control decision. Always check the apply type before touching a production parameter group, and monitor `pending_restart` in `pg_settings` (PostgreSQL) or equivalent engine views to confirm that static changes have been applied after the scheduled restart.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Option groups extend RDS with engine-specific features** — SQL Server Agent, native backup/restore to S3, and audit plugins are option group features, not parameter group entries. For SQL Server migrations in particular, enabling `SQLSERVER_BACKUP_RESTORE` via an option group is a prerequisite that blocks database restoration if missed.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Treat parameter groups as versioned artifacts under source control.** Modify parameter groups in Terraform or CloudFormation rather than through the console, export current user-set parameters before any change as a rollback artifact, and test all static parameter changes on staging before scheduling production restarts. In-place modification of production parameter groups without version control makes rollback guesswork.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Performance Insights closes the tuning feedback loop.** Parameter changes without a monitoring baseline are guesses. Use Performance Insights AAS trends and wait event breakdowns to identify the actual bottleneck before choosing a parameter response, and compare the same metrics over equivalent load periods before and after the change to confirm the intended effect was achieved.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
