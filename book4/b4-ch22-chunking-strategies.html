@@ -6,6 +6,10 @@
   <title>Chapter 22: Chunking Strategies: Size, Overlap, Semantic Splitting — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 22: Chunking Strategies: Size, Overlap, Semantic Splitting. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -475,7 +479,335 @@ CREATE INDEX IF NOT EXISTS idx_chunks_embedding
 # n = ingest_document(doc_text, "doc-001", {"source": "manual", "version": "2.1"}, pg_conn, index)
 # print(f"Ingested {n} chunks")</code></pre>
 
-<p class="text-gray-300 leading-relaxed">The schema design here reflects DBA instincts: a GIN index on the</p>
+<p class="text-gray-300 leading-relaxed">The schema design here reflects DBA instincts: a GIN index on the<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">metadata</code> JSONB column enables fast filtering by source, version, access tier, or any dimension you attach at ingestion time. The HNSW index on the embedding column uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m=16</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction=64</code>, which are conservative defaults suitable for up to a few million chunks before you need to tune upward. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ON CONFLICT</code> upsert pattern means you can re-run ingestion on the same document without creating duplicate chunks—critical for pipelines that re-index documents when source content changes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone index setup</strong> follows the serverless pattern introduced in Chapter 12:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+def ensure_pinecone_index(pc: Pinecone, index_name: str, dimension: int) -&gt; object:
+    """
+    Creates a Pinecone serverless index if it does not exist.
+    Returns the Index object ready for upsert/query.
+    """
+    existing = [idx.name for idx in pc.list_indexes()]
+    if index_name not in existing:
+        pc.create_index(
+            name=index_name,
+            dimension=dimension,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        )
+        # Wait for index to be ready
+        import time
+        while not pc.describe_index(index_name).status["ready"]:
+            time.sleep(1)
+    return pc.Index(index_name)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One Pinecone-specific concern worth flagging: metadata stored alongside vectors is not free. Each vector's metadata counts toward your index size, and the 40KB per-vector metadata limit is generous but not infinite. Storing the full chunk text in metadata is convenient for retrieval—you avoid a round-trip to PostgreSQL or another store—but for large corpora it meaningfully inflates pod or storage costs. A common production pattern is to store a truncated preview (200–300 characters) in Pinecone metadata for display purposes, and retrieve full text from PostgreSQL using the chunk ID when context assembly requires complete content.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.6 Querying Across Chunk Strategies</h3>
+
+<p class="text-gray-300 leading-relaxed">A chunking strategy that looks good during ingestion must also hold up at query time. The query path exposes failure modes that are invisible until users start asking questions.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The boundary problem in retrieval</strong>: Suppose a user asks "What is the difference between session pooling and transaction pooling in PgBouncer?" Your document about PgBouncer has a section that spans 800 tokens, covering both modes. With 512-token fixed chunks and no overlap, one chunk covers session pooling and a second chunk covers transaction pooling. The query embeds to something close to both chunks, but the top-1 result might be only one of them. The LLM then generates an answer about session pooling without mentioning transaction pooling.</p>
+
+<p class="text-gray-300 leading-relaxed">Two retrieval-side mitigations exist. First, retrieve top-K with K larger than you plan to pass to the LLM—fetch 20, pass 5. This increases the probability that both relevant chunks appear in the candidate set. Second, implement <strong class="text-white">parent-child chunking</strong> (also called the "small-to-big" retrieval pattern): embed small chunks (128 tokens) for retrieval precision, but when a small chunk is retrieved, return its parent chunk (512 tokens) for context. LlamaIndex calls this <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ParentDocumentRetriever</code>; LangChain implements it via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ParentDocumentRetriever</code> as well.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Parent-child chunking: embed small chunks, retrieve large parent chunks
+
+from langchain.retrievers import ParentDocumentRetriever
+from langchain.storage import InMemoryStore
+from langchain.vectorstores import PGVector
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings
+import os
+
+# Child splitter: small chunks for embedding precision
+child_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=128,
+    chunk_overlap=16,
+    length_function=lambda s: len(enc.encode(s)),
+)
+
+# Parent splitter: larger chunks for context delivery
+parent_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=512,
+    chunk_overlap=0,   # No overlap at parent level—parents are complete units
+    length_function=lambda s: len(enc.encode(s)),
+)
+
+embeddings = OpenAIEmbeddings(
+    model="text-embedding-3-small",
+    openai_api_key=os.environ["OPENAI_API_KEY"],
+)
+
+# PGVector as the vector store for child chunk embeddings
+vectorstore = PGVector(
+    connection_string=os.environ["PG_DSN"],
+    embedding_function=embeddings,
+    collection_name="child_chunks",
+)
+
+# InMemoryStore holds parent chunks keyed by parent ID
+# In production, replace with a Redis or PostgreSQL-backed store
+docstore = InMemoryStore()
+
+retriever = ParentDocumentRetriever(
+    vectorstore=vectorstore,
+    docstore=docstore,
+    child_splitter=child_splitter,
+    parent_splitter=parent_splitter,
+)
+
+# Adding documents splits them into parents first, then children
+# Children are embedded; parents are stored in the docstore
+# from langchain.schema import Document as LCDocument
+# docs = [LCDocument(page_content=text, metadata={"source": "pgbouncer_manual"})]
+# retriever.add_documents(docs)
+
+# At query time, similarity search finds child chunks,
+# but the retriever returns the parent chunk for each match
+# results = retriever.get_relevant_documents("transaction pooling vs session pooling")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The parent-child pattern is particularly effective for technical documentation where individual sentences are too narrow to be meaningful and full sections are too wide to embed accurately. The small chunk gives you embedding precision; the parent chunk gives you LLM-ready context.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    P["Parent chunk (512 tokens)<br/>returned to LLM for context"]
+    C1["Child chunk (128 tokens)<br/>embedded + indexed"]
+    C2["Child chunk (128 tokens)<br/>embedded + indexed"]
+    C3["Child chunk (128 tokens)<br/>embedded + indexed"]
+
+    P --> C1
+    P --> C2
+    P --> C3
+
+    Query[Query embedding] -.matches.-> C2
+    C2 -.returns parent.-> P</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Retrieval searches against small child embeddings for precision, then returns the larger parent chunk the LLM actually reads — precise targeting, complete context.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chunk-level filtering</strong>: The metadata columns you attach at ingestion become filter dimensions at query time. In pgvector, this is a standard SQL <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE</code> clause combined with the vector similarity operator:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: retrieve chunks from a specific document version,
+-- ranked by cosine similarity to a query embedding
+
+SELECT
+    id,
+    doc_id,
+    chunk_index,
+    content,
+    metadata,
+    1 - (embedding &lt;=&gt; '[0.021, -0.047, ...]'::vector) AS cosine_similarity
+FROM document_chunks
+WHERE
+    metadata-&gt;&gt;'version' = '2.1'
+    AND metadata-&gt;&gt;'doc_type' = 'manual'
+    AND token_count BETWEEN 64 AND 512
+ORDER BY embedding &lt;=&gt; '[0.021, -0.047, ...]'::vector
+LIMIT 10;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent using the vector similarity pattern
+-- (assuming a computed cosine similarity UDF or OPENJSON metadata pattern)
+
+SELECT TOP 10
+    id,
+    doc_id,
+    chunk_index,
+    content,
+    JSON_VALUE(metadata, '$.version')    AS version,
+    JSON_VALUE(metadata, '$.doc_type')   AS doc_type,
+    dbo.fn_cosine_similarity(embedding, '[0.021, -0.047, ...]') AS cosine_similarity
+FROM document_chunks
+WHERE
+    JSON_VALUE(metadata, '$.version')  = '2.1'
+    AND JSON_VALUE(metadata, '$.doc_type') = 'manual'
+    AND token_count BETWEEN 64 AND 512
+ORDER BY dbo.fn_cosine_similarity(embedding, '[0.021, -0.047, ...]') DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Pre-filtering on metadata before the vector similarity scan is an important performance decision. In pgvector with an HNSW index, a filtered ANN search scans the HNSW graph and then applies the filter, which can be inefficient if the filter is highly selective. For high-selectivity filters (where the filter eliminates more than 90% of rows), an exact KNN scan (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET enable_indexscan = off</code>) over the filtered subset often outperforms HNSW. Pinecone handles this natively through its metadata filtering layer, which routes queries to a subset of the index before ANN search.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.7 Choosing a Chunking Strategy by Document Type</h3>
+
+<p class="text-gray-300 leading-relaxed">The correct chunking strategy depends on the document type, the query patterns it must serve, and the embedding model in use. The following table organizes the common cases:</p>
+
+<p class="text-gray-300 leading-relaxed">| Document Type | Recommended Strategy | Chunk Size | Overlap | Notes |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Technical documentation (Markdown/HTML) | Structural (headings) then fixed within sections | 256–512 tokens | 10–15% | Preserve heading metadata per chunk |</p>
+<p class="text-gray-300 leading-relaxed">| Legal or regulatory text | Sentence-aware + overlap | 256–384 tokens | 15–20% | Sentence boundaries are semantic boundaries |</p>
+<p class="text-gray-300 leading-relaxed">| Source code | Structural (function/class via tree-sitter) | Variable | 0–5% | Never split mid-function |</p>
+<p class="text-gray-300 leading-relaxed">| Conversational transcripts | Turn-based or fixed small | 128–256 tokens | 5–10% | Speaker turns are natural boundaries |</p>
+<p class="text-gray-300 leading-relaxed">| Academic papers | Section-structural + semantic within sections | 384–512 tokens | 10% | Abstract and conclusions warrant separate chunks |</p>
+<p class="text-gray-300 leading-relaxed">| FAQ / Q&A documents | One chunk per Q&A pair | Variable | 0% | Natural atomic units; no splitting needed |</p>
+<p class="text-gray-300 leading-relaxed">| Tabular data (CSV, spreadsheets) | Row-based or row-group | Variable | 0% | Embed column headers in every chunk |</p>
+<p class="text-gray-300 leading-relaxed">| Mixed media (PDF with figures) | Text extraction + structural | 256–512 tokens | 10% | Tag figure captions separately |</p>
+
+<p class="text-gray-300 leading-relaxed">Two principles cut across all document types:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Preserve provenance in every chunk</strong>. Every chunk should carry its source document ID, the heading or section it belongs to, and its position. A chunk retrieved without provenance cannot be cited, and citation is table stakes for enterprise RAG deployments.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Match chunk granularity to query granularity</strong>. If your users ask narrow factual questions ("What is the default <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code> in PostgreSQL 16?"), small precise chunks (128–256 tokens) will outperform large ones. If your users ask synthesis questions ("Summarize the tradeoffs between BRIN and B-Tree indexes"), larger chunks (512 tokens or more) serve better because the answer requires more surrounding context. When a single application serves both query types, the parent-child pattern described in Section 22.6 is the production-grade solution.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.8 Measuring Chunking Quality</h3>
+
+<p class="text-gray-300 leading-relaxed">Chunking strategy cannot be evaluated in isolation—it must be measured through the full RAG pipeline. Three metrics are practical to implement:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chunk hit rate</strong>: For a labeled evaluation set of (question, answer) pairs, what percentage of queries return at least one chunk containing the correct answer in the top-K results? A drop in hit rate after changing chunking parameters is a clear signal of regression.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Answer faithfulness</strong>: Using an LLM-as-judge pattern, score whether the generated answer is faithful to the retrieved chunks (no hallucination). If faithfulness drops, your chunks may be too short to give the LLM enough context, or overlap may be insufficient to prevent boundary fragmentation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Mean reciprocal rank (MRR)</strong>: Among queries where the relevant chunk is retrieved, at what rank does it appear? An MRR of 0.85 means the relevant chunk typically appears within the first two positions; 0.5 means it appears around position two to three. MRR is sensitive to chunk granularity—too-coarse chunks often rank lower because they contain more irrelevant content alongside the answer.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Lightweight chunking evaluation framework
+
+from dataclasses import dataclass
+from typing import Callable
+import numpy as np
+
+@dataclass
+class EvalSample:
+    question: str
+    expected_answer_fragment: str  # substring that should appear in a relevant chunk
+
+def evaluate_chunking_strategy(
+    eval_samples: list[EvalSample],
+    retriever_fn: Callable[[str, int], list[dict]],  # (query, top_k) -&gt; list of chunk dicts
+    top_k: int = 10,
+) -&gt; dict:
+    """
+    Evaluate a chunking + retrieval configuration against labeled samples.
+    retriever_fn must return chunk dicts with at least a 'text' key.
+    """
+    hit_count = 0
+    reciprocal_ranks = []
+
+    for sample in eval_samples:
+        results = retriever_fn(sample.question, top_k)
+        hit = False
+        for rank, chunk in enumerate(results, start=1):
+            if sample.expected_answer_fragment.lower() in chunk["text"].lower():
+                reciprocal_ranks.append(1.0 / rank)
+                hit = True
+                break
+        if not hit:
+            reciprocal_ranks.append(0.0)
+        if hit:
+            hit_count += 1
+
+    return {
+        "hit_rate": hit_count / len(eval_samples),
+        "mrr": float(np.mean(reciprocal_ranks)),
+        "sample_count": len(eval_samples),
+    }
+
+
+# Example evaluation samples for a PostgreSQL knowledge base
+eval_set = [
+    EvalSample(
+        question="How does autovacuum decide when to run?",
+        expected_answer_fragment="autovacuum_vacuum_threshold",
+    ),
+    EvalSample(
+        question="What is the difference between BRIN and B-Tree indexes?",
+        expected_answer_fragment="Block Range",
+    ),
+    EvalSample(
+        question="How does MVCC handle concurrent reads and writes?",
+        expected_answer_fragment="xmin",
+    ),
+]
+
+# Wire up your retriever and run:
+# metrics = evaluate_chunking_strategy(eval_set, my_retriever_fn, top_k=10)
+# print(f"Hit Rate: {metrics['hit_rate']:.2%}, MRR: {metrics['mrr']:.3f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running this evaluation across a grid of chunk sizes and overlap values—say, chunk sizes of [128, 256, 512] crossed with overlaps of [0%, 10%, 20%]—gives you nine data points that reveal the optimal configuration for your specific corpus and query distribution. The investment of building a 50–100 sample labeled set pays back quickly: chunking parameters that look similar on paper often diverge by 15–25 percentage points in hit rate depending on document structure and query patterns.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.9 Operational Considerations: Re-Chunking and Schema Evolution</h3>
+
+<p class="text-gray-300 leading-relaxed">Documents change. New versions of technical manuals, updated policy documents, revised code—all of these require re-ingestion. Chunking strategy changes also require re-ingestion of the entire corpus. These are operational realities that deserve schema and pipeline design attention upfront.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Versioned chunk storage</strong>: Rather than overwriting chunks on re-ingestion, consider keeping a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">chunk_version</code> column that increments with each ingestion run. This allows you to roll back to a previous chunking configuration if a new strategy degrades retrieval quality. The tradeoff is storage cost, which is manageable for most corpora but worth considering for multi-billion-token knowledge bases.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Schema with versioning support for chunk evolution
+
+ALTER TABLE document_chunks
+    ADD COLUMN IF NOT EXISTS ingestion_run_id  UUID,
+    ADD COLUMN IF NOT EXISTS chunk_strategy    TEXT,  -- e.g. 'fixed_512_64' or 'semantic_v2'
+    ADD COLUMN IF NOT EXISTS is_active         BOOLEAN DEFAULT TRUE;
+
+-- When re-ingesting, mark old chunks inactive rather than deleting them:
+UPDATE document_chunks
+SET is_active = FALSE
+WHERE doc_id = $1
+  AND ingestion_run_id != $2;
+
+-- Query filters on active chunks only:
+CREATE INDEX IF NOT EXISTS idx_chunks_active
+    ON document_chunks(doc_id, is_active)
+    WHERE is_active = TRUE;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
+
+ALTER TABLE document_chunks
+    ADD ingestion_run_id  UNIQUEIDENTIFIER NULL,
+        chunk_strategy    NVARCHAR(100)    NULL,
+        is_active         BIT              NOT NULL DEFAULT 1;
+
+-- Deactivate prior chunks on re-ingestion:
+UPDATE document_chunks
+SET is_active = 0
+WHERE doc_id = @doc_id
+  AND ingestion_run_id &lt;&gt; @new_run_id;
+
+-- Filtered index on active chunks:
+CREATE INDEX idx_chunks_active
+    ON document_chunks(doc_id, is_active)
+    WHERE is_active = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cascading re-embedding</strong>: When an embedding model is upgraded—from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-small</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">text-embedding-3-large</code>, for instance—all stored embeddings become stale because the two models occupy different vector spaces. Cosine similarity between a new-model query embedding and an old-model chunk embedding is meaningless. This is analogous to changing a hash function in a relational database: every stored value must be recomputed.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical response is to store the model name and version alongside each chunk and treat model upgrades as full re-ingestion events. Pinecone's approach is to create a new index for the upgraded model and switch query traffic to the new index only after full re-ingestion completes, using a feature flag or DNS-level cutover. In pgvector, you can add a second vector column for the new model and backfill it in batches before switching the query path:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Zero-downtime embedding model upgrade
+
+-- Step 1: Add new vector column (existing queries still use embedding_v1)
+ALTER TABLE document_chunks
+    ADD COLUMN embedding_v2 vector(3072);  -- text-embedding-3-large dimension
+
+-- Step 2: Backfill in batches (run as a background job)
+-- UPDATE document_chunks SET embedding_v2 = $1 WHERE id = $2;
+
+-- Step 3: Build HNSW index on new column
+CREATE INDEX CONCURRENTLY idx_chunks_embedding_v2
+    ON document_chunks USING hnsw(embedding_v2 vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- Step 4: Switch application queries to embedding_v2 via config flag
+-- Step 5: Drop old column after validation period
+-- ALTER TABLE document_chunks DROP COLUMN embedding;
+-- ALTER TABLE document_chunks RENAME COLUMN embedding_v2 TO embedding;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> syntax in PostgreSQL builds the index without blocking reads or writes, which is the correct approach for production tables that serve live query traffic during a migration. SQL Server's equivalent is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chunking is a normalization decision**: chunk granularity governs retrieval precision the same way index selectivity governs query performance in relational databases. Too coarse and embeddings are noisy; too fine and embeddings become brittle against phrasing variation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Token-accurate sizing matters**: use the tokenizer that matches your embedding model (`tiktoken` for OpenAI models, the model's native tokenizer otherwise) rather than character counts. Mismatched sizing causes silent truncation that degrades embedding quality without surfacing an error.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Overlap helps precision, not recall**: overlapping tokens at chunk boundaries ensures that semantically complete sentences appear in at least one chunk, reducing boundary fragmentation at retrieval time. Keep overlap between 10–20%; beyond 25%, adjacent chunks become near-duplicates that pollute top-K results.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Match strategy to document structure**: fixed-size chunking is fast and predictable; structural splitting (on headings, functions, or sections) outperforms it for well-marked documents; semantic splitting finds topic boundaries in unstructured prose at the cost of extra embedding calls during ingestion. The production pattern for most technical corpora is structural splitting first, semantic splitting within oversized sections.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Design for re-ingestion from the start**: chunk versioning, inactive-flag patterns, and dual-column embedding migrations are operational necessities for any corpus that will change over time or migrate to an improved embedding model. Treating chunks as immutable blobs rather than versioned rows creates painful re-indexing events that proper schema design avoids.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
