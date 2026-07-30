@@ -6,6 +6,10 @@
   <title>Chapter 15: Azure SQL Hyperscale: When You Need It — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 15: Azure SQL Hyperscale: When You Need It. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -62,6 +66,21 @@
 <p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Azure Storage</strong> — The durable backing store underneath the page servers. This is Azure Premium Storage, providing the actual durability guarantee.</p>
 
 <p class="text-gray-300 leading-relaxed">The practical consequence: your compute node's buffer pool is a cache in front of a distributed page store. A cold query that misses the buffer pool on a Hyperscale instance will be slower than the equivalent query on a Business Critical instance with local SSD, because it pays a network round-trip to a page server. On hot, well-cached workloads, Hyperscale performs comparably or better than other tiers for reads because you can add named replicas that each have their own independent buffer pool.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    App[Application] --> Primary[Primary Compute Replica<br/>buffer pool cache]
+    App -.read-only.-> Named[Named Replica<br/>independent buffer pool]
+    Primary --> Log[Log Service<br/>distributed, append-only]
+    Named --> Log
+    Log --> HA[HA Secondary Replica]
+    Log --> PS1[Page Server shard 1]
+    Log --> PS2[Page Server shard 2]
+    Log --> PS3[Page Server shard N]
+    PS1 --> Storage[(Azure Premium Storage)]
+    PS2 --> Storage
+    PS3 --> Storage
+    Primary -.page fetch on cache miss.-> PS1</pre></div>
+<p class="text-gray-300 leading-relaxed">*Hyperscale's decoupled layers: compute replicas hold only a buffer-pool cache; durable page data lives in sharded page servers backed by Azure Storage, with the log service as the single write path all replicas consume from.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">What It Is Designed For</strong></p>
 
@@ -437,7 +456,411 @@ az dms project task show \
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cross-database queries within the same instance — Azure SQL is database-scoped. If your application uses three-part names to query across databases, that needs rearchitecting.</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> BULK INSERT from local file paths — requires Azure Blob Storage as the source.</li>
 
-<p class="text-gray-300 leading-relaxed">These are not Hyper</p>
+<p class="text-gray-300 leading-relaxed">These are not Hyperscale-specific limitations. They are Azure SQL Database limitations that apply across all tiers including Hyperscale. The point is that you discover them during migration planning, not after you have committed to the migration.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Production Gotchas and Operational Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">Hyperscale has behaviors that will surprise experienced SQL Server DBAs because they are not documented in the places you look first. This section covers the ones that cause the most friction in real production deployments.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cold Query Latency and Buffer Pool Warming</strong></p>
+
+<p class="text-gray-300 leading-relaxed">After a compute replica failover — whether from a planned scaling event, an unplanned node failure, or the HA replica being promoted to primary — the new compute node starts with a cold buffer pool. Pages must be fetched from page servers on demand. For a large database, the period immediately following a failover will have noticeably higher read latency than steady state.</p>
+
+<p class="text-gray-300 leading-relaxed">On Business Critical, failover also lands you on a cold buffer pool on the new node if it was an unplanned failover, but the page fetch is from local SSD. On Hyperscale, it is a network round-trip to a page server. The latency is typically measured in single-digit milliseconds per page fetch, but queries that scan large ranges and miss the buffer pool can feel sluggish for several minutes to an hour after failover, depending on your working set size and query patterns.</p>
+
+<p class="text-gray-300 leading-relaxed">The mitigation strategies are:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Schedule planned failovers (compute scaling, maintenance) during low-traffic periods when possible.</p>
+<p class="text-gray-300 leading-relaxed">2. Use connection retry logic in your application so that the brief (~30 second) failover window does not produce user-visible errors.</p>
+<p class="text-gray-300 leading-relaxed">3. For workloads where cold start latency is particularly damaging, consider pre-warming by running a scheduled query after known maintenance windows that touches your most-accessed indexes.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Simple buffer pool pre-warming query pattern
+-- Run this after a planned failover or compute scaling event
+-- Adjust the table and index list to match your actual hot working set
+
+-- Pre-warm a specific clustered index by scanning it
+-- This forces pages into the buffer pool proactively
+SELECT COUNT_BIG(*) FROM dbo.Orders WITH (NOLOCK);
+SELECT COUNT_BIG(*) FROM dbo.OrderItems WITH (NOLOCK);
+SELECT COUNT_BIG(*) FROM dbo.Customers WITH (NOLOCK);
+
+-- You can also pre-warm specific index ranges if full scans are too expensive
+-- Warm the last 90 days of orders (typical hot working set for OLTP)
+SELECT COUNT_BIG(*) 
+FROM dbo.Orders WITH (NOLOCK)
+WHERE OrderDate &gt;= DATEADD(DAY, -90, GETDATE());
+
+-- Monitor buffer pool state after warming
+-- Check what percentage of a table is currently cached
+SELECT
+    t.name AS TableName,
+    i.name AS IndexName,
+    i.type_desc AS IndexType,
+    COUNT(1) AS CachedPages,
+    COUNT(1) * 8 / 1024 AS CachedMB,
+    SUM(CASE WHEN b.is_modified = 1 THEN 1 ELSE 0 END) AS DirtyPages
+FROM sys.dm_os_buffer_descriptors b
+INNER JOIN sys.allocation_units au 
+    ON b.allocation_unit_id = au.allocation_unit_id
+INNER JOIN sys.partitions p 
+    ON au.container_id = p.hobt_id
+INNER JOIN sys.indexes i 
+    ON p.object_id = i.object_id AND p.index_id = i.index_id
+INNER JOIN sys.tables t 
+    ON p.object_id = t.object_id
+WHERE b.database_id = DB_ID()
+GROUP BY t.name, i.name, i.type_desc
+ORDER BY CachedMB DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Checkpoint Behavior Difference</strong></p>
+
+<p class="text-gray-300 leading-relaxed">On standard SQL Server, checkpoints flush dirty pages from the buffer pool to disk at the storage layer. On Hyperscale, checkpoint behavior is different because the primary compute node does not own the storage. Checkpoints on Hyperscale flush dirty pages from the compute buffer pool to the page servers. This means the write path goes: application DML → log service (commit acknowledged here) → page server receives log record and applies it → dirty page flushed from compute buffer pool on checkpoint.</p>
+
+<p class="text-gray-300 leading-relaxed">The practical consequence is that I/O patterns around checkpoint look different in wait statistics. You will see <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WRITELOG</code> waits that correspond to log service throughput, not local disk throughput. If you have historically used <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WRITELOG</code> waits as a proxy for your storage I/O ceiling, you need to recalibrate — the constraint in Hyperscale is the log service throughput, which scales with your vCore tier.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Monitor log throughput and wait statistics relevant to Hyperscale
+SELECT
+    wait_type,
+    waiting_tasks_count,
+    wait_time_ms,
+    max_wait_time_ms,
+    signal_wait_time_ms,
+    wait_time_ms - signal_wait_time_ms AS resource_wait_time_ms
+FROM sys.dm_os_wait_stats
+WHERE wait_type IN (
+    'WRITELOG',
+    'LOG_RATE_GOVERNOR',
+    'HADR_LOGCAPTURE_WAIT',
+    'HADR_WORK_QUEUE',
+    'PAGEIOLATCH_SH',
+    'PAGEIOLATCH_EX',
+    'PAGEIOLATCH_UP',
+    'REMOTEBUF_IO_WAIT'  -- Hyperscale-specific: wait for remote page server I/O
+)
+ORDER BY wait_time_ms DESC;
+
+-- LOG_RATE_GOVERNOR is particularly important for Hyperscale
+-- It indicates your workload is hitting the log generation rate limit for your vCore tier
+-- If you see high LOG_RATE_GOVERNOR waits, you need to scale up vCores or reduce log throughput</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">LOG_RATE_GOVERNOR: The Throttle You Will Hit</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Each Hyperscale vCore tier has a maximum log generation rate measured in MB/s. When your transaction workload generates log records faster than this limit, SQL Server itself throttles new log-generating transactions, producing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOG_RATE_GOVERNOR</code> waits. This is not a bug — it is an intentional throttle that protects the log service and downstream page servers.</p>
+
+<p class="text-gray-300 leading-relaxed">The log rate limits increase with vCore count. If you are routinely hitting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOG_RATE_GOVERNOR</code> waits, the options are:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Scale up vCores to a tier with a higher log rate limit.</p>
+<p class="text-gray-300 leading-relaxed">2. Reduce log generation per unit of work — batch your DML operations, minimize unnecessary row-by-row processing, use minimally logged operations where appropriate.</p>
+<p class="text-gray-300 leading-relaxed">3. Spread bulk operations over time rather than running them in large single transactions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify the heaviest log-generating operations currently running
+SELECT
+    r.session_id,
+    r.status,
+    r.command,
+    r.wait_type,
+    r.wait_time,
+    r.total_elapsed_time,
+    r.reads,
+    r.writes,
+    r.logical_reads,
+    t.text AS QueryText,
+    qp.query_plan
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+CROSS APPLY sys.dm_exec_query_plan(r.plan_handle) qp
+WHERE r.wait_type = 'LOG_RATE_GOVERNOR'
+ORDER BY r.total_elapsed_time DESC;
+
+-- Historical log generation rate from ring buffer
+-- This gives you a picture of log throughput over recent minutes
+SELECT
+    end_time,
+    delta_log_bytes_used / 1048576.0 AS log_MB_generated,
+    avg_log_rate_value / 1048576.0 AS log_rate_MB_per_sec
+FROM sys.dm_db_resource_stats
+ORDER BY end_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Snapshot Isolation and Read Committed Snapshot</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Hyperscale databases have RCSI (Read Committed Snapshot Isolation) enabled by default and it cannot be disabled. For on-prem DBAs who have spent years managing version store pressure on tempdb, this is actually welcome news — Hyperscale stores version records in the page server layer, not in tempdb. The version store does not create the tempdb pressure that causes headaches on busy on-prem instances.</p>
+
+<p class="text-gray-300 leading-relaxed">However, if your application was written against a database with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">READ_COMMITTED_SNAPSHOT OFF</code> and relies on blocking behavior for correctness (for example, using locks as a coordination mechanism between application processes), you need to verify that RCSI does not change the behavior. Applications that take explicit <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDLOCK</code> hints or use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SERIALIZABLE</code> transactions are not affected. Applications that relied on reader-writer blocking as an implicit synchronization mechanism will behave differently.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tempdb Is Still Shared on Standard Compute</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Unlike on-prem SQL Server where each instance has its own tempdb, Azure SQL Database shares tempdb resources across databases on the same logical server. On standard vCore tiers this is per the Azure SQL infrastructure. This is not a Hyperscale-specific behavior, but it catches DBAs who come from dedicated instances. Heavy tempdb consumers (large sorts, hash joins, spill-heavy plans, excessive temp table use) can see unexpected tempdb pressure from neighboring databases.</p>
+
+<p class="text-gray-300 leading-relaxed">Monitor tempdb usage and address spills in your query plans:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify queries spilling to tempdb on Hyperscale
+SELECT TOP 20
+    qs.total_spills / qs.execution_count AS avg_spills_per_exec,
+    qs.total_spills,
+    qs.execution_count,
+    qs.total_elapsed_time / qs.execution_count / 1000 AS avg_elapsed_ms,
+    SUBSTRING(st.text, (qs.statement_start_offset / 2) + 1,
+        ((CASE qs.statement_end_offset
+            WHEN -1 THEN DATALENGTH(st.text)
+            ELSE qs.statement_end_offset
+          END - qs.statement_start_offset) / 2) + 1) AS QueryText
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+WHERE qs.total_spills &gt; 0
+ORDER BY qs.total_spills DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Monitoring Hyperscale in Production</h3>
+
+<p class="text-gray-300 leading-relaxed">Standard Azure SQL monitoring applies to Hyperscale, with some additional dimensions. You should be collecting metrics from Azure Monitor, DMV-based monitoring from within the database, and query store data for workload trends.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Monitor Metrics for Hyperscale</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The metrics that matter most for Hyperscale, beyond the standard CPU and connection count, are:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `log_write_percent` — how close you are to the log rate limit. Watch for sustained values above 80%.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `storage_percent` — Hyperscale does not have a fixed storage cap in the traditional sense, but this metric reflects page server utilization.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `xtp_storage_percent` — In-Memory OLTP storage (if you use memory-optimized tables).</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `dwu_consumption_percent` — effective compute consumption.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `sessions_percent` — connection count relative to the limit for your tier.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Pull Hyperscale-specific metrics via Azure CLI
+az monitor metrics list \
+  --resource "/subscriptions/&lt;sub-id&gt;/resourceGroups/rg-hyperscale-prod/providers/Microsoft.Sql/servers/sql-hs-prod-eastus2/databases/OrdersDB" \
+  --metric "log_write_percent,cpu_percent,physical_data_read_percent,sessions_percent" \
+  --interval PT1M \
+  --start-time "$(date -u -d '1 hour ago' '+%Y-%m-%dT%H:%MZ')" \
+  --end-time "$(date -u '+%Y-%m-%dT%H:%MZ')" \
+  --output table
+
+# Set up an alert for log rate throttling
+az monitor metrics alert create \
+  --name "hs-log-rate-high" \
+  --resource-group rg-hyperscale-prod \
+  --scopes "/subscriptions/&lt;sub-id&gt;/resourceGroups/rg-hyperscale-prod/providers/Microsoft.Sql/servers/sql-hs-prod-eastus2/databases/OrdersDB" \
+  --condition "avg log_write_percent &gt; 80" \
+  --window-size 5m \
+  --evaluation-frequency 1m \
+  --action-group /subscriptions/&lt;sub-id&gt;/resourceGroups/rg-hyperscale-prod/providers/Microsoft.Insights/actionGroups/ag-dba-oncall \
+  --description "Hyperscale log rate sustained above 80% - risk of LOG_RATE_GOVERNOR throttling"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Query Store for Workload Trend Analysis</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Query Store is enabled by default on Hyperscale and is your primary tool for identifying plan regressions, tracking query performance over time, and understanding whether a performance problem is from a plan change or a data volume change.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Configure Query Store for production Hyperscale workloads
+-- The defaults are reasonable but you may want to increase retention
+ALTER DATABASE [OrdersDB]
+SET QUERY_STORE = ON (
+    OPERATION_MODE = READ_WRITE,
+    CLEANUP_POLICY = (STALE_QUERY_THRESHOLD_DAYS = 90),
+    DATA_FLUSH_INTERVAL_SECONDS = 900,
+    INTERVAL_LENGTH_MINUTES = 15,
+    MAX_STORAGE_SIZE_MB = 4096,
+    QUERY_CAPTURE_MODE = AUTO,
+    MAX_PLANS_PER_QUERY = 200,
+    SIZE_BASED_CLEANUP_MODE = AUTO,
+    WAIT_STATS_CAPTURE_MODE = ON
+);
+GO
+
+-- Find queries with the highest average elapsed time in the last 24 hours
+SELECT TOP 20
+    q.query_id,
+    qt.query_sql_text,
+    rs.avg_duration / 1000.0 AS avg_elapsed_ms,
+    rs.avg_cpu_time / 1000.0 AS avg_cpu_ms,
+    rs.avg_logical_io_reads,
+    rs.avg_physical_io_reads,  -- High value here = page server fetches
+    rs.count_executions,
+    p.plan_id,
+    p.last_force_failure_reason_desc
+FROM sys.query_store_query q
+JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+JOIN sys.query_store_plan p ON q.query_id = p.query_id
+JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+JOIN sys.query_store_runtime_stats_interval i ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
+WHERE i.start_time &gt;= DATEADD(HOUR, -24, GETUTCDATE())
+ORDER BY rs.avg_duration DESC;
+
+-- Find plan regressions: queries that have gotten slower recently
+WITH recent_stats AS (
+    SELECT
+        q.query_id,
+        AVG(rs.avg_duration) AS recent_avg_duration,
+        MAX(rs.avg_duration) AS recent_max_duration,
+        SUM(rs.count_executions) AS recent_executions
+    FROM sys.query_store_query q
+    JOIN sys.query_store_plan p ON q.query_id = p.query_id
+    JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+    JOIN sys.query_store_runtime_stats_interval i ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
+    WHERE i.start_time &gt;= DATEADD(HOUR, -4, GETUTCDATE())
+    GROUP BY q.query_id
+),
+baseline_stats AS (
+    SELECT
+        q.query_id,
+        AVG(rs.avg_duration) AS baseline_avg_duration
+    FROM sys.query_store_query q
+    JOIN sys.query_store_plan p ON q.query_id = p.query_id
+    JOIN sys.query_store_runtime_stats rs ON p.plan_id = rs.plan_id
+    JOIN sys.query_store_runtime_stats_interval i ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
+    WHERE i.start_time &gt;= DATEADD(HOUR, -28, GETUTCDATE())
+      AND i.start_time &lt; DATEADD(HOUR, -4, GETUTCDATE())
+    GROUP BY q.query_id
+)
+SELECT
+    r.query_id,
+    qt.query_sql_text,
+    b.baseline_avg_duration / 1000.0 AS baseline_avg_ms,
+    r.recent_avg_duration / 1000.0 AS recent_avg_ms,
+    r.recent_avg_duration / NULLIF(b.baseline_avg_duration, 0) AS regression_ratio
+FROM recent_stats r
+JOIN baseline_stats b ON r.query_id = b.query_id
+JOIN sys.query_store_query q ON r.query_id = q.query_id
+JOIN sys.query_store_query_text qt ON q.query_text_id = qt.query_text_id
+WHERE r.recent_avg_duration &gt; b.baseline_avg_duration * 2  -- 2x regression threshold
+  AND r.recent_executions &gt;= 10  -- Only queries with meaningful execution count
+ORDER BY regression_ratio DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Page Server Latency DMV</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Hyperscale exposes a DMV specifically for page server operations that has no equivalent in standard Azure SQL tiers:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- sys.dm_user_db_resource_governance includes Hyperscale-specific limits
+-- For page server I/O characteristics, use this combination:
+SELECT
+    io_stall,
+    io_stall_read_ms,
+    io_stall_write_ms,
+    num_of_reads,
+    num_of_writes,
+    num_of_bytes_read,
+    num_of_bytes_written,
+    io_stall_queued_read_ms,    -- time spent waiting to issue reads
+    io_stall_queued_write_ms    -- time spent waiting to issue writes
+FROM sys.dm_io_virtual_file_stats(DB_ID(), NULL)
+ORDER BY io_stall DESC;
+
+-- Hyperscale-specific: check page server fetch activity
+-- This is available in sys.dm_exec_requests during active queries
+SELECT
+    r.session_id,
+    r.wait_type,
+    r.wait_time,
+    r.page_server_reads,
+    r.page_server_reads_in_progress,
+    r.page_server_read_elapsed_ms,
+    CASE 
+        WHEN r.page_server_reads &gt; 0 
+        THEN r.page_server_read_elapsed_ms / r.page_server_reads
+        ELSE 0 
+    END AS avg_page_server_read_ms,
+    SUBSTRING(t.text, r.statement_start_offset / 2 + 1,
+        (CASE r.statement_end_offset 
+            WHEN -1 THEN DATALENGTH(t.text) 
+            ELSE r.statement_end_offset 
+         END - r.statement_start_offset) / 2 + 1) AS current_statement
+FROM sys.dm_exec_requests r
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE r.page_server_reads &gt; 0
+ORDER BY r.page_server_reads DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">If your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">avg_page_server_read_ms</code> values are consistently above 5–10 ms for a heavily accessed query, it is a signal that your working set does not fit in the buffer pool and you would benefit from more memory — either by scaling vCores up or by adding a named replica that caches a subset of pages independently.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Migrating Out of Hyperscale</h3>
+
+<p class="text-gray-300 leading-relaxed">Because the tier change from Hyperscale back to another Azure SQL tier is not supported through the portal or API, you need a data movement strategy. This is not a frequent operation, but the scenarios where it arises include consolidation, cost reduction after a data archiving project that brought the database below 4 TB, or a strategic decision to move to a different database service entirely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Export to BACPAC</strong></p>
+
+<p class="text-gray-300 leading-relaxed">BACPAC export is the simplest path for databases that are not extremely large. It exports the schema and data to an Azure Blob Storage file that can be imported into any Azure SQL tier.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Export Hyperscale database to BACPAC
+# Note: For very large databases, this can take many hours
+# Monitor progress via the export operation status
+
+az sql db export \
+  --resource-group rg-hyperscale-prod \
+  --server sql-hs-prod-eastus2 \
+  --name OrdersDB \
+  --admin-user sqladmin \
+  --admin-password "$(az keyvault secret show --vault-name kv-prod --name sql-admin-password --query value -o tsv)" \
+  --storage-key "$(az storage account keys list --resource-group rg-hyperscale-prod --account-name storprodmigration --query '[0].value' -o tsv)" \
+  --storage-key-type StorageAccessKey \
+  --storage-uri "https://storprodmigration.blob.core.windows.net/exports/OrdersDB_export.bacpac"
+
+# Monitor the export operation
+az sql db op list \
+  --resource-group rg-hyperscale-prod \
+  --server sql-hs-prod-eastus2 \
+  --database OrdersDB \
+  --query "[?operation=='ExportDatabase']" \
+  --output table
+
+# Import BACPAC to a new General Purpose database
+az sql db import \
+  --resource-group rg-target \
+  --server sql-gp-prod \
+  --name OrdersDB \
+  --admin-user sqladmin \
+  --admin-password "$(az keyvault secret show --vault-name kv-prod --name sql-admin-password --query value -o tsv)" \
+  --storage-key "$(az storage account keys list --resource-group rg-hyperscale-prod --account-name storprodmigration --query '[0].value' -o tsv)" \
+  --storage-key-type StorageAccessKey \
+  --storage-uri "https://storprodmigration.blob.core.windows.net/exports/OrdersDB_export.bacpac" \
+  --edition GeneralPurpose \
+  --service-objective GP_Gen5_8</code></pre>
+
+<p class="text-gray-300 leading-relaxed">BACPAC export is not point-in-time consistent for active databases. If the database is still receiving writes during export, the resulting BACPAC may have a logically inconsistent state for tables that were modified while the export was running. For a clean migration out of Hyperscale, the safest approach is to quiesce writes during export or use the backup-and-restore path with a log backup applied at cutover.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Transactional Replication for Live Cutover</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For large databases or workloads that cannot tolerate extended downtime, transactional replication from the Hyperscale source to a target database in a different tier provides continuous synchronization until cutover. You configure Hyperscale as the publisher, the target as the subscriber, let replication catch up, then flip the connection string and remove the replication topology.</p>
+
+<p class="text-gray-300 leading-relaxed">This approach requires careful attention to replication topology setup, but it is the same replication mechanism that on-prem DBAs have used for decades. Hyperscale supports being both a publisher and a subscriber for transactional replication, with the same T-SQL configuration commands that work on-prem.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cost Modeling: When Hyperscale Is the Right Economic Choice</h3>
+
+<p class="text-gray-300 leading-relaxed">Hyperscale is not always the cheapest choice even for large databases, and it is worth doing the arithmetic before committing.</p>
+
+<p class="text-gray-300 leading-relaxed">The cost components for a Hyperscale database are:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Compute</strong>: vCore-hours for the primary compute replica.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">HA replicas</strong>: Each HA replica is billed at the same vCore rate as the primary. One HA replica effectively doubles your compute cost.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Named replicas</strong>: Each named replica is billed at its own vCore rate.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Storage</strong>: Hyperscale storage pricing is per-GB per-month beyond the first 100 GB. Storage consumption grows with your database and does not shrink automatically when you delete data (pages are not immediately reclaimed from page servers after DELETE operations — space reclamation happens through index rebuilds and DBCC SHRINKFILE, which should be used judiciously).</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Backup storage</strong>: Billed per GB-month beyond 1x the database size.</p>
+<p class="text-gray-300 leading-relaxed">6. <strong class="text-white">Log service egress</strong>: Generally included in the tier, but cross-region configurations may have network transfer costs.</p>
+
+<p class="text-gray-300 leading-relaxed">The inflection point where Hyperscale becomes economically competitive with Business Critical is roughly at the point where:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The database exceeds 4 TB (forced migration anyway for General Purpose or Business Critical)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Or the named replica topology you need would require multiple Always On nodes that would each need to be Business Critical size</li>
+
+<p class="text-gray-300 leading-relaxed">For databases below 2 TB with no read scale-out requirement and a stable, OLTP-dominant workload, Business Critical often delivers better price-performance because of local SSD and the tighter latency profile.</p>
+
+<p class="text-gray-300 leading-relaxed">Do the vCore math with your actual workload size, your replica topology needs, and the current Azure SQL pricing for your region. Prices change, reserved instance discounts alter the comparison significantly, and the Dev/Test pricing for non-production Hyperscale instances reduces the cost of running staging and QA environments on the same tier as production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hyperscale is architecturally distinct, not just a storage upgrade.** Its decoupled compute, log service, and page server model gives you near-instant backup and restore at any size, but introduces cold-page network latency that does not exist in Business Critical. Understand the tradeoff before provisioning.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The migration into Hyperscale is one-directional through the service tier API.** You can migrate out, but only through data movement operations like BACPAC export, backup/restore, or transactional replication — not through a tier change. Make the decision with full awareness of this constraint.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Named replicas are a genuinely different read scale-out model.** Because they share the page server layer rather than maintaining full storage copies, you can add or remove them in minutes regardless of database size. This makes dynamic read scale-out practical in ways that traditional readable secondaries are not.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`LOG_RATE_GOVERNOR` is your primary throughput ceiling indicator.** High `LOG_RATE_GOVERNOR` wait times mean your log generation rate exceeds what your vCore tier allows. The response is either to scale vCores up or to reduce log generation through batching and minimally logged patterns.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Backup storage redundancy and RCSI-on behavior are set at creation and cannot be changed.** Validate your DR requirements and your application's isolation level assumptions before the first provisioning command runs — these are not settings you can tune after the fact without rebuilding the database.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
