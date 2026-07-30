@@ -5,6 +5,10 @@
   <title>Chapter 39: Testing AI Features: Regression Testing with DB Fixtures — AI-Native Apps on PostgreSQL</title>
   <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 39: Testing AI Features: Regression Testing with DB Fixtures. LLMs, RAG, agents — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -54,6 +58,18 @@
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 3 — Regression comparison</strong>: Does the current pipeline produce responses that are meaningfully different from the last approved baseline? If so, flag it for human review before deployment.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Layer 4 — Contract testing for agents</strong>: When an AI agent calls a database tool, does the tool return data in the schema the agent expects, and does the agent's response reflect that data accurately?</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    F[fixture_documents: versioned corpus + embeddings] --> R[Layer 1: retrieval hit rate]
+    F --> G[Layer 2: golden dataset semantic similarity]
+    R --> RUN[evaluation_runs + evaluation_results]
+    G --> RUN
+    RUN -->|compare vs| B[regression_baselines]
+    B --> D{Layer 3: REGRESSION / DEGRADED / STABLE / IMPROVED}
+    D -->|any regression| GATE[CI gate fails deployment]
+    D -->|clean| PASS[CI gate passes]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Layers 1 and 2 score a single run; Layer 3 turns that score into a pass/fail signal by diffing against the last approved baseline — the same run can look fine in isolation and still fail the gate.*</p>
 
 <p class="text-gray-300 leading-relaxed">PostgreSQL is the right place to anchor all four layers. Fixtures live in the database. Test results are stored as JSONB records. Comparisons use SQL window functions. The entire history of evaluation runs is queryable.</p>
 
@@ -395,7 +411,1275 @@ if __name__ == "__main__":
 <p class="text-gray-300 leading-relaxed">With fixtures loaded, the evaluation harness runs the actual RAG pipeline against each golden example and scores the results. The scoring uses two metrics: retrieval hit rate (did the right documents appear in the top-k results?) and semantic similarity (does the generated answer mean the same thing as the expected answer?).</p>
 
 <p class="text-gray-300 leading-relaxed">The pipeline under test runs exactly as it would in production — same embedding model, same vector similarity query, same LLM prompt. The only difference is that it queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ai_testing.fixture_documents</code> instead of the production documents table.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># evaluator.py — runs golden dataset evaluation against the RAG pipeline
+import asyncio
+import json
+import os
+import time
+import uuid
+from typing import Optional
+
+import asyncpg
+import anthropic
+import numpy as np
+from openai import AsyncOpenAI
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+LLM_MODEL = "claude-opus-4-5"
+TOP_K = 5
+
+
+class RAGEvaluator:
+    def __init__(self, dsn: str, openai_api_key: str, anthropic_api_key: str):
+        self.dsn = dsn
+        self.openai = AsyncOpenAI(api_key=openai_api_key)
+        self.anthropic = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    async def embed_text(self, text: str) -&gt; list[float]:
+        response = await self.openai.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=text
+        )
+        return response.data[0].embedding
+
+    def cosine_similarity(self, a: list[float], b: list[float]) -&gt; float:
+        a_arr = np.array(a)
+        b_arr = np.array(b)
+        return float(np.dot(a_arr, b_arr) / (np.linalg.norm(a_arr) * np.linalg.norm(b_arr)))
+
+    async def retrieve_from_fixture(
+        self,
+        conn: asyncpg.Connection,
+        fixture_id: str,
+        question_embedding: list[float],
+        top_k: int = TOP_K
+    ) -&gt; list[dict]:
+        """Run vector similarity search against the fixture document set."""
+        embedding_str = f"[{','.join(str(x) for x in question_embedding)}]"
+        rows = await conn.fetch("""
+            SELECT
+                source_document_id,
+                content,
+                metadata,
+                1 - (embedding &lt;=&gt; $1::vector) AS similarity
+            FROM ai_testing.fixture_documents
+            WHERE fixture_id = $2
+            ORDER BY embedding &lt;=&gt; $1::vector
+            LIMIT $3
+        """, embedding_str, fixture_id, top_k)
+        return [dict(r) for r in rows]
+
+    def build_rag_prompt(self, question: str, context_chunks: list[dict]) -&gt; str:
+        context = "\n\n---\n\n".join(
+            f"[Source: {c['source_document_id']}]\n{c['content']}"
+            for c in context_chunks
+        )
+        return f"""Answer the following question using only the provided context.
+Be concise and accurate. If the context does not contain enough information
+to answer the question, say so explicitly.
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+    async def generate_answer(self, prompt: str) -&gt; str:
+        """Generate an answer using Claude."""
+        message = self.anthropic.messages.create(
+            model=LLM_MODEL,
+            max_tokens=512,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return message.content[0].text
+
+    async def evaluate_single(
+        self,
+        conn: asyncpg.Connection,
+        run_id: str,
+        golden: dict,
+        fixture_id: str
+    ) -&gt; dict:
+        """Evaluate one golden example and record the result."""
+        start_time = time.monotonic()
+
+        # Step 1: Embed the question
+        question_embedding = await self.embed_text(golden["question"])
+
+        # Step 2: Retrieve documents from the fixture
+        retrieved_docs = await self.retrieve_from_fixture(
+            conn, fixture_id, question_embedding
+        )
+        retrieved_ids = [d["source_document_id"] for d in retrieved_docs]
+
+        # Step 3: Build context and generate answer
+        context = retrieved_docs[:3]  # top 3 for generation
+        prompt = self.build_rag_prompt(golden["question"], context)
+        actual_answer = await self.generate_answer(prompt)
+
+        latency_ms = int((time.monotonic() - start_time) * 1000)
+
+        # Step 4: Score retrieval — what fraction of expected docs appeared?
+        expected_ids = set(golden["expected_doc_ids"])
+        if expected_ids:
+            hit_count = len(expected_ids.intersection(set(retrieved_ids)))
+            retrieval_hit_rate = hit_count / len(expected_ids)
+        else:
+            retrieval_hit_rate = 1.0  # no specific docs required
+
+        # Step 5: Score semantic similarity of actual vs expected answer
+        actual_embedding = await self.embed_text(actual_answer)
+        expected_embedding = await self.embed_text(golden["expected_answer"])
+        semantic_similarity = self.cosine_similarity(actual_embedding, expected_embedding)
+
+        # Step 6: Determine pass/fail
+        passed = (
+            retrieval_hit_rate &gt;= 1.0
+            and semantic_similarity &gt;= golden["min_similarity"]
+        )
+        failure_reason = None
+        if not passed:
+            reasons = []
+            if retrieval_hit_rate &lt; 1.0:
+                missing = expected_ids - set(retrieved_ids)
+                reasons.append(f"Missing docs in retrieval: {missing}")
+            if semantic_similarity &lt; golden["min_similarity"]:
+                reasons.append(
+                    f"Semantic similarity {semantic_similarity:.3f} &lt; "
+                    f"threshold {golden['min_similarity']}"
+                )
+            failure_reason = "; ".join(reasons)
+
+        # Step 7: Store result
+        actual_emb_str = f"[{','.join(str(x) for x in actual_embedding)}]"
+        await conn.execute("""
+            INSERT INTO ai_testing.evaluation_results (
+                run_id, golden_id, actual_answer, retrieved_doc_ids,
+                retrieval_hit_rate, semantic_similarity, answer_embedding,
+                latency_ms, passed, failure_reason, raw_context
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        """,
+            run_id,
+            golden["golden_id"],
+            actual_answer,
+            retrieved_ids,
+            retrieval_hit_rate,
+            semantic_similarity,
+            actual_emb_str,
+            latency_ms,
+            passed,
+            failure_reason,
+            json.dumps([{"id": d["source_document_id"], "score": d["similarity"]}
+                        for d in retrieved_docs])
+        )
+
+        return {
+            "golden_id": str(golden["golden_id"]),
+            "question": golden["question"],
+            "passed": passed,
+            "retrieval_hit_rate": retrieval_hit_rate,
+            "semantic_similarity": semantic_similarity,
+            "latency_ms": latency_ms,
+            "failure_reason": failure_reason
+        }
+
+    async def run_evaluation(
+        self,
+        fixture_name: str,
+        pipeline_version: str,
+        git_commit: Optional[str] = None,
+        triggered_by: str = "manual"
+    ) -&gt; dict:
+        """Run the full evaluation suite against a named fixture."""
+        conn = await asyncpg.connect(self.dsn)
+
+        try:
+            # Fetch fixture metadata
+            fixture = await conn.fetchrow(
+                "SELECT fixture_id FROM ai_testing.fixture_sets WHERE name = $1",
+                fixture_name
+            )
+            if not fixture:
+                raise ValueError(f"Fixture '{fixture_name}' not found")
+            fixture_id = str(fixture["fixture_id"])
+
+            # Fetch all active golden examples for this fixture
+            golden_rows = await conn.fetch("""
+                SELECT
+                    golden_id::text,
+                    question,
+                    expected_answer,
+                    expected_doc_ids,
+                    min_similarity,
+                    tags
+                FROM ai_testing.golden_dataset
+                WHERE fixture_id = $1 AND is_active = true
+            """, fixture_id)
+
+            # Create the evaluation run record
+            run_id = str(uuid.uuid4())
+            await conn.execute("""
+                INSERT INTO ai_testing.evaluation_runs (
+                    run_id, fixture_id, triggered_by, model_name,
+                    embedding_model, pipeline_version, git_commit
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+            """,
+                run_id, fixture_id, triggered_by,
+                LLM_MODEL, EMBEDDING_MODEL, pipeline_version, git_commit
+            )
+
+            # Evaluate each golden example
+            results = []
+            for golden in golden_rows:
+                print(f"  Evaluating: {golden['question'][:60]}...")
+                result = await self.evaluate_single(
+                    conn=conn,
+                    run_id=run_id,
+                    golden=dict(golden),
+                    fixture_id=fixture_id
+                )
+                results.append(result)
+                status = "✓" if result["passed"] else "✗"
+                print(f"  {status} sim={result['semantic_similarity']:.3f} "
+                      f"hit={result['retrieval_hit_rate']:.2f} "
+                      f"latency={result['latency_ms']}ms")
+
+            # Compute aggregate scores
+            total = len(results)
+            passed_count = sum(1 for r in results if r["passed"])
+            overall_score = passed_count / total if total &gt; 0 else 0.0
+            suite_passed = overall_score &gt;= 0.90  # 90% pass rate required
+
+            avg_similarity = (
+                sum(r["semantic_similarity"] for r in results) / total
+                if total &gt; 0 else 0.0
+            )
+            avg_latency = (
+                sum(r["latency_ms"] for r in results) / total
+                if total &gt; 0 else 0
+            )
+
+            summary = {
+                "total": total,
+                "passed": passed_count,
+                "failed": total - passed_count,
+                "pass_rate": overall_score,
+                "avg_semantic_similarity": avg_similarity,
+                "avg_latency_ms": avg_latency,
+                "failures": [
+                    r for r in results if not r["passed"]
+                ]
+            }
+
+            # Update the run record with final scores
+            await conn.execute("""
+                UPDATE ai_testing.evaluation_runs
+                SET overall_score = $1,
+                    passed = $2,
+                    summary = $3
+                WHERE run_id = $4
+            """,
+                overall_score, suite_passed, json.dumps(summary), run_id
+            )
+
+            print(f"\nEvaluation complete: {passed_count}/{total} passed "
+                  f"(score={overall_score:.2%})")
+            return {"run_id": run_id, "passed": suite_passed, "summary": summary}
+
+        finally:
+            await conn.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.4 Regression Comparison: Detecting Silent Degradation</h3>
+
+<p class="text-gray-300 leading-relaxed">The evaluation harness tells you whether the pipeline passes today. Regression comparison tells you whether it is *worse* than it was last week. These are different questions, and the second one is more important for catching subtle degradations from prompt tweaks, dependency updates, or model version changes.</p>
+
+<p class="text-gray-300 leading-relaxed">The regression query compares the current evaluation run against the approved baseline run stored in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ai_testing.regression_baselines</code>. It uses window functions to surface per-question deltas and flags cases where semantic similarity has dropped or retrieval has degraded.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- regression_analysis.sql
+-- Compare current run against the approved baseline for a fixture
+
+WITH baseline_run AS (
+    SELECT
+        rb.run_id         AS baseline_run_id,
+        er.run_at         AS baseline_run_at,
+        er.model_name     AS baseline_model,
+        er.pipeline_version AS baseline_version
+    FROM ai_testing.regression_baselines rb
+    JOIN ai_testing.evaluation_runs er ON er.run_id = rb.run_id
+    WHERE rb.fixture_id = (
+        SELECT fixture_id FROM ai_testing.fixture_sets WHERE name = 'product-docs-v1'
+    )
+    AND rb.is_current = true
+),
+
+current_run AS (
+    SELECT
+        er.run_id,
+        er.run_at,
+        er.model_name,
+        er.pipeline_version
+    FROM ai_testing.evaluation_runs er
+    WHERE er.fixture_id = (
+        SELECT fixture_id FROM ai_testing.fixture_sets WHERE name = 'product-docs-v1'
+    )
+    ORDER BY er.run_at DESC
+    LIMIT 1
+),
+
+baseline_results AS (
+    SELECT
+        evr.golden_id,
+        evr.semantic_similarity  AS baseline_sim,
+        evr.retrieval_hit_rate   AS baseline_hit,
+        evr.passed               AS baseline_passed,
+        evr.latency_ms           AS baseline_latency
+    FROM ai_testing.evaluation_results evr
+    JOIN baseline_run br ON evr.run_id = br.baseline_run_id
+),
+
+current_results AS (
+    SELECT
+        evr.golden_id,
+        evr.semantic_similarity  AS current_sim,
+        evr.retrieval_hit_rate   AS current_hit,
+        evr.passed               AS current_passed,
+        evr.latency_ms           AS current_latency,
+        evr.actual_answer,
+        evr.failure_reason
+    FROM ai_testing.evaluation_results evr
+    JOIN current_run cr ON evr.run_id = cr.run_id
+)
+
+SELECT
+    gd.question,
+    gd.tags,
+    br.baseline_sim,
+    cr.current_sim,
+    ROUND((cr.current_sim - br.baseline_sim)::numeric, 4) AS sim_delta,
+    br.baseline_hit,
+    cr.current_hit,
+    ROUND((cr.current_hit - br.baseline_hit)::numeric, 4) AS hit_delta,
+    br.baseline_passed,
+    cr.current_passed,
+    CASE
+        WHEN br.baseline_passed AND NOT cr.current_passed THEN 'REGRESSION'
+        WHEN NOT br.baseline_passed AND cr.current_passed THEN 'IMPROVEMENT'
+        WHEN cr.current_sim &lt; br.baseline_sim - 0.05 THEN 'DEGRADED'
+        WHEN cr.current_sim &gt; br.baseline_sim + 0.05 THEN 'IMPROVED'
+        ELSE 'STABLE'
+    END AS status,
+    cr.failure_reason
+FROM baseline_results br
+JOIN current_results cr ON cr.golden_id = br.golden_id
+JOIN ai_testing.golden_dataset gd ON gd.golden_id = br.golden_id
+ORDER BY sim_delta ASC;  -- worst regressions first</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The status column gives you an actionable signal: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REGRESSION</code> means a previously passing test now fails; <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DEGRADED</code> means the score dropped by more than five points even if it still passes. Both warrant investigation before deployment. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IMPROVEMENT</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">IMPROVED</code> are useful for tracking the positive impact of model upgrades.</p>
+
+<p class="text-gray-300 leading-relaxed">To set a new baseline after a successful deployment:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Promote the most recent successful run to the regression baseline
+--
+-- A WITH clause only scopes to the single statement it's attached to —
+-- the earlier version of this block attached latest_good_run to the UPDATE
+-- and then referenced it from a separate INSERT after the semicolon, which
+-- fails with "relation latest_good_run does not exist". Capture the values
+-- once in a DO block instead so both statements can use them.
+DO $$
+DECLARE
+    v_fixture_id UUID;
+    v_run_id     UUID;
+BEGIN
+    SELECT fixture_id INTO v_fixture_id
+    FROM ai_testing.fixture_sets WHERE name = 'product-docs-v1';
+
+    SELECT run_id INTO v_run_id
+    FROM ai_testing.evaluation_runs
+    WHERE fixture_id = v_fixture_id
+      AND passed = true
+    ORDER BY run_at DESC
+    LIMIT 1;
+
+    UPDATE ai_testing.regression_baselines
+    SET is_current = false
+    WHERE fixture_id = v_fixture_id;
+
+    INSERT INTO ai_testing.regression_baselines (
+        fixture_id, run_id, approved_by, notes, is_current
+    ) VALUES (
+        v_fixture_id, v_run_id, current_user,
+        'Promoted automatically after passing deployment gate', true
+    );
+END $$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.5 Integrating the Test Suite into CI/CD</h3>
+
+<p class="text-gray-300 leading-relaxed">The evaluation harness is only useful if it runs automatically. Here is the complete CI integration — a Python script that ties fixture loading, evaluation, and regression comparison into a single gate that blocks deployment if quality degrades.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># ci_gate.py — AI quality gate for CI/CD pipelines
+import asyncio
+import json
+import os
+import subprocess
+import sys
+from datetime import datetime
+
+import asyncpg
+
+from fixture_loader import FixtureLoader, PRODUCT_DOCS_FIXTURE, GOLDEN_EXAMPLES
+from evaluator import RAGEvaluator
+
+PASS_THRESHOLD = 0.90        # 90% of golden examples must pass
+REGRESSION_THRESHOLD = 0.05  # flag if avg similarity drops more than 5 points
+
+
+def get_git_commit() -&gt; str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True
+        )
+        return result.stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+async def run_ci_gate(pipeline_version: str) -&gt; bool:
+    dsn = os.environ["DATABASE_URL"]
+    openai_key = os.environ["OPENAI_API_KEY"]
+    anthropic_key = os.environ["ANTHROPIC_API_KEY"]
+    git_commit = get_git_commit()
+
+    print(f"[{datetime.utcnow().isoformat()}] Starting AI quality gate")
+    print(f"  Pipeline version: {pipeline_version}")
+    print(f"  Git commit: {git_commit}")
+
+    # Step 1: Load/refresh the fixture
+    print("\n[1/3] Loading test fixtures...")
+    conn = await asyncpg.connect(dsn)
+    loader = FixtureLoader(dsn=dsn, openai_api_key=openai_key)
+    await loader.create_fixture_set(
+        conn=conn,
+        name="product-docs-v1",
+        description="Product documentation RAG fixture",
+        documents=PRODUCT_DOCS_FIXTURE,
+        golden_examples=GOLDEN_EXAMPLES
+    )
+    await conn.close()
+
+    # Step 2: Run evaluation
+    print("\n[2/3] Running evaluation suite...")
+    evaluator = RAGEvaluator(
+        dsn=dsn,
+        openai_api_key=openai_key,
+        anthropic_api_key=anthropic_key
+    )
+    result = await evaluator.run_evaluation(
+        fixture_name="product-docs-v1",
+        pipeline_version=pipeline_version,
+        git_commit=git_commit,
+        triggered_by="ci"
+    )
+
+    run_id = result["run_id"]
+    summary = result["summary"]
+
+    # Step 3: Regression comparison against baseline
+    print("\n[3/3] Running regression comparison...")
+    conn = await asyncpg.connect(dsn)
+
+    try:
+        regression_rows = await conn.fetch("""
+            WITH baseline_run AS (
+                SELECT rb.run_id AS baseline_run_id
+                FROM ai_testing.regression_baselines rb
+                WHERE rb.fixture_id = (
+                    SELECT fixture_id FROM ai_testing.fixture_sets
+                    WHERE name = 'product-docs-v1'
+                )
+                AND rb.is_current = true
+            ),
+            deltas AS (
+                SELECT
+                    cr.semantic_similarity - br.semantic_similarity AS sim_delta,
+                    cr.passed AS current_passed,
+                    br.passed AS baseline_passed
+                FROM ai_testing.evaluation_results cr
+                JOIN ai_testing.evaluation_results br
+                    ON cr.golden_id = br.golden_id
+                WHERE cr.run_id = $1
+                AND br.run_id = (SELECT baseline_run_id FROM baseline_run)
+            )
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE baseline_passed AND NOT current_passed
+                ) AS regressions,
+                AVG(sim_delta)  AS avg_sim_delta,
+                MIN(sim_delta)  AS worst_sim_delta
+            FROM deltas
+        """, run_id)
+
+        has_baseline = len(regression_rows) &gt; 0 and regression_rows[0]["regressions"] is not None
+
+        if has_baseline:
+            regressions = regression_rows[0]["regressions"] or 0
+            avg_sim_delta = float(regression_rows[0]["avg_sim_delta"] or 0)
+            worst_sim_delta = float(regression_rows[0]["worst_sim_delta"] or 0)
+
+            print(f"  Regressions vs baseline: {regressions}")
+            print(f"  Avg similarity delta:    {avg_sim_delta:+.4f}")
+            print(f"  Worst similarity delta:  {worst_sim_delta:+.4f}")
+
+            if regressions &gt; 0:
+                print(f"\n✗ GATE FAILED: {regressions} regression(s) detected")
+                return False
+
+            if avg_sim_delta &lt; -REGRESSION_THRESHOLD:
+                print(f"\n✗ GATE FAILED: Average similarity dropped by "
+                      f"{abs(avg_sim_delta):.3f} (threshold: {REGRESSION_THRESHOLD})")
+                return False
+        else:
+            print("  No baseline found — skipping regression comparison")
+
+    finally:
+        await conn.close()
+
+    # Overall pass/fail
+    pass_rate = summary["pass_rate"]
+    if pass_rate &lt; PASS_THRESHOLD:
+        print(f"\n✗ GATE FAILED: Pass rate {pass_rate:.2%} &lt; threshold {PASS_THRESHOLD:.2%}")
+        print("  Failed questions:")
+        for failure in summary.get("failures", []):
+            print(f"    - {failure['question'][:70]}")
+            print(f"      Reason: {failure['failure_reason']}")
+        return False
+
+    print(f"\n✓ GATE PASSED: {pass_rate:.2%} pass rate, "
+          f"no regressions vs baseline")
+    return True
+
+
+if __name__ == "__main__":
+    pipeline_version = sys.argv[1] if len(sys.argv) &gt; 1 else "dev"
+    passed = asyncio.run(run_ci_gate(pipeline_version))
+    sys.exit(0 if passed else 1)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Wire this into your CI pipeline as a pre-deployment step:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># .github/workflows/ai-quality-gate.yml
+name: AI Quality Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  ai-quality-gate:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: ai_test
+        options: &gt;-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install asyncpg openai anthropic numpy
+
+      - name: Initialize schema
+        run: psql $DATABASE_URL -f schema/ai_testing.sql
+        env:
+          DATABASE_URL: postgresql://postgres:test@localhost/ai_test
+
+      - name: Run AI quality gate
+        run: python ci_gate.py ${{ github.sha }}
+        env:
+          DATABASE_URL: postgresql://postgres:test@localhost/ai_test
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.6 Querying Evaluation History for Trend Analysis</h3>
+
+<p class="text-gray-300 leading-relaxed">Storing every evaluation run in PostgreSQL gives you a queryable history. You can answer questions like "which golden examples have been failing most frequently over the past month?" or "did the model upgrade two weeks ago improve or hurt retrieval quality?"</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Trend: pass rate per run over time
+SELECT
+    er.run_at::date                           AS run_date,
+    er.pipeline_version,
+    er.model_name,
+    er.overall_score,
+    er.passed,
+    COUNT(evr.result_id)                      AS total_questions,
+    COUNT(evr.result_id) FILTER (WHERE evr.passed) AS passed_questions,
+    ROUND(AVG(evr.semantic_similarity)::numeric, 4) AS avg_similarity,
+    ROUND(AVG(evr.latency_ms)::numeric, 0)    AS avg_latency_ms
+FROM ai_testing.evaluation_runs er
+JOIN ai_testing.evaluation_results evr ON evr.run_id = er.run_id
+WHERE er.fixture_id = (
+    SELECT fixture_id FROM ai_testing.fixture_sets WHERE name = 'product-docs-v1'
+)
+AND er.run_at &gt;= now() - INTERVAL '30 days'
+GROUP BY
+    er.run_id, er.run_at, er.pipeline_version,
+    er.model_name, er.overall_score, er.passed
+ORDER BY er.run_at DESC;
+
+-- Flaky questions: those that have failed more than once in recent runs
+SELECT
+    gd.question,
+    gd.tags,
+    COUNT(evr.result_id)                                    AS total_evaluations,
+    COUNT(evr.result_id) FILTER (WHERE NOT evr.passed)      AS failures,
+    ROUND(
+        COUNT(evr.result_id) FILTER (WHERE NOT evr.passed)::numeric
+        / NULLIF(COUNT(evr.result_id), 0) * 100, 1
+    )                                                       AS failure_rate_pct,
+    ROUND(AVG(evr.semantic_similarity)::numeric, 4)         AS avg_similarity,
+    ROUND(MIN(evr.semantic_similarity)::numeric, 4)         AS min_similarity,
+    array_agg(DISTINCT evr.failure_reason)
+        FILTER (WHERE evr.failure_reason IS NOT NULL)       AS failure_reasons
+FROM ai_testing.golden_dataset gd
+JOIN ai_testing.evaluation_results evr ON evr.golden_id = gd.golden_id
+JOIN ai_testing.evaluation_runs er ON er.run_id = evr.run_id
+WHERE er.run_at &gt;= now() - INTERVAL '30 days'
+GROUP BY gd.golden_id, gd.question, gd.tags
+HAVING COUNT(evr.result_id) FILTER (WHERE NOT evr.passed) &gt; 1
+ORDER BY failure_rate_pct DESC;
+
+-- Similarity percentile distribution for the most recent run
+WITH latest_run AS (
+    SELECT run_id
+    FROM ai_testing.evaluation_runs
+    WHERE fixture_id = (
+        SELECT fixture_id FROM ai_testing.fixture_sets WHERE name = 'product-docs-v1'
+    )
+    ORDER BY run_at DESC
+    LIMIT 1
+)
+SELECT
+    ROUND(
+        percentile_cont(0.10) WITHIN GROUP (ORDER BY semantic_similarity)::numeric, 4
+    ) AS p10_similarity,
+    ROUND(
+        percentile_cont(0.25) WITHIN GROUP (ORDER BY semantic_similarity)::numeric, 4
+    ) AS p25_similarity,
+    ROUND(
+        percentile_cont(0.50) WITHIN GROUP (ORDER BY semantic_similarity)::numeric, 4
+    ) AS p50_similarity,
+    ROUND(
+        percentile_cont(0.75) WITHIN GROUP (ORDER BY semantic_similarity)::numeric, 4
+    ) AS p75_similarity,
+    ROUND(
+        percentile_cont(0.90) WITHIN GROUP (ORDER BY semantic_similarity)::numeric, 4
+    ) AS p90_similarity
+FROM ai_testing.evaluation_results
+WHERE run_id = (SELECT run_id FROM latest_run);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The flaky-question query is particularly useful during fixture development. Questions with high failure rates across multiple runs are candidates for either tightening the fixture corpus (add more relevant documents), adjusting the expected answer, or reconsidering whether the question belongs in the golden dataset at all.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.7 Contract Testing for AI Agent Tool Calls</h3>
+
+<p class="text-gray-300 leading-relaxed">AI agents that call database tools introduce a different failure mode: the tool might return data in a schema the agent does not expect, or the agent might hallucinate details that are absent from the tool's response. Contract testing validates both sides.</p>
+
+<p class="text-gray-300 leading-relaxed">The contract test records the actual tool call the agent makes, the data returned by the database, and the agent's final response. It then verifies that every factual claim in the response is traceable to the tool output.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># contract_tester.py — validates agent tool calls against DB contract
+import asyncio
+import json
+import re
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+import asyncpg
+import anthropic
+
+# Schema for recording tool call contracts
+CONTRACT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ai_testing.agent_contracts (
+    contract_id     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    agent_name      TEXT NOT NULL,
+    scenario_name   TEXT NOT NULL,
+    tool_name       TEXT NOT NULL,
+    input_params    JSONB NOT NULL,
+    expected_schema JSONB NOT NULL,  -- JSON Schema for tool response validation
+    description     TEXT,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS ai_testing.contract_test_results (
+    test_id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    contract_id     UUID NOT NULL REFERENCES ai_testing.agent_contracts(contract_id),
+    run_id          UUID REFERENCES ai_testing.evaluation_runs(run_id),
+    tool_response   JSONB,
+    agent_response  TEXT,
+    schema_valid    BOOLEAN,
+    grounded        BOOLEAN,          -- agent response grounded in tool data?
+    schema_errors   TEXT[],
+    grounding_score FLOAT,
+    tested_at       TIMESTAMPTZ DEFAULT now(),
+    passed          BOOLEAN
+);
+"""
+
+@dataclass
+class ToolContract:
+    agent_name: str
+    scenario_name: str
+    tool_name: str
+    input_params: dict
+    expected_schema: dict          # simplified JSON Schema
+    description: str = ""
+
+class ContractTester:
+    def __init__(self, dsn: str, anthropic_api_key: str):
+        self.dsn = dsn
+        self.anthropic = anthropic.Anthropic(api_key=anthropic_api_key)
+
+    def validate_schema(self, data: Any, schema: dict) -&gt; tuple[bool, list[str]]:
+        """
+        Minimal JSON Schema validator for testing purposes.
+        Checks type, required fields, and field types.
+        """
+        errors = []
+
+        if schema.get("type") == "array":
+            if not isinstance(data, list):
+                return False, [f"Expected array, got {type(data).__name__}"]
+            item_schema = schema.get("items", {})
+            for i, item in enumerate(data):
+                valid, item_errors = self.validate_schema(item, item_schema)
+                if not valid:
+                    errors.extend([f"[{i}].{e}" for e in item_errors])
+            return len(errors) == 0, errors
+
+        if schema.get("type") == "object":
+            if not isinstance(data, dict):
+                return False, [f"Expected object, got {type(data).__name__}"]
+            for req_field in schema.get("required", []):
+                if req_field not in data:
+                    errors.append(f"Missing required field: {req_field}")
+            for prop, prop_schema in schema.get("properties", {}).items():
+                if prop in data:
+                    valid, prop_errors = self.validate_schema(data[prop], prop_schema)
+                    if not valid:
+                        errors.extend([f"{prop}.{e}" for e in prop_errors])
+            return len(errors) == 0, errors
+
+        return True, []
+
+    def check_grounding(self, agent_response: str, tool_data: Any) -&gt; float:
+        """
+        Heuristic grounding check: are numeric/entity values in the response
+        traceable to the tool data? Returns a score from 0 to 1.
+        """
+        if isinstance(tool_data, list):
+            tool_text = json.dumps(tool_data)
+        else:
+            tool_text = json.dumps(tool_data)
+
+        # Extract numeric values from agent response
+        response_numbers = set(re.findall(r'\b\d+(?:\.\d+)?\b', agent_response))
+        if not response_numbers:
+            return 1.0  # no numbers to verify
+
+        grounded_count = sum(
+            1 for num in response_numbers if num in tool_text
+        )
+        return grounded_count / len(response_numbers)
+
+    async def run_contract_test(
+        self,
+        contract: ToolContract,
+        tool_response: Any,     # actual data returned by the tool
+        agent_response: str     # LLM's response given tool data
+    ) -&gt; dict:
+        """Validate tool response against contract schema and check grounding."""
+        conn = await asyncpg.connect(self.dsn)
+
+        try:
+            # Upsert the contract record
+            contract_id = str(uuid.uuid4())
+            row = await conn.fetchrow("""
+                INSERT INTO ai_testing.agent_contracts
+                    (contract_id, agent_name, scenario_name, tool_name,
+                     input_params, expected_schema, description)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT DO NOTHING
+                RETURNING contract_id
+            """,
+                contract_id,
+                contract.agent_name,
+                contract.scenario_name,
+                contract.tool_name,
+                json.dumps(contract.input_params),
+                json.dumps(contract.expected_schema),
+                contract.description
+            )
+
+            # If ON CONFLICT fired, fetch the existing contract_id
+            if not row:
+                row = await conn.fetchrow("""
+                    SELECT contract_id FROM ai_testing.agent_contracts
+                    WHERE agent_name = $1
+                    AND scenario_name = $2
+                    AND tool_name = $3
+                """, contract.agent_name, contract.scenario_name, contract.tool_name)
+
+            contract_id = str(row["contract_id"])
+
+            # Validate schema
+            schema_valid, schema_errors = self.validate_schema(
+                tool_response, contract.expected_schema
+            )
+
+            # Check grounding
+            grounding_score = self.check_grounding(agent_response, tool_response)
+            grounded = grounding_score &gt;= 0.80
+
+            passed = schema_valid and grounded
+
+            # Record result
+            await conn.execute("""
+                INSERT INTO ai_testing.contract_test_results
+                    (contract_id, tool_response, agent_response,
+                     schema_valid, grounded, schema_errors,
+                     grounding_score, passed)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            """,
+                contract_id,
+                json.dumps(tool_response),
+                agent_response,
+                schema_valid,
+                grounded,
+                schema_errors,
+                grounding_score,
+                passed
+            )
+
+            return {
+                "contract_id": contract_id,
+                "schema_valid": schema_valid,
+                "schema_errors": schema_errors,
+                "grounding_score": grounding_score,
+                "grounded": grounded,
+                "passed": passed
+            }
+
+        finally:
+            await conn.close()
+
+
+# Example contract for a "get_customer_orders" agent tool
+ORDERS_CONTRACT = ToolContract(
+    agent_name="customer-support-agent",
+    scenario_name="lookup_recent_orders",
+    tool_name="get_customer_orders",
+    input_params={"customer_id": "cust-123", "limit": 5},
+    expected_schema={
+        "type": "array",
+        "items": {
+            "type": "object",
+            "required": ["order_id", "total_amount", "status", "created_at"],
+            "properties": {
+                "order_id":     {"type": "string"},
+                "total_amount": {"type": "number"},
+                "status":       {"type": "string"},
+                "created_at":   {"type": "string"}
+            }
+        }
+    },
+    description="Returns a list of recent orders for a customer"
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Contract testing catches a class of bug that standard evaluation misses: cases where the database query runs successfully but returns data in a format the agent's prompt does not handle. If the agent expects <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_amount</code> as a number but the query returns it as a string, the agent may silently format it incorrectly in its response. The grounding check then catches cases where the agent fabricates figures not present in the tool response.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.8 SQL Server Equivalent Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">SQL Server teams can implement the same framework using T-SQL with a few adaptations. The schema structure maps directly; the primary differences are in vector operations (SQL Server 2025 introduces native vector support) and JSON handling.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server version of the core testing schema
+-- Requires SQL Server 2022+ for JSON_OBJECT, 2025 for VECTOR type
+
+USE [AITestingDB];
+GO
+
+CREATE SCHEMA ai_testing;
+GO
+
+-- Fixture sets
+CREATE TABLE ai_testing.fixture_sets (
+    fixture_id      UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    name            NVARCHAR(255) NOT NULL,
+    description     NVARCHAR(MAX),
+    created_at      DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    created_by      NVARCHAR(128) DEFAULT SUSER_SNAME(),
+    is_active       BIT DEFAULT 1,
+    metadata        NVARCHAR(MAX) CHECK (ISJSON(metadata) = 1)
+                    DEFAULT '{}',
+    CONSTRAINT uq_fixture_name UNIQUE (name)
+);
+
+-- Fixture documents — using VECTOR(1536) for SQL Server 2025
+-- For earlier versions, store embeddings as NVARCHAR(MAX) JSON arrays
+CREATE TABLE ai_testing.fixture_documents (
+    doc_id              UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    fixture_id          UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.fixture_sets(fixture_id)
+                        ON DELETE CASCADE,
+    source_document_id  NVARCHAR(255) NOT NULL,
+    content             NVARCHAR(MAX) NOT NULL,
+    embedding           VECTOR(1536),          -- SQL Server 2025+
+    chunk_index         INT DEFAULT 0,
+    metadata            NVARCHAR(MAX) CHECK (ISJSON(metadata) = 1)
+                        DEFAULT '{}',
+    created_at          DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET()
+);
+
+CREATE INDEX ix_fixture_docs_fixture_id
+    ON ai_testing.fixture_documents (fixture_id);
+
+-- Golden dataset
+CREATE TABLE ai_testing.golden_dataset (
+    golden_id           UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    fixture_id          UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.fixture_sets(fixture_id),
+    question            NVARCHAR(MAX) NOT NULL,
+    expected_answer     NVARCHAR(MAX) NOT NULL,
+    expected_doc_ids    NVARCHAR(MAX) DEFAULT '[]'  -- JSON array of doc IDs
+                        CHECK (ISJSON(expected_doc_ids) = 1),
+    min_similarity      FLOAT DEFAULT 0.85,
+    tags                NVARCHAR(MAX) DEFAULT '[]'
+                        CHECK (ISJSON(tags) = 1),
+    created_at          DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    is_active           BIT DEFAULT 1
+);
+
+-- Evaluation runs
+CREATE TABLE ai_testing.evaluation_runs (
+    run_id              UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    fixture_id          UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.fixture_sets(fixture_id),
+    run_at              DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    triggered_by        NVARCHAR(50),
+    model_name          NVARCHAR(255) NOT NULL,
+    embedding_model     NVARCHAR(255) NOT NULL,
+    pipeline_version    NVARCHAR(255),
+    git_commit          NVARCHAR(40),
+    overall_score       FLOAT,
+    passed              BIT,
+    summary             NVARCHAR(MAX) CHECK (ISJSON(summary) = 1)
+                        DEFAULT '{}'
+);
+
+-- Per-question evaluation results
+CREATE TABLE ai_testing.evaluation_results (
+    result_id           UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    run_id              UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.evaluation_runs(run_id)
+                        ON DELETE CASCADE,
+    golden_id           UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.golden_dataset(golden_id),
+    actual_answer       NVARCHAR(MAX),
+    retrieved_doc_ids   NVARCHAR(MAX) DEFAULT '[]'
+                        CHECK (ISJSON(retrieved_doc_ids) = 1),
+    retrieval_hit_rate  FLOAT,
+    semantic_similarity FLOAT,
+    answer_embedding    VECTOR(1536),          -- SQL Server 2025+
+    latency_ms          INT,
+    passed              BIT,
+    failure_reason      NVARCHAR(MAX),
+    raw_context         NVARCHAR(MAX),
+    metadata            NVARCHAR(MAX) CHECK (ISJSON(metadata) = 1)
+                        DEFAULT '{}'
+);
+
+CREATE INDEX ix_eval_results_run_id
+    ON ai_testing.evaluation_results (run_id);
+CREATE INDEX ix_eval_results_golden_id
+    ON ai_testing.evaluation_results (golden_id);
+
+-- Regression baselines
+CREATE TABLE ai_testing.regression_baselines (
+    baseline_id         UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWID(),
+    fixture_id          UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.fixture_sets(fixture_id),
+    run_id              UNIQUEIDENTIFIER NOT NULL
+                        REFERENCES ai_testing.evaluation_runs(run_id),
+    approved_by         NVARCHAR(128),
+    approved_at         DATETIMEOFFSET DEFAULT SYSDATETIMEOFFSET(),
+    notes               NVARCHAR(MAX),
+    is_current          BIT DEFAULT 1
+);
+GO
+
+-- Filtered index to enforce single current baseline per fixture
+-- SQL Server does not support partial unique indexes directly,
+-- so we use a filtered unique index instead
+CREATE UNIQUE INDEX uix_current_baseline
+    ON ai_testing.regression_baselines (fixture_id)
+    WHERE is_current = 1;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The regression comparison query maps cleanly to T-SQL window functions:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server regression analysis
+-- Compare current run against the approved baseline
+
+WITH baseline_run AS (
+    SELECT
+        rb.run_id         AS baseline_run_id,
+        er.run_at         AS baseline_run_at,
+        er.model_name     AS baseline_model,
+        er.pipeline_version AS baseline_version
+    FROM ai_testing.regression_baselines rb
+    JOIN ai_testing.evaluation_runs er ON er.run_id = rb.run_id
+    WHERE rb.fixture_id = (
+        SELECT fixture_id
+        FROM ai_testing.fixture_sets
+        WHERE name = 'product-docs-v1'
+    )
+    AND rb.is_current = 1
+),
+
+current_run AS (
+    SELECT TOP (1)
+        er.run_id,
+        er.run_at,
+        er.model_name,
+        er.pipeline_version
+    FROM ai_testing.evaluation_runs er
+    WHERE er.fixture_id = (
+        SELECT fixture_id
+        FROM ai_testing.fixture_sets
+        WHERE name = 'product-docs-v1'
+    )
+    ORDER BY er.run_at DESC
+),
+
+baseline_results AS (
+    SELECT
+        evr.golden_id,
+        evr.semantic_similarity  AS baseline_sim,
+        evr.retrieval_hit_rate   AS baseline_hit,
+        evr.passed               AS baseline_passed,
+        evr.latency_ms           AS baseline_latency
+    FROM ai_testing.evaluation_results evr
+    JOIN baseline_run br ON evr.run_id = br.baseline_run_id
+),
+
+current_results AS (
+    SELECT
+        evr.golden_id,
+        evr.semantic_similarity  AS current_sim,
+        evr.retrieval_hit_rate   AS current_hit,
+        evr.passed               AS current_passed,
+        evr.latency_ms           AS current_latency,
+        evr.actual_answer,
+        evr.failure_reason
+    FROM ai_testing.evaluation_results evr
+    JOIN current_run cr ON evr.run_id = cr.run_id
+)
+
+SELECT
+    gd.question,
+    gd.tags,
+    ROUND(br.baseline_sim, 4)                               AS baseline_sim,
+    ROUND(cr.current_sim, 4)                                AS current_sim,
+    ROUND(cr.current_sim - br.baseline_sim, 4)              AS sim_delta,
+    ROUND(br.baseline_hit, 4)                               AS baseline_hit,
+    ROUND(cr.current_hit, 4)                                AS current_hit,
+    ROUND(cr.current_hit - br.baseline_hit, 4)              AS hit_delta,
+    br.baseline_passed,
+    cr.current_passed,
+    CASE
+        WHEN br.baseline_passed = 1 AND cr.current_passed = 0 THEN 'REGRESSION'
+        WHEN br.baseline_passed = 0 AND cr.current_passed = 1 THEN 'IMPROVEMENT'
+        WHEN cr.current_sim &lt; br.baseline_sim - 0.05        THEN 'DEGRADED'
+        WHEN cr.current_sim &gt; br.baseline_sim + 0.05        THEN 'IMPROVED'
+        ELSE 'STABLE'
+    END                                                     AS status,
+    cr.failure_reason
+FROM baseline_results br
+JOIN current_results cr   ON cr.golden_id  = br.golden_id
+JOIN ai_testing.golden_dataset gd ON gd.golden_id = br.golden_id
+ORDER BY sim_delta ASC;  -- worst regressions first
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For vector similarity search in SQL Server 2025, the syntax mirrors the pgvector pattern closely:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server 2025 vector similarity retrieval from fixture
+SELECT TOP (@top_k)
+    source_document_id,
+    content,
+    metadata,
+    VECTOR_DISTANCE('cosine', embedding, CAST(@query_embedding AS VECTOR(1536)))
+        AS distance,
+    1 - VECTOR_DISTANCE('cosine', embedding, CAST(@query_embedding AS VECTOR(1536)))
+        AS similarity
+FROM ai_testing.fixture_documents
+WHERE fixture_id = @fixture_id
+ORDER BY
+    VECTOR_DISTANCE('cosine', embedding, CAST(@query_embedding AS VECTOR(1536))) ASC;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server versions prior to 2025, store embeddings as <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(MAX)</code> JSON arrays and compute cosine similarity in a CLR function or a Python external script via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_execute_external_script</code>. The schema and evaluation logic remain identical; only the similarity computation changes.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.9 Extending the Framework: Prompt Regression and Chunk-Size Sensitivity</h3>
+
+<p class="text-gray-300 leading-relaxed">Two common sources of silent degradation deserve dedicated test fixtures beyond the basic golden dataset: prompt template changes and retrieval chunk-size changes. Both affect quality in ways that are invisible to code review.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Prompt regression fixtures</strong> capture the exact prompt template in use at the time the baseline was approved. When a developer edits the prompt, the CI gate recomputes similarity scores using the new template against the same fixture corpus. A drop in the aggregate score triggers review before the change reaches production.</p>
+
+<p class="text-gray-300 leading-relaxed">Store prompt templates as versioned records alongside the evaluation run:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Extend evaluation_runs to capture the prompt template used
+ALTER TABLE ai_testing.evaluation_runs
+    ADD COLUMN prompt_template_hash TEXT,  -- SHA-256 of the prompt template
+    ADD COLUMN prompt_template      TEXT;  -- full template text for audit
+
+-- Index for quick lookup by template
+CREATE INDEX ON ai_testing.evaluation_runs (prompt_template_hash)
+    WHERE prompt_template_hash IS NOT NULL;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Then in the evaluator, hash and store the prompt template before the run starts:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import hashlib
+
+def hash_prompt_template(template: str) -&gt; str:
+    return hashlib.sha256(template.encode()).hexdigest()
+
+# In run_evaluation(), before inserting the run record:
+prompt_hash = hash_prompt_template(RAG_PROMPT_TEMPLATE)
+
+await conn.execute("""
+    INSERT INTO ai_testing.evaluation_runs (
+        run_id, fixture_id, triggered_by, model_name,
+        embedding_model, pipeline_version, git_commit,
+        prompt_template_hash, prompt_template
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+""",
+    run_id, fixture_id, triggered_by,
+    LLM_MODEL, EMBEDDING_MODEL, pipeline_version, git_commit,
+    prompt_hash, RAG_PROMPT_TEMPLATE
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With this in place, the regression query can immediately surface whether a quality change correlates with a prompt change or a model change — two failure modes that otherwise look identical in aggregate metrics.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Chunk-size sensitivity fixtures</strong> test whether your retrieval quality holds when you change how documents are chunked. Chunking strategy — how many tokens per chunk, how much overlap, whether you split on sentence boundaries — has an outsized effect on RAG quality that is easy to miss during code review because chunking code rarely triggers test failures.</p>
+
+<p class="text-gray-300 leading-relaxed">Create a family of fixture variants with different chunking strategies:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Load the same source documents with three chunk size variants
+CHUNK_VARIANTS = [
+    {"name": "product-docs-chunk256",  "size": 256,  "overlap": 32},
+    {"name": "product-docs-chunk512",  "size": 512,  "overlap": 64},
+    {"name": "product-docs-chunk1024", "size": 1024, "overlap": 128},
+]
+
+for variant in CHUNK_VARIANTS:
+    chunked_docs = chunk_documents(
+        SOURCE_DOCUMENTS,
+        chunk_size=variant["size"],
+        overlap=variant["overlap"]
+    )
+    await loader.create_fixture_set(
+        conn=conn,
+        name=variant["name"],
+        description=f"Chunk size {variant['size']} with {variant['overlap']} overlap",
+        documents=chunked_docs,
+        golden_examples=GOLDEN_EXAMPLES,  # same golden examples for all variants
+        metadata=variant
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running the same golden examples against all three chunk variants in CI gives you a direct comparison of which chunking strategy produces the best retrieval quality for your specific document domain. You can then make this a data-driven decision rather than a guess.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">39.10 Debugging Failed Evaluations with SQL</h3>
+
+<p class="text-gray-300 leading-relaxed">When a golden example fails, the evaluation results table contains everything you need to debug it without re-running the pipeline. The raw context shows exactly what documents were retrieved. The actual answer shows what the LLM generated. The failure reason explains which check failed.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Debugging query: full context for a specific failed evaluation
+SELECT
+    gd.question,
+    gd.expected_answer,
+    gd.expected_doc_ids                         AS expected_docs,
+    evr.retrieved_doc_ids                       AS retrieved_docs,
+    evr.retrieval_hit_rate,
+    evr.semantic_similarity,
+    gd.min_similarity                           AS threshold,
+    evr.actual_answer,
+    evr.failure_reason,
+    evr.raw_context,
+    evr.latency_ms,
+    er.model_name,
+    er.pipeline_version,
+    er.run_at
+FROM ai_testing.evaluation_results evr
+JOIN ai_testing.golden_dataset gd       ON gd.golden_id   = evr.golden_id
+JOIN ai_testing.evaluation_runs er      ON er.run_id       = evr.run_id
+WHERE evr.passed = false
+AND er.run_at &gt;= now() - INTERVAL '7 days'
+ORDER BY evr.semantic_similarity ASC;
+
+-- Find golden examples where retrieval is good but generation is poor
+-- (good retrieval hit rate but low semantic similarity)
+SELECT
+    gd.question,
+    evr.retrieval_hit_rate,
+    evr.semantic_similarity,
+    gd.min_similarity  AS threshold,
+    evr.actual_answer,
+    gd.expected_answer
+FROM ai_testing.evaluation_results evr
+JOIN ai_testing.golden_dataset gd ON gd.golden_id = evr.golden_id
+JOIN ai_testing.evaluation_runs er ON er.run_id = evr.run_id
+WHERE evr.retrieval_hit_rate &gt;= 0.9   -- retrieval is fine
+AND evr.semantic_similarity &lt; gd.min_similarity  -- but generation failed
+AND er.run_at &gt;= now() - INTERVAL '7 days'
+ORDER BY evr.semantic_similarity ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The second query is the most valuable diagnostic. When retrieval is good but generation is poor, the problem is almost always in the prompt template, the LLM model version, or the expected answer itself being too narrow. When retrieval is poor, the problem is in embedding quality, chunk size, or document coverage. Separating these two failure modes in SQL saves hours of manual investigation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AI features fail silently in ways traditional tests cannot detect**: LLM stochasticity and data-dependent retrieval quality require fixture-based evaluation frameworks rather than deterministic unit tests.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Database fixtures are the foundation of reproducible AI testing**: Pre-computed embeddings stored in a versioned schema decouple pipeline quality from data volatility, making every test run attributable to code changes alone.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Regression comparison against a stored baseline catches subtle degradation**: Comparing semantic similarity deltas across runs exposes prompt tweaks, model upgrades, and dependency changes that pass code review but hurt production quality.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Retrieval and generation failures have different root causes and require separate diagnostics**: SQL queries that split failures by retrieval hit rate versus semantic similarity pinpoint whether to investigate chunking, embeddings, or prompt templates.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prompt templates and chunk sizes are first-class test artifacts**: Storing prompt hashes with evaluation runs and maintaining chunk-size fixture variants transforms invisible configuration decisions into measurable, comparable quality signals.</li></div>
     <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
