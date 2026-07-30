@@ -6,6 +6,10 @@
   <title>Chapter 23: AlloyDB Omni: Running Google's Database On-Premises — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 23: AlloyDB Omni: Running Google's Database On-Premises. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -61,7 +65,7 @@
 
 <p class="text-gray-300 leading-relaxed">Omni is not a fully managed service. You own the container runtime, the host OS, the storage subsystem, backup scheduling, and HA failover. Google does not patch it for you. You pull new container images when updates release, test them, and roll them out on your own schedule. This is the fundamental trade-off: you get the engine, not the platform.</p>
 
-<p class="text-gray-300 leading-relaxed">Omni also does not replicate the AlloyDB storage layer from Google Cloud. In GCP, AlloyDB uses a distributed, disaggregated storage system with six-way replication across two regions. In Omni, you get standard PostgreSQL WAL-based storage on whatever block device you mount into the container. The columnar engine still works, but the durability model is your problem to design.</p>
+<p class="text-gray-300 leading-relaxed">Omni also does not replicate the AlloyDB storage layer from Google Cloud. In GCP, AlloyDB uses a distributed, disaggregated storage system that durably replicates across multiple zones within a region — consult current AlloyDB documentation for the exact replica topology. In Omni, you get standard PostgreSQL WAL-based storage on whatever block device you mount into the container. The columnar engine still works, but the durability model is your problem to design.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Comparing Omni to PostgreSQL</strong></p>
 
@@ -240,6 +244,14 @@ kubectl get svc -n database | grep prod-analytics</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">23.3 Connecting AlloyDB Omni to Google Cloud Services</h3>
 
 <p class="text-gray-300 leading-relaxed">Running Omni on-premises does not mean operating in isolation. Google designed Omni to optionally connect back to Google Cloud for observability, AI feature access, and fleet management through the AlloyDB Omni management API. This section covers those integrations and when to use them.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    App[Application] --> Omni[AlloyDB Omni container<br/>on-prem / edge]
+    Omni -->|metrics + logs| CM[Cloud Monitoring /<br/>Cloud Logging]
+    Omni -->|WAL archive_command| GCS[(Cloud Storage<br/>WAL + base backups)]
+    Omni -->|google_ml_integration| Vertex[Vertex AI<br/>embedding / model endpoints]
+    Omni -.optional.-> LogRep[Logical replication<br/>to central AlloyDB/Omni]</pre></div>
+<p class="text-gray-300 leading-relaxed">*Omni owns its own storage and HA on-premises; the connections back to Google Cloud are opt-in integrations for observability, backup, and ML inference — each crosses the network boundary and should be evaluated against data-residency requirements before enabling.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud Observability integration</strong></p>
 
@@ -486,6 +498,522 @@ tags:
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Diagnosing columnar engine utilization</strong></p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check if the columnar engine is being used for your analytical queries
+-- Run this after the workload has been running for at least 30 minutes
+-- to allow the columnar cache to warm up
+
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT
+    c.customer_region,
+    p.product_category,
+    DATE_TRUNC('month', o.order_date) AS order_month,
+    COUNT(*) AS order_count,
+    SUM(ol.quantity * ol.unit_price) AS total_revenue,
+    AVG(ol.unit_price) AS avg_unit_price
+FROM orders o
+JOIN order_line_items ol ON o.order_id = ol.order_id
+JOIN customers c ON o.customer_id = c.customer_id
+JOIN products p ON ol.product_id = p.product_id
+WHERE o.order_date &gt;= '2023-01-01'
+  AND o.order_date &lt; '2024-01-01'
+GROUP BY 1, 2, 3
+ORDER BY 1, 2, 3;
+
+-- In the plan output, look for nodes like:
+--   "Columnar Scan on order_line_items"
+--   "Columnar Scan on orders"
+-- If you see "Seq Scan" on large tables, the columnar cache has not
+-- yet populated those tables or the threshold is preventing columnar access
+
+-- Check current columnar cache contents
+SELECT
+    schemaname,
+    tablename,
+    pg_size_pretty(columnar_size_bytes) AS columnar_size,
+    columnar_row_count,
+    to_char(last_refresh_time, 'YYYY-MM-DD HH24:MI:SS') AS last_refresh
+FROM alloydb_columnar_info
+WHERE columnar_row_count &gt; 0
+ORDER BY columnar_size_bytes DESC;
+
+-- Check columnar engine memory utilization
+SELECT
+    name,
+    setting,
+    unit
+FROM pg_settings
+WHERE name IN (
+    'alloydb.columnar_memory_size_mb',
+    'alloydb.enable_columnar_engine',
+    'alloydb.auto_columnar_scan_threshold',
+    'alloydb.columnar_engine_mode'
+);
+
+-- Force specific columns' tables into the columnar cache
+-- when automatic population is too slow for your testing cadence
+SELECT alloydb_columnar_refresh('public.order_line_items');
+SELECT alloydb_columnar_refresh('public.orders');</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tuning memory allocation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The columnar engine competes with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code> for RAM. The right split depends heavily on your workload ratio. A useful starting heuristic:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Primarily OLTP (< 20% analytical queries):** `shared_buffers` = 25% of RAM, columnar memory = 5–10% of RAM</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Mixed OLTP/OLAP (20–60% analytical queries):** `shared_buffers` = 20% of RAM, columnar memory = 15–20% of RAM</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Primarily OLAP (> 60% analytical queries):** `shared_buffers` = 15% of RAM, columnar memory = 25–30% of RAM</li>
+
+<p class="text-gray-300 leading-relaxed">These are starting points, not rules. Use the query timing before and after adjustments to validate whether moving memory between the two caches improves your actual workload.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On a 64 GB host with a mixed OLTP/OLAP workload
+-- Adjust shared_buffers and columnar memory simultaneously
+-- Note: shared_buffers requires a restart; columnar memory does not
+
+ALTER SYSTEM SET shared_buffers = '12GB';
+-- Restart container after this change
+
+-- Columnar memory can be adjusted without restart
+ALTER SYSTEM SET alloydb.columnar_memory_size_mb = 12288;  -- 12 GB
+SELECT pg_reload_conf();
+
+-- After workload runs for 30+ minutes, measure hit rates
+-- Columnar reads vs total analytical scans
+SELECT
+    SUM(columnar_rows_read) AS columnar_rows,
+    SUM(heap_rows_read) AS heap_rows,
+    ROUND(
+        SUM(columnar_rows_read)::numeric /
+        NULLIF(SUM(columnar_rows_read) + SUM(heap_rows_read), 0) * 100,
+        2
+    ) AS columnar_pct
+FROM alloydb_columnar_query_stats;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema design patterns that maximize columnar benefit</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The columnar engine rewards the same schema design choices that help any columnar store — wide, flat tables with fewer joins. If you have a heavily normalized schema designed for OLTP efficiency, you will get less columnar benefit than someone running a star schema. This does not mean you should denormalize your OLTP tables; it means you should consider whether Omni is the right home for your most analytical workloads, or whether you should push aggregated data into dedicated wide tables that the columnar engine can work through efficiently.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PATTERN: Create a materialized summary table optimized for columnar access
+-- Refresh this periodically from the normalized OLTP tables
+
+CREATE TABLE sales_summary_columnar (
+    summary_date        DATE NOT NULL,
+    customer_region     TEXT NOT NULL,
+    product_category    TEXT NOT NULL,
+    product_subcategory TEXT NOT NULL,
+    sales_channel       TEXT NOT NULL,
+    order_count         INTEGER NOT NULL,
+    unit_count          INTEGER NOT NULL,
+    gross_revenue       NUMERIC(18, 4) NOT NULL,
+    discount_amount     NUMERIC(18, 4) NOT NULL,
+    net_revenue         NUMERIC(18, 4) NOT NULL,
+    return_count        INTEGER NOT NULL DEFAULT 0,
+    return_amount       NUMERIC(18, 4) NOT NULL DEFAULT 0
+)
+-- Partition by month to improve columnar segment pruning
+PARTITION BY RANGE (summary_date);
+
+-- Create monthly partitions
+CREATE TABLE sales_summary_columnar_2024_01
+    PARTITION OF sales_summary_columnar
+    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
+
+CREATE TABLE sales_summary_columnar_2024_02
+    PARTITION OF sales_summary_columnar
+    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
+
+-- Force the summary table into the columnar cache immediately
+-- rather than waiting for query pattern detection
+ALTER TABLE sales_summary_columnar SET (columnar = on);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Partitioning interacts with the columnar engine in an important way: the columnar cache tracks data at the partition level. A query that filters on the partition key can skip entire partitions before the columnar engine even evaluates individual rows. Combine partition pruning with columnar scanning and you get compounding performance improvements on date-range analytical queries — the most common pattern in reporting workloads.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.6 Upgrading AlloyDB Omni Without Downtime</h3>
+
+<p class="text-gray-300 leading-relaxed">Omni updates release as new container image tags. You control when to apply them, but letting upgrades accumulate creates larger, riskier jumps. A rolling upgrade process for standalone container deployments and Kubernetes deployments looks different but shares the same validation structure.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Standalone container upgrade procedure</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# alloydb_omni_upgrade.sh
+# Safe upgrade procedure for a standalone AlloyDB Omni deployment
+# Prerequisites: Patroni or application-level connection retry in place
+
+set -euo pipefail
+
+NEW_IMAGE="gcr.io/alloydb-omni/alloydb-omni:15.6.0"
+CONTAINER_NAME="alloydb-omni"
+DATA_DIR="/alloydb/data"
+LOG_DIR="/alloydb/logs"
+CREDS_DIR="/etc/alloydb"
+POSTGRES_PASSWORD="YourSecureP@ssword123"
+GCP_PROJECT="your-project-id"
+COLUMNAR_MB=8192
+
+echo "=== AlloyDB Omni Upgrade ==="
+echo "Target image: ${NEW_IMAGE}"
+echo "Start time: $(date)"
+
+# Step 1: Pull the new image while the current container is still running
+echo "[1/7] Pulling new image..."
+docker pull "${NEW_IMAGE}"
+
+# Step 2: Verify current cluster health before touching anything
+echo "[2/7] Checking cluster health..."
+docker exec "${CONTAINER_NAME}" psql -U postgres -c "SELECT version();" || {
+    echo "ERROR: Current instance not healthy. Aborting upgrade."
+    exit 1
+}
+
+# Step 3: Capture current configuration for comparison after upgrade
+echo "[3/7] Capturing current configuration snapshot..."
+docker exec "${CONTAINER_NAME}" psql -U postgres -t -c \
+    "SELECT name || '=' || setting FROM pg_settings
+     WHERE source = 'configuration file'
+     ORDER BY name;" &gt; /tmp/pre_upgrade_config.txt
+
+# Step 4: Checkpoint and graceful shutdown
+echo "[4/7] Initiating checkpoint and graceful shutdown..."
+docker exec "${CONTAINER_NAME}" psql -U postgres -c "CHECKPOINT;"
+docker stop "${CONTAINER_NAME}"
+
+# Step 5: Rename the old container (preserve it for rollback)
+echo "[5/7] Archiving old container..."
+docker rename "${CONTAINER_NAME}" "${CONTAINER_NAME}-prev-$(date +%Y%m%d%H%M%S)"
+
+# Step 6: Start the new container on the same data directory
+echo "[6/7] Starting new container version..."
+docker run -d \
+  --name "${CONTAINER_NAME}" \
+  --restart unless-stopped \
+  -e POSTGRES_PASSWORD="${POSTGRES_PASSWORD}" \
+  -e ALLOYDB_ENABLE_COLUMNAR_ENGINE=true \
+  -e ALLOYDB_COLUMNAR_MEMORY_SIZE_MB="${COLUMNAR_MB}" \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/etc/alloydb/gcp-credentials.json \
+  -e GOOGLE_CLOUD_PROJECT="${GCP_PROJECT}" \
+  -e ALLOYDB_OBSERVABILITY_ENABLED=true \
+  -p 5432:5432 \
+  -v "${DATA_DIR}:/var/lib/postgresql/data" \
+  -v "${LOG_DIR}:/var/log/postgresql" \
+  -v "${CREDS_DIR}:/etc/alloydb:ro" \
+  --shm-size=2g \
+  --cpus=16 \
+  --memory=64g \
+  "${NEW_IMAGE}"
+
+# Step 7: Validate the new instance
+echo "[7/7] Validating new instance..."
+sleep 10  # Allow PostgreSQL to finish startup
+
+docker exec "${CONTAINER_NAME}" psql -U postgres -c "SELECT version();" && \
+docker exec "${CONTAINER_NAME}" psql -U postgres -c \
+    "SELECT count(*) FROM pg_settings WHERE name LIKE 'alloydb%';" && \
+echo "Upgrade complete. New version running." || {
+    echo "ERROR: Post-upgrade validation failed."
+    echo "To rollback, stop the new container and start the -prev container."
+    exit 1
+}
+
+echo "Upgrade complete at: $(date)"
+echo "Previous container preserved as: ${CONTAINER_NAME}-prev-*"
+echo "Once satisfied with stability, remove old container with:"
+echo "  docker rm \$(docker ps -a --filter name=${CONTAINER_NAME}-prev -q)"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Kubernetes rolling upgrade</strong></p>
+
+<p class="text-gray-300 leading-relaxed">With the AlloyDB Omni Operator, upgrades are handled by patching the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DBCluster</code> resource with the new version. The Operator coordinates a rolling restart that respects the primary/standby topology:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Check available versions
+kubectl describe dbcluster prod-analytics-cluster -n database | grep -i version
+
+# Patch the databaseVersion field to trigger a rolling upgrade
+kubectl patch dbcluster prod-analytics-cluster \
+  -n database \
+  --type merge \
+  -p '{"spec":{"databaseVersion":"15.6.0"}}'
+
+# Watch the Operator coordinate the upgrade
+kubectl get dbcluster prod-analytics-cluster -n database -w
+
+# The Operator upgrades standbys first, then performs a controlled
+# switchover before upgrading the original primary.
+# This produces a brief connection interruption at switchover time —
+# typically a few seconds if your application handles connection retries.
+
+# Verify post-upgrade
+kubectl exec -n database \
+  $(kubectl get pods -n database -l dbcluster=prod-analytics-cluster \
+    -o jsonpath='{.items[0].metadata.name}') \
+  -- psql -U postgres -c "SELECT version();"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.7 Edge Deployment Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">One use case that AlloyDB Omni enables and cloud-only AlloyDB cannot is edge deployment: running a full AlloyDB-compatible engine at a location with intermittent or constrained connectivity to Google Cloud. Factory floors, retail point-of-sale systems, ships, remote mining sites — anywhere that needs analytical query capability locally but cannot tolerate cloud round-trip latency or potential connectivity loss.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Design principles for edge deployments</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Edge deployments require a different set of trade-offs than datacenter deployments:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Resource constraints are real.** An edge device may have 8 GB of RAM and a 4-core industrial CPU. The columnar engine's default memory allocation of 1 GB may be more than you can spare. Be aggressive about setting `alloydb.columnar_memory_size_mb` to a value that leaves adequate headroom for OS and application processes.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connectivity is intermittent by definition.** Design your backup and observability pipeline to tolerate periods without Cloud Storage or Cloud Monitoring access. The WAL archiving `archive_command` should fail gracefully and queue locally rather than crashing the database when the WAN link is down.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Data sync is a separate problem.** Omni does not solve bidirectional sync between edge and central. You need to design replication flows explicitly — whether that is logical replication from edge to a central AlloyDB instance, a change-data-capture pipeline, or periodic bulk export.</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Edge deployment: resource-constrained container configuration
+# Assumes 16 GB RAM host, 8 vCPUs, local SSD storage
+
+docker run -d \
+  --name alloydb-omni-edge \
+  --restart unless-stopped \
+  -e POSTGRES_PASSWORD='EdgeSecurePass456' \
+  -e ALLOYDB_ENABLE_COLUMNAR_ENGINE=true \
+  -e ALLOYDB_COLUMNAR_MEMORY_SIZE_MB=1024 \
+  -e ALLOYDB_OBSERVABILITY_ENABLED=false \
+  -p 5432:5432 \
+  -v /alloydb/data:/var/lib/postgresql/data \
+  -v /alloydb/wal-archive:/var/lib/postgresql/wal-archive \
+  --shm-size=512m \
+  --cpus=6 \
+  --memory=12g \
+  gcr.io/alloydb-omni/alloydb-omni:latest
+
+# Configure archiving to local directory when cloud is unavailable
+# A separate sync process uploads to Cloud Storage when connectivity resumes
+docker exec alloydb-omni-edge psql -U postgres &lt;&lt; 'EOF'
+ALTER SYSTEM SET archive_mode = 'on';
+ALTER SYSTEM SET archive_command =
+    'test ! -f /var/lib/postgresql/wal-archive/%f &&
+     cp %p /var/lib/postgresql/wal-archive/%f';
+ALTER SYSTEM SET archive_timeout = '600';
+SELECT pg_reload_conf();
+EOF</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Sync script to upload locally archived WAL to Cloud Storage
+# Run this as a cron job — it handles intermittent connectivity gracefully
+#!/bin/bash
+# edge_wal_sync.sh
+
+WAL_ARCHIVE_DIR="/alloydb/wal-archive"
+GCS_BUCKET="gs://your-company-edge-wal-archive"
+SITE_ID="factory-floor-01"
+
+# Attempt upload — gsutil exits 0 on success, non-zero on network failure
+# The loop ensures already-uploaded files are skipped (gsutil -n flag)
+gsutil -m cp -n \
+  "${WAL_ARCHIVE_DIR}"/*.* \
+  "${GCS_BUCKET}/${SITE_ID}/" 2&gt;/var/log/edge_wal_sync.log
+
+if [ $? -eq 0 ]; then
+    # Clean up local WAL files older than 7 days after successful upload
+    find "${WAL_ARCHIVE_DIR}" -name "*.gz" -mtime +7 -delete
+    echo "$(date): WAL sync completed successfully" &gt;&gt; /var/log/edge_wal_sync.log
+else
+    echo "$(date): WAL sync failed — will retry next cycle" &gt;&gt; /var/log/edge_wal_sync.log
+fi</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Logical replication from edge to central AlloyDB</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If you need near-real-time data flow from edge Omni instances to a central AlloyDB cluster in GCP (or to another Omni instance in your datacenter), logical replication is the right mechanism. AlloyDB Omni supports PostgreSQL logical replication as both publisher and subscriber.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the edge AlloyDB Omni instance (publisher side)
+-- Requires wal_level = logical, which we set in the earlier configuration
+
+-- Create a publication for the tables you want to replicate centrally
+CREATE PUBLICATION edge_to_central_pub
+FOR TABLE
+    sensor_readings,
+    production_events,
+    quality_inspection_results
+WITH (publish = 'insert, update, delete');
+
+-- Create a replication user with minimal privileges
+CREATE ROLE replication_user
+  LOGIN REPLICATION PASSWORD 'ReplPass789!';
+
+GRANT SELECT ON
+    sensor_readings,
+    production_events,
+    quality_inspection_results
+TO replication_user;
+
+-- Verify publication
+SELECT pubname, pubtables FROM pg_publication_tables
+WHERE pubname = 'edge_to_central_pub';</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the central AlloyDB instance (subscriber side)
+-- This runs on either AlloyDB in GCP or another AlloyDB Omni instance
+
+-- The target tables must already exist with compatible schemas
+-- Create the subscription pointing to the edge Omni instance
+CREATE SUBSCRIPTION central_from_edge_sub
+CONNECTION 'host=edge-site-01.internal
+            port=5432
+            dbname=production
+            user=replication_user
+            password=ReplPass789!
+            sslmode=require'
+PUBLICATION edge_to_central_pub
+WITH (
+    connect = true,
+    enabled = true,
+    create_slot = true,
+    copy_data = true,
+    synchronous_commit = 'off'  -- async is appropriate for edge replication
+);
+
+-- Monitor replication lag
+SELECT
+    subname,
+    pid,
+    received_lsn,
+    latest_end_lsn,
+    latest_end_time
+FROM pg_stat_subscription;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One operational concern with logical replication from edge sites: if the edge site loses connectivity for an extended period, the replication slot on the publisher holds WAL on disk until the subscriber reconnects. On a space-constrained edge device, this can fill the data volume. Set a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_slot_wal_keep_size</code> parameter to bound WAL retention, accepting that a subscriber that falls too far behind will need a full re-sync rather than catching up through replication:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the edge Omni instance: limit WAL held for replication slots
+ALTER SYSTEM SET max_slot_wal_keep_size = '10GB';
+SELECT pg_reload_conf();
+
+-- Monitor slot WAL retention
+SELECT
+    slot_name,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS wal_retained,
+    active
+FROM pg_replication_slots;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.8 Security Hardening for Production Omni Deployments</h3>
+
+<p class="text-gray-300 leading-relaxed">Running a database in a container introduces security considerations beyond what you face with a binary installed directly on a host. Container security, network isolation, credential management, and PostgreSQL-level access controls all need attention.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Container security baseline</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Run the container as a non-root user where the image supports it
+# AlloyDB Omni's image runs the PostgreSQL process as uid 999 internally
+# but the container itself should not be started as root on the host
+
+# Verify the process user inside the container
+docker exec alloydb-omni ps aux | grep postgres
+
+# Restrict container capabilities — PostgreSQL does not need most Linux capabilities
+docker stop alloydb-omni && docker rm alloydb-omni
+
+docker run -d \
+  --name alloydb-omni \
+  --restart unless-stopped \
+  --security-opt no-new-privileges:true \
+  --cap-drop ALL \
+  --cap-add CHOWN \
+  --cap-add SETUID \
+  --cap-add SETGID \
+  --cap-add DAC_OVERRIDE \
+  --read-only \
+  --tmpfs /tmp:rw,noexec,nosuid,size=512m \
+  --tmpfs /run:rw,noexec,nosuid,size=64m \
+  -e POSTGRES_PASSWORD='YourSecureP@ssword123' \
+  -e ALLOYDB_ENABLE_COLUMNAR_ENGINE=true \
+  -e ALLOYDB_COLUMNAR_MEMORY_SIZE_MB=8192 \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/etc/alloydb/gcp-credentials.json \
+  -e GOOGLE_CLOUD_PROJECT=your-project-id \
+  -p 127.0.0.1:5432:5432 \
+  -v /alloydb/data:/var/lib/postgresql/data \
+  -v /alloydb/logs:/var/log/postgresql \
+  -v /etc/alloydb:/etc/alloydb:ro \
+  --shm-size=2g \
+  --cpus=16 \
+  --memory=64g \
+  gcr.io/alloydb-omni/alloydb-omni:latest</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">-p 127.0.0.1:5432:5432</code> binding. Binding the port to loopback rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.0.0.0</code> means PostgreSQL is only reachable from the host itself. Applications connect through a reverse proxy or pgBouncer that handles TLS termination and connection pooling. This is preferable to exposing the PostgreSQL port directly to the network.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL-level access controls</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Harden the pg_hba.conf defaults
+-- AlloyDB Omni ships with permissive defaults for developer convenience
+-- Replace them with production-appropriate rules
+
+-- View current HBA configuration
+SELECT line_number, type, database, user_name, address, auth_method
+FROM pg_hba_file_rules
+ORDER BY line_number;
+
+-- Remove the 'trust' auth method for local connections
+-- Edit pg_hba.conf inside the data volume and reload
+-- (Do this through a volume-mounted config file in production,
+--  not by editing inside the container)
+
+-- Create role hierarchy for application access
+-- Never allow applications to connect as postgres superuser
+
+CREATE ROLE app_readonly NOLOGIN;
+CREATE ROLE app_readwrite NOLOGIN;
+CREATE ROLE app_user LOGIN PASSWORD 'AppUserPass321!'
+  IN ROLE app_readwrite;
+CREATE ROLE reporting_user LOGIN PASSWORD 'ReportingPass654!'
+  IN ROLE app_readonly;
+
+-- Grant schema-level privileges rather than table-by-table
+GRANT USAGE ON SCHEMA public TO app_readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO app_readonly;
+
+GRANT USAGE ON SCHEMA public TO app_readwrite;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public
+    TO app_readwrite;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_readwrite;
+
+-- Audit who has superuser access
+SELECT usename, usesuper, usecreatedb, usecreaterole
+FROM pg_user
+WHERE usesuper = true;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">TLS configuration</strong></p>
+
+<p class="text-gray-300 leading-relaxed">AlloyDB Omni will use the certificates you place in the data directory. Generate a proper certificate for production rather than relying on the self-signed certificate the engine creates on first startup:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Generate a certificate signing request on the host
+openssl req -new -newkey rsa:4096 \
+  -keyout /alloydb/tls/server.key \
+  -out /alloydb/tls/server.csr \
+  -nodes \
+  -subj "/CN=alloydb-omni.internal/O=YourCompany/C=US"
+
+# Have your CA sign it (or use a self-signed cert for internal networks)
+# Copy the signed cert to the data directory where PostgreSQL expects it
+cp /alloydb/tls/server.crt /alloydb/data/server.crt
+cp /alloydb/tls/server.key /alloydb/data/server.key
+chmod 600 /alloydb/data/server.key
+
+# Configure PostgreSQL to require TLS
+docker exec alloydb-omni psql -U postgres &lt;&lt; 'EOF'
+ALTER SYSTEM SET ssl = 'on';
+ALTER SYSTEM SET ssl_cert_file = 'server.crt';
+ALTER SYSTEM SET ssl_key_file = 'server.key';
+ALTER SYSTEM SET ssl_min_protocol_version = 'TLSv1.2';
+SELECT pg_reload_conf();
+EOF</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AlloyDB Omni delivers the columnar engine and AI extensions on your hardware**, but it does not replicate the managed-service durability model from GCP. Backup, HA, and patching are your complete responsibility; plan the operational model before deploying in production.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The columnar cache is automatic but not instantaneous.** New deployments and post-failover primaries start with a cold columnar cache. Use `ALTER TABLE ... SET (columnar = on)` and `alloydb_columnar_refresh()` to seed the cache proactively for your most important analytical tables rather than waiting for query-pattern detection to populate it.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connecting Omni to Google Cloud is optional but valuable.** WAL archiving to Cloud Storage, metrics shipping to Cloud Monitoring, and Vertex AI embedding calls are all available through the service account integration. Each requires evaluating the data-egress and compliance implications before enabling in regulated environments.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Edge deployments are a genuine use case**, but they require explicit design for intermittent connectivity. Use `max_slot_wal_keep_size` to prevent replication slots from filling edge storage, and design your WAL archive sync to tolerate WAN outages gracefully rather than failing hard.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The columnar engine rewards query and schema design choices, not just memory tuning.** Wide, flat tables with date-range partitioning extract more benefit from the columnar path than heavily normalized schemas. Materialized summary tables populated from OLTP data are often the fastest path to realizing columnar performance gains without restructuring your transactional schema.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
