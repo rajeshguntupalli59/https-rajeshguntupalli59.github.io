@@ -6,6 +6,10 @@
   <title>Chapter 11: Predictive Failure Detection — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 11: Predictive Failure Detection. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -62,6 +66,17 @@
 <p class="text-gray-300 leading-relaxed">Each signal is not evaluated in isolation but fed into a composite health score. The most effective early production implementation is a weighted linear model with hand-tuned weights derived from your historical incident data. More sophisticated deployments use gradient boosting models (XGBoost, LightGBM) trained on labeled failure events. Both approaches require the same foundation: a reliable, high-resolution signal pipeline.</p>
 
 <p class="text-gray-300 leading-relaxed">A signal pipeline at ADE scale looks like this: database-side metrics → Prometheus exporters (postgres_exporter, sql_exporter) → Prometheus TSDB → feature extraction layer → scoring model → decision engine → action executor. Every component except the database itself is replaceable; what cannot change is the requirement for sub-minute metric resolution and durable storage of at least 90 days of history for model training.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    M[DB Metrics] --> E[Prometheus Exporters]
+    E --> R[Recording Rules<br/>rates, trends, projections]
+    R --> S[Scoring Model<br/>P failure, time-to-failure]
+    S --> D{Confidence Window<br/>N consecutive cycles > threshold}
+    D -->|0.50-0.75 ambiguous| L[LLM Diagnosis<br/>async, off critical path]
+    D -->|threshold met| A[Action Executor]
+    L --> A
+    A --> N[Notify / Mitigate / Escalate / Failover]</pre></div>
+<p class="text-gray-300 leading-relaxed">*The predictive pipeline: trends are derived at collection time, the confidence window guards against acting on a single noisy cycle, and LLM reasoning is reserved for the ambiguous middle band rather than every cycle.*</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -408,6 +423,98 @@ groups:
 
 <p class="text-gray-300 leading-relaxed">The pattern is not to replace the quantitative model with an LLM. It is to escalate to LLM reasoning when the quantitative model fires with moderate confidence (P between 0.50 and 0.75) and the signals are ambiguous. At this confidence range, the human DBA would normally investigate manually. The autonomous system instead queries an LLM with the full anomalous signal context and asks it to reason about likely failure class, estimated time horizon, and recommended action.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># llm_diagnosis.py — escalation path for ambiguous failure signals
+import os
+import json
+import logging
+from anthropic import Anthropic
+from typing import Optional
+
+client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+SYSTEM_PROMPT = """
+You are an expert database reliability engineer analyzing production database
+telemetry. You will receive a JSON object containing metric signals from a
+database instance over the last 30 minutes. Your job is to:
+
+1. Identify the most likely failure mode (disk, memory, replication, connection,
+   locking, or none).
+2. Estimate time to failure in minutes (or 'none' if no failure is predicted).
+3. Recommend the single most important autonomous action to take right now.
+4. Assign an overall confidence score from 0.0 to 1.0.
+
+Respond ONLY with valid JSON matching this schema:
+{
+  "failure_mode": "&lt;disk|memory|replication|connection|locking|none&gt;",
+  "time_to_failure_minutes": &lt;number or null&gt;,
+  "recommended_action": "&lt;string, max 100 chars&gt;",
+  "confidence": &lt;0.0 to 1.0&gt;,
+  "reasoning": "&lt;string, max 300 chars&gt;"
+}
+"""
+
+def llm_diagnose(signal_context: dict) -&gt; Optional[dict]:
+    """
+    Send ambiguous signal context to Claude for qualitative diagnosis.
+    Returns structured diagnosis or None on failure.
+    """
+    try:
+        message = client.messages.create(
+            model   = os.environ.get("ANTHROPIC_MODEL", "&lt;configured-model-id&gt;"),  # set to your provider's current model
+            max_tokens = 512,
+            system  = SYSTEM_PROMPT,
+            messages = [{
+                "role":    "user",
+                "content": json.dumps(signal_context, indent=2)
+            }]
+        )
+        raw = message.content[0].text.strip()
+        diagnosis = json.loads(raw)
+
+        # Validate required fields before trusting the response
+        required = {"failure_mode", "recommended_action", "confidence"}
+        if not required.issubset(diagnosis.keys()):
+            logging.warning(f"LLM response missing required fields: {raw[:200]}")
+            return None
+
+        return diagnosis
+
+    except json.JSONDecodeError as e:
+        logging.error(f"LLM returned non-JSON response: {e}")
+        return None
+    except Exception as e:
+        logging.error(f"LLM diagnosis call failed: {e}")
+        return None
+
+
+def build_signal_context(instance: str, features: dict,
+                          recent_events: list[str]) -&gt; dict:
+    """
+    Package features and recent events into LLM context payload.
+    recent_events: list of human-readable event strings from audit log,
+                   e.g. ["VACUUM ran on orders table 12m ago",
+                         "Index rebuild started on inventory 25m ago"]
+    """
+    return {
+        "instance":           instance,
+        "timestamp_utc":      features.get("timestamp"),
+        "signals":            features,
+        "recent_events":      recent_events,
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The confidence-band escalation pattern — only invoking the LLM when the quantitative model is genuinely ambiguous — keeps the reasoning layer off the critical path for the majority of predictions, where the statistical model is confident and fast. It also keeps the system's cost and latency profile bounded: a system that calls an LLM on every scoring cycle for every instance does not scale, and most of those calls would add no diagnostic value over the quantitative score alone.</p>
+
+<p class="text-gray-300 leading-relaxed">The LLM diagnosis output is treated the same way as any Tier 2 or Tier 3 action from the autonomy envelope established earlier in this book: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recommended_action</code> is surfaced to the action executor as a proposal, not a command. Low-risk recommended actions that match a pre-approved catalog entry (killing a specific session, running an ANALYZE, throttling a specific application's connection pool) may execute autonomously. Anything else queues for human approval with the full reasoning context attached, which is precisely the situation where a synthesized explanation saves the on-call engineer the ten minutes they would otherwise spend reconstructing the same picture from raw dashboards.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Predictive failure detection replaces static thresholds with trajectory-aware scoring — trend, rate of change, and projected time-to-failure — because a stable system near a threshold is a different risk than an unstable system approaching one from a distance.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A durable signal pipeline (metrics → recording rules computed at collection time → a scoring model → a decision engine → an action executor) is the prerequisite; deriving trends at alert-evaluation time instead of collection time couples signal quality to alert latency in ways that degrade both.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Every failure class needs an explicit trigger threshold, a confidence window (consecutive scoring cycles above threshold), and a bounded action class — the confidence window is what prevents a single noisy scoring cycle from triggering an irreversible action like a failover.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> LLM reasoning belongs in the ambiguous middle band of model confidence, not on every scoring cycle — it augments the quantitative model for novel failure modes the statistical approach hasn't seen before, and its recommendations still flow through the same autonomy-tier approval gates as any other proposed action.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Avoid citing specific accuracy percentages, false-positive rates, or time-to-detection figures for a predictive system without your own measured data behind them — these numbers are entirely dependent on the quality and volume of labeled historical incidents in a given environment.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
