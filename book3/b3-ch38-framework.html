@@ -6,6 +6,10 @@
   <title>Chapter 38: Building Your Own Autonomous DBA Framework — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 38: Building Your Own Autonomous DBA Framework. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -55,17 +59,13 @@
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Verify</strong> is the validation plane. After every action, it re-queries the affected system to confirm that the intended effect occurred, measures whether the root signal improved, and feeds the outcome back into the Decide plane as training signal.</p>
 
-<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>┌─────────────┐    signals    ┌─────────────┐   proposals  ┌─────────────┐
-│   OBSERVE   │──────────────▶│   DECIDE    │─────────────▶│     ACT     │
-│  (Telegraf, │               │ (rule eng., │              │ (executor,  │
-│   pgStat,   │               │  ML, LLM)   │              │  Terraform, │
-│   sys.dm_*) │               │             │              │  k8s ops)   │
-└─────────────┘               └─────────────┘              └──────┬──────┘
-       ▲                             ▲                             │
-       │         outcomes            │         feedback            │
-       └─────────────────────────────┴─────────────────────────── ┘
-                                 VERIFY
-                         (diff expected vs actual)</code></pre>
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    O["OBSERVE<br/>Telegraf, pg_stat, sys.dm_*"] -->|signals| D["DECIDE<br/>rule engine, ML, LLM"]
+    D -->|proposals| A["ACT<br/>executor, Terraform, k8s ops"]
+    A -->|outcomes| V["VERIFY<br/>diff expected vs actual"]
+    V -->|feedback| D</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The four-plane loop: signals flow forward from Observe through Decide and Act, while Verify closes the loop by feeding measured outcomes back into the Decide plane.*</p>
 
 <p class="text-gray-300 leading-relaxed">The critical design rule: <strong class="text-white">no plane writes directly to another plane's data store</strong>. Each plane has its own schema or topic namespace. Cross-plane communication happens through a message bus — Kafka, NATS, or even a dedicated PostgreSQL schema acting as a persistent queue. This prevents race conditions and makes the entire system auditable.</p>
 
@@ -264,7 +264,7 @@ DETERMINISTIC_RULES = {
     "active_lock_waiters": {
         "threshold": 20,
         "action": "identify_and_kill_blocking_head",
-        "params_query": "SELECT pid FROM pg_blocking_pids_tree LIMIT 1",
+        "params_query": "SELECT DISTINCT unnest(pg_blocking_pids(pid)) AS blocking_pid FROM pg_stat_activity WHERE wait_event_type = 'Lock' LIMIT 1",
         "rollback": "no_rollback_required",
         "impact": "low"
     },
@@ -416,6 +416,831 @@ END</code></pre>
 <p class="text-gray-300 leading-relaxed">The most operationally important actions for PostgreSQL environments — and the ones where incorrect execution causes the most damage — are index creation, configuration parameter changes, and connection pool resizing. All three must execute through change-controlled wrappers:</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF executor wrapper: safe concurrent index creation
+-- Never fires without prior EXPLAIN ANALYZE estimate and impact classification
+
+CREATE OR REPLACE PROCEDURE adf.exec_create_index_safe(
+    p_table     TEXT,
+    p_columns   TEXT[],
+    p_index_name TEXT,
+    p_proposal_id UUID
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_index_sql     TEXT;
+    v_start_time    TIMESTAMPTZ := now();
+    v_estimated_rows BIGINT;
+    v_table_size_mb NUMERIC;
+BEGIN
+    -- Blast radius check: refuse if table &gt; 100GB without explicit override
+    SELECT pg_total_relation_size(p_table::regclass) / (1024*1024)
+    INTO v_table_size_mb;
+
+    IF v_table_size_mb &gt; 102400 THEN
+        UPDATE adf.action_proposals
+        SET status = 'BLOCKED',
+            block_reason = 'table_exceeds_blast_radius_100gb',
+            updated_at = now()
+        WHERE proposal_id = p_proposal_id;
+        RAISE EXCEPTION 'ADF: Index build blocked — table % is %.0f MB (&gt;100GB limit)',
+            p_table, v_table_size_mb;
+    END IF;
+
+    -- Cooldown check: no actions on this table in the last 30 minutes
+    IF EXISTS (
+        SELECT 1 FROM adf.action_history
+        WHERE target_object = p_table
+          AND completed_at &gt; now() - interval '30 minutes'
+          AND status IN ('COMPLETED', 'FAILED')
+    ) THEN
+        UPDATE adf.action_proposals
+        SET status = 'DEFERRED', block_reason = 'target_in_cooldown'
+        WHERE proposal_id = p_proposal_id;
+        RAISE EXCEPTION 'ADF: Action deferred — % in cooldown window', p_table;
+    END IF;
+
+    -- Build and execute CONCURRENTLY — never block production traffic
+    v_index_sql := format(
+        'CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %s (%s)',
+        p_index_name,
+        p_table,
+        array_to_string(p_columns, ', ')
+    );
+
+    UPDATE adf.action_proposals
+    SET status = 'EXECUTING', started_at = now()
+    WHERE proposal_id = p_proposal_id;
+
+    EXECUTE v_index_sql;
+
+    UPDATE adf.action_proposals
+    SET status = 'COMPLETED', completed_at = now()
+    WHERE proposal_id = p_proposal_id;
+
+    INSERT INTO adf.action_history
+        (proposal_id, target_object, action_type, executed_at, completed_at, status)
+    VALUES
+        (p_proposal_id, p_table, 'CREATE_INDEX_CONCURRENTLY',
+         v_start_time, now(), 'COMPLETED');
+
+EXCEPTION WHEN OTHERS THEN
+    UPDATE adf.action_proposals
+    SET status = 'FAILED', failure_reason = SQLERRM, completed_at = now()
+    WHERE proposal_id = p_proposal_id;
+
+    INSERT INTO adf.action_history
+        (proposal_id, target_object, action_type, executed_at, completed_at, status, failure_reason)
+    VALUES
+        (p_proposal_id, p_table, 'CREATE_INDEX_CONCURRENTLY',
+         v_start_time, now(), 'FAILED', SQLERRM);
+
+    RAISE;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF executor wrapper: safe online index creation with blast radius guard
+-- Uses ONLINE = ON to minimize blocking; defers if table exceeds size threshold
+
+CREATE OR ALTER PROCEDURE adf.exec_CreateIndexSafe
+    @TableName      NVARCHAR(256),
+    @Columns        NVARCHAR(512),
+    @IndexName      NVARCHAR(128),
+    @ProposalId     UNIQUEIDENTIFIER
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @TableSizeMB    DECIMAL(18,2);
+    DECLARE @IndexSQL       NVARCHAR(MAX);
+    DECLARE @StartTime      DATETIME2 = SYSUTCDATETIME();
+    DECLARE @CooldownCount  INT;
+
+    -- Blast radius check: refuse if table &gt; 100 GB without explicit override
+    SELECT @TableSizeMB = SUM(a.total_pages) * 8.0 / 1024
+    FROM sys.tables t
+    JOIN sys.indexes i  ON t.object_id = i.object_id
+    JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+    JOIN sys.allocation_units a ON p.partition_id = a.container_id
+    WHERE t.name = PARSENAME(@TableName, 1)
+      AND OBJECT_SCHEMA_NAME(t.object_id) = ISNULL(PARSENAME(@TableName, 2), SCHEMA_NAME());
+
+    IF @TableSizeMB &gt; 102400
+    BEGIN
+        UPDATE adf.ActionProposals
+        SET status = 'BLOCKED',
+            BlockReason = 'table_exceeds_blast_radius_100gb',
+            UpdatedAt = SYSUTCDATETIME()
+        WHERE ProposalId = @ProposalId;
+
+        RAISERROR('ADF: Index build blocked — table %s is %.0f MB (&gt;100GB limit)', 16, 1,
+                  @TableName, @TableSizeMB);
+        RETURN;
+    END
+
+    -- Cooldown check: no actions on this table in the last 30 minutes
+    SELECT @CooldownCount = COUNT(*)
+    FROM adf.ActionHistory
+    WHERE TargetObject = @TableName
+      AND CompletedAt &gt; DATEADD(MINUTE, -30, SYSUTCDATETIME())
+      AND Status IN ('COMPLETED', 'FAILED');
+
+    IF @CooldownCount &gt; 0
+    BEGIN
+        UPDATE adf.ActionProposals
+        SET Status = 'DEFERRED', BlockReason = 'target_in_cooldown'
+        WHERE ProposalId = @ProposalId;
+
+        RAISERROR('ADF: Action deferred — %s is in cooldown window', 16, 1, @TableName);
+        RETURN;
+    END
+
+    -- Build and execute with ONLINE = ON to avoid blocking production reads/writes
+    SET @IndexSQL = N'CREATE INDEX ' + QUOTENAME(@IndexName)
+                  + N' ON ' + @TableName
+                  + N' (' + @Columns + N')'
+                  + N' WITH (ONLINE = ON, SORT_IN_TEMPDB = ON);';
+
+    UPDATE adf.ActionProposals
+    SET Status = 'EXECUTING', StartedAt = SYSUTCDATETIME()
+    WHERE ProposalId = @ProposalId;
+
+    BEGIN TRY
+        EXEC sp_executesql @IndexSQL;
+
+        UPDATE adf.ActionProposals
+        SET Status = 'COMPLETED', CompletedAt = SYSUTCDATETIME()
+        WHERE ProposalId = @ProposalId;
+
+        INSERT INTO adf.ActionHistory
+            (ProposalId, TargetObject, ActionType, ExecutedAt, CompletedAt, Status)
+        VALUES
+            (@ProposalId, @TableName, 'CREATE_INDEX_ONLINE',
+             @StartTime, SYSUTCDATETIME(), 'COMPLETED');
+    END TRY
+    BEGIN CATCH
+        UPDATE adf.ActionProposals
+        SET Status = 'FAILED',
+            FailureReason = ERROR_MESSAGE(),
+            CompletedAt = SYSUTCDATETIME()
+        WHERE ProposalId = @ProposalId;
+
+        INSERT INTO adf.ActionHistory
+            (ProposalId, TargetObject, ActionType, ExecutedAt, CompletedAt, Status, FailureReason)
+        VALUES
+            (@ProposalId, @TableName, 'CREATE_INDEX_ONLINE',
+             @StartTime, SYSUTCDATETIME(), 'FAILED', ERROR_MESSAGE());
+
+        THROW;
+    END CATCH
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The cooldown and blast radius parameters are not hardcoded constants — they live in an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.executor_policy</code> table that can be updated without redeploying the framework. Different tables, different schemas, and different environments (production vs. staging) carry different policies. A table tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tier=critical</code> might have a 4-hour cooldown and a 10 GB blast radius limit. A table tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">tier=archive</code> might have a 5-minute cooldown and no size limit at all.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.executor_policy (
+    policy_id       SERIAL PRIMARY KEY,
+    target_pattern  TEXT NOT NULL,          -- regex matched against target_object
+    tier_tag        TEXT NOT NULL DEFAULT 'standard',
+    cooldown_mins   INT  NOT NULL DEFAULT 30,
+    max_size_gb     INT  NULL,              -- NULL = no limit
+    allow_auto      BOOL NOT NULL DEFAULT TRUE,
+    notes           TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- Populate base policies
+INSERT INTO adf.executor_policy (target_pattern, tier_tag, cooldown_mins, max_size_gb, allow_auto)
+VALUES
+    ('^orders$',              'critical',  240,  10,   FALSE),
+    ('^inventory_.*',         'critical',  120,  25,   TRUE),
+    ('^archive_.*',           'archive',   5,    NULL, TRUE),
+    ('.*',                    'standard',  30,   100,  TRUE);   -- catch-all</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.ExecutorPolicy (
+    PolicyId        INT IDENTITY PRIMARY KEY,
+    TargetPattern   NVARCHAR(256) NOT NULL,
+    TierTag         NVARCHAR(64)  NOT NULL DEFAULT 'standard',
+    CooldownMins    INT           NOT NULL DEFAULT 30,
+    MaxSizeGB       INT           NULL,
+    AllowAuto       BIT           NOT NULL DEFAULT 1,
+    Notes           NVARCHAR(512) NULL,
+    UpdatedAt       DATETIME2     DEFAULT SYSUTCDATETIME()
+);
+
+INSERT INTO adf.ExecutorPolicy (TargetPattern, TierTag, CooldownMins, MaxSizeGB, AllowAuto)
+VALUES
+    ('orders',              'critical',  240,  10,   0),
+    ('inventory[_]%',       'critical',  120,  25,   1),
+    ('archive[_]%',         'archive',   5,    NULL, 1),
+    ('%',                   'standard',  30,   100,  1);  -- catch-all</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The executor resolves the applicable policy at runtime by scanning <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">executor_policy</code> rows in specificity order (longest matching pattern wins) before every action, not at framework startup. This means a DBA can tighten policy on a table that is about to receive a large load event without restarting the framework.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.5 The Verify Plane: Closing the Feedback Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous system that does not verify its own actions is no different from a script run by a cron job. The Verify plane exists to answer three questions after every action: Did the action complete as intended? Did the root signal improve? Did any collateral signal degrade?</p>
+
+<p class="text-gray-300 leading-relaxed">Verification is time-boxed. Each action type carries a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">verify_window_seconds</code> value — how long the system waits before re-querying the target signals. An index creation on a small table verifies in 30 seconds. A configuration parameter change that requires a connection pool restart might carry a 5-minute verify window. A bulk <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code> on a large table might not show in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_user_tables</code> for 15 minutes, so its verify window is set accordingly.</p>
+
+<p class="text-gray-300 leading-relaxed">The verification record drives the learning loop. Every verified outcome — whether the action succeeded, failed, or produced an unexpected side effect — is written back to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.outcome_history</code> table. The statistical scoring model in Tier 2 of the decision engine is retrained weekly against this table.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify plane: post-action outcome recorder
+CREATE TABLE adf.outcome_history (
+    outcome_id          BIGSERIAL PRIMARY KEY,
+    proposal_id         UUID        NOT NULL REFERENCES adf.action_proposals(proposal_id),
+    signal_name         TEXT        NOT NULL,
+    signal_value_before NUMERIC,
+    signal_value_after  NUMERIC,
+    collateral_signals  JSONB,      -- snapshot of all signals at verify time
+    action_effective    BOOL,       -- did root signal improve?
+    side_effect_detected BOOL,
+    side_effect_detail  TEXT,
+    verified_at         TIMESTAMPTZ DEFAULT now(),
+    verify_window_secs  INT
+);
+
+-- Verification query: did lock waiters drop after kill_blocking_head action?
+CREATE OR REPLACE FUNCTION adf.verify_lock_waiter_action(
+    p_proposal_id UUID,
+    p_value_before NUMERIC
+)
+RETURNS VOID LANGUAGE plpgsql AS $$
+DECLARE
+    v_value_after NUMERIC;
+    v_effective   BOOL;
+BEGIN
+    SELECT count(*) INTO v_value_after
+    FROM pg_stat_activity
+    WHERE state = 'active' AND wait_event_type = 'Lock';
+
+    v_effective := (v_value_after &lt; p_value_before * 0.5);  -- 50% reduction required
+
+    INSERT INTO adf.outcome_history
+        (proposal_id, signal_name, signal_value_before,
+         signal_value_after, action_effective, verified_at, verify_window_secs)
+    VALUES
+        (p_proposal_id, 'active_lock_waiters', p_value_before,
+         v_value_after, v_effective, now(), 30);
+
+    IF NOT v_effective THEN
+        -- Escalate: action did not resolve the signal, promote to HUMAN_REQUIRED
+        UPDATE adf.action_proposals
+        SET status = 'ESCALATED',
+            failure_reason = format(
+                'lock_waiters_not_reduced: before=%s after=%s',
+                p_value_before, v_value_after)
+        WHERE proposal_id = p_proposal_id;
+    END IF;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Verify plane: post-action outcome recorder
+CREATE TABLE adf.OutcomeHistory (
+    OutcomeId           BIGINT IDENTITY PRIMARY KEY,
+    ProposalId          UNIQUEIDENTIFIER NOT NULL,
+    SignalName          NVARCHAR(128)    NOT NULL,
+    SignalValueBefore   DECIMAL(18,4),
+    SignalValueAfter    DECIMAL(18,4),
+    CollateralSignals   NVARCHAR(MAX),   -- JSON snapshot
+    ActionEffective     BIT,
+    SideEffectDetected  BIT,
+    SideEffectDetail    NVARCHAR(512),
+    VerifiedAt          DATETIME2        DEFAULT SYSUTCDATETIME(),
+    VerifyWindowSecs    INT
+);
+
+-- Verification proc: did lock waiters drop after kill_blocking_head action?
+CREATE OR ALTER PROCEDURE adf.verify_LockWaiterAction
+    @ProposalId     UNIQUEIDENTIFIER,
+    @ValueBefore    DECIMAL(18,4)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @ValueAfter     DECIMAL(18,4);
+    DECLARE @Effective      BIT;
+
+    SELECT @ValueAfter = COUNT(*)
+    FROM sys.dm_exec_requests
+    WHERE wait_type LIKE 'LCK%';
+
+    SET @Effective = CASE
+        WHEN @ValueAfter &lt; @ValueBefore * 0.5 THEN 1
+        ELSE 0
+    END;
+
+    INSERT INTO adf.OutcomeHistory
+        (ProposalId, SignalName, SignalValueBefore,
+         SignalValueAfter, ActionEffective, VerifiedAt, VerifyWindowSecs)
+    VALUES
+        (@ProposalId, 'active_lock_waiters', @ValueBefore,
+         @ValueAfter, @Effective, SYSUTCDATETIME(), 30);
+
+    IF @Effective = 0
+    BEGIN
+        UPDATE adf.ActionProposals
+        SET Status = 'ESCALATED',
+            FailureReason = CONCAT(
+                'lock_waiters_not_reduced: before=', CAST(@ValueBefore AS NVARCHAR(20)),
+                ' after=', CAST(@ValueAfter AS NVARCHAR(20)))
+        WHERE ProposalId = @ProposalId;
+    END
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The collateral signal check is equally important. If the framework kills a blocking head process and lock waiters drop, but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">long_running_queries</code> simultaneously spikes from 2 to 40, the side effect is flagged and the proposal is marked <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ESCALATED</code> rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COMPLETED</code>. The Decide plane will not issue the same action again until a human clears the escalation. This prevents the framework from repeatedly applying a corrective action that is causing a different class of damage.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.6 Governance: Policy Tables, Change Windows, and the Autonomy Dial</h3>
+
+<p class="text-gray-300 leading-relaxed">The framework is only as trustworthy as the governance layer that controls what it is permitted to do, when, and to what. Governance is not bureaucracy — it is the mechanism that allows the framework to earn progressive trust from the teams operating it.</p>
+
+<p class="text-gray-300 leading-relaxed">The central governance object is the <strong class="text-white">autonomy dial</strong>: a per-environment, per-action-class setting that controls whether an action fires automatically, requires same-day human approval, requires change-board approval, or is permanently blocked. It is implemented as a simple lookup table with a well-understood override hierarchy.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.autonomy_policy (
+    policy_id       SERIAL PRIMARY KEY,
+    environment     TEXT NOT NULL,          -- 'production', 'staging', 'dev'
+    action_class    TEXT NOT NULL,          -- 'index_management', 'vacuum', 'config_change',
+                                            -- 'connection_scaling', 'failover', 'query_kill'
+    autonomy_level  TEXT NOT NULL           -- 'full_auto', 'auto_offhours', 'approval_required',
+        CHECK (autonomy_level IN            --  'change_board', 'blocked'
+            ('full_auto','auto_offhours','approval_required','change_board','blocked')),
+    offhours_start  TIME,                   -- only used if autonomy_level = 'auto_offhours'
+    offhours_end    TIME,
+    updated_by      TEXT,
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+
+-- Example: production environment governance defaults
+INSERT INTO adf.autonomy_policy
+    (environment, action_class, autonomy_level, offhours_start, offhours_end, updated_by)
+VALUES
+    ('production', 'vacuum',             'full_auto',       NULL,    NULL,    'adf_bootstrap'),
+    ('production', 'query_kill',         'full_auto',       NULL,    NULL,    'adf_bootstrap'),
+    ('production', 'index_management',   'auto_offhours',  '22:00', '06:00', 'adf_bootstrap'),
+    ('production', 'config_change',      'approval_required', NULL, NULL,    'adf_bootstrap'),
+    ('production', 'connection_scaling', 'auto_offhours',  '22:00', '06:00', 'adf_bootstrap'),
+    ('production', 'failover',           'change_board',    NULL,    NULL,    'adf_bootstrap');</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.AutonomyPolicy (
+    PolicyId        INT IDENTITY PRIMARY KEY,
+    Environment     NVARCHAR(64)  NOT NULL,
+    ActionClass     NVARCHAR(64)  NOT NULL,
+    AutonomyLevel   NVARCHAR(32)  NOT NULL
+        CHECK (AutonomyLevel IN
+            ('full_auto','auto_offhours','approval_required','change_board','blocked')),
+    OffhoursStart   TIME          NULL,
+    OffhoursEnd     TIME          NULL,
+    UpdatedBy       NVARCHAR(128) NULL,
+    UpdatedAt       DATETIME2     DEFAULT SYSUTCDATETIME()
+);
+
+INSERT INTO adf.AutonomyPolicy
+    (Environment, ActionClass, AutonomyLevel, OffhoursStart, OffhoursEnd, UpdatedBy)
+VALUES
+    ('production', 'vacuum',             'full_auto',        NULL,    NULL,    'adf_bootstrap'),
+    ('production', 'query_kill',         'full_auto',        NULL,    NULL,    'adf_bootstrap'),
+    ('production', 'index_management',   'auto_offhours',  '22:00', '06:00', 'adf_bootstrap'),
+    ('production', 'config_change',      'approval_required', NULL,  NULL,    'adf_bootstrap'),
+    ('production', 'connection_scaling', 'auto_offhours',  '22:00', '06:00', 'adf_bootstrap'),
+    ('production', 'failover',           'change_board',     NULL,    NULL,    'adf_bootstrap');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The autonomy dial creates a predictable trust escalation path. New action classes always start at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approval_required</code>. After the framework has executed that action class successfully ten times in staging with no collateral effects, the team can promote it to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_offhours</code> in production. After ten successful production off-hours executions, the team can consider <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">full_auto</code> during business hours for that action class. This progression is not automated — it requires deliberate human sign-off at each step. The framework tracks the promotion history in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.autonomy_policy_changelog</code> so the evidence base for each autonomy grant is auditable.</p>
+
+<p class="text-gray-300 leading-relaxed">Change windows work in conjunction with the autonomy dial. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">change_board</code>-level action can only execute if a corresponding approved change record exists in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.change_window</code>:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.change_window (
+    window_id       SERIAL PRIMARY KEY,
+    action_class    TEXT        NOT NULL,
+    environment     TEXT        NOT NULL,
+    approved_by     TEXT        NOT NULL,
+    window_start    TIMESTAMPTZ NOT NULL,
+    window_end      TIMESTAMPTZ NOT NULL,
+    ticket_ref      TEXT,
+    consumed        BOOL        DEFAULT FALSE,
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE OR REPLACE FUNCTION adf.is_change_window_open(
+    p_action_class TEXT,
+    p_environment  TEXT
+) RETURNS BOOL LANGUAGE sql STABLE AS $$
+    SELECT EXISTS (
+        SELECT 1 FROM adf.change_window
+        WHERE action_class  = p_action_class
+          AND environment   = p_environment
+          AND now() BETWEEN window_start AND window_end
+          AND consumed      = FALSE
+    );
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE adf.ChangeWindow (
+    WindowId        INT IDENTITY PRIMARY KEY,
+    ActionClass     NVARCHAR(64)  NOT NULL,
+    Environment     NVARCHAR(64)  NOT NULL,
+    ApprovedBy      NVARCHAR(128) NOT NULL,
+    WindowStart     DATETIME2     NOT NULL,
+    WindowEnd       DATETIME2     NOT NULL,
+    TicketRef       NVARCHAR(64),
+    Consumed        BIT           DEFAULT 0,
+    CreatedAt       DATETIME2     DEFAULT SYSUTCDATETIME()
+);
+
+CREATE OR ALTER FUNCTION adf.fn_IsChangeWindowOpen(
+    @ActionClass    NVARCHAR(64),
+    @Environment    NVARCHAR(64)
+)
+RETURNS BIT
+AS
+BEGIN
+    DECLARE @Result BIT = 0;
+    IF EXISTS (
+        SELECT 1 FROM adf.ChangeWindow
+        WHERE ActionClass = @ActionClass
+          AND Environment = @Environment
+          AND SYSUTCDATETIME() BETWEEN WindowStart AND WindowEnd
+          AND Consumed = 0
+    )
+        SET @Result = 1;
+    RETURN @Result;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once a change-window action executes, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">consumed</code> is flipped to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">TRUE</code>. A single approved change window ticket grants exactly one execution. This prevents the framework from replaying a change board-approved action multiple times under a stale approval.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.7 Integrating the LLM Layer: Prompt Engineering for Database Reasoning</h3>
+
+<p class="text-gray-300 leading-relaxed">The LLM tier of the decision engine handles novelty — situations the rule base and scoring model have not seen before. It also serves a second function: producing human-readable explanations of every action the framework takes, which satisfies the audit requirement that autonomous systems be explainable to non-engineer stakeholders.</p>
+
+<p class="text-gray-300 leading-relaxed">The LLM integration is not a free-form chat interface. It receives a precisely structured JSON context packet and is constrained to return a JSON response against a defined schema. Any response that does not parse cleanly against the schema is discarded, and the proposal drops to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HUMAN_REQUIRED</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># llm_client.py — structured LLM interface for ADF Tier 3 decisions
+# Compatible with OpenAI-compatible APIs; substitute endpoint for self-hosted models
+
+import json
+import logging
+from typing import Optional
+import httpx
+
+logger = logging.getLogger("adf.llm")
+
+SYSTEM_PROMPT = """You are a database reliability reasoning engine.
+You receive anonymized metric signals from a PostgreSQL or SQL Server database cluster.
+Your job is to reason about the root cause and propose ONE safe, reversible corrective action.
+
+CONSTRAINTS:
+- Proposed actions must be executable by a database administrator without application downtime.
+- You must specify a rollback procedure for every proposed action.
+- Estimated impact must be "low", "medium", or "high".
+- Confidence must be a float between 0.0 and 1.0.
+- Never propose dropping tables, truncating data, or revoking user permissions.
+- Never propose actions affecting more than one database cluster simultaneously.
+
+RESPONSE FORMAT (strict JSON, no markdown):
+{
+  "proposed_action": "&lt;action_identifier&gt;",
+  "params": { "&lt;key&gt;": "&lt;value&gt;" },
+  "rollback": "&lt;rollback_procedure_description&gt;",
+  "impact": "low|medium|high",
+  "confidence": 0.0,
+  "reasoning_text": "&lt;plain English explanation of root cause and action rationale&gt;"
+}"""
+
+def build_context_packet(signal_result: dict, recent_actions: list, environment: str) -&gt; str:
+    context = {
+        "signal": signal_result,
+        "recent_actions_last_6h": recent_actions[-5:] if recent_actions else [],
+        "environment": environment,
+        "current_utc_hour": __import__('datetime').datetime.utcnow().hour,
+        "instruction": "Propose a corrective action for the signal above."
+    }
+    return json.dumps(context, default=str)
+
+def reason(
+    signal_result: dict,
+    recent_actions: list,
+    environment: str,
+    api_url: str,
+    api_key: str,
+    model: str = "gpt-4o-mini",
+    timeout_seconds: int = 20
+) -&gt; Optional[dict]:
+    context_packet = build_context_packet(signal_result, recent_actions, environment)
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": context_packet}
+        ],
+        "temperature": 0.1,    # Low temperature: we want consistent, conservative reasoning
+        "max_tokens": 512,
+        "response_format": {"type": "json_object"}
+    }
+
+    try:
+        response = httpx.post(
+            f"{api_url}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json=payload,
+            timeout=timeout_seconds
+        )
+        response.raise_for_status()
+        raw_content = response.json()["choices"][0]["message"]["content"]
+        parsed = json.loads(raw_content)
+
+        # Schema validation
+        required_keys = {"proposed_action", "params", "rollback", "impact",
+                         "confidence", "reasoning_text"}
+        if not required_keys.issubset(parsed.keys()):
+            logger.error(f"LLM response missing required keys: {parsed.keys()}")
+            return None
+
+        if parsed["impact"] not in ("low", "medium", "high"):
+            logger.error(f"LLM returned invalid impact value: {parsed['impact']}")
+            return None
+
+        confidence = float(parsed["confidence"])
+        if not 0.0 &lt;= confidence &lt;= 1.0:
+            logger.error(f"LLM returned out-of-range confidence: {confidence}")
+            return None
+
+        logger.info(f"LLM proposal: {parsed['proposed_action']} "
+                    f"(confidence={confidence}, impact={parsed['impact']})")
+        return parsed
+
+    except (httpx.HTTPError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.error(f"LLM reasoning failed: {exc}")
+        return None</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Several design choices in this integration deserve explicit attention. Temperature is set to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.1</code> rather than <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.0</code> — pure determinism at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">0.0</code> can produce slightly different outputs from identical inputs due to floating-point nondeterminism in the model backend, and a very low but nonzero temperature smooths this without materially affecting conservatism. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">response_format</code> field enforces JSON mode on the model side, which eliminates the most common failure mode of LLM API integrations: receiving a markdown-wrapped explanation instead of parseable JSON. The timeout of 20 seconds is intentionally short; if the model takes longer than 20 seconds to respond during an active incident, the framework should not wait — it should fall back to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">HUMAN_REQUIRED</code> and page an on-call engineer.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">reasoning_text</code> field from the LLM response is stored in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.action_proposals.llm_reasoning</code> and surfaced in the incident response interface. This means that during a post-incident review, a non-engineer manager can read "the system detected that lock waiter counts were growing at 3 per minute, identified query PID 42891 as the blocking head by its age and lock graph position, and proposed terminating it because doing so releases all downstream lock chains without data loss" rather than seeing a raw metric value and a procedure call. This explainability function is the most undervalued benefit of the LLM tier.</p>
+
+<p class="text-gray-300 leading-relaxed">For teams operating in air-gapped environments or with strict data residency requirements, the LLM client is swappable — the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">api_url</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">model</code> parameters accept any OpenAI-compatible endpoint. Self-hosted models running on Ollama, vLLM, or similar inference servers behind the corporate firewall can fulfill the same contract as long as they support <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">response_format: json_object</code>. The schema validation in the client catches capability gaps between different model sizes without changing any other part of the framework.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.8 Deploying the Framework: Schema Bootstrap, Scheduler Integration, and Observability</h3>
+
+<p class="text-gray-300 leading-relaxed">The complete ADF schema bootstrap creates all required tables, views, and functions in a dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf</code> schema that is owned by a restricted service role. No application user should have write access to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf</code> schema — only the framework's service account and DBAs with explicit grant.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF schema bootstrap (abbreviated — full DDL in companion repository)
+CREATE SCHEMA IF NOT EXISTS adf;
+
+CREATE ROLE adf_service NOLOGIN;
+GRANT USAGE ON SCHEMA adf TO adf_service;
+GRANT SELECT, INSERT, UPDATE ON ALL TABLES IN SCHEMA adf TO adf_service;
+GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA adf TO adf_service;
+ALTER DEFAULT PRIVILEGES IN SCHEMA adf
+    GRANT SELECT, INSERT, UPDATE ON TABLES TO adf_service;
+
+-- Core state tables
+CREATE TABLE IF NOT EXISTS adf.action_proposals (
+    proposal_id     UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    signal_name     TEXT        NOT NULL,
+    proposed_action TEXT        NOT NULL,
+    action_params   JSONB,
+    confidence      NUMERIC(5,4),
+    tier            TEXT,
+    rollback_procedure TEXT,
+    estimated_impact TEXT,
+    status          TEXT        NOT NULL DEFAULT 'PENDING',
+    approved        BOOL        NOT NULL DEFAULT FALSE,
+    approved_by     TEXT,
+    block_reason    TEXT,
+    failure_reason  TEXT,
+    llm_reasoning   TEXT,
+    started_at      TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ DEFAULT now(),
+    created_at      TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS adf.action_history (
+    history_id      BIGSERIAL   PRIMARY KEY,
+    proposal_id     UUID        REFERENCES adf.action_proposals(proposal_id),
+    target_object   TEXT,
+    action_type     TEXT,
+    executed_at     TIMESTAMPTZ,
+    completed_at    TIMESTAMPTZ,
+    status          TEXT,
+    failure_reason  TEXT
+);
+
+-- Index for cooldown lookups
+CREATE INDEX IF NOT EXISTS idx_action_history_target_completed
+    ON adf.action_history (target_object, completed_at DESC);
+
+-- Partitioned signal history (by day, retained 90 days)
+CREATE TABLE IF NOT EXISTS adf.signal_history (
+    collected_at    TIMESTAMPTZ NOT NULL,
+    signal_name     TEXT        NOT NULL,
+    value           NUMERIC,
+    slope           NUMERIC,
+    confidence      NUMERIC(5,4),
+    raw_snapshot    JSONB
+) PARTITION BY RANGE (collected_at);
+
+-- Create rolling partitions via pg_cron
+SELECT cron.schedule(
+    'adf_create_signal_partition',
+    '0 0 * * *',
+    $$
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS adf.signal_history_%s
+         PARTITION OF adf.signal_history
+         FOR VALUES FROM (%L) TO (%L)',
+        to_char(now() + interval '1 day', 'YYYYMMDD'),
+        date_trunc('day', now() + interval '1 day'),
+        date_trunc('day', now() + interval '2 days')
+    )
+    $$
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ADF schema bootstrap (SQL Server)
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'adf')
+    EXEC('CREATE SCHEMA adf');
+
+-- Create restricted service login (Windows auth or contained DB user)
+-- EXEC sp_addlogin 'adf_service', '&lt;strong_password&gt;';
+-- CREATE USER adf_service FOR LOGIN adf_service;
+-- GRANT SELECT, INSERT, UPDATE ON SCHEMA::adf TO adf_service;
+
+-- T-SQL has no CREATE TABLE IF NOT EXISTS; guard with an existence check instead
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'ActionProposals' AND schema_id = SCHEMA_ID('adf'))
+BEGIN
+    CREATE TABLE adf.ActionProposals (
+        ProposalId          UNIQUEIDENTIFIER PRIMARY KEY DEFAULT NEWSEQUENTIALID(),
+        SignalName          NVARCHAR(128)   NOT NULL,
+        ProposedAction      NVARCHAR(256)   NOT NULL,
+        ActionParams        NVARCHAR(MAX),              -- JSON
+        Confidence          DECIMAL(5,4),
+        Tier                NVARCHAR(32),
+        RollbackProcedure   NVARCHAR(512),
+        EstimatedImpact      NVARCHAR(16),
+        Status              NVARCHAR(32)    NOT NULL DEFAULT 'PENDING',
+        Approved            BIT             NOT NULL DEFAULT 0,
+        ApprovedBy          NVARCHAR(128),
+        BlockReason         NVARCHAR(512),
+        FailureReason       NVARCHAR(512),
+        LLMReasoning        NVARCHAR(MAX),
+        StartedAt           DATETIME2,
+        CompletedAt         DATETIME2,
+        UpdatedAt           DATETIME2       DEFAULT SYSUTCDATETIME(),
+        CreatedAt           DATETIME2       DEFAULT SYSUTCDATETIME()
+    );
+END
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'ActionHistory' AND schema_id = SCHEMA_ID('adf'))
+BEGIN
+    CREATE TABLE adf.ActionHistory (
+        HistoryId           BIGINT IDENTITY PRIMARY KEY,
+        ProposalId          UNIQUEIDENTIFIER REFERENCES adf.ActionProposals(ProposalId),
+        TargetObject        NVARCHAR(256),
+        ActionType          NVARCHAR(128),
+        ExecutedAt          DATETIME2,
+        CompletedAt         DATETIME2,
+        Status              NVARCHAR(32),
+        FailureReason       NVARCHAR(512)
+    );
+END
+
+CREATE INDEX idx_ActionHistory_TargetCompleted
+    ON adf.ActionHistory (TargetObject, CompletedAt DESC);
+
+-- Signal history table with monthly partitioning via partition function
+CREATE PARTITION FUNCTION pf_SignalHistoryMonth (DATETIME2)
+AS RANGE RIGHT FOR VALUES (
+    '2025-01-01', '2025-02-01', '2025-03-01', '2025-04-01',
+    '2025-05-01', '2025-06-01', '2025-07-01', '2025-08-01',
+    '2025-09-01', '2025-10-01', '2025-11-01', '2025-12-01'
+);
+
+CREATE PARTITION SCHEME ps_SignalHistoryMonth
+AS PARTITION pf_SignalHistoryMonth ALL TO ([PRIMARY]);
+
+CREATE TABLE adf.SignalHistory (
+    CollectedAt     DATETIME2       NOT NULL,
+    SignalName      NVARCHAR(128)   NOT NULL,
+    Value           DECIMAL(18,4),
+    Slope           DECIMAL(18,6),
+    Confidence      DECIMAL(5,4),
+    RawSnapshot     NVARCHAR(MAX)   -- JSON
+) ON ps_SignalHistoryMonth (CollectedAt);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The scheduler integration connects the signal collection view, the Python processor, and the decision engine into a single execution pipeline. For environments that prefer keeping everything inside the database, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> on PostgreSQL and SQL Agent on SQL Server can drive the collection cycle. For environments with a Kubernetes control plane, a lightweight CronJob manifest calling the Python collector is preferable because it externalizes state management and makes the collector horizontally scalable.</p>
+
+<p class="text-gray-300 leading-relaxed">The framework's own health is observable through a dedicated status view that any external monitoring system — Grafana, Datadog, PagerDuty — can scrape:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR REPLACE VIEW adf.framework_health AS
+SELECT
+    (SELECT count(*) FROM adf.action_proposals
+     WHERE status = 'PENDING'
+       AND created_at &gt; now() - interval '1 hour')         AS pending_proposals_1h,
+    (SELECT count(*) FROM adf.action_proposals
+     WHERE status = 'EXECUTING')                           AS currently_executing,
+    (SELECT count(*) FROM adf.action_proposals
+     WHERE status = 'FAILED'
+       AND created_at &gt; now() - interval '24 hours')       AS failed_actions_24h,
+    (SELECT count(*) FROM adf.action_proposals
+     WHERE status = 'ESCALATED'
+       AND created_at &gt; now() - interval '24 hours')       AS escalations_24h,
+    (SELECT count(*) FROM adf.outcome_history
+     WHERE action_effective = TRUE
+       AND verified_at &gt; now() - interval '24 hours')      AS effective_actions_24h,
+    (SELECT count(*) FROM adf.outcome_history
+     WHERE side_effect_detected = TRUE
+       AND verified_at &gt; now() - interval '24 hours')      AS side_effects_24h,
+    (SELECT max(collected_at) FROM adf.signal_history)     AS last_signal_collected_at,
+    (SELECT now() - max(collected_at) FROM adf.signal_history) AS signal_staleness;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE OR ALTER VIEW adf.FrameworkHealth AS
+SELECT
+    (SELECT COUNT(*) FROM adf.ActionProposals
+     WHERE Status = 'PENDING'
+       AND CreatedAt &gt; DATEADD(HOUR, -1, SYSUTCDATETIME()))    AS PendingProposals1h,
+    (SELECT COUNT(*) FROM adf.ActionProposals
+     WHERE Status = 'EXECUTING')                               AS CurrentlyExecuting,
+    (SELECT COUNT(*) FROM adf.ActionProposals
+     WHERE Status = 'FAILED'
+       AND CreatedAt &gt; DATEADD(HOUR, -24, SYSUTCDATETIME()))   AS FailedActions24h,
+    (SELECT COUNT(*) FROM adf.ActionProposals
+     WHERE Status = 'ESCALATED'
+       AND CreatedAt &gt; DATEADD(HOUR, -24, SYSUTCDATETIME()))   AS Escalations24h,
+    (SELECT COUNT(*) FROM adf.OutcomeHistory
+     WHERE ActionEffective = 1
+       AND VerifiedAt &gt; DATEADD(HOUR, -24, SYSUTCDATETIME()))  AS EffectiveActions24h,
+    (SELECT COUNT(*) FROM adf.OutcomeHistory
+     WHERE SideEffectDetected = 1
+       AND VerifiedAt &gt; DATEADD(HOUR, -24, SYSUTCDATETIME()))  AS SideEffects24h,
+    (SELECT MAX(CollectedAt) FROM adf.SignalHistory)            AS LastSignalCollectedAt,
+    (SELECT DATEDIFF(SECOND, MAX(CollectedAt), SYSUTCDATETIME())
+     FROM adf.SignalHistory)                                    AS SignalStalenessSeconds;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">An alert rule should fire if <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">signal_staleness</code> exceeds 180 seconds — three missed collection cycles. When the observability plane stops collecting, the entire framework is flying blind, and the on-call engineer needs to know before the decision engine starts acting on stale data or, worse, stops acting when it should.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.9 Operational Runbook: The First 90 Days</h3>
+
+<p class="text-gray-300 leading-relaxed">Deploying the framework is not the same as operating it. The first 90 days determine whether the framework earns enough trust to expand its autonomy level or gets switched off after one bad action. The following phased approach has proven reliable across varied PostgreSQL and SQL Server environments.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Days 1–14: Shadow Mode</strong></p>
+
+<p class="text-gray-300 leading-relaxed">All four planes are running, but the Act plane is configured to only log proposed actions rather than execute them. Every proposal is written to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.action_proposals</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">status = 'SHADOW'</code> and the DBA team reviews the log daily. The goal is to calibrate signal thresholds against actual operational patterns. A <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vacuum_starved_tables</code> threshold of 5 might be appropriate for a small OLTP database but will generate constant noise in a large data warehouse where vacuum lag is expected and managed through scheduled jobs. Threshold calibration during shadow mode prevents alert fatigue when the framework goes live.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Days 15–30: Live Execution, Low-Risk Actions Only</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Promote <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">vacuum</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_kill</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">connection_scaling</code> actions to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">full_auto</code> in the staging environment and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_offhours</code> in production. Leave all other action classes at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approval_required</code>. Monitor <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.framework_health.side_effects_24h</code> daily. Any side effect triggers a 48-hour pause and a root-cause review before autonomy is restored.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Days 31–60: Expand to Index Management</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Once the low-risk action classes have accumulated at least 20 successful executions with zero collateral side effects, promote <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index_management</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto_offhours</code> in production. Index creation is inherently lower risk when executed with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ONLINE = ON</code>, but the blast radius controls from section 38.4 must be validated against the largest tables in the production schema before promotion.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Days 61–90: Review, Retrain, and Plan</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run the statistical scoring model retraining cycle against the accumulated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.outcome_history</code> data. Review all <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ESCALATED</code> proposals from the period — these are the cases where the framework correctly identified a problem but could not act, and they represent the highest-value opportunities for new Tier 1 deterministic rules. By day 90, the team should have a documented evidence base for which action classes perform reliably and which need further calibration before expanding their autonomy level.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">38.10 What the Framework Does Not Do (And Should Not)</h3>
+
+<p class="text-gray-300 leading-relaxed">No autonomous framework should attempt to fully replace the judgment of an experienced DBA. There are categories of database work that require contextual knowledge the framework cannot hold: business-cycle awareness, application release coordination, regulatory constraints on data access, and the organizational dynamics of multi-team systems. Three categories deserve explicit exclusion.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema migrations</strong> are beyond the framework's scope. Altering table structures, adding columns with defaults to large tables, and changing data types all carry application-layer dependencies that the framework has no visibility into. The framework can detect that a migration is causing lock pressure and propose killing the migration session, but it should never initiate migrations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Data purge and archival</strong> decisions require business-level authorization. The framework can surface signals that a table is growing faster than storage projections allow, but the decision of what data to delete, when, and to what archive destination belongs to the data governance process.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Security configuration changes</strong> — modifying roles, revoking privileges, changing authentication settings — must never be in the autonomous action set. A framework that can change its own access controls is a framework that can be exploited to escalate privileges.</p>
+
+<p class="text-gray-300 leading-relaxed">These exclusions are not limitations of the framework's design. They are its defining characteristic. An autonomous framework that knows its own boundaries is significantly more trustworthy than one that claims unlimited scope. The boundary enforcement belongs in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">adf.autonomy_policy</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomy_level = 'blocked'</code> for these action classes, and no operational pressure should ever lift that block.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A production-grade Autonomous DBA Framework requires four distinct planes** — Observe, Decide, Act, and Verify — with no direct writes across plane boundaries; cross-plane communication through a message bus makes the system auditable and prevents race conditions between stale signals and active executors.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The decision engine must be a three-tier stack**, not a flat rule list: deterministic rules for known-safe actions, statistical scoring for context-dependent decisions, and LLM escalation for novel states — with each tier having a clearly defined confidence threshold and fallback path to human review.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Blast radius controls, cooldown policies, and rollback contracts are not optional safety features** — they are what distinguishes an autonomous framework from an uncontrolled script; every action the executor takes must be bounded by scope, reversibility, concurrency limit, and a per-target cooldown enforced at runtime against a configurable policy table.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The autonomy dial and change window system create a trust escalation path** that allows action classes to earn progressively higher autonomy levels based on a documented evidence base of successful executions, preventing the framework from being granted more authority than its operational track record justifies.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The Verify plane closes the feedback loop** by measuring both root signal improvement and collateral signal degradation after every action; failed verifications immediately escalate to human review and suppress re-execution of the same action, ensuring the framework learns from its failures rather than repeatedly applying a corrective action that is causing a different class of damage.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
