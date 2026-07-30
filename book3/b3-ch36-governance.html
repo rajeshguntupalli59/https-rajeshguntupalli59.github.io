@@ -6,6 +6,10 @@
   <title>Chapter 36: Governance Models for Autonomous DBAs — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 36: Governance Models for Autonomous DBAs. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -432,6 +436,21 @@ if __name__ == '__main__':
 
 <p class="text-gray-300 leading-relaxed">This architecture eliminates human latency from the critical path while preserving human authority. Engineers are in a position of continuous veto power, not continuous approval power — a far more scalable model.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Action Request] --> B{Governance Track}
+    B -->|auto| C[Execute Immediately]
+    B -->|async_approval| D[Queue + Notify: 15-min Window]
+    B -->|sync_approval| E[Block Until Explicit Approval]
+    B -->|urgent, high-impact| F[Execute Now + 30s Veto Window]
+    D -->|Rejected| G[Cancelled]
+    D -->|Timeout, No Reject| H[Timeout-Approved]
+    F -->|Vetoed, Reversible| I[Rolled Back]
+    F -->|Vetoed, Irreversible| J[Post-Incident Review]
+    C --> K[(Hash-Chained Audit Log)]
+    H --> K</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Governance track routing: only sync_approval blocks on a human; every other path keeps engineers in a veto role rather than an approval role, and every terminal state lands in the immutable audit log.*</p>
+
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Immutable Audit Trails: Design and Enforcement</h3>
@@ -480,6 +499,496 @@ REVOKE UPDATE, DELETE ON autonomous_audit_log FROM PUBLIC;
 REVOKE UPDATE, DELETE ON autonomous_audit_log FROM ade_worker;</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Immutable audit log using temporal-style append-only enforcement
+CREATE TABLE dbo.AutonomousAuditLog (
+    LogId        UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
+    QueueId      UNIQUEIDENTIFIER NOT NULL,
+    LogType      NVARCHAR(20)     NOT NULL
+                         CONSTRAINT CK_AAL_LogType CHECK (
+                         LogType IN ('decision','pre_state','execution',
+                                     'post_state','diff','error')),
+    SequenceNum  INT              NOT NULL,
+    LoggedAt     DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
+    Actor        NVARCHAR(200)    NOT NULL,
+    Payload      NVARCHAR(MAX)    NOT NULL,  -- JSON
+    Checksum     NVARCHAR(64)     NOT NULL   -- SHA-256 hex
+);
+
+-- Deny UPDATE and DELETE at the permission level for all application roles
+DENY UPDATE ON dbo.AutonomousAuditLog TO ade_worker;
+DENY DELETE ON dbo.AutonomousAuditLog TO ade_worker;
+
+-- DDL trigger to prevent schema changes that would circumvent the above
+CREATE TRIGGER trg_PreventAuditLogAlteration
+ON DATABASE
+FOR DROP_TABLE, ALTER_TABLE
+AS
+BEGIN
+    DECLARE @EventData XML = EVENTDATA();
+    IF @EventData.value('(/EVENT_INSTANCE/ObjectName)[1]','NVARCHAR(128)') = 'AutonomousAuditLog'
+    BEGIN
+        RAISERROR('Schema changes to AutonomousAuditLog are prohibited.', 16, 1);
+        ROLLBACK;
+    END
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The checksum field is essential: each log entry carries a SHA-256 hash of its own content including the previous entry's hash, forming a hash chain. Any tampering with a historical entry invalidates all subsequent checksums, making silent modification detectable without an external audit service. Implement the chaining in the writer:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># audit_writer.py
+import hashlib
+import json
+import psycopg2
+from uuid import UUID
+from datetime import datetime, timezone
+
+class AuditWriter:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+
+    def _compute_checksum(self, queue_id: str, log_type: str,
+                          sequence_num: int, payload: dict,
+                          prev_checksum: str) -&gt; str:
+        content = json.dumps({
+            'queue_id': queue_id,
+            'log_type': log_type,
+            'sequence_num': sequence_num,
+            'payload': payload,
+            'prev_checksum': prev_checksum
+        }, sort_keys=True, default=str)
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def _get_prev_checksum(self, cur, queue_id: str) -&gt; str:
+        cur.execute("""
+            SELECT checksum FROM autonomous_audit_log
+            WHERE queue_id = %s
+            ORDER BY sequence_num DESC
+            LIMIT 1
+        """, (queue_id,))
+        row = cur.fetchone()
+        return row[0] if row else 'GENESIS'
+
+    def write(self, queue_id: str, log_type: str, sequence_num: int,
+              actor: str, payload: dict) -&gt; str:
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                prev_checksum = self._get_prev_checksum(cur, queue_id)
+                checksum = self._compute_checksum(
+                    queue_id, log_type, sequence_num, payload, prev_checksum
+                )
+                cur.execute("""
+                    INSERT INTO autonomous_audit_log
+                        (queue_id, log_type, sequence_num, actor, payload, checksum)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    RETURNING log_id
+                """, (queue_id, log_type, sequence_num,
+                      actor, json.dumps(payload, default=str), checksum))
+                log_id = cur.fetchone()[0]
+            conn.commit()
+        return str(log_id)
+
+    def verify_chain(self, queue_id: str) -&gt; tuple[bool, list[str]]:
+        """Returns (is_valid, list_of_violations)."""
+        violations = []
+        with psycopg2.connect(self.dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT log_type, sequence_num, actor, payload, checksum
+                    FROM autonomous_audit_log
+                    WHERE queue_id = %s
+                    ORDER BY sequence_num ASC
+                """, (queue_id,))
+                rows = cur.fetchall()
+
+        prev_checksum = 'GENESIS'
+        for log_type, seq, actor, payload_str, stored_checksum in rows:
+            payload = json.loads(payload_str)
+            expected = self._compute_checksum(
+                queue_id, log_type, seq, payload, prev_checksum
+            )
+            if expected != stored_checksum:
+                violations.append(
+                    f"Checksum mismatch at sequence {seq} "
+                    f"(type={log_type}): expected {expected}, got {stored_checksum}"
+                )
+            prev_checksum = stored_checksum
+
+        return (len(violations) == 0, violations)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">verify_chain</code> as part of your daily governance health check and on-demand during incident investigations. Any violation is a potential integrity incident and should trigger immediate escalation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Governance Scopes Across Multi-Tenant and Multi-Region Environments</h3>
+
+<p class="text-gray-300 leading-relaxed">Single-database governance is relatively straightforward. The complexity multiplies when an autonomous system manages dozens or hundreds of databases across multiple cloud regions, each with different regulatory classifications, SLA tiers, and team ownership.</p>
+
+<p class="text-gray-300 leading-relaxed">The governance model must express scope explicitly. A policy that says "kill idle-in-transaction sessions older than 5 minutes" means something very different on a development database with a one-engineer team than on a financial trading platform with a four-nines SLA and SOX controls.</p>
+
+<p class="text-gray-300 leading-relaxed">Design your governance scope hierarchy as a tree:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Organization
+└── Environment (production, staging, development)
+    └── Region (us-east-1, eu-west-1, ap-southeast-2)
+        └── Cluster (postgres-prod-cluster-01)
+            └── Database (orders_db, catalog_db)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Policies inherit downward but can be overridden at any level. A global policy prohibiting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP TABLE</code> outside maintenance windows applies everywhere unless a specific database has a registered TTL archiving exemption that overrides it. Store the scope hierarchy and inheritance rules:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE governance_scope_nodes (
+    node_id      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    parent_id    UUID REFERENCES governance_scope_nodes(node_id),
+    node_type    TEXT NOT NULL CHECK (node_type IN
+                     ('org','environment','region','cluster','database')),
+    node_name    TEXT NOT NULL,
+    metadata     JSONB NOT NULL DEFAULT '{}',
+    UNIQUE (parent_id, node_name)
+);
+
+CREATE TABLE governance_policy_assignments (
+    assignment_id  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    policy_id      TEXT NOT NULL,
+    node_id        UUID NOT NULL REFERENCES governance_scope_nodes(node_id),
+    override_mode  TEXT NOT NULL CHECK (override_mode IN ('inherit','replace','extend')),
+    active         BOOLEAN NOT NULL DEFAULT TRUE,
+    assigned_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    assigned_by    TEXT NOT NULL
+);
+
+-- Recursive CTE to resolve effective policies for a given database node
+-- by walking the scope tree from root to leaf, applying overrides
+CREATE OR REPLACE FUNCTION effective_policies_for_node(p_node_id UUID)
+RETURNS TABLE (policy_id TEXT, source_node_id UUID, override_mode TEXT) AS $$
+WITH RECURSIVE scope_ancestors AS (
+    SELECT node_id, parent_id, 0 AS depth
+    FROM governance_scope_nodes
+    WHERE node_id = p_node_id
+    UNION ALL
+    SELECT n.node_id, n.parent_id, sa.depth + 1
+    FROM governance_scope_nodes n
+    JOIN scope_ancestors sa ON n.node_id = sa.parent_id
+),
+ranked_assignments AS (
+    SELECT
+        pa.policy_id,
+        pa.node_id AS source_node_id,
+        pa.override_mode,
+        sa.depth,
+        ROW_NUMBER() OVER (
+            PARTITION BY pa.policy_id
+            ORDER BY sa.depth ASC   -- lower depth = closer to leaf = higher precedence
+        ) AS rn
+    FROM governance_policy_assignments pa
+    JOIN scope_ancestors sa ON pa.node_id = sa.node_id
+    WHERE pa.active = TRUE
+)
+SELECT policy_id, source_node_id, override_mode
+FROM ranked_assignments
+WHERE rn = 1
+  AND override_mode != 'inherit';  -- 'inherit' means use parent's version
+$$ LANGUAGE sql STABLE;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE dbo.GovernanceScopeNodes (
+    NodeId     UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
+    ParentId   UNIQUEIDENTIFIER NULL REFERENCES dbo.GovernanceScopeNodes(NodeId),
+    NodeType   NVARCHAR(20)     NOT NULL
+                   CONSTRAINT CK_GSN_NodeType CHECK (
+                       NodeType IN ('org','environment','region','cluster','database')),
+    NodeName   NVARCHAR(200)    NOT NULL,
+    Metadata   NVARCHAR(MAX)    NOT NULL DEFAULT '{}',
+    CONSTRAINT UQ_GSN_Parent_Name UNIQUE (ParentId, NodeName)
+);
+
+CREATE TABLE dbo.GovernancePolicyAssignments (
+    AssignmentId  UNIQUEIDENTIFIER NOT NULL DEFAULT NEWSEQUENTIALID() PRIMARY KEY,
+    PolicyId      NVARCHAR(100)    NOT NULL,
+    NodeId        UNIQUEIDENTIFIER NOT NULL
+                      REFERENCES dbo.GovernanceScopeNodes(NodeId),
+    OverrideMode  NVARCHAR(20)     NOT NULL
+                      CONSTRAINT CK_GPA_Override CHECK (
+                          OverrideMode IN ('inherit','replace','extend')),
+    Active        BIT              NOT NULL DEFAULT 1,
+    AssignedAt    DATETIME2        NOT NULL DEFAULT SYSUTCDATETIME(),
+    AssignedBy    NVARCHAR(200)    NOT NULL
+);
+
+-- Recursive CTE: effective policies for a database node
+CREATE OR REPLACE VIEW dbo.EffectivePoliciesView AS
+-- Parameterised inline TVF equivalent using APPLY is preferred; this is a scaffold
+-- In practice, implement as a stored procedure or inline TVF accepting @NodeId
+WITH ScopeAncestors AS (
+    SELECT NodeId, ParentId, 0 AS Depth
+    FROM dbo.GovernanceScopeNodes
+    -- Anchor: replace with parameter in TVF
+    UNION ALL
+    SELECT n.NodeId, n.ParentId, sa.Depth + 1
+    FROM dbo.GovernanceScopeNodes n
+    JOIN ScopeAncestors sa ON n.NodeId = sa.ParentId
+),
+RankedAssignments AS (
+    SELECT
+        pa.PolicyId,
+        pa.NodeId AS SourceNodeId,
+        pa.OverrideMode,
+        sa.Depth,
+        ROW_NUMBER() OVER (
+            PARTITION BY pa.PolicyId
+            ORDER BY sa.Depth ASC
+        ) AS rn
+    FROM dbo.GovernancePolicyAssignments pa
+    JOIN ScopeAncestors sa ON pa.NodeId = sa.NodeId
+    WHERE pa.Active = 1
+)
+SELECT PolicyId, SourceNodeId, OverrideMode
+FROM RankedAssignments
+WHERE rn = 1 AND OverrideMode != 'inherit';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Regulatory scope is a separate dimension layered on top of the hierarchy. A database hosting EU personal data under GDPR, or US financial records under SOX, carries labels that activate additional policy constraints — most notably prohibiting autonomous schema changes without a change management ticket reference, and requiring pre-action and post-action state snapshots to be retained for a defined period:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: regulatory labels and their policy constraints
+CREATE TABLE regulatory_labels (
+    label_id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    label_name        TEXT NOT NULL UNIQUE,   -- 'GDPR', 'SOX', 'HIPAA', 'PCI-DSS'
+    prohibited_tracks TEXT[] NOT NULL DEFAULT '{}',
+    required_retention_days INT NOT NULL DEFAULT 365,
+    require_ticket_reference BOOLEAN NOT NULL DEFAULT TRUE,
+    require_dual_approval    BOOLEAN NOT NULL DEFAULT FALSE
+);
+
+CREATE TABLE database_regulatory_labels (
+    node_id   UUID NOT NULL REFERENCES governance_scope_nodes(node_id),
+    label_id  UUID NOT NULL REFERENCES regulatory_labels(label_id),
+    labeled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    labeled_by TEXT NOT NULL,
+    PRIMARY KEY (node_id, label_id)
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When the policy engine evaluates a request, it fetches all regulatory labels for the target database node and applies the most restrictive constraints. If a database carries both GDPR and SOX labels, and SOX requires dual approval while GDPR requires a 7-year audit retention, both constraints apply simultaneously.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Organizational Models: Who Owns Autonomous Governance?</h3>
+
+<p class="text-gray-300 leading-relaxed">Technical governance architecture is necessary but not sufficient. The organizational structure around it determines whether governance operates in practice or erodes under operational pressure.</p>
+
+<p class="text-gray-300 leading-relaxed">Three models are observed in engineering organizations that have deployed autonomous database systems at scale.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model 1: Platform Engineering Ownership</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The autonomous database system is owned by a platform engineering or SRE team. That team maintains the taxonomy, policies, audit infrastructure, and escalation workflows. Individual database-owning teams (e.g., the payments team that owns <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments_db</code>) are consumers of the governance system — they can request policy exceptions via a self-service API, but they cannot modify the governance rules directly. This model concentrates expertise and produces consistent policy application, but creates a bottleneck when database teams need rapid policy changes to support feature delivery.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model 2: Federated Ownership with Central Policy Floor</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The platform team defines a minimum policy floor: a set of policies that apply globally and cannot be overridden. Database-owning teams own their own database-scoped policy extensions, subject to the floor. They can permit more aggressive autonomous actions within their scope (e.g., allowing index rebuilds during business hours on their staging cluster), but cannot weaken the floor protections. This model scales better and gives teams autonomy proportional to their maturity, but requires clear documentation of what constitutes the floor versus an extension.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Model 3: Committee-Based Governance</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A cross-functional governance committee — typically including representatives from platform engineering, security, compliance, and database engineering — reviews and approves changes to the taxonomy and global policies on a defined cadence (monthly or quarterly). Day-to-day execution is delegated to the platform team. This model is appropriate for organizations where database systems are subject to regulatory or audit scrutiny, and is often mandated rather than chosen.</p>
+
+<p class="text-gray-300 leading-relaxed">Most organizations operating at scale use a hybrid of Model 1 and Model 2: a central policy floor enforced by the platform team, with a structured delegation mechanism that allows database teams to extend policies within defined bounds. This maps naturally to the scope hierarchy in the previous section.</p>
+
+<p class="text-gray-300 leading-relaxed">The organizational model must also define three roles with non-overlapping responsibilities:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy Author</strong> — Writes and version-controls governance policies. Has write access to the governance database's policy tables. Cannot approve their own policies.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy Approver</strong> — Reviews and activates policy changes. Is distinct from the Policy Author. In regulated environments, this is often a named individual accountable to the compliance function.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Audit Reviewer</strong> — Has read-only access to the audit log and chain verification tooling. Produces periodic attestations that autonomous system actions were within approved policy bounds. Cannot modify policies or approve actions.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Change Management Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous systems that operate without any connection to your organization's change management process are invisible to the change record — and an invisible change that causes an incident produces an investigation with a missing causal chain. Integrate autonomous action proposals with your change management system, even when the action is auto-approved.</p>
+
+<p class="text-gray-300 leading-relaxed">The integration does not mean every auto-approved action requires a manual change ticket. It means:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Every governance track of <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">async_approval</code> or higher creates a change record automatically, populated with the action context, estimated impact, and rollback procedure.</p>
+<p class="text-gray-300 leading-relaxed">2. Auto-approved actions with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">auto</code> governance track are batched into a daily digest change record that summarizes all autonomous actions taken, grouped by database and action type.</p>
+<p class="text-gray-300 leading-relaxed">3. Any action that results in an error or triggers a rollback creates an incident record automatically.</p>
+
+<p class="text-gray-300 leading-relaxed">This keeps the change calendar accurate without imposing human latency on routine autonomous operations:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># change_management_integration.py
+# Integrates governance queue events with an external ITSM system (ServiceNow, Jira Service Management, etc.)
+# via a generic webhook interface.
+
+import requests
+import json
+from dataclasses import dataclass
+from typing import Optional
+from datetime import datetime, timezone
+
+@dataclass
+class ChangeRecord:
+    external_id: Optional[str]
+    title: str
+    description: str
+    category: str          # 'standard', 'normal', 'emergency'
+    risk_level: str        # 'low', 'medium', 'high'
+    rollback_plan: str
+    scheduled_start: Optional[datetime]
+    scheduled_end: Optional[datetime]
+    auto_approved: bool
+    queue_id: str
+
+class ChangeManagementClient:
+    def __init__(self, webhook_url: str, api_token: str):
+        self.webhook_url = webhook_url
+        self.headers = {
+            'Authorization': f'Bearer {api_token}',
+            'Content-Type': 'application/json'
+        }
+
+    def create_change(self, record: ChangeRecord) -&gt; str:
+        """Returns the external change record ID."""
+        payload = {
+            'title': record.title,
+            'description': record.description,
+            'category': record.category,
+            'risk_level': record.risk_level,
+            'rollback_plan': record.rollback_plan,
+            'auto_approved': record.auto_approved,
+            'source_system': 'autonomous_dba_engine',
+            'source_reference': record.queue_id,
+            'scheduled_start': record.scheduled_start.isoformat()
+                               if record.scheduled_start else None,
+            'scheduled_end': record.scheduled_end.isoformat()
+                             if record.scheduled_end else None
+        }
+        response = requests.post(
+            self.webhook_url,
+            headers=self.headers,
+            data=json.dumps(payload, default=str),
+            timeout=10
+        )
+        response.raise_for_status()
+        return response.json().get('change_id', 'unknown')
+
+    def close_change(self, external_id: str, outcome: str, notes: str):
+        response = requests.patch(
+            f"{self.webhook_url}/{external_id}",
+            headers=self.headers,
+            data=json.dumps({'status': 'closed', 'outcome': outcome, 'notes': notes}),
+            timeout=10
+        )
+        response.raise_for_status()
+
+def classify_change_risk(action_type: str, governance_track: str) -&gt; tuple[str, str]:
+    """Returns (category, risk_level) for a change record."""
+    if governance_track == 'auto':
+        return ('standard', 'low')
+    if governance_track == 'async_approval':
+        return ('normal', 'medium')
+    if governance_track == 'sync_approval':
+        return ('normal', 'high')
+    if action_type in ('primary_failover', 'ag_failover'):
+        return ('emergency', 'high')
+    return ('normal', 'medium')</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The change management integration ensures that when an auditor asks "what changed in the orders database last Thursday between 02:00 and 03:00 UTC?", the answer is available in the ITSM system in the same format as any human-initiated change — not buried in application logs that only platform engineers know how to query.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Governance Health Metrics and Dashboards</h3>
+
+<p class="text-gray-300 leading-relaxed">Governance infrastructure is itself a system that can degrade. Policies can become stale. The approval queue can back up. Audit chain verification can silently fail. Treat the governance system as a first-class service with its own SLOs:</p>
+
+<p class="text-gray-300 leading-relaxed">| Metric | SLO Target | Alert Threshold |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Policy engine refresh latency | < 90 seconds from policy update to evaluation | > 5 minutes |</p>
+<p class="text-gray-300 leading-relaxed">| Approval queue depth (pending items) | < 20 items | > 50 items |</p>
+<p class="text-gray-300 leading-relaxed">| Audit chain integrity (% valid chains past 24h) | 100% | Any violation |</p>
+<p class="text-gray-300 leading-relaxed">| Auto-approval timeout rate | < 5% of async proposals | > 15% |</p>
+<p class="text-gray-300 leading-relaxed">| Action execution failure rate | < 2% | > 5% |</p>
+<p class="text-gray-300 leading-relaxed">| Time from proposal to execution (async track) | < 20 minutes median | > 45 minutes p95 |</p>
+
+<p class="text-gray-300 leading-relaxed">Expose these metrics through your observability stack. In PostgreSQL environments, expose them as a monitoring view that a Prometheus scraper or your existing monitoring agent can poll:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: governance health metrics view
+CREATE VIEW governance_health_metrics AS
+SELECT
+    -- Queue depth by status
+    COUNT(*) FILTER (WHERE status = 'pending')          AS queue_pending,
+    COUNT(*) FILTER (WHERE status = 'executing')        AS queue_executing,
+    COUNT(*) FILTER (WHERE status = 'timeout_approved'
+                        AND executed_at IS NULL)         AS timeout_awaiting_exec,
+
+    -- Failure rate over last hour
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE status = 'failed'
+                                   AND completed_at &gt; now() - INTERVAL '1 hour')
+        / NULLIF(COUNT(*) FILTER (WHERE completed_at &gt; now() - INTERVAL '1 hour'), 0),
+        2
+    )                                                    AS failure_rate_pct_1h,
+
+    -- Auto-approval timeout rate over last 24 hours
+    ROUND(
+        100.0 * COUNT(*) FILTER (WHERE decided_by = 'timeout'
+                                   AND decided_at &gt; now() - INTERVAL '24 hours')
+        / NULLIF(COUNT(*) FILTER (WHERE governance_track = 'async_approval'
+                                    AND proposed_at &gt; now() - INTERVAL '24 hours'), 0),
+        2
+    )                                                    AS timeout_approval_rate_pct_24h,
+
+    -- Median proposal-to-execution time (async track, last 24h, completed)
+    PERCENTILE_CONT(0.5) WITHIN GROUP (
+        ORDER BY EXTRACT(EPOCH FROM (executed_at - proposed_at))
+    ) FILTER (WHERE governance_track = 'async_approval'
+                AND executed_at IS NOT NULL
+                AND proposed_at &gt; now() - INTERVAL '24 hours') AS median_async_exec_seconds,
+
+    now()                                                AS metric_timestamp
+FROM governance_action_queue;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE VIEW dbo.GovernanceHealthMetrics AS
+SELECT
+    SUM(CASE WHEN Status = 'pending'   THEN 1 ELSE 0 END)  AS QueuePending,
+    SUM(CASE WHEN Status = 'executing' THEN 1 ELSE 0 END)  AS QueueExecuting,
+    SUM(CASE WHEN Status = 'timeout_approved'
+              AND ExecutedAt IS NULL   THEN 1 ELSE 0 END)  AS TimeoutAwaitingExec,
+
+    ROUND(
+        100.0 * SUM(CASE WHEN Status = 'failed'
+                          AND CompletedAt &gt; DATEADD(HOUR, -1, SYSUTCDATETIME())
+                          THEN 1 ELSE 0 END)
+        / NULLIF(SUM(CASE WHEN CompletedAt &gt; DATEADD(HOUR, -1, SYSUTCDATETIME())
+                           THEN 1 ELSE 0 END), 0),
+        2
+    )                                                       AS FailureRatePct1h,
+
+    ROUND(
+        100.0 * SUM(CASE WHEN DecidedBy = 'timeout'
+                          AND DecidedAt &gt; DATEADD(HOUR, -24, SYSUTCDATETIME())
+                          THEN 1 ELSE 0 END)
+        / NULLIF(SUM(CASE WHEN GovernanceTrack = 'async_approval'
+                           AND ProposedAt &gt; DATEADD(HOUR, -24, SYSUTCDATETIME())
+                           THEN 1 ELSE 0 END), 0),
+        2
+    )                                                       AS TimeoutApprovalRatePct24h,
+
+    SYSUTCDATETIME()                                        AS MetricTimestamp
+FROM dbo.GovernanceActionQueue;
+-- Note: SQL Server lacks a built-in PERCENTILE_CONT in views without windowing;
+-- median exec time is best computed in a stored procedure or reporting layer.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Alert on the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">timeout_approval_rate_pct_24h</code> metric with particular care. A rising timeout rate means engineers are not engaging with the approval queue — either notifications are broken, proposals are arriving too frequently to review, or approval fatigue has set in. The correct response is not to reduce the timeout window; it is to investigate why proposals are not being reviewed and fix the upstream signal.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Taxonomy before governance**: Every autonomous action must be formally classified by impact radius, reversibility, and urgency before any governance rule can be written around it. Unclassified actions are ungoverned actions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Separate the policy engine from the action executor**: Policies stored as structured data in a database — not as code — can be versioned, approved, audited, and changed by non-engineers. This separation is what makes governance durable across team turnover and organizational change.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Eliminate human latency from the critical path without eliminating human authority**: The timeout-approval model and the pre-execution veto window together give engineers continuous authority over the system without making the system's reliability dependent on engineer response time.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Immutability requires enforcement, not convention**: Audit logs protected only by application-level convention will eventually be tampered with, accidentally or deliberately. Hash-chain checksums combined with database-level permission denial create audit integrity that is verifiable and self-evidencing.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Governance health is a service SLO**: Policy staleness, approval queue depth, audit chain integrity, and timeout approval rates are operational metrics that require the same monitoring, alerting, and on-call response as the database systems the autonomous engine manages.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
