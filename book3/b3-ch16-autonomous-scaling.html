@@ -6,6 +6,10 @@
   <title>Chapter 16: Autonomous Scaling in Cloud Databases — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 16: Autonomous Scaling in Cloud Databases. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -436,6 +440,379 @@ def scale_postgres_replicas(
 <p class="text-gray-300 leading-relaxed">5. Issue the Kubernetes delete or cloud API decommission.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 2/3: Check active connections on draining replica
+-- Run on the replica being drained
+SELECT
+    pid,
+    usename,
+    application_name,
+    client_addr,
+    state,
+    wait_event_type,
+    wait_event,
+    ROUND(EXTRACT(EPOCH FROM (now() - state_change)), 1) AS seconds_in_state,
+    LEFT(query, 80) AS query_preview
+FROM pg_stat_activity
+WHERE pid &lt;&gt; pg_backend_pid()
+  AND state &lt;&gt; 'idle'
+ORDER BY seconds_in_state DESC;
+
+-- Force-disconnect idle connections after drain timeout
+SELECT pg_terminate_backend(pid)
+FROM pg_stat_activity
+WHERE pid &lt;&gt; pg_backend_pid()
+  AND state = 'idle'
+  AND application_name NOT IN ('pg_basebackup', 'walreceiver', 'replication');</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check active sessions on an AG secondary being drained
+-- Run on the secondary instance
+SELECT
+    s.session_id,
+    s.login_name,
+    s.host_name,
+    s.program_name,
+    s.status,
+    r.blocking_session_id,
+    r.wait_type,
+    r.wait_time / 1000.0 AS wait_seconds,
+    DATEDIFF(SECOND, s.last_request_start_time, GETDATE()) AS seconds_since_request,
+    LEFT(t.text, 80) AS query_preview
+FROM sys.dm_exec_sessions s
+LEFT JOIN sys.dm_exec_requests r ON s.session_id = r.session_id
+OUTER APPLY sys.dm_exec_sql_text(r.sql_handle) t
+WHERE s.is_user_process = 1
+  AND s.session_id &lt;&gt; @@SPID
+ORDER BY seconds_since_request DESC;
+
+-- Force-disconnect idle sessions after drain timeout
+-- Uses a cursor to terminate sessions one at a time with audit logging
+DECLARE @session_id INT;
+DECLARE @kill_cmd NVARCHAR(20);
+
+DECLARE drain_cursor CURSOR FOR
+    SELECT session_id
+    FROM sys.dm_exec_sessions
+    WHERE is_user_process = 1
+      AND session_id &lt;&gt; @@SPID
+      AND status = 'sleeping'
+      AND program_name NOT LIKE '%replication%'
+      AND program_name NOT LIKE '%hadr%';
+
+OPEN drain_cursor;
+FETCH NEXT FROM drain_cursor INTO @session_id;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SET @kill_cmd = N'KILL ' + CAST(@session_id AS NVARCHAR(10));
+    EXEC sp_executesql @kill_cmd;
+    FETCH NEXT FROM drain_cursor INTO @session_id;
+END;
+CLOSE drain_cursor;
+DEALLOCATE drain_cursor;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Beyond the drain sequence, the scale-down controller enforces a set of hard guardrails that cannot be overridden by the evaluation engine — only by a human operator with explicit override authorization:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Minimum replica floor.</strong> The cluster must retain at least two replicas at all times if the primary is a single-AZ deployment, or at least one replica if the primary is Multi-AZ. Scaling below the floor is blocked unconditionally.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Replication lag gate.</strong> If aggregate replica lag across the surviving replicas exceeds the defined SLA threshold at the time the scale-down is proposed, the action is deferred. Removing a replica while surviving replicas are already lagging compounds the problem.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Active backup exclusion.</strong> If a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_basebackup</code> or equivalent RDS snapshot is in progress against any instance in the cluster, scale-down is deferred until the backup completes. Terminating a replica mid-backup produces an incomplete backup that may be silently useless.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recent failover exclusion.</strong> If a primary failover occurred within the preceding 60 minutes, the scaling controller enters a mandatory observation window and takes no scale-down action. Failovers transiently inflate replica lag metrics and can make the cluster appear under-utilized when it is in fact recovering.</p>
+
+<p class="text-gray-300 leading-relaxed">These guardrails are implemented as precondition checks in the scaling decision function, evaluated before any decommissioning API call is issued:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Scale-down guardrail evaluator
+
+from dataclasses import dataclass
+from typing import List, Optional
+import time
+
+@dataclass
+class ClusterState:
+    replica_count: int
+    primary_is_multi_az: bool
+    max_replica_lag_seconds: float
+    lag_sla_seconds: float
+    backup_in_progress: bool
+    last_failover_epoch: Optional[float]
+    failover_observation_window_minutes: int = 60
+
+class ScaleDownGuardrails:
+
+    def evaluate(self, state: ClusterState) -&gt; tuple[bool, str]:
+        """
+        Returns (allowed: bool, reason: str).
+        Scale-down proceeds only if allowed is True.
+        """
+        min_replicas = 1 if state.primary_is_multi_az else 2
+        if state.replica_count &lt;= min_replicas:
+            return False, (
+                f"Replica count ({state.replica_count}) at or below minimum "
+                f"floor ({min_replicas}) for this topology."
+            )
+
+        if state.max_replica_lag_seconds &gt; state.lag_sla_seconds:
+            return False, (
+                f"Replica lag ({state.max_replica_lag_seconds:.1f}s) exceeds "
+                f"SLA ({state.lag_sla_seconds:.1f}s). Deferring scale-down."
+            )
+
+        if state.backup_in_progress:
+            return False, "Backup in progress. Scale-down deferred until completion."
+
+        if state.last_failover_epoch is not None:
+            elapsed_minutes = (time.time() - state.last_failover_epoch) / 60.0
+            if elapsed_minutes &lt; state.failover_observation_window_minutes:
+                remaining = state.failover_observation_window_minutes - elapsed_minutes
+                return False, (
+                    f"Recent failover detected ({elapsed_minutes:.1f} minutes ago). "
+                    f"Observation window active for {remaining:.1f} more minutes."
+                )
+
+        return True, "All guardrails passed. Scale-down approved."</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">evaluate</code> method returns a structured reason alongside the boolean decision so that every blocked scale-down is logged with full context. This audit trail becomes the primary diagnostic tool when the scaling system appears to be stuck — engineers can read the log and understand exactly which guardrail is holding the action.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Predictive Scaling: Demand Forecasting Ahead of Load Events</h3>
+
+<p class="text-gray-300 leading-relaxed">Reactive scaling — responding to observed degradation — introduces an unavoidable lag between demand onset and capacity availability. For predictable load patterns, predictive scaling closes this gap by provisioning capacity before demand materializes. The most common patterns amenable to prediction are: daily business-hour load cycles, weekly batch processing windows, end-of-month reporting runs, and marketing campaign spikes with known start times.</p>
+
+<p class="text-gray-300 leading-relaxed">The predictive layer uses a lightweight Prophet model trained on the historical composite signal from the Prometheus time series. Prophet handles weekly and daily seasonality natively and tolerates missing data, making it practical for production environments where the signal pipeline occasionally has gaps.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Predictive scaling using Facebook Prophet
+# Trains on rolling 30-day history from Prometheus and generates 4-hour lookahead
+
+import pandas as pd
+from prophet import Prophet
+from prometheus_api_client import PrometheusConnect
+import logging
+from datetime import datetime, timedelta
+
+logger = logging.getLogger("predictive_scaler")
+
+PROMETHEUS_URL = "http://prometheus.monitoring.svc.cluster.local:9090"
+LOOKAHEAD_HOURS = 4
+SCALE_UP_THRESHOLD = 0.75  # predicted composite score that triggers preemptive scale
+TRAINING_DAYS = 30
+
+def fetch_composite_signal(prom: PrometheusConnect) -&gt; pd.DataFrame:
+    end = datetime.utcnow()
+    start = end - timedelta(days=TRAINING_DAYS)
+
+    result = prom.get_metric_range_data(
+        metric_name='db_composite_load_score',
+        start_time=start,
+        end_time=end,
+        chunk_size=timedelta(hours=6)
+    )
+
+    if not result:
+        raise ValueError("No data returned from Prometheus for composite load score.")
+
+    records = []
+    for series in result:
+        for ts, val in series['values']:
+            records.append({'ds': pd.to_datetime(ts, unit='s', utc=True), 'y': float(val)})
+
+    df = pd.DataFrame(records).sort_values('ds').drop_duplicates('ds')
+    df['ds'] = df['ds'].dt.tz_localize(None)  # Prophet requires tz-naive timestamps
+    return df
+
+def generate_scaling_forecast(df: pd.DataFrame) -&gt; pd.DataFrame:
+    model = Prophet(
+        changepoint_prior_scale=0.05,   # conservative — avoid overfitting spikes
+        seasonality_mode='multiplicative',
+        daily_seasonality=True,
+        weekly_seasonality=True,
+        yearly_seasonality=False        # 30 days insufficient for annual patterns
+    )
+    model.fit(df)
+
+    future = model.make_future_dataframe(
+        periods=LOOKAHEAD_HOURS * 4,  # 15-minute granularity
+        freq='15min',
+        include_history=False
+    )
+    forecast = model.predict(future)
+    return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']]
+
+def evaluate_predictive_intent(forecast: pd.DataFrame) -&gt; dict:
+    upcoming_peak = forecast['yhat'].max()
+    peak_time = forecast.loc[forecast['yhat'].idxmax(), 'ds']
+    minutes_until_peak = (peak_time - datetime.utcnow()).total_seconds() / 60.0
+
+    if upcoming_peak &gt;= SCALE_UP_THRESHOLD and minutes_until_peak &gt; 0:
+        logger.warning(
+            f"Predictive scale-up intent: peak score {upcoming_peak:.3f} "
+            f"predicted at {peak_time} ({minutes_until_peak:.0f} minutes from now)"
+        )
+        return {
+            "action": "preemptive_scale_up",
+            "predicted_peak": upcoming_peak,
+            "peak_time": str(peak_time),
+            "minutes_until_peak": round(minutes_until_peak, 1)
+        }
+
+    return {"action": "none", "predicted_peak": upcoming_peak}
+
+if __name__ == "__main__":
+    prom = PrometheusConnect(url=PROMETHEUS_URL, disable_ssl=True)
+    df = fetch_composite_signal(prom)
+    forecast = generate_scaling_forecast(df)
+    intent = evaluate_predictive_intent(forecast)
+    logger.info(f"Predictive scaling evaluation complete: {intent}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The predictive controller runs on a 15-minute cron schedule, separate from the reactive controller. Its outputs are intents — structured JSON records written to a shared intent queue — not direct API calls. The execution controller consumes intents from both reactive and predictive paths, applies deduplication (so a predictive scale-up and a reactive scale-up targeting the same resource within the same cooldown window result in a single operation), and issues the actual cloud API call.</p>
+
+<p class="text-gray-300 leading-relaxed">This separation of intent generation from execution is architecturally important. It allows the predictive and reactive paths to be tuned, disabled, and audited independently. A runaway predictive model (one that has drifted from reality after a business pattern change) can be disabled without affecting reactive scaling behavior.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Cost Guardrails: Preventing Runaway Scaling Expenditure</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous scaling that operates without cost visibility is a liability. A misconfigured threshold or a model that drifts after an unusual traffic event can scale an instance to the maximum available SKU and hold it there through the cooldown period, generating significant unplanned expenditure. Cost guardrails are the final layer of the autonomous scaling architecture.</p>
+
+<p class="text-gray-300 leading-relaxed">The cost guardrail system maintains a per-resource monthly budget cap expressed in cloud provider currency units, a rolling expenditure estimate updated from cloud billing APIs, and a maximum SKU ceiling that the scaler is permitted to target regardless of the scaling intent's recommendation.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Cost guardrail enforcer for the autonomous scaling controller
+
+from dataclasses import dataclass
+from typing import Dict
+import logging
+
+logger = logging.getLogger("cost_guardrail")
+
+# SKU cost map — populated from cloud provider price list API at startup
+# Values are approximate hourly costs in USD; replace with live API data
+SKU_HOURLY_COST_USD: Dict[str, float] = {
+    # AWS RDS PostgreSQL (example tier names)
+    "db.t3.medium":   0.068,
+    "db.r6g.large":   0.240,
+    "db.r6g.xlarge":  0.480,
+    "db.r6g.2xlarge": 0.960,
+    "db.r6g.4xlarge": 1.920,
+    # Azure PostgreSQL Flexible Server (example SKU names)
+    "Standard_D2ds_v4":  0.181,
+    "Standard_D4ds_v4":  0.362,
+    "Standard_D8ds_v4":  0.724,
+    "Standard_D16ds_v4": 1.448,
+}
+
+@dataclass
+class ResourceBudget:
+    resource_id: str
+    monthly_budget_usd: float
+    current_month_spend_usd: float
+    max_sku_ceiling: str           # controller may never exceed this SKU
+
+class CostGuardrailEnforcer:
+
+    def __init__(self, budgets: Dict[str, ResourceBudget]):
+        self.budgets = budgets
+
+    def _hours_remaining_in_month(self) -&gt; float:
+        from datetime import datetime, timezone
+        import calendar
+        now = datetime.now(timezone.utc)
+        days_in_month = calendar.monthrange(now.year, now.month)[1]
+        end_of_month = datetime(now.year, now.month, days_in_month, 23, 59, 59,
+                                tzinfo=timezone.utc)
+        return (end_of_month - now).total_seconds() / 3600.0
+
+    def approve_scaling_intent(
+        self,
+        resource_id: str,
+        current_sku: str,
+        target_sku: str
+    ) -&gt; tuple[bool, str]:
+
+        budget = self.budgets.get(resource_id)
+        if budget is None:
+            # No budget defined — allow scaling but log warning
+            logger.warning(f"No budget configured for {resource_id}. Allowing scaling.")
+            return True, "No budget constraint configured."
+
+        # SKU ceiling check
+        current_cost = SKU_HOURLY_COST_USD.get(current_sku, 0.0)
+        target_cost = SKU_HOURLY_COST_USD.get(target_sku, 0.0)
+        ceiling_cost = SKU_HOURLY_COST_USD.get(budget.max_sku_ceiling, float('inf'))
+
+        if target_cost &gt; ceiling_cost:
+            return False, (
+                f"Target SKU {target_sku} (${target_cost:.3f}/hr) exceeds "
+                f"configured ceiling {budget.max_sku_ceiling} "
+                f"(${ceiling_cost:.3f}/hr) for {resource_id}."
+            )
+
+        # Projected spend check
+        hours_remaining = self._hours_remaining_in_month()
+        incremental_hourly = target_cost - current_cost
+        projected_additional_spend = incremental_hourly * hours_remaining
+        projected_total = budget.current_month_spend_usd + projected_additional_spend
+
+        if projected_total &gt; budget.monthly_budget_usd:
+            return False, (
+                f"Projected month-end spend ${projected_total:.2f} would exceed "
+                f"budget ${budget.monthly_budget_usd:.2f} for {resource_id}. "
+                f"Scaling from {current_sku} to {target_sku} blocked."
+            )
+
+        return True, (
+            f"Cost guardrail approved. Projected month-end spend: "
+            f"${projected_total:.2f} of ${budget.monthly_budget_usd:.2f} budget."
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When a scaling intent is blocked by the cost guardrail, the controller raises a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COST_GUARDRAIL_BLOCKED</code> alert to the on-call channel. This alert carries the full context: resource ID, blocked target SKU, projected overspend amount, and remaining budget. The human operator can choose to approve a one-time budget override, raise the monthly cap, or accept the degraded performance. The system does not silently absorb blocked scale-up events — each one is surfaced as an operational signal requiring a human judgment call on the cost-performance trade-off.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">End-to-End Autonomous Scaling Workflow</h3>
+
+<p class="text-gray-300 leading-relaxed">Bringing together all the components described in this chapter, the end-to-end autonomous scaling workflow operates as a continuous loop with clearly separated phases:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 1 — Observe (15-second cadence):</strong> The metric collector queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_activity</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code>, and related views (or DMVs for SQL Server) and pushes results to Prometheus. The composite load score is computed and stored as a time series.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 2 — Evaluate (5-minute windows):</strong> The reactive evaluator computes the sliding-window composite score. If the score exceeds the scale-up threshold for three consecutive windows, a reactive scale-up intent is generated. If the score is below the scale-down threshold for six consecutive windows and all guardrails pass, a scale-down intent is generated.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 3 — Predict (15-minute cadence):</strong> The Prophet-based predictive evaluator loads 30 days of composite score history, generates a 4-hour forecast, and produces a predictive scale-up intent if the forecast predicts a peak above threshold within the lookahead window.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 4 — Gate (per intent):</strong> Each intent — reactive or predictive — passes through the guardrail stack: cooldown check, topology floor check, replication lag gate, backup exclusion, recent failover exclusion, and cost guardrail. Any failed gate defers the intent and generates an audit log entry.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 5 — Execute (per approved intent):</strong> The execution controller calls the appropriate cloud API (RDS <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">modify_db_instance</code>, Azure REST PATCH, Kubernetes CRD patch) and records the scale event with full metadata to the audit log.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Phase 6 — Verify (5-minute post-scale window):</strong> After execution, the controller enters a heightened monitoring mode, sampling at 30-second intervals. If the composite score does not improve within 10 minutes of a scale-up completing, a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SCALING_INEFFECTIVE</code> alert is raised, prompting investigation of non-resource bottlenecks (lock contention, schema design, query plan regression) that scaling alone cannot resolve.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Phase 1: Observe<br/>15s cadence] --> B[Phase 2: Evaluate<br/>5-min sliding windows]
+    C[Phase 3: Predict<br/>Prophet, 15-min cadence] --> D[Shared Intent Queue]
+    B --> D
+    D --> E[Phase 4: Gate<br/>cooldown, floor, lag,<br/>backup, failover, cost]
+    E -->|approved| F[Phase 5: Execute<br/>cloud API / CRD patch]
+    E -->|blocked| G[Deferred + Audit Log]
+    F --> H[Phase 6: Verify<br/>30s sampling, 10-min window]
+    H -->|no improvement| I[SCALING_INEFFECTIVE alert]
+    H -->|improved| A</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The six-phase autonomous scaling loop: reactive and predictive evaluators both feed a shared intent queue, every intent passes through the guardrail gate before execution, and post-scale verification closes the loop.*</p>
+
+<p class="text-gray-300 leading-relaxed">This six-phase loop runs continuously in production. The phases are independent processes connected through the shared intent queue and Prometheus metric store, so any individual phase can be paused, reconfigured, or replaced without affecting the others.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Autonomous scaling requires composite signal pipelines — weighted combinations of query latency percentiles, buffer hit ratios, replication lag, and connection depth — rather than single-metric triggers like raw CPU percentage, which produce thrashing and false positive scale events.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Vertical and horizontal scaling require platform-specific execution paths: AWS RDS Multi-AZ, Azure Flexible Server PATCH APIs, and Kubernetes CRD patches each carry distinct availability semantics that a platform-agnostic abstraction layer will obscure to the point of causing outages.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Scale-down is categorically more dangerous than scale-up; a disciplined drain-before-terminate sequence combined with hard guardrails — replica floor, replication lag gate, active backup exclusion, and post-failover observation window — must be enforced unconditionally and cannot be overridden by the automated evaluation engine without a human approval path.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Separating intent generation from execution — with reactive and predictive controllers both writing to a shared intent queue consumed by a single execution controller — allows each path to be tuned, disabled, and audited independently, preventing a drifted forecasting model from affecting reactive scaling behavior and vice versa.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cost guardrails are a structural requirement, not an optional add-on: every blocked scaling intent must surface as an explicit operational alert with projected overspend context, forcing a human judgment call on the cost-performance trade-off rather than allowing the system to either silently overspend or silently degrade under load.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
