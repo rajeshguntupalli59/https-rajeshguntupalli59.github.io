@@ -6,6 +6,10 @@
   <title>Chapter 34: Observability for Autonomous Databases — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 34: Observability for Autonomous Databases. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -79,7 +83,7 @@ SELECT
 FROM pg_stat_activity blocked
 JOIN pg_stat_activity blocking
     ON blocking.pid = ANY(pg_blocking_pids(blocked.pid))
-WHERE blocked.cardinality(pg_blocking_pids(blocked.pid)) &gt; 0;
+WHERE cardinality(pg_blocking_pids(blocked.pid)) &gt; 0;
 
 -- Trend signal: connection saturation rate over sliding 5-minute window
 CREATE OR REPLACE VIEW autonomous.connection_trend AS
@@ -145,6 +149,18 @@ WHERE is_user_process = 1;</code></pre>
 <p class="text-gray-300 leading-relaxed">Raw signals in database views are the beginning of the observability pipeline, not the end. The autonomous decision engine needs a structured telemetry pipeline that ingests signals, normalizes them, stores them for trend analysis, and exposes them to the reasoning layer. Building this pipeline requires deliberate architectural choices about collection frequency, storage granularity, and the interface between the telemetry store and the decision engine.</p>
 
 <p class="text-gray-300 leading-relaxed">The reference architecture used in production autonomous PostgreSQL deployments pairs a collector agent — typically a custom Python exporter or Prometheus postgres_exporter — with a time-series backend (Prometheus, TimescaleDB, or InfluxDB) and a rule engine that subscribes to derived metrics. For SQL Server on Azure, Azure Monitor with custom metrics and Log Analytics workspaces serve the same function, though with higher latency that must be accounted for in decision logic.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    DB[(Database: pg_stat_activity / DMVs)] --> COL[Telemetry Collector]
+    COL --> CLS{Classify: state / trend / causal}
+    CLS --> AD[Contextual Anomaly Detector]
+    AD --> DE[Decision Engine]
+    DE --> ACT[Action Executor]
+    ACT --> DB
+    ACT --> LOG[(Action Audit Log)]
+    LOG -->|weekly retrospective| DE</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Signals flow from the database through classification and anomaly detection before reaching the decision engine; every resulting action writes back to both the database and the audit log, which itself feeds the next round of calibration.*</p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Autonomous telemetry collector — PostgreSQL
 # Runs as a sidecar or Kubernetes CronJob every 15 seconds
@@ -416,6 +432,331 @@ ORDER BY pct_regression DESC;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Prometheus with remote_write to TimescaleDB is the standard architecture for autonomous PostgreSQL deployments at scale. Prometheus scrapes postgres_exporter every 15 seconds and handles the collection and alerting layer. TimescaleDB stores the long-term history with hypertable compression and continuous aggregates that pre-compute the trend metrics the decision engine needs. The alerting layer — Prometheus Alertmanager — serves a different purpose here than in human-operated systems: rather than notifying on-call engineers, it fires webhooks directly to the autonomous decision engine's action API.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># prometheus/rules/autonomous_db.yml
+# These rules feed the autonomous decision engine, not human pagers
+groups:
+  - name: autonomous_postgres
+    interval: 15s
+    rules:
+      # Trend rule: replication lag increasing monotonically
+      - alert: ReplicationLagIncreasing
+        expr: |
+          deriv(pg_replication_lag_bytes[5m]) &gt; 0
+          AND pg_replication_lag_bytes &gt; 10000000
+        for: 3m
+        labels:
+          severity: warning
+          action_target: decision_engine
+        annotations:
+          summary: "Replication lag trending upward on {{ $labels.instance }}"
+          replica: "{{ $labels.application_name }}"
+          current_lag_bytes: "{{ $value }}"
+          signal_class: trend
+
+      # State rule: connection saturation
+      - alert: ConnectionPoolNearCapacity
+        expr: |
+          (pg_stat_activity_count / pg_settings_max_connections) * 100 &gt; 85
+        for: 1m
+        labels:
+          severity: critical
+          action_target: decision_engine
+        annotations:
+          summary: "Connection pool above 85% on {{ $labels.instance }}"
+          signal_class: state
+
+      # Causal rule: idle-in-transaction accumulation rate
+      - alert: IdleInTransactionAccumulating
+        expr: |
+          increase(pg_stat_activity_idle_in_transaction_count[5m]) &gt; 5
+        for: 2m
+        labels:
+          severity: warning
+          action_target: decision_engine
+        annotations:
+          summary: "Idle-in-transaction sessions accumulating on {{ $labels.instance }}"
+          signal_class: causal
+
+      # Trend rule: autovacuum falling behind dead tuple accumulation
+      - alert: AutovacuumFallingBehind
+        expr: |
+          pg_stat_user_tables_n_dead_tup
+          / NULLIF(pg_stat_user_tables_n_live_tup, 0) &gt; 0.2
+          AND pg_stat_user_tables_n_live_tup &gt; 100000
+        for: 10m
+        labels:
+          severity: warning
+          action_target: decision_engine
+        annotations:
+          summary: "Dead tuple ratio above 20% on {{ $labels.instance }}.{{ $labels.relname }}"
+          signal_class: trend</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For TimescaleDB, the continuous aggregate layer is what makes sub-second trend queries feasible. Rather than scanning millions of raw data points, the decision engine reads pre-aggregated five-minute windows:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- TimescaleDB: continuous aggregate for trend queries
+-- Decision engine reads this table rather than raw metrics
+
+CREATE MATERIALIZED VIEW autonomous.metrics_5min
+WITH (timescaledb.continuous) AS
+SELECT
+    time_bucket('5 minutes', ts)   AS bucket,
+    instance_id,
+    signal_name,
+    AVG(value)                     AS avg_value,
+    MAX(value)                     AS max_value,
+    MIN(value)                     AS min_value,
+    PERCENTILE_CONT(0.95)
+        WITHIN GROUP (ORDER BY value) AS p95_value,
+    COUNT(*)                       AS sample_count
+FROM autonomous.signal_store
+GROUP BY bucket, instance_id, signal_name
+WITH NO DATA;
+
+-- Refresh policy: keep the aggregate current within one bucket period
+SELECT add_continuous_aggregate_policy('autonomous.metrics_5min',
+    start_offset =&gt; INTERVAL '2 hours',
+    end_offset   =&gt; INTERVAL '5 minutes',
+    schedule_interval =&gt; INTERVAL '5 minutes');
+
+-- Compression policy: compress data older than 7 days
+SELECT add_compression_policy('autonomous.signal_store',
+    INTERVAL '7 days');
+
+-- Trend query example — is this signal in a sustained upward trend?
+-- Decision engine calls this function before committing to a scale-out action
+CREATE OR REPLACE FUNCTION autonomous.is_trending_up(
+    p_instance_id TEXT,
+    p_signal_name TEXT,
+    p_window_minutes INT DEFAULT 20,
+    p_min_slope      FLOAT DEFAULT 0.1
+)
+RETURNS TABLE(trending BOOL, slope FLOAT, r_squared FLOAT, sample_count INT)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    RETURN QUERY
+    WITH series AS (
+        SELECT
+            EXTRACT(EPOCH FROM bucket)::FLOAT AS t,
+            avg_value AS v
+        FROM autonomous.metrics_5min
+        WHERE instance_id = p_instance_id
+          AND signal_name  = p_signal_name
+          AND bucket &gt; now() - (p_window_minutes || ' minutes')::INTERVAL
+        ORDER BY bucket
+    ),
+    regression AS (
+        SELECT
+            COUNT(*)::INT                                       AS n,
+            REGR_SLOPE(v, t)                                    AS slope,
+            REGR_R2(v, t)                                       AS r2
+        FROM series
+    )
+    SELECT
+        (r.slope &gt; p_min_slope AND r.r2 &gt; 0.6)::BOOL  AS trending,
+        ROUND(r.slope::NUMERIC, 6)::FLOAT              AS slope,
+        ROUND(r.r2::NUMERIC, 4)::FLOAT                 AS r_squared,
+        r.n                                            AS sample_count
+    FROM regression r;
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">is_trending_up</code> function illustrates the architectural principle: the decision engine must not re-implement statistical reasoning inline every time it needs to answer a trend question. That logic lives in the observability layer and is callable as a function. The decision engine calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous.is_trending_up('prod-pg-01', 'replication_lag_bytes')</code> and receives a boolean with supporting evidence. This keeps the decision engine's logic clean and testable.</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server environments, the equivalent architecture uses Azure Monitor Metrics with a custom metrics namespace, supplemented by a local TimescaleDB or InfluxDB instance for low-latency trend queries that cannot tolerate the latency of a remote Azure Monitor API call in the middle of a decision loop. The DMV polling agent writes to both stores: Azure Monitor for durable long-term history and compliance, and TimescaleDB for the sub-second trend queries the autonomous engine needs.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Anomaly Detection: Teaching the System to Recognize Its Own Normal</h3>
+
+<p class="text-gray-300 leading-relaxed">Threshold-based alerting is insufficient for autonomous systems for a fundamental reason: it cannot distinguish between a metric value that is genuinely anomalous and one that is expected given current context. A connection count of 950 out of 1000 is an emergency at 02:00 on a Tuesday but may be normal during a scheduled end-of-month batch run. An autonomous system that pages itself every month-end will either stop acting on that alert or will thrash through unnecessary remediation steps.</p>
+
+<p class="text-gray-300 leading-relaxed">The solution is contextual anomaly detection — building a model of what normal looks like for each signal conditioned on time of day, day of week, and covarying signals (like active batch jobs or deployment flags). The simplest production-viable approach is a seasonal decomposition model per signal per instance, updated incrementally as new data arrives.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Seasonal anomaly detection for autonomous database observability
+# Uses additive decomposition: observed = trend + seasonal + residual
+# Residual z-score triggers anomaly classification
+
+import numpy as np
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class AnomalyResult:
+    signal_name: str
+    instance_id: str
+    observed_value: float
+    expected_value: float
+    residual_z_score: float
+    is_anomaly: bool
+    anomaly_direction: Optional[str]   # 'high' | 'low' | None
+    context_window: str                # e.g. 'weekday_morning_peak'
+
+
+class SeasonalAnomalyDetector:
+    """
+    Lightweight seasonal anomaly detector suitable for embedding
+    in the observability pipeline. Maintains per-signal, per-context-window
+    running statistics (mean + variance) updated with Welford's online algorithm.
+    No external ML library dependency.
+    """
+
+    def __init__(self, z_threshold: float = 3.0):
+        self.z_threshold = z_threshold
+        # Keyed by (instance_id, signal_name, context_window)
+        # Value: {'n': int, 'mean': float, 'M2': float}
+        self._stats: dict[tuple, dict] = {}
+
+    @staticmethod
+    def _context_window(ts_hour: int, ts_weekday: int) -&gt; str:
+        """Map timestamp to a context window label."""
+        if ts_weekday &gt;= 5:
+            period = "weekend"
+        elif 7 &lt;= ts_hour &lt; 10:
+            period = "morning_peak"
+        elif 10 &lt;= ts_hour &lt; 18:
+            period = "business_hours"
+        elif 18 &lt;= ts_hour &lt; 22:
+            period = "evening"
+        else:
+            period = "overnight"
+        day_type = "weekend" if ts_weekday &gt;= 5 else "weekday"
+        return f"{day_type}_{period}"
+
+    def _update(self, key: tuple, value: float):
+        """Welford's online algorithm for running mean and variance."""
+        if key not in self._stats:
+            self._stats[key] = {'n': 0, 'mean': 0.0, 'M2': 0.0}
+        s = self._stats[key]
+        s['n'] += 1
+        delta = value - s['mean']
+        s['mean'] += delta / s['n']
+        delta2 = value - s['mean']
+        s['M2'] += delta * delta2
+
+    def _z_score(self, key: tuple, value: float) -&gt; tuple[float, float]:
+        """Returns (z_score, expected_value). Returns (0, value) if insufficient data."""
+        s = self._stats.get(key)
+        if s is None or s['n'] &lt; 30:   # need at least 30 samples per context window
+            return 0.0, value
+        variance = s['M2'] / (s['n'] - 1)
+        stddev = np.sqrt(variance) if variance &gt; 0 else 1e-9
+        z = (value - s['mean']) / stddev
+        return float(z), float(s['mean'])
+
+    def observe(
+        self,
+        instance_id: str,
+        signal_name: str,
+        value: float,
+        ts_hour: int,
+        ts_weekday: int
+    ) -&gt; AnomalyResult:
+        window = self._context_window(ts_hour, ts_weekday)
+        key = (instance_id, signal_name, window)
+
+        z, expected = self._z_score(key, value)
+        self._update(key, value)
+
+        is_anomaly = abs(z) &gt; self.z_threshold
+        direction = None
+        if is_anomaly:
+            direction = "high" if z &gt; 0 else "low"
+
+        return AnomalyResult(
+            signal_name=signal_name,
+            instance_id=instance_id,
+            observed_value=value,
+            expected_value=round(expected, 4),
+            residual_z_score=round(z, 3),
+            is_anomaly=is_anomaly,
+            anomaly_direction=direction,
+            context_window=window
+        )
+
+    def load_state(self, state: dict):
+        """Restore detector state from persistent store (e.g. Redis or pickle)."""
+        self._stats = {tuple(k.split('|')): v for k, v in state.items()}
+
+    def dump_state(self) -&gt; dict:
+        """Serialize state for persistence across collector restarts."""
+        return {'|'.join(k): v for k, v in self._stats.items()}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The detector is stateful: it accumulates running statistics per context window and must survive collector restarts without losing its learned baselines. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dump_state</code> / <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">load_state</code> pattern serializes to Redis or a local file, with the decision engine periodically snapshotting the detector state to the autonomous metadata store.</p>
+
+<p class="text-gray-300 leading-relaxed">A signal that crosses a static threshold but is not anomalous in its context window is downgraded from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">critical</code> to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">informational</code> in the signal packet before it reaches the decision engine. Conversely, a signal that has not crossed any static threshold but has a z-score above 3.0 within its context window is elevated to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">warning</code> regardless of absolute value. This means the decision engine acts more on deviation from expected behavior than on absolute thresholds — which is precisely the right behavior for a system managing databases with widely varying load profiles.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Observability for Autonomous Actions: Closing the Loop</h3>
+
+<p class="text-gray-300 leading-relaxed">The most commonly overlooked dimension of autonomous database observability is observing the autonomous system itself. Every action the system takes — terminating a session, adjusting autovacuum cost settings, promoting a replica, bouncing a connection pool — must be recorded with enough context to answer the forensic questions that will inevitably be asked: What triggered that action? What signals did the system see? What was the state before and after? Was the action effective?</p>
+
+<p class="text-gray-300 leading-relaxed">This action audit log is not optional. Without it, the autonomous system is a black box that operators cannot trust or improve. Every action taken by the decision engine must be written to a structured audit store before the action is executed.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: autonomous action audit store
+CREATE TABLE IF NOT EXISTS autonomous.action_log (
+    action_id        BIGSERIAL PRIMARY KEY,
+    executed_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    instance_id      TEXT NOT NULL,
+    action_type      TEXT NOT NULL,   -- 'terminate_session'|'adjust_autovacuum'|'promote_replica'|...
+    action_params    JSONB NOT NULL,  -- full parameters passed to the action executor
+    trigger_signals  JSONB NOT NULL,  -- the signal packet(s) that caused this action
+    pre_state        JSONB,           -- captured system state immediately before action
+    post_state       JSONB,           -- captured system state 60s after action
+    outcome          TEXT,            -- 'success'|'failed'|'no_effect'|'pending'
+    outcome_detail   TEXT,
+    confidence_score FLOAT,           -- decision engine confidence at time of action (0-1)
+    operator_review  TEXT,            -- 'approved'|'overridden'|'pending' — for human-in-loop modes
+    rollback_sql     TEXT             -- SQL to reverse the action, if applicable
+);
+
+CREATE INDEX ON autonomous.action_log (instance_id, executed_at DESC);
+CREATE INDEX ON autonomous.action_log (action_type, executed_at DESC);
+CREATE INDEX ON autonomous.action_log USING GIN (trigger_signals);
+CREATE INDEX ON autonomous.action_log USING GIN (action_params);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: autonomous action audit store
+CREATE TABLE autonomous.action_log (
+    action_id        BIGINT IDENTITY(1,1) PRIMARY KEY,
+    executed_at      DATETIMEOFFSET NOT NULL DEFAULT SYSDATETIMEOFFSET(),
+    instance_id      NVARCHAR(128)  NOT NULL,
+    action_type      NVARCHAR(64)   NOT NULL,
+    action_params    NVARCHAR(MAX)  NOT NULL,   -- JSON
+    trigger_signals  NVARCHAR(MAX)  NOT NULL,   -- JSON
+    pre_state        NVARCHAR(MAX),             -- JSON
+    post_state       NVARCHAR(MAX),             -- JSON
+    outcome          NVARCHAR(32),
+    outcome_detail   NVARCHAR(MAX),
+    confidence_score FLOAT,
+    operator_review  NVARCHAR(32),
+    rollback_sql     NVARCHAR(MAX)
+);
+
+CREATE INDEX IX_action_log_instance_time
+    ON autonomous.action_log (instance_id, executed_at DESC);
+CREATE INDEX IX_action_log_type_time
+    ON autonomous.action_log (action_type, executed_at DESC);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">post_state</code> column is populated by a deferred job — typically 60 seconds after the action — that re-runs the same state queries used to populate <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pre_state</code> and records whether the condition that triggered the action has resolved. This before-and-after comparison is the feedback signal that the decision engine uses to evaluate its own effectiveness over time. If a particular action type consistently produces <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">outcome = 'no_effect'</code> for a particular signal pattern, the decision engine's rule weights for that combination are downgraded.</p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rollback_sql</code> column deserves emphasis. For every action that modifies database configuration or session state, the decision engine must generate and store the SQL to reverse that action at the time of execution. This is not primarily for automated rollback — though that is supported — but for operator trust. An engineer investigating an incident must be able to look at the action log, see exactly what the autonomous system did, understand why, and if necessary undo it with a single SQL statement. Autonomous systems that cannot be cleanly overridden by operators will not remain in production.</p>
+
+<p class="text-gray-300 leading-relaxed">The action log is also the training data set for improving the decision engine. Periodically — typically weekly — the autonomous system runs a retrospective analysis comparing trigger signals, actions taken, and outcomes. Signal patterns that consistently preceded successful outcomes reinforce the corresponding decision rules. Patterns that preceded <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">no_effect</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">failed</code> outcomes trigger a review flag in the operator dashboard. Over months of operation, this retrospective loop produces a decision engine that is observably better calibrated to the specific workload patterns of the database it manages.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous observability requires three structurally distinct signal classes** — state, trend, and causal — because a decision engine acting on state signals alone will be consistently reactive and late, while trend and causal signals enable preemptive, targeted action before conditions become critical.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The telemetry pipeline must guarantee signal freshness within two polling cycles** and handle backpressure by buffering locally rather than dropping signals; data loss during an incident is precisely when the autonomous decision engine is most dependent on a complete and continuous signal stream.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Query fingerprinting paired with stored baselines enables regression detection** that survives parameter changes, plan changes, and schema evolution — connecting current query performance anomalies to historical remediation outcomes so the decision engine can recognize recurrent patterns and apply proven fixes rather than re-deriving solutions from scratch.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Contextual anomaly detection using per-signal, per-context-window running statistics** separates genuinely anomalous behavior from expected load variations, preventing the decision engine from acting on high absolute values that are normal given the time of day or concurrent batch activity, and ensuring it does respond to subtle deviations that fall below static thresholds but are statistically significant within their context.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Every autonomous action must be written to a structured audit log with pre-state, post-state, trigger signals, confidence score, and rollback SQL** before execution; this log is simultaneously the trust mechanism for operators, the safety net for overrides, and the training dataset that closes the feedback loop enabling the decision engine to improve its calibration over time.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
