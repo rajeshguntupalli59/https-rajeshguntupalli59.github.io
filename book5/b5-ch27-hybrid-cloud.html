@@ -6,6 +6,10 @@
   <title>Chapter 27: Hybrid Cloud: On-Premises and Cloud Together — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 27: Hybrid Cloud: On-Premises and Cloud Together. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -446,6 +450,549 @@ connection = connect_to_rds_from_onpremises(
 
 <p class="text-gray-300 leading-relaxed">The IAM user's policy for this access:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["rds-db:connect"],
+      "Resource": [
+        "arn:aws:rds-db:us-east-1:123456789012:dbuser:db-ABC123/app_iam_user"]
+    }
+  ]
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Note the resource ARN format: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds-db</code> (not <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds</code>), followed by the db-resource-id (available from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws rds describe-db-instances</code>, look for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DbiResourceId</code>), and the specific database user name. The database user must exist in PostgreSQL and must have the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_iam</code> role granted:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On the RDS PostgreSQL instance, create the IAM-authenticated user
+CREATE USER app_iam_user WITH LOGIN;
+GRANT rds_iam TO app_iam_user;
+
+-- Grant this user the permissions it needs
+GRANT CONNECT ON DATABASE production TO app_iam_user;
+GRANT USAGE ON SCHEMA public TO app_iam_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_iam_user;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_iam_user;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Active Directory Integration for SQL Server Hybrid</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server shops, Active Directory integration is typically the correct identity bridge. On-premises SQL Server already authenticates Windows accounts via Kerberos. Azure SQL Managed Instance supports Azure AD-joined authentication, and Azure AD Connect can synchronize your on-premises AD with Azure AD, giving you a unified identity surface.</p>
+
+<p class="text-gray-300 leading-relaxed">For plain Azure SQL Database (not Managed Instance), you use Azure AD authentication with on-premises AD synchronized through Azure AD Connect. The SQL Server client on-premises connects using an Azure AD token rather than a SQL login.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- On Azure SQL Database: create a contained database user from Azure AD
+-- (Run as Azure AD admin)
+CREATE USER [corp\svc_appaccount] FROM EXTERNAL PROVIDER;
+ALTER ROLE db_datareader ADD MEMBER [corp\svc_appaccount];
+ALTER ROLE db_datawriter ADD MEMBER [corp\svc_appaccount];
+
+-- On-premises SQL Server: check linked server connectivity using Windows auth passthrough
+-- Create a linked server from on-premises SQL Server to Azure SQL
+EXEC sp_addlinkedserver
+    @server = N'AzureSQLLinked',
+    @srvproduct = N'',
+    @provider = N'MSOLEDBSQL',
+    @datasrc = N'yourserver.database.windows.net',
+    @catalog = N'production_db';
+
+EXEC sp_addlinkedsrvlogin
+    @rmtsrvname = N'AzureSQLLinked',
+    @useself = N'FALSE',
+    @locallogin = NULL,
+    @rmtuser = N'svc_appaccount@corp.example.com',
+    @rmtpassword = N'ServiceAccountPassword';
+
+-- Test the linked server
+SELECT TOP 10 * FROM AzureSQLLinked.production_db.dbo.orders;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Linked servers across cloud boundaries work — but they carry the same latency penalty described in section 27.1. A distributed query that joins a local on-premises table to an Azure SQL table via linked server will ship the entire remote result set across the network unless the optimizer pushes the predicate remotely. Test your execution plans with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET STATISTICS IO ON</code> and verify that remote row counts are bounded.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.5 Cross-Boundary Query Patterns and Their Performance Implications</h3>
+
+<p class="text-gray-300 leading-relaxed">Section 27.1 established that latency is the enemy of synchronous cross-boundary queries. This section goes deeper into the specific patterns that appear in hybrid architectures and how to engineer around their limitations.</p>
+
+<p class="text-gray-300 leading-relaxed">#### The Linked Server Anti-Pattern</p>
+
+<p class="text-gray-300 leading-relaxed">Developers who discover linked servers (SQL Server) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dblink</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_fdw</code> (PostgreSQL) sometimes treat them as a transparent way to query remote tables as if they are local. This works adequately in same-datacenter scenarios. Across a hybrid cloud boundary, it becomes a performance problem at any meaningful scale.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: this query looks innocent but can be expensive across a WAN link
+SELECT
+    o.order_id,
+    o.customer_id,
+    c.customer_name,    -- c comes from on-premises
+    p.product_name      -- p comes from Azure SQL via linked server
+FROM dbo.orders o                                       -- local (Azure SQL)
+INNER JOIN AzureSQLLinked.production.dbo.customers c    -- remote (on-premises)
+    ON o.customer_id = c.customer_id
+INNER JOIN dbo.products p                               -- local (Azure SQL)
+    ON o.product_id = p.product_id
+WHERE o.order_date &gt;= '2024-01-01';
+
+-- Check how SQL Server plans this
+SET STATISTICS IO ON;
+SET STATISTICS TIME ON;
+-- If the Remote Query operator shows millions of rows, you have a problem.
+-- The optimizer may fetch the entire customers table and filter locally.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The fix is rarely at the query level. The fix is to replicate the lookup tables (customers, products) to both sides of the boundary so cross-boundary joins become local joins with a small synchronization lag.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL equivalent using postgres_fdw
+-- Demonstrate the same anti-pattern and the monitoring approach
+
+-- First, set up the foreign server and user mapping
+CREATE EXTENSION IF NOT EXISTS postgres_fdw;
+
+CREATE SERVER onprem_pg
+    FOREIGN DATA WRAPPER postgres_fdw
+    OPTIONS (host '10.10.5.20', port '5432', dbname 'production_db');
+
+CREATE USER MAPPING FOR current_user
+    SERVER onprem_pg
+    OPTIONS (user 'fdw_user', password 'FdwP@ssword789');
+
+-- Import the remote schema
+IMPORT FOREIGN SCHEMA public
+    LIMIT TO (customers, products)
+    FROM SERVER onprem_pg
+    INTO remote_tables;
+
+-- Check estimated vs. actual row counts for foreign scans
+EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
+SELECT
+    o.order_id,
+    c.customer_name
+FROM orders o
+JOIN remote_tables.customers c ON o.customer_id = c.customer_id
+WHERE o.order_date &gt;= '2024-01-01';
+
+-- Look for "Foreign Scan" nodes in the plan.
+-- If rows= estimate is far from actual, update statistics:
+ANALYZE remote_tables.customers;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_fdw</code>, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">use_remote_estimate = true</code> on the foreign server to let PostgreSQL query the remote server for row count estimates. This dramatically improves plan quality for foreign tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>ALTER SERVER onprem_pg OPTIONS (ADD use_remote_estimate 'true');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Materialized Caching Pattern</p>
+
+<p class="text-gray-300 leading-relaxed">The correct pattern for frequently-queried reference data that lives on the other side of a cloud boundary is to replicate it locally with a controlled refresh cycle. Call it a materialized cache, a shadow table, or a local replica — the concept is the same.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: create a local shadow of the on-premises customers table
+-- This runs on the RDS side and refreshes on a schedule
+
+CREATE TABLE customers_shadow (
+    customer_id     BIGINT PRIMARY KEY,
+    customer_name   TEXT NOT NULL,
+    email           TEXT,
+    region          TEXT,
+    created_at      TIMESTAMPTZ,
+    synced_at       TIMESTAMPTZ DEFAULT now()  -- tracks when we last pulled this row
+);
+
+CREATE INDEX idx_customers_shadow_region ON customers_shadow (region);
+
+-- Refresh function: pull changes from the foreign table since last sync
+CREATE OR REPLACE FUNCTION refresh_customers_shadow()
+RETURNS void
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_last_sync TIMESTAMPTZ;
+    v_rows_affected INT;
+BEGIN
+    SELECT COALESCE(MAX(synced_at), '1970-01-01'::TIMESTAMPTZ)
+    INTO v_last_sync
+    FROM customers_shadow;
+
+    -- Upsert changes from the foreign table
+    INSERT INTO customers_shadow (
+        customer_id, customer_name, email, region, created_at, synced_at
+    )
+    SELECT
+        customer_id,
+        customer_name,
+        email,
+        region,
+        created_at,
+        now()
+    FROM remote_tables.customers
+    WHERE created_at &gt; v_last_sync
+       OR updated_at &gt; v_last_sync   -- assumes updated_at column exists on source
+
+    ON CONFLICT (customer_id) DO UPDATE SET
+        customer_name = EXCLUDED.customer_name,
+        email         = EXCLUDED.email,
+        region        = EXCLUDED.region,
+        synced_at     = EXCLUDED.synced_at;
+
+    GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
+
+    RAISE NOTICE 'customers_shadow refreshed: % rows upserted', v_rows_affected;
+END;
+$$;
+
+-- Schedule via pg_cron (if available) or an external scheduler
+-- SELECT cron.schedule('*/5 * * * *', 'SELECT refresh_customers_shadow()');</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: shadow table and refresh stored procedure
+
+CREATE TABLE dbo.customers_shadow (
+    customer_id     BIGINT          NOT NULL PRIMARY KEY,
+    customer_name   NVARCHAR(255)   NOT NULL,
+    email           NVARCHAR(320)   NULL,
+    region          NVARCHAR(50)    NULL,
+    created_at      DATETIME2       NULL,
+    synced_at       DATETIME2       NOT NULL DEFAULT SYSUTCDATETIME()
+);
+
+CREATE NONCLUSTERED INDEX ix_customers_shadow_region
+    ON dbo.customers_shadow (region);
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_RefreshCustomersShadow
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @last_sync DATETIME2;
+    SELECT @last_sync = ISNULL(MAX(synced_at), '19700101')
+    FROM dbo.customers_shadow;
+
+    MERGE dbo.customers_shadow AS tgt
+    USING (
+        SELECT customer_id, customer_name, email, region, created_at
+        FROM AzureSQLLinked.production_db.dbo.customers
+        WHERE created_at &gt; @last_sync
+           OR updated_at &gt; @last_sync
+    ) AS src
+    ON tgt.customer_id = src.customer_id
+
+    WHEN MATCHED THEN UPDATE SET
+        tgt.customer_name = src.customer_name,
+        tgt.email         = src.email,
+        tgt.region        = src.region,
+        tgt.synced_at     = SYSUTCDATETIME()
+
+    WHEN NOT MATCHED BY TARGET THEN INSERT (
+        customer_id, customer_name, email, region, created_at, synced_at
+    ) VALUES (
+        src.customer_id, src.customer_name, src.email,
+        src.region, src.created_at, SYSUTCDATETIME()
+    );
+
+    PRINT CAST(@@ROWCOUNT AS VARCHAR) + ' rows merged into customers_shadow.';
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The shadow table approach decouples your application queries from the remote source. When the VPN connection degrades or the on-premises server is under maintenance, your cloud-side application continues to work against the last-synced data. The lag is controlled and predictable — you know exactly how stale the shadow can be because you control the refresh interval.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.6 Monitoring a Hybrid Database Environment</h3>
+
+<p class="text-gray-300 leading-relaxed">Monitoring is harder in hybrid environments because your observability tools exist on both sides of the boundary, and combining their signals into a coherent view requires deliberate design.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Centralized Metrics Collection</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern that works at scale is to centralize all database metrics into your cloud monitoring layer and push on-premises metrics to it. CloudWatch agent, Azure Monitor agent, or the Prometheus <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">node_exporter</code> with remote_write can all collect on-premises metrics and ship them to the cloud.</p>
+
+<p class="text-gray-300 leading-relaxed">For PostgreSQL, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> (Prometheus) running on your on-premises server can scrape database metrics and push them to a centralized Prometheus/Thanos or Victoria Metrics deployment.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># prometheus.yml: scrape config for both on-premises and RDS PostgreSQL
+# On-premises instances are scraped directly.
+# RDS instances are scraped via postgres_exporter running in the VPC.
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+scrape_configs:
+  - job_name: 'postgres_onprem'
+    static_configs:
+      - targets:
+          - '10.10.5.20:9187'   # postgres_exporter on on-premises server
+          - '10.10.5.21:9187'
+    labels:
+      environment: 'onpremises'
+      datacenter: 'dc-east'
+
+  - job_name: 'postgres_rds'
+    static_configs:
+      - targets:
+          - '10.100.1.50:9187'  # postgres_exporter in VPC, scraping RDS
+    labels:
+      environment: 'aws'
+      region: 'us-east-1'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code> configuration for RDS must use a connection string pointing at the RDS endpoint — the exporter runs inside your VPC and connects to RDS over the private endpoint, then exposes its HTTP metrics port for Prometheus to scrape.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Alerting Across Boundaries</p>
+
+<p class="text-gray-300 leading-relaxed">Define alerts that specifically watch for hybrid-specific failure modes. These are the signals that pure cloud or pure on-premises setups never need to alert on:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Replication slot lag exceeding disk safety threshold</strong> — On-premises primary running out of WAL disk because the cloud subscriber is behind.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">DMS task latency spike</strong> — Network congestion or VPN instability causing CDC lag to build.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Cross-boundary query response time degradation</strong> — P99 latency on federated queries rising above acceptable threshold.</p>
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">VPN tunnel state change</strong> — The network layer itself going down is a database event from your perspective.</p>
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Shadow table staleness</strong> — The refresh procedure last ran more than N minutes ago, meaning your local cache is drifting.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Prometheus alerting rules for hybrid-specific conditions
+
+groups:
+  - name: hybrid_database_alerts
+    rules:
+
+      - alert: ReplicationSlotLagCritical
+        expr: |
+          pg_replication_slots_pg_wal_lsn_diff{slot_type="logical"} &gt; 10737418240
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Replication slot {{ $labels.slot_name }} lag exceeds 10GB"
+          description: &gt;
+            The logical replication slot {{ $labels.slot_name }} on
+            {{ $labels.instance }} has {{ $value | humanize1024 }}B of unconsumed WAL.
+            If the subscriber does not catch up, disk will fill and the primary will stop.
+
+      - alert: ShadowTableStalenessWarning
+        expr: |
+          (time() - pg_shadow_table_last_refresh_epoch{table="customers_shadow"}) &gt; 600
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "customers_shadow has not refreshed in over 10 minutes"
+          description: &gt;
+            The shadow table customers_shadow on {{ $labels.instance }}
+            last refreshed {{ $value | humanizeDuration }} ago.
+            Check the refresh job and VPN connectivity.
+
+      - alert: DMSReplicationLagCritical
+        expr: |
+          aws_dms_cdc_latency_target_maximum &gt; 300
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "DMS task replication lag exceeds 300 seconds"
+          description: &gt;
+            AWS DMS task on replication instance {{ $labels.replication_instance }}
+            has a target latency of {{ $value }}s.
+            Investigate network connectivity and DMS task errors.</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Tracing Queries Across Boundaries in SQL Server</p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server, Extended Events and Query Store give you the on-premises view. Azure SQL has its own Query Store, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_requests</code>, and Azure Monitor. Correlating a slow distributed query that hits both sides requires matching timestamps and session identifiers manually — there is no native end-to-end tracing for linked-server queries.</p>
+
+<p class="text-gray-300 leading-relaxed">The pragmatic approach: log the session ID and the start timestamp of every distributed query in your application layer, then correlate with SQL Server's DMVs using that information after the fact.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: capture distributed query performance with Extended Events
+-- Run this on the on-premises instance to capture remote query costs
+
+CREATE EVENT SESSION [hybrid_query_trace] ON SERVER
+ADD EVENT sqlserver.sql_statement_completed (
+    WHERE (
+        sqlserver.database_name = N'production_db'
+        AND package0.greater_than_equal_uint64(duration, 1000000)  -- &gt;= 1 second
+    )
+    ACTION (
+        sqlserver.sql_text,
+        sqlserver.session_id,
+        sqlserver.client_hostname,
+        sqlserver.username
+    )
+),
+ADD EVENT sqlserver.rpc_completed (
+    WHERE (
+        package0.greater_than_equal_uint64(duration, 1000000)
+    )
+    ACTION (
+        sqlserver.sql_text,
+        sqlserver.session_id
+    )
+)
+ADD TARGET package0.ring_buffer (SET max_memory = 51200)
+WITH (
+    MAX_DISPATCH_LATENCY = 5 SECONDS,
+    TRACK_CAUSALITY = ON       -- enables cross-event correlation via activity_id
+);
+
+ALTER EVENT SESSION [hybrid_query_trace] ON SERVER STATE = START;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.7 Managing Schema Changes Across Hybrid Environments</h3>
+
+<p class="text-gray-300 leading-relaxed">Schema changes are the most operationally treacherous part of hybrid database management. When your production schema exists in two places — on-premises and cloud — every migration must be coordinated. Applied out of order, a schema change will break replication, corrupt data, or crash applications.</p>
+
+<p class="text-gray-300 leading-relaxed">#### The Synchronization Problem</p>
+
+<p class="text-gray-300 leading-relaxed">Logical replication (both native PostgreSQL and DMS) replicates data but not DDL in most configurations. If you add a column to the on-premises source table, the RDS target does not automatically receive that column. Your replication task will fail when it encounters an INSERT with a column count the target does not recognize.</p>
+
+<p class="text-gray-300 leading-relaxed">DMS's default behavior on DDL changes is to stop the task with an error. Native PostgreSQL logical replication will fail with a type mismatch or column count error. Azure Data Sync ignores DDL changes entirely and lets data become inconsistent.</p>
+
+<p class="text-gray-300 leading-relaxed">The correct migration sequence for adding a column in a hybrid environment:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>1. Apply the schema change to the TARGET (cloud) FIRST
+2. Verify the change is present and replication is healthy
+3. Apply the schema change to the SOURCE (on-premises)
+4. Verify replication resumes without errors</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This order matters because the target can accept rows that do not fill optional columns (NULL-able additions), but the source cannot replicate data into a column that does not exist on the target. Adding the column to the target first gives you a window of grace.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Apply on the RDS target (PostgreSQL) FIRST
+-- Connect to RDS and run:
+ALTER TABLE orders ADD COLUMN discount_code TEXT;
+ALTER TABLE orders ADD COLUMN discount_amount NUMERIC(10,2) DEFAULT 0.00;
+
+-- Verify logical replication slot is still active and not lagging
+SELECT slot_name, active, confirmed_flush_lsn,
+       pg_size_pretty(pg_current_wal_lsn() - confirmed_flush_lsn) AS slot_lag
+FROM pg_replication_slots;
+
+-- Step 2: Apply on the on-premises source SECOND
+-- Connect to on-premises PostgreSQL and run:
+ALTER TABLE orders ADD COLUMN discount_code TEXT;
+ALTER TABLE orders ADD COLUMN discount_amount NUMERIC(10,2) DEFAULT 0.00;
+
+-- Verify replication is flowing normally after the DDL on the source
+SELECT pid, usename, application_name, client_addr, state, write_lag, flush_lag, replay_lag
+FROM pg_stat_replication;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent for DMS replication:
+-- Step 1: Apply on RDS SQL Server target FIRST
+ALTER TABLE dbo.orders ADD discount_code NVARCHAR(50) NULL;
+ALTER TABLE dbo.orders ADD discount_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00;
+
+-- Step 2: Verify DMS task is healthy in CloudWatch before proceeding
+-- (Check CDCLatencyTarget in CloudWatch — should remain stable)
+
+-- Step 3: Apply on on-premises SQL Server source SECOND
+ALTER TABLE dbo.orders ADD discount_code NVARCHAR(50) NULL;
+ALTER TABLE dbo.orders ADD discount_amount DECIMAL(10,2) NOT NULL DEFAULT 0.00;
+
+-- MS-CDC captures the DDL event; DMS will handle the new columns on the next batch
+-- Monitor DMS task for errors for 10 minutes after source DDL application</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Schema Migration Tools in Hybrid Context</p>
+
+<p class="text-gray-300 leading-relaxed">Tools like Flyway and Liquibase can manage schema versions across multiple environments, but they need explicit configuration to understand that your "on-premises" and "cloud" targets are logically the same schema lineage.</p>
+
+<p class="text-gray-300 leading-relaxed">The pattern that works: treat the on-premises and cloud databases as two members of the same migration graph, but always execute the cloud target migration first (via your CI/CD pipeline connecting to the RDS endpoint), then execute the on-premises migration immediately after (via your CI/CD pipeline connecting to the on-premises endpoint through the VPN).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>&lt;!-- Liquibase: hybrid migration pipeline configuration --&gt;
+&lt;!-- liquibase-cloud.properties — targets RDS first --&gt;
+changeLogFile=db/changelog/db.changelog-master.xml
+url=jdbc:postgresql://rds-primary.c9akciq32.us-east-1.rds.amazonaws.com:5432/production_db
+username=liquibase_runner
+password=${LIQUIBASE_PASSWORD}
+driver=org.postgresql.Driver
+
+&lt;!-- liquibase-onprem.properties — targets on-premises second --&gt;
+changeLogFile=db/changelog/db.changelog-master.xml
+url=jdbc:postgresql://10.10.5.20:5432/production_db
+username=liquibase_runner
+password=${LIQUIBASE_PASSWORD_ONPREM}
+driver=org.postgresql.Driver</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# hybrid-migration.sh — always apply cloud target before on-premises source
+
+set -e  # Exit on any error
+
+echo "=== Applying migration to cloud target (RDS) ==="
+liquibase --defaultsFile=liquibase-cloud.properties update
+
+echo "=== Verifying replication health before applying to source ==="
+python3 check_replication_lag.py --max-lag-seconds 60 || {
+    echo "ERROR: Replication lag too high. Do not apply migration to source yet."
+    exit 1
+}
+
+echo "=== Applying migration to on-premises source ==="
+liquibase --defaultsFile=liquibase-onprem.properties update
+
+echo "=== Migration complete. Monitoring replication for 5 minutes ==="
+for i in $(seq 1 10); do
+    sleep 30
+    python3 check_replication_lag.py --max-lag-seconds 120
+done
+
+echo "=== Hybrid migration pipeline completed successfully ==="</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">check_replication_lag.py</code> script queries <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_replication</code> on the on-premises primary and exits with a non-zero code if lag exceeds the threshold. This gate prevents applying source-side DDL when the target is already behind, which would compound the risk.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.8 Cost Engineering in Hybrid Architectures</h3>
+
+<p class="text-gray-300 leading-relaxed">Hybrid architectures incur costs on both sides of the boundary simultaneously. On-premises hardware, power, and administration costs do not disappear when you add cloud costs. Network egress pricing adds a third dimension. Understanding where the money goes lets you make trade-offs rather than just absorb them.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Data Transfer Costs Across the Hybrid Boundary</p>
+
+<p class="text-gray-300 leading-relaxed">AWS charges for data transfer OUT of AWS to the internet (and in some configurations to on-premises over VPN). Direct Connect has its own data transfer rates. Azure charges for egress. GCP charges for egress. The pattern is consistent: inbound data to the cloud is typically free, outbound is not.</p>
+
+<p class="text-gray-300 leading-relaxed">For hybrid database replication, your primary concern is the volume of change data flowing from source to target — or from cloud primary to on-premises DR. If your database generates 50 GB of WAL changes per day and you are shipping all of it across Direct Connect at the outbound rate, that is a meaningful monthly line item.</p>
+
+<p class="text-gray-300 leading-relaxed">Minimize cross-boundary data movement through:</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Filtering replication scope</strong>: replicate only the tables that need to exist on both sides. DMS table mappings and PostgreSQL publication table lists let you be selective.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Compressing replication streams</strong>: PostgreSQL logical replication does not inherently compress WAL. DMS compresses its transfer stream. For Direct Connect, work with your network team on link-level compression.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Co-locating the application with the data it reads most</strong>: if 90% of your application's reads are against the cloud database, do not run the application on-premises and pay for every result set to traverse the boundary.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Right-Sizing Your Hybrid Footprint</p>
+
+<p class="text-gray-300 leading-relaxed">A common mistake is running both the on-premises and cloud databases at full production sizing simultaneously. If your cloud database is a DR replica that is rarely queried, size it as a DR replica — smaller instance class, minimal IOPS provisioning, no Multi-AZ until you are within a maintenance window of promoting it. Promote it to full production sizing as part of your DR activation runbook.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Example: DR replica running at reduced capacity in normal operation
+aws rds create-db-instance-read-replica \
+  --db-instance-identifier prod-dr-replica \
+  --source-db-instance-identifier prod-primary \
+  --db-instance-class db.r6g.large \      # Smaller than production's db.r6g.4xlarge
+  --publicly-accessible false \
+  --region us-west-2
+
+# The DR activation runbook scales it up BEFORE promotion:
+aws rds modify-db-instance \
+  --db-instance-identifier prod-dr-replica \
+  --db-instance-class db.r6g.4xlarge \
+  --apply-immediately
+
+aws rds wait db-instance-available \
+  --db-instance-identifier prod-dr-replica
+
+# Then promote
+aws rds promote-read-replica \
+  --db-instance-identifier prod-dr-replica</code></pre>
+
+<p class="text-gray-300 leading-relaxed">One caveat: apply the scale-up before promoting, not after. After promotion, the instance is no longer a replica and carries full production traffic. Scaling a primary under load is riskier than scaling a cold replica.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[On-premises primary fails] --> B{Failure confirmed<br/>by on-call DBA}
+    B --> C[Scale DR replica to<br/>production instance class]
+    C --> D[Wait for instance<br/>status: available]
+    D --> E[Promote read replica<br/>to standalone primary]
+    E --> F[Update DNS CNAME<br/>TTL 60s]
+    F --> G[Applications reconnect<br/>to promoted instance]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Cloud-as-DR failover sequence: scale before promotion, promotion before DNS cutover.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Network is the foundation**: every hybrid database pattern — replication, cross-boundary queries, failover — depends on stable, low-latency connectivity. Use Direct Connect or ExpressRoute for production workloads; accept Site-to-Site VPN only for low-bandwidth or non-critical scenarios. Measure actual latency before designing your query topology.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Synchronous cross-boundary queries do not scale**: latency compounds across every query in a page load or transaction. Use native replication, DMS CDC, or the materialized shadow table pattern to bring frequently-needed data to the same side as its consumers. Reserve linked servers and `postgres_fdw` for administrative queries and low-volume operations.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **DDL changes must be sequenced target-first**: when logical replication is in place, always apply schema changes to the replication target before the source. Applying them to the source first will break replication. Build this ordering into your migration automation with a replication lag check as a gate between the two steps.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Replication slots and WAL accumulation are on-premises-specific risks**: cloud databases manage WAL retention with built-in safeguards; on-premises servers can fill their `pg_wal` directory and crash if a logical replication subscriber falls behind. Set `max_slot_wal_keep_size`, monitor slot lag aggressively, and build alerts that fire well before disk is exhausted.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Right-size your hybrid footprint continuously**: DR replicas do not need production-class instance sizing until the moment they are activated. Run them smaller, scale up as part of your DR runbook before promotion, and reduce cloud spend during normal operation without sacrificing recovery capability.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
