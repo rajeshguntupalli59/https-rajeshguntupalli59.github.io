@@ -5,6 +5,10 @@
   <title>Chapter 1: Why PostgreSQL is the Default AI Application Backend — AI-Native Apps on PostgreSQL</title>
   <meta name="description" content="AI-Native Apps on PostgreSQL Chapter 1: Why PostgreSQL is the Default AI Application Backend. LLMs, RAG, agents — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -150,7 +154,8 @@ CREATE TABLE document_chunks (
 );
 
 -- HNSW index for fast approximate nearest-neighbor search
--- ef_construction=128 is a safe default; tune higher for better recall
+-- pgvector's defaults are m=16, ef_construction=64; ef_construction=128 here
+-- trades slower index builds for higher recall
 CREATE INDEX idx_chunks_embedding ON document_chunks
     USING hnsw (embedding vector_cosine_ops)
     WITH (m=16, ef_construction=128);
@@ -526,12 +531,564 @@ CREATE POLICY rls_documents_tenant ON documents
 
 <p class="text-gray-300 leading-relaxed">The RRF merge in SQL means there is no Python code sorting two lists from two systems. The database does the work. The RLS policies mean that even if application code forgets a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE tenant_id = ?</code> clause, PostgreSQL enforces the boundary automatically — an enforcement layer that no external vector store can provide.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    Q[User query] --> E[Embed query]
+    E --> V["Vector arm: ORDER BY embedding <=> query LIMIT top_k*2"]
+    Q --> F["Full-text arm: ts_rank_cd over websearch_to_tsquery"]
+    V --> U[UNION of candidate chunk_ids]
+    F --> U
+    U --> R["Reciprocal Rank Fusion: 1/(k+rank) per arm, summed"]
+    R --> RLS["Row-Level Security filters to current tenant"]
+    RLS --> TOP[Top-N chunks returned to caller]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Both retrieval arms run inside a single SQL function; RRF and tenant isolation happen before a single row leaves PostgreSQL.*</p>
+
 <p class="text-gray-300 leading-relaxed">---</p>
 
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">1.5 The FastAPI RAG Endpoint: Full Stack in Practice</h3>
 
 <p class="text-gray-300 leading-relaxed">This is where the schema, search function, and LLM come together. This endpoint accepts a user question, retrieves relevant chunks using hybrid search, builds a prompt, calls Claude, stores the conversation turn, and writes an audit log entry — all in a single request.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># api/rag_endpoint.py
+# Dependencies: pip install fastapi anthropic openai asyncpg uvicorn pgvector
+
+import time
+import uuid
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
+import anthropic
+import asyncpg
+from fastapi import FastAPI, HTTPException, Header
+from openai import AsyncOpenAI
+from pydantic import BaseModel
+
+# ----------------------------------------------------------------
+# Pydantic models
+# ----------------------------------------------------------------
+class ChatRequest(BaseModel):
+    conversation_id: str | None = None    # None = start new conversation
+    message: str
+    user_id: str
+
+class CitationSource(BaseModel):
+    chunk_id: str
+    document_id: str
+    score: float
+    snippet: str
+
+class ChatResponse(BaseModel):
+    conversation_id: str
+    message_id: str
+    answer: str
+    citations: list[CitationSource]
+    prompt_tokens: int
+    completion_tokens: int
+    latency_ms: int
+
+# ----------------------------------------------------------------
+# Application setup with connection pooling
+# ----------------------------------------------------------------
+pool: asyncpg.Pool | None = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool
+    pool = await asyncpg.create_pool(
+        "postgresql://aiapp:secret@localhost:5432/aiapp",
+        min_size=5,
+        max_size=20,
+        command_timeout=30,
+    )
+    yield
+    await pool.close()
+
+app = FastAPI(lifespan=lifespan)
+
+openai_async  = AsyncOpenAI()
+anthropic_client = anthropic.Anthropic()
+
+# ----------------------------------------------------------------
+# Helper: embed a query string
+# ----------------------------------------------------------------
+async def embed_query(text: str) -&gt; list[float]:
+    response = await openai_async.embeddings.create(
+        model="text-embedding-3-small",
+        input=text,
+    )
+    return response.data[0].embedding
+
+# ----------------------------------------------------------------
+# Main RAG endpoint
+# ----------------------------------------------------------------
+@app.post("/chat", response_model=ChatResponse)
+async def chat(
+    request: ChatRequest,
+    x_tenant_id: str = Header(..., alias="X-Tenant-Id"),
+):
+    t_start = time.monotonic()
+
+    async with pool.acquire() as conn:
+        # --------------------------------------------------------
+        # Set the RLS tenant context for this connection
+        # --------------------------------------------------------
+        await conn.execute(
+            "SELECT set_config('app.current_tenant_id', $1, true)",
+            x_tenant_id,
+        )
+
+        # --------------------------------------------------------
+        # Resolve or create conversation
+        # --------------------------------------------------------
+        if request.conversation_id:
+            conv_row = await conn.fetchrow(
+                """
+                SELECT conversation_id, user_id, tenant_id
+                FROM conversations
+                WHERE conversation_id = $1 AND user_id = $2
+                """,
+                uuid.UUID(request.conversation_id),
+                uuid.UUID(request.user_id),
+            )
+            if not conv_row:
+                raise HTTPException(status_code=404, detail="Conversation not found")
+            conversation_id = conv_row["conversation_id"]
+        else:
+            conversation_id = await conn.fetchval(
+                """
+                INSERT INTO conversations (user_id, tenant_id, title)
+                VALUES ($1, $2, $3)
+                RETURNING conversation_id
+                """,
+                uuid.UUID(request.user_id),
+                uuid.UUID(x_tenant_id),
+                request.message[:80],   # first 80 chars as auto-title
+            )
+
+        # --------------------------------------------------------
+        # Fetch recent conversation history for context window
+        # --------------------------------------------------------
+        history_rows = await conn.fetch(
+            """
+            SELECT role, content
+            FROM messages
+            WHERE conversation_id = $1
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            conversation_id,
+        )
+        history = [
+            {"role": r["role"], "content": r["content"]}
+            for r in reversed(history_rows)   # chronological order
+        ]
+
+        # --------------------------------------------------------
+        # Embed the user query and retrieve relevant chunks
+        # --------------------------------------------------------
+        query_vector = await embed_query(request.message)
+
+        # asyncpg requires the vector as a string formatted '[x,y,z,...]'
+        vector_str = "[" + ",".join(str(v) for v in query_vector) + "]"
+
+        chunk_rows = await conn.fetch(
+            """
+            SELECT
+                chunk_id::text,
+                document_id::text,
+                content,
+                rrf_score,
+                cosine_distance
+            FROM hybrid_search(
+                $1::uuid,
+                $2,
+                $3::vector,
+                $4
+            )
+            """,
+            uuid.UUID(x_tenant_id),
+            request.message,
+            vector_str,
+            8,     # retrieve top-8 chunks
+        )
+
+        # --------------------------------------------------------
+        # Build the system prompt with retrieved context
+        # --------------------------------------------------------
+        context_blocks = []
+        for i, row in enumerate(chunk_rows, 1):
+            context_blocks.append(
+                f"[Source {i} | chunk_id={row['chunk_id'][:8]}...]\n{row['content']}"
+            )
+
+        system_prompt = (
+            "You are a helpful assistant. Answer the user's question using only "
+            "the provided context. If the context does not contain enough information "
+            "to answer confidently, say so. Always cite your sources using [Source N] notation.\n\n"
+            "Context:\n"
+            + "\n\n---\n\n".join(context_blocks)
+        )
+
+        # --------------------------------------------------------
+        # Call Claude
+        # --------------------------------------------------------
+        messages_for_llm = history + [{"role": "user", "content": request.message}]
+
+        llm_response = anthropic_client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=1024,
+            system=system_prompt,
+            messages=messages_for_llm,
+        )
+
+        answer_text      = llm_response.content[0].text
+        prompt_tokens    = llm_response.usage.input_tokens
+        completion_tokens = llm_response.usage.output_tokens
+        latency_ms       = int((time.monotonic() - t_start) * 1000)
+
+        # --------------------------------------------------------
+        # Persist user message, assistant message, audit log
+        # All in one transaction.
+        # --------------------------------------------------------
+        async with conn.transaction():
+            # User message
+            await conn.execute(
+                """
+                INSERT INTO messages
+                    (conversation_id, tenant_id, role, content, token_count)
+                VALUES ($1, $2, 'user', $3, $4)
+                """,
+                conversation_id,
+                uuid.UUID(x_tenant_id),
+                request.message,
+                prompt_tokens,
+            )
+
+            # Build citations structure
+            citations = [
+                {
+                    "chunk_id": row["chunk_id"],
+                    "score": float(row["rrf_score"]),
+                    "text_snippet": row["content"][:200],
+                }
+                for row in chunk_rows
+            ]
+
+            # Assistant message
+            message_id = await conn.fetchval(
+                """
+                INSERT INTO messages
+                    (conversation_id, tenant_id, role, content,
+                     token_count, model, finish_reason, citations, latency_ms)
+                VALUES ($1, $2, 'assistant', $3, $4, $5, $6, $7, $8)
+                RETURNING message_id
+                """,
+                conversation_id,
+                uuid.UUID(x_tenant_id),
+                answer_text,
+                completion_tokens,
+                "claude-3-5-sonnet-20241022",
+                llm_response.stop_reason,
+                asyncpg.types.json.JSONType(citations),
+                latency_ms,
+            )
+
+            # Update conversation token total
+            await conn.execute(
+                """
+                UPDATE conversations
+                SET total_tokens = total_tokens + $1,
+                    updated_at   = now()
+                WHERE conversation_id = $2
+                """,
+                prompt_tokens + completion_tokens,
+                conversation_id,
+            )
+
+            # Audit log
+            await conn.execute(
+                """
+                INSERT INTO llm_audit_log
+                    (tenant_id, user_id, conversation_id, model,
+                     prompt_tokens, completion_tokens, total_tokens,
+                     latency_ms, status)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'success')
+                """,
+                uuid.UUID(x_tenant_id),
+                uuid.UUID(request.user_id),
+                conversation_id,
+                "claude-3-5-sonnet-20241022",
+                prompt_tokens,
+                completion_tokens,
+                prompt_tokens + completion_tokens,
+                latency_ms,
+            )
+
+        # --------------------------------------------------------
+        # Build and return response
+        # --------------------------------------------------------
+        citation_sources = [
+            CitationSource(
+                chunk_id=row["chunk_id"],
+                document_id=row["document_id"],
+                score=float(row["rrf_score"]),
+                snippet=row["content"][:200],
+            )
+            for row in chunk_rows
+        ]
+
+        return ChatResponse(
+            conversation_id=str(conversation_id),
+            message_id=str(message_id),
+            answer=answer_text,
+            citations=citation_sources,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            latency_ms=latency_ms,
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Three things make this production-ready rather than demo-quality. First, the RLS tenant context is set at the connection level before any query runs, so even if the application code passed the wrong tenant ID in a WHERE clause, the policy would enforce the correct boundary. Second, all three writes — user message, assistant message, and audit log — are inside a single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">async with conn.transaction()</code> block. If the audit log write fails, the messages are not committed, and the client gets an error it can retry. Third, asyncpg's connection pool is created at startup via the lifespan context manager, so the application never pays the cost of connection setup on a hot path.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">1.6 Running the Stack Locally with Docker Compose</h3>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># docker-compose.yml
+version: "3.9"
+services:
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: aiapp
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: aiapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/01_schema.sql
+    command: &gt;
+      postgres
+        -c shared_preload_libraries=pg_stat_statements
+        -c pg_stat_statements.track=all
+        -c max_connections=200
+        -c shared_buffers=512MB
+        -c effective_cache_size=1536MB
+        -c work_mem=16MB
+        -c maintenance_work_mem=256MB
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://aiapp:secret@postgres:5432/aiapp
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+    command: uvicorn api.rag_endpoint:app --host 0.0.0.0 --port 8000 --workers 4
+
+  worker:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://aiapp:secret@postgres:5432/aiapp
+      REDIS_URL: redis://redis:6379/0
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A ingestion.pipeline:celery_app worker --concurrency=4 --loglevel=info
+
+volumes:
+  pgdata:</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgvector/pgvector:pg16</code> image ships with the vector extension pre-installed. Placing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">schema.sql</code> in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/docker-entrypoint-initdb.d/</code> causes it to execute automatically on first container start. The PostgreSQL flags inline in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">command:</code> block apply a conservative set of memory-tuning parameters appropriate for a development machine with two gigabytes of RAM allocated to the database container; production tuning is covered in Chapter 13.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">1.7 pg_notify as an AI Application Event Bus</h3>
+
+<p class="text-gray-300 leading-relaxed">PostgreSQL's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> mechanism becomes a lightweight event bus that keeps services decoupled without introducing a separate message broker for low-volume internal events. The ingestion pipeline already calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify('document_ingested', ...)</code> after committing. Here is a listener that reacts to those events to warm the vector index.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># listeners/document_listener.py
+# This runs as a separate long-lived process or as an async background task.
+
+import asyncio
+import json
+import logging
+
+import asyncpg
+
+logger = logging.getLogger(__name__)
+
+async def on_document_ingested(conn, pid, channel, payload):
+    """
+    Called by asyncpg when a NOTIFY arrives on the 'document_ingested' channel.
+    pid     = backend PID of the notifying process
+    channel = 'document_ingested'
+    payload = JSON string sent by pg_notify
+    """
+    try:
+        data = json.loads(payload)
+        document_id = data["document_id"]
+        tenant_id   = data["tenant_id"]
+        chunk_count = data["chunks"]
+
+        logger.info(
+            "Document ingested: doc=%s tenant=%s chunks=%d",
+            document_id, tenant_id, chunk_count,
+        )
+
+        # Example reaction: log to a processing queue, update a search metadata table,
+        # or trigger a downstream indexing job. In this example we simply confirm
+        # the embedding count is consistent.
+        async with conn.transaction():
+            actual_count = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM document_chunks
+                WHERE document_id = $1 AND embedding IS NOT NULL
+                """,
+                document_id,
+            )
+            if actual_count != chunk_count:
+                logger.warning(
+                    "Chunk count mismatch for doc %s: expected %d, found %d",
+                    document_id, chunk_count, actual_count,
+                )
+
+    except Exception:
+        logger.exception("Error handling document_ingested event")
+
+
+async def start_listener():
+    conn = await asyncpg.connect(
+        "postgresql://aiapp:secret@localhost:5432/aiapp"
+    )
+    await conn.add_listener("document_ingested", on_document_ingested)
+    logger.info("Listening on channel: document_ingested")
+    try:
+        # Keep the connection alive indefinitely
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        await conn.remove_listener("document_ingested", on_document_ingested)
+        await conn.close()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(start_listener())</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern is powerful because the notification is tied to the transaction. If the ingest task rolls back, no notification is sent. If the commit succeeds, the notification fires within milliseconds. Kafka or RabbitMQ would be appropriate for higher-throughput or cross-datacenter scenarios, but for intra-service coordination within a single application, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LISTEN</code>/<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NOTIFY</code> eliminates an entire infrastructure dependency.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">1.8 Analytical Queries Against the AI Application</h3>
+
+<p class="text-gray-300 leading-relaxed">One of the durable advantages of keeping everything in PostgreSQL is that business intelligence queries run against the same data store without ETL. A few examples that appear in almost every AI product review meeting:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ============================================================
+-- OPERATIONAL ANALYTICS ON AI APPLICATION DATA
+-- ============================================================
+
+-- 1. Token consumption by tenant over the last 30 days
+SELECT
+    t.name                                  AS tenant_name,
+    SUM(a.total_tokens)                     AS total_tokens,
+    SUM(a.total_tokens) FILTER (WHERE a.status = 'error') AS error_tokens,
+    COUNT(*)                                AS llm_calls,
+    AVG(a.latency_ms)::INT                  AS avg_latency_ms,
+    PERCENTILE_CONT(0.95) WITHIN GROUP
+        (ORDER BY a.latency_ms)::INT        AS p95_latency_ms
+FROM llm_audit_log a
+JOIN tenants t ON a.tenant_id = t.tenant_id
+WHERE a.created_at &gt;= now() - INTERVAL '30 days'
+GROUP BY t.name
+ORDER BY total_tokens DESC;
+
+-- 2. Most-cited document chunks — which content is actually useful?
+SELECT
+    d.title,
+    dc.chunk_index,
+    dc.content,
+    COUNT(*)                AS citation_count
+FROM messages m,
+     LATERAL jsonb_array_elements(m.citations) AS c
+JOIN document_chunks dc ON (c-&gt;&gt;'chunk_id')::UUID = dc.chunk_id
+JOIN documents d        ON dc.document_id = d.document_id
+WHERE m.role = 'assistant'
+  AND m.created_at &gt;= now() - INTERVAL '7 days'
+GROUP BY d.title, dc.chunk_index, dc.content
+ORDER BY citation_count DESC
+LIMIT 20;
+
+-- 3. User engagement: average conversation length by plan tier
+SELECT
+    t.plan,
+    ROUND(AVG(msg_counts.msg_count), 1)  AS avg_messages_per_conversation,
+    COUNT(DISTINCT c.conversation_id)    AS total_conversations
+FROM conversations c
+JOIN tenants t ON c.tenant_id = t.tenant_id
+JOIN (
+    SELECT conversation_id, COUNT(*) AS msg_count
+    FROM messages
+    GROUP BY conversation_id
+) msg_counts ON c.conversation_id = msg_counts.conversation_id
+WHERE c.created_at &gt;= now() - INTERVAL '30 days'
+GROUP BY t.plan
+ORDER BY avg_messages_per_conversation DESC;
+
+-- 4. Error rate by model — catch degraded LLM APIs quickly
+SELECT
+    model,
+    COUNT(*) FILTER (WHERE status = 'error')::FLOAT
+        / NULLIF(COUNT(*), 0) * 100     AS error_rate_pct,
+    COUNT(*)                            AS total_calls,
+    MAX(created_at) FILTER
+        (WHERE status = 'error')        AS last_error_at
+FROM llm_audit_log
+WHERE created_at &gt;= now() - INTERVAL '24 hours'
+GROUP BY model
+ORDER BY error_rate_pct DESC NULLS LAST;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Query 2 uses a lateral join against a JSONB array — the citations stored in each assistant message — to reconstruct which document chunks are actually influencing answers. This kind of analysis requires no data warehouse because the JSONB column was designed with queryability in mind from the start. Chapter 11 expands on JSONB patterns for AI data.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">1.9 Production Deployment Considerations</h3>
+
+<p class="text-gray-300 leading-relaxed">A schema and a Docker Compose file are not a production deployment. The following checklist covers the minimum viable production hardening for the stack built in this chapter.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connection pooling via PgBouncer.</strong> asyncpg opens a real PostgreSQL backend per connection. At high concurrency this exhausts <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_connections</code>. Place PgBouncer in transaction pooling mode between the application and PostgreSQL. With transaction pooling, RLS configuration calls (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">set_config('app.current_tenant_id', ...)</code>) must use the third argument <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">false</code> (session-scoped) only on dedicated connections, or be replaced with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SET LOCAL</code> inside explicit transactions where pooling mode makes the session boundary unreliable. A common pattern is to pass tenant context as a query parameter rather than a session variable when using aggressive connection pooling.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index maintenance.</strong> The HNSW index does not require VACUUM to remain healthy, but <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE</code> on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">document_chunks</code> should run regularly as chunks are deleted and re-inserted during re-ingestion. Consider a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cron</code> job that runs <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ANALYZE document_chunks;</code> nightly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Backup strategy.</strong> <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_dump</code> works but is not sufficient for point-in-time recovery. Enable WAL archiving and use <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pgbackup</code> or a managed service equivalent. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">llm_audit_log</code> table grows rapidly; partition it by month using declarative partitioning (Chapter 13 covers partitioning in detail).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Secrets management.</strong> The DATABASE_URL, OPENAI_API_KEY, and ANTHROPIC_API_KEY shown as environment variables must come from a secrets manager (AWS Secrets Manager, HashiCorp Vault, or equivalent) in production, not from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">.env</code> files in Docker.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Index concurrency.</strong> Building the HNSW index on a large corpus of chunks takes time and is CPU-intensive. Build it with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> to avoid locking the table during ingestion. Note that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> cannot run inside a transaction block.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring.</strong> The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> extension, enabled in the Docker Compose configuration, tracks query execution statistics. Connect it to a metrics pipeline (Prometheus via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">postgres_exporter</code>, Datadog, or equivalent) and alert on query latency exceeding acceptable thresholds for the hybrid search function. Query 4 in Section 1.8 can be adapted to an LLM API health check with minimal modification.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **PostgreSQL with pgvector replaces a vector store, not the other way around.** The relational model, transactions, and row-level security provide capabilities that no purpose-built vector database can match, and pgvector's HNSW index provides competitive approximate nearest-neighbor performance.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Schema design is the highest-leverage decision in an AI application.** The multi-tenant schema built in this chapter — with generated columns for content hashing and full-text indexing, JSONB for flexible metadata, and a complete audit table — handles the operational demands of a production AI product without modification for most use cases.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Hybrid search in a single SQL function outperforms application-level merging.** Reciprocal Rank Fusion combining cosine similarity and BM25-style full-text ranking runs entirely in PostgreSQL, eliminating the need to query two systems and merge results in Python.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Transactional integrity is non-negotiable for AI applications.** Writing user messages, assistant messages, token counts, and audit records inside one transaction means partial writes never occur. Downstream billing and compliance systems can trust the data.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`LISTEN`/`NOTIFY` provides a zero-dependency internal event bus.** Because notifications fire only on commit, downstream services react to events that are guaranteed to be readable, without introducing Kafka or RabbitMQ for intra-service coordination.</li></div>
     <div class="mt-14 bg-rose-950/40 border border-rose-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">DB Hub — Self-Hosted Database Platform</p>
