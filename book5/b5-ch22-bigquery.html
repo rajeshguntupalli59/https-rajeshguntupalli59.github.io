@@ -6,6 +6,10 @@
   <title>Chapter 22: BigQuery for Analytics: When to Push Workloads Out — The Cloud Database Engineer</title>
   <meta name="description" content="The Cloud Database Engineer Chapter 22: BigQuery for Analytics: When to Push Workloads Out. AWS RDS, Azure SQL, GCP — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -51,11 +55,11 @@
 
 <p class="text-gray-300 leading-relaxed">Analytics queries do the opposite. A query like <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT region, SUM(revenue) FROM orders WHERE order_date >= '2023-01-01' GROUP BY region</code> needs only two columns from a table that might have forty. On a row store, the database must read all forty columns from every qualifying row page into memory just to extract two of them. If your <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders</code> table is 800 GB, you are reading 800 GB to return a handful of rows. Buffer pool pressure spikes. I/O throughput maxes out. Other sessions wait for locks on shared buffer pages. Your OLTP application starts throwing connection timeouts.</p>
 
-<p class="text-gray-300 leading-relaxed">RDS PostgreSQL on an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> instance gives you 128 GB of RAM and roughly 4,750 MB/s of EBS throughput on io2 volumes. A full table scan of 800 GB at that throughput takes over two and a half minutes in pure I/O time, ignoring CPU for hashing and aggregation. Now put that query in a BI tool that twenty analysts hit simultaneously. You have created a resource contention crisis on the same database your application depends on for writes.</p>
+<p class="text-gray-300 leading-relaxed">RDS PostgreSQL on an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> instance gives you 128 GB of RAM and a finite, instance-class-capped EBS throughput ceiling — check the current instance specs for the exact number. A full table scan of an 800 GB table takes real, measurable minutes in pure I/O time even on a well-provisioned volume, ignoring CPU for hashing and aggregation. Now put that query in a BI tool that twenty analysts hit simultaneously. You have created a resource contention crisis on the same database your application depends on for writes.</p>
 
 <p class="text-gray-300 leading-relaxed">Read replicas help but do not solve this. A read replica on RDS or Aurora still uses a row-oriented storage engine. You have moved the scan off the primary, but you still saturate the replica's I/O and memory. Aurora's parallel query feature can push some aggregation down to the storage layer, but it targets specific single-table scan patterns, not complex multi-join analytical workloads.</p>
 
-<p class="text-gray-300 leading-relaxed">BigQuery's columnar storage changes the math entirely. For that same two-column query on 800 GB of row data, BigQuery reads only the bytes belonging to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">region</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">revenue</code> columns — roughly 2–5% of the total data volume depending on column widths and compression ratios. It distributes that read across thousands of storage shards in parallel. Slot-based compute (more on this shortly) applies CPU in parallel across the result shards. Wall-clock time for a query that takes 150 seconds on RDS might take 3–8 seconds in BigQuery.</p>
+<p class="text-gray-300 leading-relaxed">BigQuery's columnar storage changes the math entirely. For that same two-column query on 800 GB of row data, BigQuery reads only the bytes belonging to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">region</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">revenue</code> columns — a small fraction of the total data volume, with the exact percentage depending on column widths and compression ratios. It distributes that read across thousands of storage shards in parallel. Slot-based compute (more on this shortly) applies CPU in parallel across the result shards. The practical result is that a query taking minutes on a saturated OLTP replica typically completes in single-digit seconds in BigQuery — benchmark your own query mix rather than assuming a fixed multiplier.</p>
 
 <p class="text-gray-300 leading-relaxed">The workloads that belong in BigQuery share a recognizable profile:</p>
 
@@ -110,6 +114,15 @@
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">22.3 Loading Data from RDS, Cloud SQL, and AlloyDB into BigQuery</h3>
 
 <p class="text-gray-300 leading-relaxed">There are four primary patterns for getting data from your OLTP engines into BigQuery. The right choice depends on your latency requirements, data volume, and operational complexity tolerance.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    OLTP[RDS / Cloud SQL / AlloyDB] -->|"Pattern 1: scheduled export"| GCS[Cloud Storage<br/>Parquet/CSV]
+    GCS -->|bq load| BQ[(BigQuery)]
+    OLTP -->|"Pattern 2: Datastream CDC"| BQCDC[BigQuery append-only<br/>CDC table]
+    BQCDC -->|scheduled dedup query| BQCurrent[BigQuery current-state<br/>snapshot table]
+    OLTP -.->|"Pattern 3: federated query"| BQ
+    SaaS[SaaS sources<br/>Salesforce, Ads] -->|"Pattern 4: Data Transfer Service"| BQ</pre></div>
+<p class="text-gray-300 leading-relaxed">*Four paths from OLTP engines into BigQuery, ordered by increasing freshness and operational complexity — batch export is simplest, CDC via Datastream is closest to real-time but requires a snapshot layer, and federated queries avoid data movement at the cost of query latency.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Pattern 1: Batch export via Cloud Storage</strong></p>
 
@@ -409,6 +422,286 @@ print(f"Estimated cost: ${job.total_bytes_billed / 1e12 * 6.25:.4f}")</code></pr
 <p class="text-gray-300 leading-relaxed">Third, JOIN order matters differently than it does in PostgreSQL. BigQuery's query optimizer handles many cases automatically, but when joining a large fact table to multiple dimension tables, always put the largest table first (leftmost) in the FROM clause and join smaller dimension tables to it. BigQuery broadcasts small tables to all slots for hash joins; if BigQuery misidentifies the small table, the broadcast goes the wrong direction and performance collapses.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Materialized views for recurring aggregations</strong></p>
+
+<p class="text-gray-300 leading-relaxed">BigQuery supports materialized views that auto-refresh incrementally. For recurring dashboard queries that aggregate the same data repeatedly, materialized views eliminate redundant full scans:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Materialized view for daily regional revenue summary
+-- Refreshes incrementally as new data arrives in the base table
+CREATE MATERIALIZED VIEW `my-project.analytics_dataset.orders_daily_regional_summary`
+PARTITION BY report_date
+CLUSTER BY region
+OPTIONS (
+  enable_refresh = TRUE,
+  refresh_interval_minutes = 60
+)
+AS
+SELECT
+  order_date                          AS report_date,
+  region,
+  customer_segment,
+  COUNT(*)                            AS order_count,
+  SUM(revenue)                        AS total_revenue,
+  AVG(revenue)                        AS avg_order_value,
+  COUNT(DISTINCT customer_id)         AS unique_customers
+FROM `my-project.analytics_dataset.orders`
+WHERE order_date &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+GROUP BY
+  order_date,
+  region,
+  customer_segment;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">BigQuery's query optimizer will automatically rewrite queries against the base <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">orders</code> table to read from this materialized view when it determines the view can satisfy the query — a feature called *smart tuning*. Analysts do not need to change their queries. The rewrite happens transparently. You can verify whether a query used a materialized view by examining the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">referenced_tables</code> field in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA.JOBS</code>.</p>
+
+<p class="text-gray-300 leading-relaxed">One limitation to understand: BigQuery materialized views support only a restricted SQL dialect. Subqueries, window functions, and UNION operations in the view definition are not supported. The view must be a simple SELECT with aggregations, GROUP BY, and filters on the base table. If your summarization logic requires window functions, materialize through a scheduled query instead.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Scheduled queries for snapshot tables</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For the deduplication pattern from Datastream CDC, and for complex aggregations that exceed materialized view SQL restrictions, scheduled queries are the production tool:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Scheduled query: run every 30 minutes
+-- Overwrites the current-state snapshot table from CDC feed
+DECLARE cutoff_ts TIMESTAMP DEFAULT TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR);
+
+CREATE OR REPLACE TABLE `my-project.analytics_dataset.orders_current`
+PARTITION BY DATE(updated_at)
+CLUSTER BY region, status
+AS
+WITH ranked AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY order_id
+      ORDER BY _metadata_timestamp DESC
+    ) AS rn
+  FROM `my-project.analytics_dataset.orders`
+  WHERE _metadata_row_is_deleted IS DISTINCT FROM TRUE
+)
+SELECT
+  order_id,
+  customer_id,
+  region,
+  customer_segment,
+  revenue,
+  order_date,
+  status,
+  created_at,
+  updated_at
+FROM ranked
+WHERE rn = 1;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Schedule this in the BigQuery console under Scheduled Queries, or via the API. Set an alert on the scheduled query's failure notification — a missed snapshot at midnight means your morning dashboard is running against yesterday's data with no visible error to the consumer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.6 Monitoring, Alerting, and Operational Runbooks</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cloud Monitoring metrics for BigQuery</strong></p>
+
+<p class="text-gray-300 leading-relaxed">BigQuery emits metrics to Cloud Monitoring that you should baseline and alert on:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an alerting policy for slot utilization exceeding 90%
+# of reserved capacity — indicates queries queuing behind slot limit
+gcloud alpha monitoring policies create \
+  --policy-from-file=- &lt;&lt; 'EOF'
+{
+  "displayName": "BigQuery Slot Utilization High",
+  "conditions": [
+    {
+      "displayName": "Slot utilization above 90%",
+      "conditionThreshold": {
+        "filter": "resource.type=\"bigquery_project\" AND metric.type=\"bigquery.googleapis.com/slot/allocated_for_project\"",
+        "comparison": "COMPARISON_GT",
+        "thresholdValue": 90,
+        "duration": "300s",
+        "aggregations": [
+          {
+            "alignmentPeriod": "60s",
+            "perSeriesAligner": "ALIGN_MEAN"
+          }
+        ]
+      }
+    }
+  ],
+  "notificationChannels": [
+    "projects/my-project/notificationChannels/YOUR_CHANNEL_ID"
+  ],
+  "alertStrategy": {
+    "autoClose": "604800s"
+  }
+}
+EOF</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key metrics to watch in production are:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `bigquery.googleapis.com/slot/allocated_for_project` — how many slots are actively in use. Sustained near-capacity means queries are queuing.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `bigquery.googleapis.com/storage/stored_bytes` — total bytes stored, broken down by table. Tracks growth and validates partition expiration is working.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `bigquery.googleapis.com/job/num_in_flight` — number of jobs currently executing. Spikes here with high slot utilization indicate a query storm.</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">INFORMATION_SCHEMA queries for operational visibility</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run these as daily monitoring queries, either manually or via a scheduled query that writes results to a monitoring table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Daily operational summary: jobs by user, errors, and cost
+SELECT
+  DATE(creation_time)                                         AS query_date,
+  user_email,
+  COUNT(*)                                                    AS total_jobs,
+  COUNTIF(state = 'DONE' AND error_result IS NULL)           AS successful_jobs,
+  COUNTIF(error_result IS NOT NULL)                          AS failed_jobs,
+  ROUND(SUM(total_bytes_processed) / POW(1024, 4), 2)       AS total_tb_processed,
+  ROUND(SUM(total_bytes_processed) / POW(1024, 4) * 6.25, 2) AS est_cost_usd,
+  ROUND(AVG(
+    TIMESTAMP_DIFF(end_time, start_time, MILLISECOND)
+  ) / 1000.0, 1)                                             AS avg_job_duration_seconds
+FROM `region-us`.INFORMATION_SCHEMA.JOBS
+WHERE
+  creation_time &gt;= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  AND job_type = 'QUERY'
+GROUP BY
+  query_date,
+  user_email
+ORDER BY
+  query_date DESC,
+  est_cost_usd DESC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Find tables with no partition filter enforcement
+-- that are larger than 100 GB — these are cost exposure risks
+SELECT
+  t.table_catalog,
+  t.table_schema,
+  t.table_name,
+  ROUND(ps.total_logical_bytes / POW(1024, 3), 1) AS size_gb,
+  t.time_partitioning_field,
+  t.require_partition_filter
+FROM `my-project.analytics_dataset.INFORMATION_SCHEMA.TABLES` t
+LEFT JOIN `my-project.analytics_dataset.INFORMATION_SCHEMA.TABLE_STORAGE` ps
+  ON t.table_name = ps.table_name
+WHERE
+  t.table_type = 'BASE TABLE'
+  AND (t.require_partition_filter IS FALSE OR t.require_partition_filter IS NULL)
+  AND ps.total_logical_bytes &gt; 100 * POW(1024, 3)
+ORDER BY
+  ps.total_logical_bytes DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Review the second query monthly. Tables that grew past the 100 GB threshold without partition filter enforcement are candidates for a migration to a partitioned schema — create a new partitioned table, load historical data, swap it in, and enable the filter.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Runbook: responding to unexpected cost spikes</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When your billing alert fires because BigQuery spend is 3× normal for the day, this is the investigation sequence:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Query <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA.JOBS</code> ordered by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">total_bytes_processed DESC</code> for the billing period. Identify the job IDs and user emails responsible for the top 10% of bytes.</p>
+
+<p class="text-gray-300 leading-relaxed">2. Check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">referenced_tables</code> for those jobs. If they reference unpartitioned tables, that is the root cause — the query bypassed partition pruning.</p>
+
+<p class="text-gray-300 leading-relaxed">3. Check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query</code> text for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT *</code> patterns, missing WHERE clauses on partition columns, or cross joins.</p>
+
+<p class="text-gray-300 leading-relaxed">4. If the expensive queries are from a service account rather than a human, trace the service account back to the scheduled job or application that triggered it. Check whether a Datastream backfill was initiated (backfills read all historical data) or a scheduled query was manually rerun against a full time range.</p>
+
+<p class="text-gray-300 leading-relaxed">5. Engage the quota controls from Section 22.4 if a human user is the source. Per-user daily limits prevent recurrence while you address the root query.</p>
+
+<p class="text-gray-300 leading-relaxed">6. If the spike is from a legitimate new workload (a new analyst team onboarded, a new dashboard deployed), evaluate whether to move to a slot reservation to cap costs at a flat rate.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.7 When Not to Use BigQuery: Recognizing the Antipatterns</h3>
+
+<p class="text-gray-300 leading-relaxed">BigQuery solves a real problem elegantly, and that creates a temptation to use it for problems it is not designed for. Recognizing when a team is misapplying BigQuery saves significant operational pain.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The high-frequency small query problem</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Some teams, having discovered that BigQuery is "easy," begin routing application queries to it — things like "fetch this user's last 10 orders" or "look up whether this session ID exists." BigQuery's 400–800ms minimum job scheduling latency makes it unsuitable for any user-facing request. The billing impact is also punishing: the minimum 10 MB billed per query means 10,000 point lookups per day costs the same as scanning 100 GB, with no useful analytical benefit.</p>
+
+<p class="text-gray-300 leading-relaxed">If you observe an application service account in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">INFORMATION_SCHEMA.JOBS</code> running thousands of tiny queries daily (each scanning less than 1 MB), the team has routed transactional lookups to BigQuery. Redirect them to Firestore, Cloud Spanner, or back to Cloud SQL depending on their consistency and scale requirements.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The raw event store with no transformation layer</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Another antipattern: streaming every raw application event into BigQuery and having analysts query the raw events table directly. The table accumulates petabytes, has no meaningful partitioning because events don't have natural date-based query patterns, and every analyst query becomes a full table scan because the schema doesn't match any analyst's actual question.</p>
+
+<p class="text-gray-300 leading-relaxed">The production pattern is: raw events land in BigQuery in a raw dataset (or in Cloud Storage), a transformation pipeline (dbt, Dataform, or Cloud Composer/Airflow) produces cleaned, partitioned, clustered derived tables in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">analytics</code> dataset, and analysts query only the derived layer. Analysts never have direct access to the raw events tables.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The CDC table without a snapshot layer</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Described in Section 22.3: using Datastream without materializing a current-state snapshot forces every analytical query to run the ROW_NUMBER() deduplication logic. On a table with a billion CDC events, this deduplication itself becomes a multi-TB scan. Build the snapshot layer on day one, not after the first performance complaint.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">22.8 Integrating BigQuery with Your Broader Data Architecture</h3>
+
+<p class="text-gray-300 leading-relaxed">BigQuery does not operate in isolation. In a mature cloud data architecture, it connects to several other systems that a production DBA needs to understand at the integration level.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">dbt (data build tool)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">dbt is the dominant transformation framework for BigQuery. It expresses data transformations as SQL SELECT statements organized into a DAG, compiles them to BigQuery DDL and DML, and handles dependency ordering, testing, and documentation. As a DBA, you will interact with dbt in three ways: reviewing the SQL it generates for correctness and cost efficiency, managing the service account permissions it uses, and understanding that dbt models map to BigQuery tables or views in your analytics dataset.</p>
+
+<p class="text-gray-300 leading-relaxed">A dbt model that runs a full table scan on every refresh is just as expensive as a manual query doing the same thing. Review dbt model configurations for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">partition_by</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cluster_by</code> directives on large tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- dbt model configuration block (placed at top of .sql file)
+-- Ensures the dbt-generated table has proper partitioning and clustering
+{{
+  config(
+    materialized='table',
+    partition_by={
+      "field": "order_date",
+      "data_type": "date",
+      "granularity": "day"
+    },
+    cluster_by=["region", "customer_segment"],
+    require_partition_filter=true
+  )
+}}
+
+SELECT
+  order_id,
+  customer_id,
+  region,
+  customer_segment,
+  revenue,
+  order_date,
+  status
+FROM {{ ref('stg_orders') }}
+WHERE order_date IS NOT NULL</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Looker and Looker Studio</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Looker compiles LookML definitions into SQL and runs them against BigQuery. Looker Studio (formerly Data Studio) runs queries at dashboard load time. Both can generate expensive full table scans if the underlying LookML or report definition does not filter on partition columns. Review Looker explores and Looker Studio data source settings for the analysts' BI tools the same way you review application query plans — they are SQL generators, and they can generate bad SQL.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Vertex AI and BigQuery ML</strong></p>
+
+<p class="text-gray-300 leading-relaxed">BigQuery ML allows training machine learning models using SQL syntax directly inside BigQuery, without exporting data to a separate ML platform. For a DBA team supporting data scientists, this matters because training a BigQuery ML model is a BigQuery job — it consumes slots and processes bytes. A data scientist running <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE MODEL</code> on a 50 TB feature table without understanding the cost implications can generate a bill that rivals your entire monthly BigQuery spend in a single job. Apply the same per-user quota controls to data scientists as to analysts, and document the expected cost of model training jobs before they run.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Example BigQuery ML model creation
+-- Ensure data scientists run this in a sandbox project first
+-- to validate byte consumption before running in production
+CREATE OR REPLACE MODEL `my-project.ml_dataset.churn_classifier`
+OPTIONS (
+  model_type = 'logistic_reg',
+  input_label_cols = ['churned'],
+  l1_reg = 0.1,
+  max_iterations = 20
+) AS
+SELECT
+  customer_id,
+  tenure_days,
+  avg_monthly_spend,
+  support_tickets_90d,
+  last_login_days_ago,
+  churned
+FROM `my-project.analytics_dataset.customer_features`
+WHERE feature_date = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **BigQuery's columnar architecture solves a structural problem that read replicas cannot**: row-oriented engines must read all columns from qualifying pages even for two-column aggregations, while BigQuery reads only the columns referenced, reducing bytes scanned by an order of magnitude for typical analytical queries and eliminating I/O contention on your OLTP engine.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Partitioning with `require_partition_filter = TRUE` and per-user query quotas are non-negotiable production controls**: without them, a single analyst running a forgotten full table scan on a multi-TB table can generate a billing event that exceeds your daily compute budget; apply both before granting any human access to production datasets.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The CDC pattern via Datastream requires a snapshot materialization layer**: append-only CDC tables accumulate all row versions, and running deduplication logic on every query compounds into multi-TB scans at scale; build the scheduled snapshot job on day one or the analytics layer becomes unusable within weeks of onboarding.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **`INFORMATION_SCHEMA.JOBS` is your primary operational instrument**: it replaces `pg_stat_statements`, DMVs, and slow query logs in the BigQuery world — regular queries against it reveal cost outliers, missing partition filters, and service accounts routing transactional lookups incorrectly before they escalate into billing incidents.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **BigQuery is one layer in an architecture, not a general-purpose database**: point lookups, low-latency application queries, and transactional writes belong in Cloud SQL, AlloyDB, RDS, or Cloud Spanner; when teams route those patterns to BigQuery, the combination of minimum billing thresholds and job scheduling latency makes it both more expensive and slower than the OLTP engine it was meant to offload.</li>
     </div>
     <div class="mt-14 bg-orange-950/40 border border-orange-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
