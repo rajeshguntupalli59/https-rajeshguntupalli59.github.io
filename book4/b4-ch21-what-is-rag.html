@@ -6,6 +6,10 @@
   <title>Chapter 21: What is RAG and Why It Needs a Vector Database — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 21: What is RAG and Why It Needs a Vector Database. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -68,6 +72,27 @@
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">21.2 RAG Architecture: The Three-Stage Pipeline</h3>
 
 <p class="text-gray-300 leading-relaxed">A RAG system has three distinct stages: ingestion, retrieval, and generation. Most production failures can be traced to one of these three stages being implemented incorrectly.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    subgraph "Stage 1: Ingestion (offline)"
+        A[Load documents] --> B[Chunk]
+        B --> C[Embed]
+        C --> D[(Vector index)]
+    end
+    subgraph "Stage 2: Retrieval (online)"
+        E[User query] --> F[Embed query]
+        F --> G[ANN search]
+        D -.-> G
+        G --> H[Top-k chunks]
+        H --> I[Re-rank]
+    end
+    subgraph "Stage 3: Generation (online)"
+        I --> J[Assemble prompt]
+        J --> K[LLM]
+        K --> L[Answer]
+    end</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Ingestion runs offline as a batch pipeline; retrieval and generation run online, in the request path, every time a user asks a question.*</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 1: Ingestion</strong></p>
 
@@ -476,6 +501,378 @@ for src in result["sources"]:
 
 <p class="text-gray-300 leading-relaxed">Fix: Hybrid search (vector + BM25 keyword, combined via reciprocal rank fusion). The SQL hybrid search example in §21.4 demonstrates this pattern. Weaviate has native hybrid search built in:</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Weaviate hybrid search — combines BM25 and vector search natively
+# Requirements: weaviate-client&gt;=4.0
+
+import weaviate
+import weaviate.classes as wvc
+import os
+
+client = weaviate.connect_to_weaviate_cloud(
+    cluster_url=os.environ["WEAVIATE_URL"],
+    auth_credentials=wvc.init.Auth.api_key(os.environ["WEAVIATE_API_KEY"]),
+)
+
+collection = client.collections.get("DocumentChunks")
+
+# Alpha = 0.0 → pure BM25, Alpha = 1.0 → pure vector, 0.5 → balanced hybrid
+results = collection.query.hybrid(
+    query="vendor payment term extension during liquidity stress",
+    alpha=0.5,
+    limit=5,
+    filters=wvc.query.Filter.by_property("department").equal("finance"),
+    return_metadata=wvc.query.MetadataQuery(score=True, explain_score=True),
+)
+
+for obj in results.objects:
+    print(f"Score: {obj.metadata.score:.4f}")
+    print(f"Text: {obj.properties['content'][:120]}")
+    print()
+
+client.close()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure mode 2: Retrieved chunks have the answer but the LLM ignores it</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cause: "Lost in the middle" problem. Research has shown that LLMs attend more strongly to text at the beginning and end of their context window. If the relevant chunk is buried in position 4 of 8 retrieved documents, the model may not weight it correctly.</p>
+
+<p class="text-gray-300 leading-relaxed">Fix: Re-ranking. After vector retrieval, apply a cross-encoder re-ranker (Cohere Rerank, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ms-marco-MiniLM</code> local models, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bge-reranker-large</code>) to reorder results by true relevance before injecting into context. Cross-encoders compare query and document jointly rather than independently, producing more precise relevance scores at the cost of higher latency.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Re-ranking with Cohere Rerank API
+# Requirements: cohere
+
+import cohere
+import os
+
+co = cohere.Client(os.environ["COHERE_API_KEY"])
+
+# Assume vector_chunks was retrieved from pgvector/Pinecone/Weaviate
+vector_chunks = [
+    "Standard payment terms are net-30 for all vendors.",
+    "Finance VP approval is required for payment term extensions beyond 60 days.",
+    "Vendor onboarding requires a completed W-9 and insurance certificate.",
+    "Liquidity stress extensions may reach 90 days with documented approval.",
+    "Early payment discounts of 2% are available for net-10 settlement.",
+]
+
+query = "What approval do I need to extend vendor payment terms beyond 60 days?"
+
+rerank_result = co.rerank(
+    model="rerank-english-v3.0",
+    query=query,
+    documents=vector_chunks,
+    top_n=3,
+    return_documents=True,
+)
+
+print("Re-ranked results:")
+for item in rerank_result.results:
+    print(f"  Relevance score: {item.relevance_score:.4f}")
+    print(f"  Text: {item.document.text[:100]}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Re-ranking consistently improves end-to-end RAG quality without requiring changes to the vector index or embedding model. It is one of the highest-leverage improvements available to a RAG system after the initial implementation is working.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure mode 3: The knowledge base is stale</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cause: Ingestion is a batch job run infrequently. A document updated on Monday does not appear in retrieval results until the next ingestion run.</p>
+
+<p class="text-gray-300 leading-relaxed">Fix: Treat ingestion as a streaming ETL pipeline rather than a batch job. Use document change detection (file modification timestamps, database CDC events, webhook triggers from document management systems) to trigger incremental re-embedding of only changed documents. In pgvector, this is an upsert pattern:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL
+-- Upsert pattern for incremental ingestion
+-- doc_id + chunk_index uniquely identifies a chunk
+INSERT INTO document_chunks (doc_id, chunk_index, content, metadata, embedding)
+VALUES
+    ('policy-vendor-payment-v3.pdf', 0, 'Updated policy text...', '{"version": 3}'::jsonb, '[...]'::vector)
+ON CONFLICT (doc_id, chunk_index)
+DO UPDATE SET
+    content   = EXCLUDED.content,
+    metadata  = EXCLUDED.metadata,
+    embedding = EXCLUDED.embedding,
+    updated_at = NOW();
+
+-- Add a unique constraint to support the upsert
+-- (Run once during schema setup)
+ALTER TABLE document_chunks
+    ADD CONSTRAINT uq_doc_chunk UNIQUE (doc_id, chunk_index);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure mode 4: Context window overflow</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cause: Top-k is set too high, or chunks are too large. At k=10 with 600-token chunks, you are injecting 6,000 tokens of context before the question. With GPT-4o's 128k context window this is manageable, but with latency-sensitive or cost-sensitive deployments it creates problems.</p>
+
+<p class="text-gray-300 leading-relaxed">Fix: Tune chunk size and top-k together. A useful mental model: the context budget available for retrieved content is <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">max_context_tokens - system_prompt_tokens - query_tokens - response_buffer</code>. Divide that by your chunk size to get maximum viable k. Track cost per query using token counting before optimizing.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure mode 5: The model hallucinates despite retrieved context</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Cause: The retrieved context contradicts itself (multiple documents with conflicting facts), the question asks for something not covered in any retrieved document, or the system prompt does not instruct the model to stay grounded.</p>
+
+<p class="text-gray-300 leading-relaxed">Fix: System prompt engineering. The system prompt must explicitly instruct the model to:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Answer only from the provided context</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Say "I don't have information about that in the available documents" when context is absent</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Flag conflicting information rather than synthesizing a false resolution</li>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# System prompt pattern for grounded generation
+
+SYSTEM_PROMPT = """You are a knowledge base assistant. Answer questions using ONLY the 
+provided context documents. Follow these rules strictly:
+
+1. If the context contains the answer, provide it with a reference to the specific 
+   document or section.
+2. If the context does not contain sufficient information to answer the question, 
+   respond with: "The available documents do not contain information about this topic."
+3. If the context contains conflicting information on the topic, state the conflict 
+   explicitly: "The documents contain conflicting information: [source A states X], 
+   [source B states Y]."
+4. Do not use knowledge from outside the provided context.
+5. Do not speculate or extrapolate beyond what is stated in the context.
+
+Context documents:
+{context}
+"""
+
+def build_prompt(retrieved_chunks: list[dict], question: str) -&gt; list[dict]:
+    """Build a chat prompt with retrieved context for grounded generation."""
+    context_text = "\n\n---\n\n".join(
+        f"[Document {i+1}: {chunk.get('source', 'unknown')}]\n{chunk['text']}"
+        for i, chunk in enumerate(retrieved_chunks)
+    )
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT.format(context=context_text)},
+        {"role": "user", "content": question},
+    ]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.7 Choosing Your Vector Database for RAG</h3>
+
+<p class="text-gray-300 leading-relaxed">The choice of vector database is a function of your existing infrastructure, scale requirements, and operational tolerance for managed services.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">pgvector (PostgreSQL extension)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Best when: Your data volume fits on a single PostgreSQL instance (under ~5 million vectors for comfortable HNSW performance), your team already operates PostgreSQL, and you want transactional consistency between vector search and relational data.</p>
+
+<p class="text-gray-300 leading-relaxed">Operational model: Self-managed (or managed via RDS, Supabase, Neon, AlloyDB). pgvector 0.7+ added HNSW support; earlier versions used only IVFFlat. Full ACID guarantees. SQL joins between vector results and relational tables work naturally.</p>
+
+<p class="text-gray-300 leading-relaxed">Limitations: Single-node; no distributed index. ANN search is slower than dedicated vector databases at very high QPS because PostgreSQL's query executor is not purpose-built for vector operations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pinecone</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Best when: You need a fully managed, scalable vector database with no operational overhead. Teams that do not want to manage infrastructure for their retrieval layer. Serverless tier is appropriate for development and medium-scale production.</p>
+
+<p class="text-gray-300 leading-relaxed">Operational model: Fully managed SaaS. Namespaces for multi-tenancy. Serverless (pay per query and storage) or pod-based (dedicated resources, predictable latency). No SQL; Pinecone-specific SDK.</p>
+
+<p class="text-gray-300 leading-relaxed">Limitations: Vendor lock-in is real—your vectors live in Pinecone's infrastructure. No SQL joins; metadata filtering has limitations compared to relational predicates. Data export is possible but not trivial.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weaviate</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Best when: You want hybrid search (BM25 + vector) built in without writing RRF fusion yourself, or when your use case benefits from Weaviate's native multi-tenancy model. Open source with cloud hosted option.</p>
+
+<p class="text-gray-300 leading-relaxed">Operational model: Self-hosted via Docker/Kubernetes or managed via Weaviate Cloud. GraphQL and REST APIs. Strong schema definition with property-level configuration.</p>
+
+<p class="text-gray-300 leading-relaxed">Limitations: More operationally complex to self-host than pgvector. The GraphQL API has a learning curve for teams fluent in SQL. Resource requirements (RAM for HNSW in-memory index) can be significant at scale.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Qdrant</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Best when: Performance is the primary criterion. Qdrant's Rust implementation delivers consistently high throughput and low latency. Strong support for payload (metadata) filtering with pre-filtering applied before ANN, which is important for highly filtered queries.</p>
+
+<p class="text-gray-300 leading-relaxed">Operational model: Self-hosted (Docker, Kubernetes, binary) or Qdrant Cloud managed. REST and gRPC APIs. Collections-based.</p>
+
+<p class="text-gray-300 leading-relaxed">Limitations: Smaller ecosystem and community than Pinecone or Weaviate. Fewer native integrations with LLM frameworks, though LangChain and LlamaIndex both support it.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Qdrant RAG ingestion and retrieval
+# Requirements: qdrant-client, sentence-transformers
+
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    Distance, VectorParams, PointStruct,
+    Filter, FieldCondition, MatchValue
+)
+from sentence_transformers import SentenceTransformer
+import uuid
+
+client = QdrantClient(host="localhost", port=6333)
+model  = SentenceTransformer("all-MiniLM-L6-v2")
+
+COLLECTION = "company_docs"
+DIM = 384  # all-MiniLM-L6-v2 dimension
+
+# Create collection (idempotent check)
+existing = [c.name for c in client.get_collections().collections]
+if COLLECTION not in existing:
+    client.create_collection(
+        collection_name=COLLECTION,
+        vectors_config=VectorParams(size=DIM, distance=Distance.COSINE),
+    )
+
+# Ingest
+documents = [
+    {"text": "Finance VP approval required for payment extensions beyond 60 days.",
+     "department": "finance", "source": "policy-v3.pdf"},
+    {"text": "All vendor contracts above $100k need Legal review.",
+     "department": "legal", "source": "contracts-policy.pdf"},
+]
+
+points = []
+for doc in documents:
+    vec = model.encode(doc["text"], normalize_embeddings=True).tolist()
+    points.append(PointStruct(
+        id=str(uuid.uuid4()),
+        vector=vec,
+        payload={"text": doc["text"], "department": doc["department"],
+                 "source": doc["source"]},
+    ))
+
+client.upsert(collection_name=COLLECTION, points=points)
+
+# Retrieval with metadata filter
+query = "What approval do I need to extend payment terms?"
+query_vec = model.encode(query, normalize_embeddings=True).tolist()
+
+results = client.search(
+    collection_name=COLLECTION,
+    query_vector=query_vec,
+    query_filter=Filter(
+        must=[FieldCondition(key="department", match=MatchValue(value="finance"))]
+    ),
+    limit=3,
+    with_payload=True,
+)
+
+for hit in results:
+    print(f"Score: {hit.score:.4f} | Source: {hit.payload['source']}")
+    print(f"  {hit.payload['text']}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">21.8 Chunking Strategies and Their Database Implications</h3>
+
+<p class="text-gray-300 leading-relaxed">Chunking is the step that determines retrieval quality more than almost anything else, yet it is often implemented as an afterthought. The way you divide documents into chunks determines whether semantically coherent information ends up in the same vector or split across multiple vectors that may never be retrieved together.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Fixed-size chunking</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Split every <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">n</code> tokens, with optional overlap. Simple, predictable, and wrong for structured documents. A 500-token chunk that starts mid-sentence and ends mid-paragraph contains arbitrary semantic content.</p>
+
+<p class="text-gray-300 leading-relaxed">Use when: Documents are already semantically uniform (e.g., uniform-length Q&A pairs, log lines).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Recursive character text splitting</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Split at the largest available boundary (paragraph → sentence → word → character) until chunks are below the target size. LangChain's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RecursiveCharacterTextSplitter</code> implements this. Produces much more coherent chunks than fixed-size for prose documents.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Semantic chunking</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Split based on embedding similarity discontinuities: generate embeddings for each sentence, compute similarity between adjacent sentences, and split where similarity drops sharply. Computationally expensive but produces chunks that correspond to coherent topics.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Semantic chunking with LlamaIndex SemanticSplitterNodeParser
+# Requirements: llama-index, llama-index-embeddings-openai
+
+from llama_index.core.node_parser import SemanticSplitterNodeParser
+from llama_index.embeddings.openai import OpenAIEmbedding
+from llama_index.core import Document
+
+embed_model = OpenAIEmbedding(model="text-embedding-3-small")
+
+splitter = SemanticSplitterNodeParser(
+    buffer_size=1,              # sentences on each side of split point to consider
+    breakpoint_percentile_threshold=95,  # split when similarity drops below 95th percentile
+    embed_model=embed_model,
+)
+
+document = Document(text="""
+Vendor payment terms govern the timeline for invoice settlement. Standard terms 
+are net-30, meaning invoices must be paid within 30 days of receipt. Early payment 
+discounts of 2% are available for settlement within 10 days under the net-10 program.
+
+Employee benefits include health insurance, dental, and vision coverage. Open 
+enrollment occurs annually in November. Employees may add dependents during the 
+open enrollment window or within 30 days of a qualifying life event.
+
+Capital expenditure requests above $50,000 require CFO approval. Requests 
+between $10,000 and $50,000 require department VP approval. All CapEx requests 
+must be submitted through the procurement portal with a business case attached.
+""")
+
+nodes = splitter.get_nodes_from_documents([document])
+
+print(f"Document split into {len(nodes)} semantic chunks:")
+for i, node in enumerate(nodes):
+    print(f"\n--- Chunk {i+1} ({len(node.text.split())} words) ---")
+    print(node.text.strip()[:200])</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This document would be split into three chunks—vendor payment, employee benefits, and CapEx—because each paragraph covers a distinct topic. Fixed-size chunking would likely merge the first two into a single chunk, degrading retrieval precision for both topics.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Parent-child chunking (small-to-big retrieval)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Store small child chunks for retrieval (better semantic targeting) but return the larger parent chunk to the LLM (more complete context). The parent-child relationship is tracked in metadata or a companion document store.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+# Parent-child chunking pattern
+# Small chunks retrieved, parent chunk returned to LLM
+
+from llama_index.core.node_parser import HierarchicalNodeParser, get_leaf_nodes
+from llama_index.core import Document, VectorStoreIndex
+from llama_index.core.retrievers import AutoMergingRetriever
+from llama_index.core.storage.docstore import SimpleDocumentStore
+
+# HierarchicalNodeParser creates chunk sizes at multiple granularities:
+# Level 1 (parent): 1024 tokens
+# Level 2 (child): 256 tokens
+# Level 3 (leaf): 64 tokens (these are what get embedded and retrieved)
+node_parser = HierarchicalNodeParser.from_defaults(
+    chunk_sizes=[1024, 256, 64]
+)
+
+document = Document(text="[long policy document content here...]")
+all_nodes = node_parser.get_nodes_from_documents([document])
+leaf_nodes = get_leaf_nodes(all_nodes)
+
+# Store ALL nodes in a docstore so parents can be fetched at retrieval time
+docstore = SimpleDocumentStore()
+docstore.add_documents(all_nodes)
+
+# Index only the leaf nodes (small chunks) for vector search
+index = VectorStoreIndex(leaf_nodes)
+
+# AutoMergingRetriever: retrieves leaf nodes, merges to parent if
+# a sufficient fraction of sibling leaves are retrieved for same parent
+base_retriever = index.as_retriever(similarity_top_k=12)
+retriever = AutoMergingRetriever(
+    base_retriever,
+    storage_context=index.storage_context,
+    verbose=True,
+)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The parent-child pattern captures a real database design principle: index on granular keys but fetch at a coarser granularity when the query warrants it. The leaf node embedding is the index entry; the parent document is the row.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Database implications of chunking decisions</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Every chunking decision has a storage and performance corollary:</p>
+
+<p class="text-gray-300 leading-relaxed">| Chunking approach | Chunks per document | Index size | Retrieval precision | Context quality |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Fixed-size, no overlap | Low | Smallest | Low | Variable |</p>
+<p class="text-gray-300 leading-relaxed">| Fixed-size + overlap | Medium | Medium | Medium | Improved |</p>
+<p class="text-gray-300 leading-relaxed">| Recursive/semantic | Medium | Medium | High | High |</p>
+<p class="text-gray-300 leading-relaxed">| Parent-child | High (leaf) | Larger | Highest (leaf) | Highest (parent) |</p>
+
+<p class="text-gray-300 leading-relaxed">Overlap—having adjacent chunks share a window of tokens—prevents the situation where a sentence that straddles a chunk boundary becomes semantically unretrievable. Standard overlap is 10–20% of chunk size. Excessive overlap (>40%) increases index size without proportional retrieval improvement.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RAG grounds LLMs in external knowledge at query time** rather than encoding knowledge into model weights, solving hallucination and recency problems without the cost or latency of fine-tuning. The retrieval step is the critical path; a poorly performing retrieval layer cannot be compensated by a more capable LLM.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Vector search retrieves by semantic meaning, not keyword overlap.** This is what allows a query about "cash flow stress and supplier flexibility" to retrieve a document about "liquidity events and vendor credit extension." Traditional full-text search cannot close this semantic gap, and hybrid search (vector + BM25) via reciprocal rank fusion combines the strengths of both for maximum recall.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding model consistency is an absolute requirement.** The same model must be used for ingestion and query-time encoding. Mismatched models produce geometrically meaningless results without generating any errors, making this failure mode particularly dangerous in production.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Chunking strategy determines retrieval quality as much as embedding model choice.** Recursive and semantic chunking produce more coherent chunks than fixed-size splitting. Parent-child chunking achieves both precise retrieval (small chunks) and complete context (large parent returned to LLM). Chunk size, overlap, and top-k must be tuned together within the available context budget.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RAG failure modes map directly to database-layer decisions.** Missed retrieval → fix with hybrid search or re-ranking. Stale knowledge → fix with incremental upsert-based ingestion. Cross-tenant data leakage → fix with namespace or collection isolation at the vector database layer. Hallucination despite good retrieval → fix with system prompt engineering that constrains generation to the retrieved context.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
