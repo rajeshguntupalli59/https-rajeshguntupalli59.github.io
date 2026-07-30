@@ -6,6 +6,10 @@
   <title>Chapter 27: Building Autonomous Pipelines with AIOps — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 27: Building Autonomous Pipelines with AIOps. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -448,6 +452,528 @@ WHERE blocker_duration_sec &gt; 30
   AND application_name NOT IN ('pgbouncer', 'logical_replication_worker');</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong> Equivalent pre-flight + safe kill for blocking chains:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Confirm blocking chain still present
+WITH blocking_chain AS (
+    SELECT
+        r.session_id        AS blocked_spid,
+        r.blocking_session_id AS blocker_spid,
+        s.login_name        AS blocker_login,
+        s.program_name      AS blocker_program,
+        r.wait_time / 1000.0  AS wait_seconds,
+        SUBSTRING(t.text, (r.statement_start_offset / 2) + 1,
+            ((CASE r.statement_end_offset
+                WHEN -1 THEN DATALENGTH(t.text)
+                ELSE r.statement_end_offset
+              END - r.statement_start_offset) / 2) + 1) AS blocker_query
+    FROM sys.dm_exec_requests r
+    JOIN sys.dm_exec_sessions s ON s.session_id = r.blocking_session_id
+    CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t
+    WHERE r.blocking_session_id &gt; 0
+      AND r.wait_time / 1000.0 &gt; 30
+)
+SELECT * FROM blocking_chain
+ORDER BY wait_seconds DESC;
+
+-- Step 2: Kill the blocker if still confirmed and not a system process
+-- The executor checks program_name against the exclusion list before proceeding
+DECLARE @spid INT = (
+    SELECT TOP 1 blocker_spid
+    FROM blocking_chain
+    WHERE wait_seconds &gt; 30
+      AND blocker_program NOT IN ('SQL Server Replication', 'SQLAgent - Generic Refresher')
+    ORDER BY wait_seconds DESC
+);
+
+IF @spid IS NOT NULL
+    KILL @spid;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The executor wraps every action in a Python context manager that writes begin/end audit records and handles partial failures:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import redis
+import psycopg2
+import pyodbc
+import json
+import logging
+from datetime import datetime, timezone
+from contextlib import contextmanager
+
+logger = logging.getLogger("action-executor")
+
+class ActionExecutor:
+    def __init__(self, redis_client: redis.Redis, audit_dsn: str):
+        self.redis  = redis_client
+        self.audit_conn = psycopg2.connect(audit_dsn)
+
+    @contextmanager
+    def action_lock(self, db_host: str, action_name: str, ttl_seconds: int = 300):
+        lock_key = f"aiops:lock:{db_host}:{action_name}"
+        acquired = self.redis.set(lock_key, "1", nx=True, ex=ttl_seconds)
+        if not acquired:
+            raise RuntimeError(
+                f"Concurrent action lock held for {db_host}:{action_name}; skipping."
+            )
+        try:
+            yield
+        finally:
+            self.redis.delete(lock_key)
+
+    def check_circuit_breaker(self, db_host: str, window_minutes: int = 15, max_actions: int = 3):
+        cb_key = f"aiops:cb:{db_host}"
+        recent = self.redis.lrange(cb_key, 0, -1)
+        cutoff = datetime.now(timezone.utc).timestamp() - (window_minutes * 60)
+        recent_in_window = [
+            ts for ts in recent
+            if float(ts) &gt; cutoff
+        ]
+        if len(recent_in_window) &gt;= max_actions:
+            raise RuntimeError(
+                f"Circuit breaker open for {db_host}: "
+                f"{len(recent_in_window)} actions in last {window_minutes} min."
+            )
+
+    def record_action(self, db_host: str, action_name: str, parameters: dict,
+                      outcome: str, anomaly_id: str, duration_ms: float):
+        cb_key = f"aiops:cb:{db_host}"
+        self.redis.rpush(cb_key, datetime.now(timezone.utc).timestamp())
+        self.redis.expire(cb_key, 900)
+
+        with self.audit_conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO aiops_action_log
+                    (db_host, action_name, parameters, outcome,
+                     anomaly_id, duration_ms, executed_at)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """, (
+                db_host,
+                action_name,
+                json.dumps(parameters),
+                outcome,
+                anomaly_id,
+                duration_ms,
+            ))
+        self.audit_conn.commit()
+
+    def execute_pg_cancel_backend(self, pg_dsn: str, db_host: str,
+                                   blocker_pid: int, anomaly_id: str):
+        self.check_circuit_breaker(db_host)
+        with self.action_lock(db_host, "pg_cancel_backend"):
+            start = datetime.now(timezone.utc).timestamp()
+            try:
+                with psycopg2.connect(pg_dsn) as conn:
+                    with conn.cursor() as cur:
+                        # Re-verify condition before acting
+                        cur.execute("""
+                            SELECT pid FROM pg_stat_activity
+                            WHERE pid = %s
+                              AND state != 'idle'
+                              AND EXTRACT(EPOCH FROM (NOW() - query_start)) &gt; 25
+                        """, (blocker_pid,))
+                        if cur.fetchone() is None:
+                            logger.info("Blocker %s no longer present; skipping.", blocker_pid)
+                            return
+                        cur.execute("SELECT pg_cancel_backend(%s)", (blocker_pid,))
+                        result = cur.fetchone()[0]
+                outcome = "success" if result else "no_op"
+            except Exception as e:
+                outcome = f"error:{e}"
+                logger.exception("pg_cancel_backend failed for pid %s", blocker_pid)
+            finally:
+                duration_ms = (datetime.now(timezone.utc).timestamp() - start) * 1000
+                self.record_action(
+                    db_host, "pg_cancel_backend",
+                    {"blocker_pid": blocker_pid},
+                    outcome, anomaly_id, duration_ms
+                )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The audit table in PostgreSQL backs the feedback loop described in section 27.7:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE TABLE IF NOT EXISTS aiops_action_log (
+    id            BIGSERIAL PRIMARY KEY,
+    db_host       TEXT        NOT NULL,
+    action_name   TEXT        NOT NULL,
+    parameters    JSONB       NOT NULL DEFAULT '{}',
+    outcome       TEXT        NOT NULL,   -- 'success', 'no_op', 'error:...'
+    anomaly_id    TEXT,
+    duration_ms   NUMERIC(10, 2),
+    executed_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ON aiops_action_log (db_host, executed_at DESC);
+CREATE INDEX ON aiops_action_log (anomaly_id);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">SQL Server environments use an equivalent table in a dedicated <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aiops</code> database, with the same schema translated to T-SQL types (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">NVARCHAR(MAX)</code> for JSON, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DATETIMEOFFSET</code>).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.6 Autonomous Index Management as a Pipeline Use Case</h3>
+
+<p class="text-gray-300 leading-relaxed">Index management is one of the highest-value autonomous pipeline use cases because the decision logic is bounded, the benefit is measurable, and the risk of a wrong action is manageable when guardrails are applied. The pipeline targets two problems: <strong class="text-white">missing indexes</strong> that cause full scans on hot tables, and <strong class="text-white">bloated or unused indexes</strong> that waste storage and slow writes.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Missing index detection — PostgreSQL:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Identify tables with sequential scans exceeding a threshold
+-- that also have query patterns suggesting a selective predicate
+SELECT
+    schemaname,
+    relname                              AS table_name,
+    seq_scan,
+    seq_tup_read,
+    idx_scan,
+    seq_tup_read / NULLIF(seq_scan, 0)  AS avg_rows_per_seq_scan,
+    n_live_tup,
+    pg_size_pretty(pg_total_relation_size(schemaname || '.' || relname)) AS table_size
+FROM pg_stat_user_tables
+WHERE seq_scan &gt; 100
+  AND seq_tup_read / NULLIF(seq_scan, 0) &lt; 50000   -- selective scans
+  AND n_live_tup &gt; 10000
+ORDER BY seq_tup_read DESC
+LIMIT 30;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Missing index detection — SQL Server:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- DMV-based missing index candidates with impact score
+SELECT TOP 30
+    ROUND(
+        migs.avg_total_user_cost *
+        migs.avg_user_impact *
+        (migs.user_seeks + migs.user_scans), 2
+    )                                               AS improvement_score,
+    mid.statement                                   AS table_name,
+    mid.equality_columns,
+    mid.inequality_columns,
+    mid.included_columns,
+    migs.user_seeks,
+    migs.user_scans,
+    migs.last_user_seek,
+    migs.avg_user_impact
+FROM sys.dm_db_missing_index_group_stats  migs
+JOIN sys.dm_db_missing_index_groups       mig  ON mig.index_group_handle  = migs.group_handle
+JOIN sys.dm_db_missing_index_details      mid  ON mid.index_handle        = mig.index_handle
+WHERE migs.avg_total_user_cost * migs.avg_user_impact * (migs.user_seeks + migs.user_scans) &gt; 1000
+ORDER BY improvement_score DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When the pipeline identifies a candidate index, it does <strong class="text-white">not</strong> create the index immediately. Instead, it:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Generates the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX CONCURRENTLY</code> (PostgreSQL) or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE INDEX ... WITH (ONLINE = ON)</code> (SQL Server) DDL</p>
+<p class="text-gray-300 leading-relaxed">2. Estimates the index build duration using table size and historical build rates</p>
+<p class="text-gray-300 leading-relaxed">3. Checks whether a maintenance window is currently active or within the next 4 hours</p>
+<p class="text-gray-300 leading-relaxed">4. Writes the candidate to an <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">index_candidates</code> queue with status <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pending_approval</code> if outside maintenance window, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approved</code> if inside</p>
+<p class="text-gray-300 leading-relaxed">5. During the maintenance window, executes approved candidates in order of impact score, with a per-host concurrency limit of 1 index build at a time</p>
+<p class="text-gray-300 leading-relaxed">6. After build completion, monitors the query statistics for the target table for 24 hours and records whether the index was used</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong> Generating and executing the index safely:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Executor-generated DDL for a missing index candidate
+-- The pipeline fills in table_name, column_list from the candidate record
+CREATE INDEX CONCURRENTLY IF NOT EXISTS
+    idx_auto_{table_name}_{column_hash}
+ON {schema_name}.{table_name} ({column_list})
+-- INCLUDE clause added if avg_rows_per_seq_scan suggests covering index benefit
+;
+
+-- Post-build validation: confirm the index is valid (not invalid from a failed build)
+SELECT indexname, indexdef
+FROM pg_indexes
+WHERE schemaname = '{schema_name}'
+  AND tablename  = '{table_name}'
+  AND indexname  = 'idx_auto_{table_name}_{column_hash}'
+  AND indexdef NOT LIKE '%INVALID%';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong> Online index creation with progress monitoring:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Executor-generated DDL
+CREATE INDEX [idx_auto_{table_name}_{column_hash}]
+ON [{schema_name}].[{table_name}] ({equality_columns})
+INCLUDE ({included_columns})
+WITH (
+    ONLINE      = ON,
+    SORT_IN_TEMPDB = ON,
+    DATA_COMPRESSION = ROW
+);
+
+-- Post-build: confirm no disabled or suspect index state
+SELECT name, is_disabled, is_hypothetical
+FROM sys.indexes
+WHERE object_id = OBJECT_ID('{schema_name}.{table_name}')
+  AND name = 'idx_auto_{table_name}_{column_hash}';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Unused index retirement</strong> follows the same pipeline pattern with a stricter safety gate: an index is eligible for retirement only if it has had zero <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">idx_scan</code> (PostgreSQL) or zero <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">user_seeks + user_lookups + user_scans</code> (SQL Server) for a continuous period of 30 days across all replicas, and it is not a primary key, unique constraint, or foreign key support index. The retirement action is always <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP INDEX CONCURRENTLY</code> in PostgreSQL and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP INDEX ... WITH (ONLINE = ON)</code> in SQL Server — never a blocking drop in production.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.7 Feedback Loops and Continuous Model Improvement</h3>
+
+<p class="text-gray-300 leading-relaxed">An AIOps pipeline that does not learn from its own actions degrades over time. Workloads change, query patterns evolve, new application versions alter the statistical baseline. The feedback loop is the mechanism that keeps the anomaly detector and decision engine aligned with current reality.</p>
+
+<p class="text-gray-300 leading-relaxed">The feedback pipeline reads from the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aiops_action_log</code> and joins it against subsequent telemetry to determine whether each autonomous action produced the expected outcome:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong> Feedback analysis query:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Evaluate action effectiveness: did exec time improve after a cancel action?
+WITH action_events AS (
+    SELECT
+        al.id              AS action_id,
+        al.db_host,
+        al.anomaly_id,
+        al.action_name,
+        al.parameters -&gt;&gt; 'queryid'    AS queryid,
+        al.executed_at,
+        al.outcome
+    FROM aiops_action_log al
+    WHERE al.action_name IN ('pg_cancel_backend', 'analyze_table', 'alter_system_work_mem')
+      AND al.executed_at &gt; NOW() - INTERVAL '7 days'
+      AND al.outcome = 'success'
+),
+pre_post AS (
+    SELECT
+        ae.action_id,
+        ae.db_host,
+        ae.action_name,
+        AVG(CASE WHEN m.collected_at &lt; ae.executed_at
+                 THEN m.avg_exec_ms END)    AS pre_action_avg_ms,
+        AVG(CASE WHEN m.collected_at BETWEEN ae.executed_at
+                      AND ae.executed_at + INTERVAL '30 minutes'
+                 THEN m.avg_exec_ms END)    AS post_action_avg_ms
+    FROM action_events ae
+    JOIN query_metrics_archive m
+        ON  m.db_host  = ae.db_host
+        AND m.queryid  = ae.queryid
+        AND m.collected_at BETWEEN ae.executed_at - INTERVAL '10 minutes'
+                               AND ae.executed_at + INTERVAL '30 minutes'
+    GROUP BY ae.action_id, ae.db_host, ae.action_name
+)
+SELECT
+    action_name,
+    COUNT(*)                                                AS total_actions,
+    AVG(pre_action_avg_ms)                                  AS avg_pre_ms,
+    AVG(post_action_avg_ms)                                 AS avg_post_ms,
+    AVG((pre_action_avg_ms - post_action_avg_ms)
+        / NULLIF(pre_action_avg_ms, 0) * 100)               AS avg_improvement_pct,
+    COUNT(*) FILTER (WHERE post_action_avg_ms &lt; pre_action_avg_ms * 0.8)
+                                                            AS clearly_effective,
+    COUNT(*) FILTER (WHERE post_action_avg_ms &gt; pre_action_avg_ms * 1.1)
+                                                            AS made_things_worse
+FROM pre_post
+GROUP BY action_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server:</strong> Equivalent feedback analysis:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>WITH action_events AS (
+    SELECT
+        al.id              AS action_id,
+        al.db_host,
+        al.anomaly_id,
+        al.action_name,
+        JSON_VALUE(al.parameters, '$.queryid')   AS queryid,
+        al.executed_at,
+        al.outcome
+    FROM aiops_action_log al
+    WHERE al.action_name IN ('kill_spid', 'update_statistics', 'sp_recompile')
+      AND al.executed_at &gt; DATEADD(DAY, -7, GETUTCDATE())
+      AND al.outcome = 'success'
+),
+pre_post AS (
+    SELECT
+        ae.action_id,
+        ae.db_host,
+        ae.action_name,
+        AVG(CASE WHEN m.collected_at &lt; ae.executed_at
+                 THEN m.avg_elapsed_us END)     AS pre_action_avg_us,
+        AVG(CASE WHEN m.collected_at &gt;= ae.executed_at
+                  AND m.collected_at &lt;= DATEADD(MINUTE, 30, ae.executed_at)
+                 THEN m.avg_elapsed_us END)     AS post_action_avg_us
+    FROM action_events ae
+    JOIN query_metrics_archive m
+        ON  m.db_host  = ae.db_host
+        AND m.queryid  = ae.queryid
+        AND m.collected_at BETWEEN DATEADD(MINUTE, -10, ae.executed_at)
+                               AND DATEADD(MINUTE,  30, ae.executed_at)
+    GROUP BY ae.action_id, ae.db_host, ae.action_name
+)
+SELECT
+    action_name,
+    COUNT(*)                                                    AS total_actions,
+    AVG(pre_action_avg_us)                                      AS avg_pre_us,
+    AVG(post_action_avg_us)                                     AS avg_post_us,
+    AVG((pre_action_avg_us - post_action_avg_us)
+        / NULLIF(CAST(pre_action_avg_us AS FLOAT), 0) * 100)    AS avg_improvement_pct,
+    SUM(CASE WHEN post_action_avg_us &lt; pre_action_avg_us * 0.8
+             THEN 1 ELSE 0 END)                                 AS clearly_effective,
+    SUM(CASE WHEN post_action_avg_us &gt; pre_action_avg_us * 1.1
+             THEN 1 ELSE 0 END)                                 AS made_things_worse
+FROM pre_post
+GROUP BY action_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The feedback results feed into two downstream processes:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Confidence threshold calibration</strong>: If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_cancel_backend</code> produces improvement fewer than 60% of the time for a given anomaly pattern, the confidence threshold for triggering that action is raised from 0.85 to 0.92, reducing false-positive interventions.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Training data labeling</strong>: Feature vectors associated with "clearly effective" interventions are labeled as true positives; those associated with "made_things_worse" outcomes contribute to the false-positive training set. The nightly retraining job incorporates this labeled data in a semi-supervised pass after the unsupervised IsolationForest fit.</p>
+
+<p class="text-gray-300 leading-relaxed">This loop prevents two common failure modes: <strong class="text-white">alarm fatigue</strong> (the system fires too often on non-events, operators stop trusting it) and <strong class="text-white">drift blindness</strong> (the model stops detecting real anomalies because the baseline has shifted without retraining).</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.8 Guardrails, Governance, and Audit Compliance</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous systems operating on production databases must be auditable, reversible where possible, and governed by explicit policy. Without these properties, autonomous pipelines create operational risk rather than reducing it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Immutability of the audit log</strong> is the foundation. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aiops_action_log</code> table is protected by a trigger that prevents <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">UPDATE</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DELETE</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: audit log immutability enforcement
+CREATE OR REPLACE FUNCTION prevent_audit_modification()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION
+        'Audit log is immutable. action_id=% cannot be modified or deleted.', OLD.id;
+END;
+$$;
+
+CREATE TRIGGER audit_log_immutable
+BEFORE UPDATE OR DELETE ON aiops_action_log
+FOR EACH ROW EXECUTE FUNCTION prevent_audit_modification();</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: equivalent DDL trigger on the aiops database
+CREATE TRIGGER trg_audit_log_immutable
+ON aiops_action_log
+AFTER UPDATE, DELETE
+AS
+BEGIN
+    RAISERROR(
+        'Audit log is immutable. Modifications to aiops_action_log are not permitted.',
+        16, 1
+    );
+    ROLLBACK TRANSACTION;
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Policy-as-code</strong> ensures the safe action envelope is version-controlled alongside application code. The YAML policy file checked into the operations repository defines which actions are permitted for which environments, time windows, and confidence thresholds:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># aiops-policy.yaml — version controlled in ops repository
+policy_version: "2.1"
+environments:
+  production:
+    circuit_breaker:
+      max_actions_per_host_per_15min: 3
+      hard_stop_on_breach: true
+    maintenance_windows:
+      - cron: "0 2 * * 0"   # Sunday 02:00 UTC
+        duration_minutes: 120
+    allowed_actions:
+      - name: pg_cancel_backend
+        min_confidence: 0.85
+        blocker_duration_min_seconds: 30
+        excluded_application_names:
+          - pgbouncer
+          - logical_replication_worker
+          - pg_basebackup
+      - name: analyze_table
+        min_confidence: 0.80
+        require_maintenance_window: false
+        max_table_size_gb: 500
+      - name: alter_system_work_mem
+        min_confidence: 0.88
+        bounds_mb: [4, 256]
+        require_maintenance_window: false
+      - name: update_statistics
+        min_confidence: 0.82
+        require_maintenance_window: false
+      - name: sp_recompile
+        min_confidence: 0.80
+        require_maintenance_window: false
+      - name: kill_spid
+        min_confidence: 0.85
+        blocker_duration_min_seconds: 30
+        excluded_program_names:
+          - "SQL Server Replication"
+          - "SQLAgent - Generic Refresher"
+    denied_actions:
+      - create_index_on_primary_outside_window
+      - drop_index_without_30day_unused_confirmation
+      - terminate_application_service_account_connection
+  staging:
+    circuit_breaker:
+      max_actions_per_host_per_15min: 10
+      hard_stop_on_breach: false
+    allowed_actions: "*"    # all actions permitted in staging</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Change approval integration</strong>: For Tier 2 actions proposed by the LLM planner that fall within the envelope but above a configurable "review threshold" (e.g., any <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER SYSTEM</code> outside business hours), the pipeline integrates with ServiceNow or Jira Service Management via webhook to auto-create a change record. If no human approves within 10 minutes and the anomaly condition is still present, the system proceeds under the "auto-approve after timeout" policy if the environment policy permits it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Rollback capability</strong>: Where actions are reversible, the executor stores the pre-action state and generates a rollback script:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `alter_system_work_mem`: stores the prior value, generates `ALTER SYSTEM SET work_mem = '<prior_value>'`</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `update_statistics`: not directly reversible, but the executor records pre-statistics metadata from `sys.dm_db_stats_properties` so a human can assess drift</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `analyze_table`: re-running ANALYZE is always safe; rollback is not needed</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> `pg_cancel_backend` / `kill_spid`: by nature irreversible, but the consequence is bounded to a single query cancellation</li>
+
+<p class="text-gray-300 leading-relaxed">The rollback scripts are stored in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aiops_action_log.rollback_ddl</code> column and are executable by operations staff without requiring pipeline access.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">27.9 Deployment Topology and Operational Maturity Model</h3>
+
+<p class="text-gray-300 leading-relaxed">A production AIOps pipeline for a multi-region PostgreSQL or SQL Server fleet is not a single-host installation. It is a distributed system with its own availability, consistency, and latency requirements.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Reference Kubernetes deployment</strong>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>┌────────────────────────────────────────────────────────────────┐
+│  AIOps Namespace                                               │
+│                                                                │
+│  [telemetry-collector-pg]  [telemetry-collector-mssql]         │
+│       DaemonSet (per DB host)   DaemonSet (per DB host)        │
+│              │                          │                      │
+│              └──────────┬───────────────┘                      │
+│                         ▼                                      │
+│                  [kafka-cluster]                               │
+│                  StatefulSet (3 brokers)                       │
+│                         │                                      │
+│         ┌───────────────┼───────────────┐                      │
+│         ▼               ▼               ▼                      │
+│  [feature-engineer] [anomaly-detector] [feedback-processor]    │
+│    Deployment(3)      Deployment(3)      CronJob(nightly)       │
+│                         │                                      │
+│                         ▼                                      │
+│                  [decision-engine]                             │
+│                    Deployment(2)                               │
+│                         │                                      │
+│                         ▼                                      │
+│                  [action-executor]                             │
+│                    Deployment(2)                               │
+│                         │                                      │
+│               ┌─────────┴─────────┐                           │
+│               ▼                   ▼                            │
+│         [redis-cluster]    [audit-postgres]                    │
+│         StatefulSet(3)     StatefulSet(primary+standby)        │
+└────────────────────────────────────────────────────────────────┘</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Operational Maturity Model</strong>: Organizations adopting autonomous database pipelines typically progress through four stages, and the pipeline design should accommodate teams at any stage:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 1 — Observe only</strong>: The pipeline collects telemetry and generates anomaly reports but takes no autonomous action. All output goes to dashboards and alerts. This stage builds operator confidence and baseline data for model training. Duration: 4–8 weeks minimum.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 2 — Recommend and confirm</strong>: The decision engine generates recommended actions and presents them through a chat interface (Slack, Teams) with a one-click approval button. The executor waits for the button press. This stage validates that the recommended actions are correct before removing the human from the loop.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 3 — Autonomous for Tier 1, confirm for Tier 2</strong>: Low-risk, high-confidence actions execute autonomously. Moderate-confidence actions still require human confirmation. Operators begin to build trust in the system's judgment on the actions that execute autonomously.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stage 4 — Fully autonomous within policy</strong>: All actions within the safe envelope execute without human approval during the confidence thresholds defined in policy. Tier 3 escalation remains for out-of-envelope events. The pipeline's effectiveness is measured by MTTR reduction and false-positive rate, not by operator involvement.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    S1[Stage 1<br/>Observe only<br/>4-8 wks min] --> S2[Stage 2<br/>Recommend + confirm<br/>one-click approval]
+    S2 --> S3[Stage 3<br/>Autonomous Tier 1<br/>confirm Tier 2]
+    S3 --> S4[Stage 4<br/>Fully autonomous<br/>within policy]</pre></div>
+<p class="text-gray-300 leading-relaxed">*Each stage removes one increment of human confirmation — teams that skip Stage 2 tend to discover its edge cases the hard way, after an autonomous action rather than before one.*</p>
+
+<p class="text-gray-300 leading-relaxed">Most organizations benefit from spending more time at Stage 2 than they initially plan. The recommendation-and-confirm stage surfaces edge cases and policy gaps that would otherwise only be discovered after an autonomous action causes harm.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AIOps pipelines follow a closed-loop architecture** — collect, correlate, classify, decide, act, and audit — where each stage operates asynchronously on a queue, giving the system bounded end-to-end latency without blocking upstream telemetry collection.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feature engineering is more important than model sophistication**: transforming raw telemetry into Z-score deviations, rate-of-change signals, and behavioral fingerprint distances gives even a simple IsolationForest enough signal to achieve low false-positive rates in production.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The safe action envelope is the single most important governance construct** in an autonomous database pipeline: it defines precisely which actions the system may take without human approval, and every action proposed by the LLM planner must be validated against it before execution — LLM output is never trusted without envelope enforcement.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Action execution must be idempotent, re-verifying and circuit-broken**: the executor re-confirms the anomaly condition immediately before acting, holds a distributed lock to prevent concurrent duplicate actions, and halts autonomy on a per-host basis if the action rate exceeds the circuit breaker threshold, preventing a mis-detection cascade from causing widespread harm.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Feedback loops and an operational maturity model prevent two failure modes**: the feedback pipeline measures whether actions produced the expected outcomes and adjusts confidence thresholds accordingly, while the four-stage maturity model (observe → recommend → partial autonomous → fully autonomous) ensures teams build justified trust in the system before removing human approval from high-consequence decision paths.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
