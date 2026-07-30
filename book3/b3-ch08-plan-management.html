@@ -6,6 +6,10 @@
   <title>Chapter 8: Autonomous Execution Plan Management — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 8: Autonomous Execution Plan Management. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -168,6 +172,14 @@ CREATE INDEX IX_ade_plan_baselines_queryid
     ON dbo.ade_plan_baselines (query_id, force_status);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">The key architectural decision is the <strong class="text-white">promotion pipeline</strong>: candidate → accepted → pinned. A plan enters as a candidate when the autonomous system captures it during a clean performance window. It advances to accepted after surviving validation runs (section 8.3). It becomes pinned when the system actively forces it in response to a detected regression. This state machine prevents the automation from forcing plans that were only observed once under favorable conditions.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    C[Candidate<br/>captured in clean window] -->|passes shadow validation| A[Accepted]
+    A -->|regression detected| P[Pinned<br/>forced in production]
+    A -->|fails weekly re-validation| C
+    C -->|fails validation| R[Rejected]
+    P -->|second regression within 24h| ESC[Escalate to human]</pre></div>
+<p class="text-gray-300 leading-relaxed">*The plan baseline state machine: no plan is forced without first surviving validation, and repeated regression on a pinned plan escalates rather than triggers another automatic force.*</p>
 
 <p class="text-gray-300 leading-relaxed">For SQL Server, the native Query Store forced plan mechanism is invoked with:</p>
 
@@ -333,8 +345,8 @@ def dispatch_action(action: PlanAction, signal: QuerySignal,
 SET pg_hint_plan.enable_hint = on;
 SET pg_hint_plan.debug_print = on;
 
--- Example: force index scan with SeqScan disabled hint
-/*+ SeqScan(orders) IndexScan(orders idx_orders_customer_date) */
+-- Example: force the candidate index scan for this table
+/*+ IndexScan(orders idx_orders_customer_date) */
 EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON, TIMING ON)
 SELECT o.order_id, o.total_amount, c.email
 FROM orders o
@@ -424,6 +436,79 @@ def evaluate_candidate_plan(
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — Automated plan forcing via Query Store:</strong></p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rollback procedure: forces the accepted baseline plan
+-- Called by the decision engine when regression rule fires
+CREATE OR ALTER PROCEDURE dbo.usp_ade_force_baseline_plan
+    @query_id   BIGINT,
+    @reason     NVARCHAR(500) = 'Autonomous regression rollback'
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @plan_id        BIGINT;
+    DECLARE @current_status NVARCHAR(20);
+
+    -- Retrieve the accepted baseline plan for this query
+    SELECT TOP 1
+        @plan_id        = b.plan_id,
+        @current_status = b.force_status
+    FROM dbo.ade_plan_baselines b
+    WHERE b.query_id    = @query_id
+      AND b.force_status IN ('accepted', 'pinned')
+    ORDER BY b.captured_at DESC;
+
+    IF @plan_id IS NULL
+    BEGIN
+        RAISERROR('No accepted baseline available for query_id %d; escalating to human review.', 16, 1, @query_id);
+        RETURN;
+    END
+
+    -- Force the plan via Query Store
+    EXEC sys.sp_query_store_force_plan @query_id = @query_id, @plan_id = @plan_id;
+
+    UPDATE dbo.ade_plan_baselines
+    SET force_status       = 'pinned',
+        forced_by          = 'autonomous',
+        last_validated_at  = SYSUTCDATETIME(),
+        notes              = @reason
+    WHERE query_id = @query_id
+      AND plan_id  = @plan_id;
+
+    INSERT INTO dbo.ade_plan_action_log (query_id, plan_id, action, reason, acted_at)
+    VALUES (@query_id, @plan_id, 'FORCE_PLAN', @reason, SYSUTCDATETIME());
+END</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For PostgreSQL, the equivalent rollback is a hint-table update rather than a native plan-forcing call, since PostgreSQL has no built-in forced-plan mechanism:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Autonomous rollback: reinstate the accepted baseline hint string
+-- Called by the decision engine when the regression rule fires
+UPDATE ade_plan_mgmt.plan_baselines
+SET status = 'pinned',
+    promoted_by = 'autonomous',
+    last_validated_at = now()
+WHERE queryid = $1
+  AND status = 'accepted';
+
+INSERT INTO hint_plan.hints (norm_query_string, application_name, hints)
+SELECT query_fingerprint, '', hint_string
+FROM ade_plan_mgmt.plan_baselines
+WHERE queryid = $1 AND status = 'pinned'
+ON CONFLICT (norm_query_string, application_name)
+DO UPDATE SET hints = EXCLUDED.hints;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Rollback cascade prevention</strong> is the safeguard that keeps this loop from oscillating. If a forced plan itself starts regressing — because the underlying data distribution has shifted again — the naive response would be to force yet another plan, and potentially flip back and forth indefinitely as conditions change. The autonomous system enforces a cooldown: once a plan is forced, no further forcing action is taken for that query for a minimum window (typically one hour), and if a second regression is detected within 24 hours of a prior force, the action escalates to human review instead of forcing again automatically. Two autonomous corrections in one day on the same query is treated as evidence that the underlying cause is not a simple plan flip but something the decision policy doesn't understand yet.</p>
+
+<p class="text-gray-300 leading-relaxed">The feedback mechanism records every rollback's outcome — did execution time actually return to baseline after the force? — back into the audit log. This closes the loop: a decision engine that forces a plan and never checks whether it worked is not meaningfully different from a human who guesses and walks away.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plan instability falls into three distinguishable categories — regression, parameter sensitivity, and optimizer-version regression — and the observability layer must capture enough plan-level detail (via Query Store on SQL Server, or `auto_explain`/plan-tracking extensions on PostgreSQL) to tell them apart before any automated action fires.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> A plan baseline store with an explicit state machine (candidate → accepted → pinned) prevents the system from forcing a plan that was only ever observed once under favorable conditions; SQL Server implements forcing natively via Query Store, PostgreSQL requires `pg_hint_plan` and a custom hint-table overlay.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> The decision engine's policy rules must be explicit, ordered, and auditable — regression detection, instability capture, pre-promotion validation, and escalation thresholds for high-frequency or structurally complex queries — because implicit logic cannot be reviewed or trusted in production.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> No candidate plan should be promoted without shadow validation against production-representative data and a real statistical test (not just an eyeballed percentage difference); a plan that is merely equivalent to the current one should be rejected, since any plan change carries operational risk without corresponding benefit.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Rollback automation needs its own safeguard against oscillation: a cooldown window after forcing a plan, and escalation to human review if the same query regresses again shortly after a prior autonomous correction, rather than repeatedly re-forcing plans in response to a cause the system doesn't understand.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
