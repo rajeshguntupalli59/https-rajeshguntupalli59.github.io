@@ -6,6 +6,10 @@
   <title>Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 37: Cost Optimization: Dimensionality Reduction and Quantization. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -432,6 +436,400 @@ client.close()</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Every compression decision requires recall validation. "Recall@K" measures what fraction of the true top-K nearest neighbors you retrieve when using an approximate or compressed index. This is your primary metric.</p>
 
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import numpy as np
+from typing import Callable
+import time
+
+def compute_recall_at_k(
+    queries: np.ndarray,
+    corpus: np.ndarray,
+    search_fn: Callable,    # function: query_vector -&gt; list of retrieved IDs
+    k: int = 10,
+    batch_size: int = 100
+) -&gt; dict:
+    """
+    Computes Recall@K by comparing approximate search results
+    against brute-force exact neighbors.
+    
+    queries:    shape (n_queries, dims)
+    corpus:     shape (n_corpus, dims) — the indexed vectors
+    search_fn:  your vector DB search call, returns list of IDs
+    """
+    
+    # Ground truth: exact brute-force neighbors
+    # For large corpora, compute this once and cache it
+    print("Computing ground truth (brute force)...")
+    ground_truth = []
+    
+    # Batch to avoid OOM on large corpora
+    for q_start in range(0, len(queries), batch_size):
+        q_batch = queries[q_start:q_start + batch_size]
+        
+        # Cosine similarity via dot product (assumes normalized vectors)
+        similarities = q_batch @ corpus.T         # (batch, n_corpus)
+        top_k_indices = np.argsort(-similarities, axis=1)[:, :k]
+        ground_truth.extend(top_k_indices.tolist())
+    
+    # Approximate search with the system under test
+    print("Running approximate search...")
+    retrieved = []
+    latencies = []
+    
+    for i, query in enumerate(queries):
+        start = time.perf_counter()
+        result_ids = search_fn(query)
+        elapsed = time.perf_counter() - start
+        latencies.append(elapsed * 1000)   # ms
+        retrieved.append(result_ids[:k])
+    
+    # Recall@K: what fraction of ground truth top-K did we find?
+    recall_scores = []
+    for true_ids, ret_ids in zip(ground_truth, retrieved):
+        true_set = set(true_ids)
+        ret_set = set(ret_ids)
+        recall = len(true_set & ret_set) / len(true_set)
+        recall_scores.append(recall)
+    
+    return {
+        "recall_at_k": np.mean(recall_scores),
+        "recall_p50": np.percentile(recall_scores, 50),
+        "recall_p10": np.percentile(recall_scores, 10),   # worst queries
+        "latency_p50_ms": np.percentile(latencies, 50),
+        "latency_p95_ms": np.percentile(latencies, 95),
+        "latency_p99_ms": np.percentile(latencies, 99),
+        "k": k
+    }
+
+# Example: compare float32 vs int8 quantized search in Qdrant
+from qdrant_client import QdrantClient
+from qdrant_client.models import QuantizationSearchParams
+
+qdrant = QdrantClient(url="http://localhost:6333")
+
+def search_float32(query: np.ndarray) -&gt; list:
+    """Search without quantization."""
+    results = qdrant.search(
+        collection_name="documents_float32",
+        query_vector=query.tolist(),
+        limit=10,search_params=QuantizationSearchParams(ignore=True)  # disable quantization
+    )
+    return [r.id for r in results]
+
+def search_int8_rescore(query: np.ndarray) -&gt; list:
+    """Search with int8 quantization + rescoring."""
+    results = qdrant.search(
+        collection_name="documents_sq",
+        query_vector=query.tolist(),
+        limit=10,
+        search_params=QuantizationSearchParams(
+            ignore=False,
+            rescore=True,
+            oversampling=2.0
+        )
+    )
+    return [r.id for r in results]
+
+def search_int8_no_rescore(query: np.ndarray) -&gt; list:
+    """Search with int8 quantization only — maximum speed."""
+    results = qdrant.search(
+        collection_name="documents_sq",
+        query_vector=query.tolist(),
+        limit=10,
+        search_params=QuantizationSearchParams(
+            ignore=False,
+            rescore=False
+        )
+    )
+    return [r.id for r in results]
+
+# Load your benchmark queries
+queries = np.load("benchmark_queries.npy")        # shape (1000, 1536)
+corpus  = np.load("corpus_vectors_sample.npy")    # shape (50000, 1536) — same IDs as DB
+
+configs = {
+    "float32_exact":       search_float32,
+    "int8_with_rescore":   search_int8_rescore,
+    "int8_no_rescore":     search_int8_no_rescore,
+}
+
+results = {}
+for name, fn in configs.items():
+    print(f"\nBenchmarking: {name}")
+    results[name] = compute_recall_at_k(queries, corpus, fn, k=10)
+
+# Print comparison table
+print(f"\n{'Config':&lt;25} {'Recall@10':&gt;10} {'P10 Recall':&gt;10} {'P50 Lat ms':&gt;12} {'P95 Lat ms':&gt;12}")
+print("-" * 75)
+for name, metrics in results.items():
+    print(f"{name:&lt;25} {metrics['recall_at_k']:&gt;10.4f} "
+          f"{metrics['recall_p10']:&gt;10.4f} "
+          f"{metrics['latency_p50_ms']:&gt;12.2f} "
+          f"{metrics['latency_p95_ms']:&gt;12.2f}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The P10 recall column — the 10th percentile recall across your query set — is more informative than the mean. A mean recall of 0.95 can hide specific query categories that consistently miss. Those outliers often correspond to semantically sparse topics, short queries, or domain-specific vocabulary your embedding model handles poorly. Investigate them.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">What to do when recall is too low:</strong></p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Increase `oversampling` (Qdrant) or `nprobe` (Milvus/Faiss) — the fastest fix</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Increase `ef` at query time on HNSW indexes — trades latency for recall</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Switch from binary to int8 quantization — better recall at more memory cost</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Use a higher-quality embedding model — more information preserved at same dimensions</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Increase target dimensions if using MRL truncation — recall usually improves monotonically</li>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Combining Both Techniques: Dimension Reduction + Quantization</h3>
+
+<p class="text-gray-300 leading-relaxed">The highest compression ratios come from stacking both techniques: reduce dimensions first, then quantize. The order matters — quantize the reduced vectors, not the original ones.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A["Full vector<br/>1536-dim float32<br/>6144 bytes"] --> B["MRL truncation<br/>512-dim float32<br/>2048 bytes"]
+    B --> C["int8 quantization<br/>512-dim int8<br/>512 bytes (RAM)"]
+    B -.kept on disk for rescoring.-> D["512-dim float32<br/>on disk"]
+    C --> E["ANN candidate search"]
+    D --> F["Rescore top candidates<br/>with full precision"]
+    E --> F
+    F --> G["Final top-k results"]
+    style C fill:#c8e6c9</pre></div>
+<p class="text-gray-300 leading-relaxed">*Dimension reduction happens first, then quantization compresses the already-reduced vector — reducing the original would discard information the truncation already preserved.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python — Combined pipeline: MRL truncation + int8 in Qdrant
+
+from openai import OpenAI
+from qdrant_client import QdrantClient
+from qdrant_client.models import (
+    VectorParams, Distance,
+    ScalarQuantizationConfig, ScalarType,
+    QuantizationSearchParams, PointStruct
+)
+import numpy as np
+import uuid
+
+openai_client = OpenAI()
+qdrant = QdrantClient(url="http://localhost:6333")
+
+TARGET_DIMS = 512    # MRL truncation: 1536 → 512 (3.3× smaller)
+# Combined with int8: 512 × 1 byte = 512 bytes vs 1536 × 4 = 6144 bytes → 12× smaller
+
+# Create the collection: 512-dim vectors with int8 quantization
+qdrant.recreate_collection(
+    collection_name="documents_optimized",
+    vectors_config=VectorParams(
+        size=TARGET_DIMS,
+        distance=Distance.COSINE
+    ),
+    quantization_config=ScalarQuantizationConfig(
+        type=ScalarType.INT8,
+        quantile=0.99,
+        always_ram=True
+    )
+)
+
+def embed_documents(texts: list[str]) -&gt; np.ndarray:
+    """Embed at target dimensions using MRL truncation."""
+    response = openai_client.embeddings.create(
+        model="text-embedding-3-small",
+        input=texts,
+        dimensions=TARGET_DIMS
+    )
+    return np.array([item.embedding for item in response.data])
+
+def ingest_batch(texts: list[str], ids: list[str] = None):
+    """Embed and upsert a batch of documents."""
+    embeddings = embed_documents(texts)
+    
+    if ids is None:
+        ids = [str(uuid.uuid4()) for _ in texts]
+    
+    points = [
+        PointStruct(
+            id=id_,
+            vector=embedding.tolist(),
+            payload={"text": text}
+        )
+        for id_, text, embedding in zip(ids, texts, embeddings)
+    ]
+    
+    qdrant.upsert(collection_name="documents_optimized", points=points)
+    return ids
+
+def search_optimized(query_text: str, top_k: int = 10) -&gt; list[dict]:
+    """
+    Embed query at same truncated dimension, search with rescoring.
+    """
+    query_embedding = embed_documents([query_text])[0]
+    
+    results = qdrant.search(
+        collection_name="documents_optimized",
+        query_vector=query_embedding.tolist(),
+        limit=top_k,
+        search_params=QuantizationSearchParams(
+            rescore=True,
+            oversampling=2.0
+        ),
+        with_payload=True
+    )
+    
+    return [
+        {"id": r.id, "score": r.score, "text": r.payload.get("text", "")}
+        for r in results
+    ]
+
+# Storage math for this configuration:
+# Original: 1536 dims × 4 bytes = 6,144 bytes per vector
+# Optimized: 512 dims × 1 byte  =   512 bytes per vector (quantized in RAM)
+# + 512 dims × 4 bytes = 2,048 bytes on disk for rescoring originals
+# RAM savings: 12× for the hot index; disk holds originals at 3×</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A practical comparison across compression strategies for 10 million vectors:</p>
+
+<p class="text-gray-300 leading-relaxed">| Strategy | RAM (index only) | Disk | Recall@10 | Query Latency |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| float32, 1536 dims | ~200 GB | 58 GB | 0.99 | baseline |</p>
+<p class="text-gray-300 leading-relaxed">| float32, 512 dims (MRL) | ~67 GB | 19 GB | 0.97 | faster |</p>
+<p class="text-gray-300 leading-relaxed">| int8, 1536 dims + rescore | ~50 GB | 58 GB | 0.97 | similar |</p>
+<p class="text-gray-300 leading-relaxed">| int8, 512 dims + rescore | ~17 GB | 19 GB | 0.95 | faster |</p>
+<p class="text-gray-300 leading-relaxed">| binary, 1536 dims + rescore | ~6 GB | 58 GB | 0.93 | fastest search |</p>
+<p class="text-gray-300 leading-relaxed">| binary, 512 dims + rescore | ~2 GB | 19 GB | 0.90 | fastest overall |</p>
+
+<p class="text-gray-300 leading-relaxed">The int8 + 512 dims row represents the practical optimum for most production RAG systems: it cuts RAM by more than 10× versus full float32 HNSW, preserves 95% recall with rescoring, and keeps query latency low. Binary quantization pushes further but requires more careful recall validation — acceptable for some use cases, not for others.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">pgvector Optimization Workflow</h3>
+
+<p class="text-gray-300 leading-relaxed">For teams running vector search inside PostgreSQL via pgvector, the optimization path looks different from managed vector databases but the principles are identical.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector — full optimization workflow
+
+-- Step 1: Baseline — full float32, HNSW
+CREATE TABLE documents (
+    id          BIGSERIAL PRIMARY KEY,
+    content     TEXT,
+    source      TEXT,
+    embedding   VECTOR(1536)
+);
+
+CREATE INDEX idx_docs_embedding ON documents
+USING hnsw (embedding vector_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Step 2: Migrate to halfvec for 2× storage savings
+-- (pgvector &gt;= 0.7.0)
+ALTER TABLE documents ADD COLUMN embedding_half HALFVEC(1536);
+
+-- Backfill: cast existing vectors (batch this in production)
+UPDATE documents SET embedding_half = embedding::HALFVEC;
+
+-- Create HNSW on halfvec
+CREATE INDEX idx_docs_half ON documents
+USING hnsw (embedding_half halfvec_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- Test: compare result sets between full and half precision
+WITH full_results AS (
+    SELECT id, embedding &lt;=&gt; '[0.1, ...]'::VECTOR AS dist_full
+    FROM documents ORDER BY dist_full LIMIT 20
+),
+half_results AS (
+    SELECT id, embedding_half &lt;=&gt; '[0.1, ...]'::HALFVEC AS dist_half
+    FROM documents ORDER BY dist_half LIMIT 20
+)
+SELECT
+    COALESCE(f.id, h.id) AS id,
+    f.dist_full,
+    h.dist_half,
+    CASE WHEN f.id IS NULL THEN 'only in half'
+         WHEN h.id IS NULL THEN 'only in full'
+         ELSE 'in both' END AS status
+FROM full_results f
+FULL OUTER JOIN half_results h USING (id)
+ORDER BY COALESCE(f.dist_full, h.dist_half);
+
+-- Step 3: Dimension reduction at the application layer + halfvec
+-- If using MRL truncation, store 512-dim halfvec directly
+ALTER TABLE documents ADD COLUMN embedding_512h HALFVEC(512);
+
+-- This column gets populated from the application with 512-dim embeddings
+-- Storage: 512 × 2 bytes = 1024 bytes vs 1536 × 4 = 6144 bytes → 6× reduction
+
+CREATE INDEX idx_docs_512h ON documents
+USING hnsw (embedding_512h halfvec_cosine_ops)
+WITH (m = 16, ef_construction = 64);
+
+-- HNSW query-time recall tuning via session parameter
+SET hnsw.ef_search = 100;    -- default is 40; increase for better recall
+                              -- tune per query if needed
+
+SELECT id, content,
+       embedding_512h &lt;=&gt; $1::HALFVEC AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;
+
+-- Step 4: Measure index sizes
+SELECT
+    indexname,
+    pg_size_pretty(pg_relation_size(indexrelid)) AS index_size,
+    pg_size_pretty(pg_total_relation_size(indexrelid)) AS total_size
+FROM pg_stat_user_indexes
+WHERE relname = 'documents'
+ORDER BY pg_relation_size(indexrelid) DESC;
+
+-- Step 5: IVFFlat as lower-memory alternative to HNSW
+-- HNSW has better recall-latency tradeoff but uses more memory for the graph
+-- IVFFlat uses less memory, needs lists tuning
+
+CREATE INDEX idx_docs_ivfflat ON documents
+USING ivfflat (embedding_512h halfvec_cosine_ops)
+WITH (lists = 200);         -- rule of thumb: sqrt(n_rows) for up to 1M rows
+                            -- use 10*sqrt(n_rows) for larger datasets
+
+-- IVFFlat requires probes at query time:
+SET ivfflat.probes = 20;    -- check 20 of 200 lists (10%); tune for recall/speed
+
+SELECT id, content,
+       embedding_512h &lt;=&gt; $1::HALFVEC AS distance
+FROM documents
+ORDER BY distance
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SQL Server pairing for pgvector doesn't have a native equivalent — SQL Server does not include a production-grade vector index type as of 2024. For teams standardized on SQL Server who need vector search, the practical options are Azure AI Search (a managed service with its own vector index support) or a sidecar vector database alongside SQL Server for the embedding workload.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operational Checklist: Before You Compress</h3>
+
+<p class="text-gray-300 leading-relaxed">Compression decisions are difficult to reverse once data is in production. Run through this checklist before changing your vector storage strategy:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Benchmark with your actual queries, not synthetic ones.</strong></p>
+<p class="text-gray-300 leading-relaxed">Random query vectors don't represent the distribution of queries your users send. Use a sample of real production queries or, at minimum, queries from your domain.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Establish a recall floor, not just a recall target.</strong></p>
+<p class="text-gray-300 leading-relaxed">Decide in advance: what is the minimum acceptable Recall@10 for your application? If your RAG system fails to retrieve the right context, downstream LLM quality degrades. Set the floor before seeing the numbers, or you'll be tempted to rationalize whatever the benchmark shows.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Test re-indexing time.</strong></p>
+<p class="text-gray-300 leading-relaxed">Changing dimensions or quantization type requires re-embedding and re-indexing. For 10 million vectors, this can take hours. Know your re-indexing window before committing to a strategy that might need to change.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">4. Keep originals if you use binary quantization.</strong></p>
+<p class="text-gray-300 leading-relaxed">Binary quantization without rescoring loses too much recall for most applications. Rescoring requires access to original float32 vectors. If you compress and discard originals, you lose the ability to rescore.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">5. Stage changes through a shadow index.</strong></p>
+<p class="text-gray-300 leading-relaxed">Build the new compressed index in parallel, run your recall benchmark against both indexes simultaneously, and cut over only after validating recall. Never optimize directly on the production index.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">6. Monitor recall in production, not just at launch.</strong></p>
+<p class="text-gray-300 leading-relaxed">Query distributions shift over time. A compression strategy that meets your recall floor at launch may degrade as users ask questions about topics not well-represented in your corpus sample. Build a production recall monitor using human-labeled query-document pairs sampled weekly.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage and memory costs scale with both vector count and vector size**: the two primary levers for controlling cost are dimensionality reduction (fewer dimensions) and quantization (fewer bits per dimension), and they can be stacked for compounding savings.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **MRL-trained models (OpenAI text-embedding-3-*, Cohere v3) enable native truncation**: you can reduce from 1536 to 512 dimensions by setting a single API parameter, with better quality than PCA projection because the model was explicitly trained for it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Scalar quantization (int8) with rescoring is the lowest-risk compression step**: it delivers 4× memory reduction with recall loss typically under 3%, using the original float32 vectors stored on disk for rescoring top candidates identified by the compressed index.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The practical production optimum for most RAG systems is 512-dim MRL + int8 quantization**: this combination achieves roughly 12× memory reduction versus full float32 HNSW while preserving approximately 95% Recall@10, and it is straightforward to implement in both Qdrant and pgvector.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Recall benchmarking must use real queries and must track the P10 recall, not just the mean**: a high average recall can hide systematically poor retrieval on specific query categories, and those failures are the ones that degrade downstream LLM response quality in production.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
