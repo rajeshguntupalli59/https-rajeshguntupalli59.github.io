@@ -6,6 +6,10 @@
   <title>Chapter 29: Human Oversight in Autonomous DBA Systems — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 29: Human Oversight in Autonomous DBA Systems. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -106,6 +110,26 @@ def resolve_tier(base_tier: OversightTier, ctx: ActionContext) -&gt; OversightTi
 <p class="text-gray-300 leading-relaxed">The confidence score feeding this function comes from the decision model itself — whether that is a rule-based scoring system, an ML model trained on historical outcomes, or an LLM-based reasoning layer that expresses uncertainty. The architecture requires that every autonomous decision carry a machine-readable confidence estimate. Systems that cannot express uncertainty should not be trusted to act on Tier 0 or Tier 1 classifications.</p>
 
 <p class="text-gray-300 leading-relaxed">The oversight spectrum must be documented, version-controlled, and reviewed on a cadence. As the system accumulates operational history, tier assignments should drift downward for proven action classes and upward for any class that has produced a rollback or incident. This is how the system earns expanded autonomy — through demonstrated performance, not through assumption.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Signal Observed] --> B[Decision Engine: Base Tier + Confidence]
+    B --> C{Policy Engine: Context Adjustment}
+    C -->|Incident Active / Low Confidence| D[Escalate Tier]
+    C -->|Proven History, Non-prod| E[Downgrade Tier]
+    C --> F{Resolved Tier}
+    D --> F
+    E --> F
+    F -->|0-1| G[Execute Automatically]
+    F -->|2| H[Execute, Then Notify]
+    F -->|3| I[Queue for Human Approval]
+    F -->|4| J[Human-Initiated Only]
+    I -->|Approved| G
+    G --> K[Audit Trail]
+    H --> K
+    K --> L[Trust Evaluation]
+    L -->|Rollback Detected| D</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The tier-resolution flow: signals feed a decision engine, the policy engine adjusts for context, and the resolved tier routes the action through the appropriate oversight gate before feeding outcomes back into trust evaluation.*</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -453,7 +477,416 @@ SELECT session_id, request_id, status, command, blocking_session_id
 FROM sys.dm_exec_requests
 WHERE session_id = 87;</code></pre>
 
-<p class="text-gray-300 leading-relaxed">For Scenario 3, rollback is pre-planned. Every autonomous action that modifies state must have its rollback procedure defined before execution begins. The rollback procedure is stored in the audit record at proposal time, not at execution time — because by execution time, the state that makes the rollback deterministic may have changed.</p>
+<p class="text-gray-300 leading-relaxed">For Scenario 3, rollback is pre-planned. Every autonomous action that modifies state must have its rollback procedure defined before execution begins. The rollback procedure is stored in the audit record at proposal time, not at execution time — because by execution time, the state that makes the rollback deterministic may have changed. For index operations, rollbacks are straightforward: drop the index. For configuration parameter changes, rollbacks restore the prior value. For data-affecting operations — statistics updates, for example — rollbacks may require restoring from a pre-action snapshot if the operation is non-reversible by SQL alone.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Rollback executor: retrieves and applies stored rollback procedure
+import psycopg2
+import logging
+from datetime import datetime, timezone
+
+logger = logging.getLogger("ade.rollback")
+
+def execute_rollback(proposal_id: str, operator: str, conn_str: str) -&gt; dict:
+    """
+    Retrieves the pre-stored rollback procedure for a proposal and executes it.
+    Returns a result dict with success status and details.
+    """
+    with psycopg2.connect(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT p.proposal_id, p.rollback_procedure, p.proposed_sql,
+                       p.target_database, p.status, a.audit_id
+                FROM autonomous_action_proposals p
+                LEFT JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
+                WHERE p.proposal_id = %s
+            """, (proposal_id,))
+            row = cur.fetchone()
+
+    if not row:
+        return {"success": False, "error": f"Proposal {proposal_id} not found"}
+
+    pid, rollback_sql, original_sql, target_db, status, audit_id = row
+
+    if status != 'executed':
+        return {
+            "success": False,
+            "error": f"Proposal is in status '{status}'; rollback only applies to 'executed' actions"
+        }
+
+    if not rollback_sql:
+        return {
+            "success": False,
+            "error": "No rollback procedure stored for this action"
+        }
+
+    rollback_start = datetime.now(timezone.utc)
+
+    try:
+        with psycopg2.connect(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute(rollback_sql)
+            conn.commit()
+
+        rollback_duration_ms = int(
+            (datetime.now(timezone.utc) - rollback_start).total_seconds() * 1000
+        )
+
+        # Update proposal status and audit record
+        with psycopg2.connect(conn_str) as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE autonomous_action_proposals
+                    SET status = 'rolled_back'
+                    WHERE proposal_id = %s
+                """, (proposal_id,))
+                if audit_id:
+                    cur.execute("""
+                        UPDATE autonomous_action_audit
+                        SET execution_result = execution_result
+                                || E'\n\n--- ROLLBACK ---\n'
+                                || %s
+                                || ' by ' || %s
+                                || ' at ' || now()::text
+                        WHERE audit_id = %s
+                    """, (rollback_sql, operator, audit_id))
+            conn.commit()
+
+        logger.info(
+            "Rollback completed for proposal %s by %s in %dms",
+            proposal_id, operator, rollback_duration_ms
+        )
+        return {
+            "success": True,
+            "proposal_id": proposal_id,
+            "rolled_back_by": operator,
+            "duration_ms": rollback_duration_ms
+        }
+
+    except Exception as exc:
+        logger.error("Rollback failed for proposal %s: %s", proposal_id, exc)
+        return {
+            "success": False,
+            "error": str(exc),
+            "proposal_id": proposal_id
+        }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The equivalent rollback pattern for SQL Server follows the same pre-stored procedure model. Because SQL Server's DDL operations are transactional in many cases, the rollback procedure for an index creation can often simply be:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server rollback for an autonomous index creation
+-- Stored at proposal time as the rollback_procedure field
+IF EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE object_id = OBJECT_ID(N'dbo.orders')
+      AND name = N'IX_orders_customer_id_created_at_ade_20241103'
+)
+BEGIN
+    DROP INDEX IX_orders_customer_id_created_at_ade_20241103
+        ON dbo.orders;
+END</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The naming convention — embedding <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">_ade_</code> and a datestamp in the index name — is not cosmetic. It is what makes rollback queries unambiguous and auditable without needing to cross-reference a separate data store.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Trust Boundary Expansion: How Autonomy Earns Its Own Latitude</h3>
+
+<p class="text-gray-300 leading-relaxed">The oversight tier assignments described in the opening section are not static configuration. A healthy autonomous database system earns expanded latitude over time by demonstrating reliable performance. Conversely, it should lose latitude automatically when it produces poor outcomes. This feedback loop — trust earned through demonstrated behavior, revoked by demonstrated failure — is what separates a mature ADE deployment from an automation script that happens to be running unattended.</p>
+
+<p class="text-gray-300 leading-relaxed">Trust expansion operates at the action class level, not at the system level. The system might earn Tier 1 autonomy for autovacuum tuning while remaining at Tier 3 for partition management, because the execution history for each class is independent.</p>
+
+<p class="text-gray-300 leading-relaxed">The trust model requires three inputs for each action class and environment pair:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Execution history</strong>: How many times has this action class been executed? A minimum threshold — for example, twenty successful executions — establishes the baseline before any downgrade is considered.</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Outcome verification rate</strong>: Of executed actions, what fraction were confirmed successful by the post-execution signal check? An action that executes without error but does not produce the expected metric improvement counts against this rate.</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Rollback rate</strong>: Of executed actions, what fraction required rollback? Even a single rollback event within a rolling window should pause downgrade consideration.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Trust model: automated tier downgrade evaluation
+from dataclasses import dataclass
+from typing import Optional
+import psycopg2
+
+@dataclass
+class TrustEvaluation:
+    action_class: str
+    environment: str
+    current_tier: int
+    recommended_tier: int
+    reason: str
+    eligible_for_change: bool
+
+def evaluate_trust(
+    action_class: str,
+    environment: str,
+    conn_str: str,
+    lookback_days: int = 60,
+    min_executions: int = 20
+) -&gt; TrustEvaluation:
+
+    with psycopg2.connect(conn_str) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*)                                            AS total,
+                    SUM(CASE WHEN p.status = 'executed'
+                             THEN 1 ELSE 0 END)                        AS executed,
+                    SUM(CASE WHEN p.status = 'rolled_back'
+                             THEN 1 ELSE 0 END)                        AS rolled_back,
+                    SUM(CASE WHEN a.outcome_verified = TRUE
+                             THEN 1 ELSE 0 END)                        AS verified_success,
+                    AVG(p.confidence_score)                            AS avg_confidence,
+                    MAX(p.oversight_tier)                              AS current_tier
+                FROM autonomous_action_proposals p
+                LEFT JOIN autonomous_action_audit a
+                       ON a.proposal_id = p.proposal_id
+                WHERE p.action_class = %s
+                  AND p.target_environment = %s
+                  AND p.proposed_at &gt;= now() - (%s || ' days')::INTERVAL
+            """, (action_class, environment, str(lookback_days)))
+            row = cur.fetchone()
+
+    total, executed, rolled_back, verified, avg_confidence, current_tier = row
+
+    if total is None or executed is None or executed &lt; min_executions:
+        return TrustEvaluation(
+            action_class=action_class,
+            environment=environment,
+            current_tier=current_tier or 3,
+            recommended_tier=current_tier or 3,
+            reason=f"Insufficient history: {executed or 0} executions, need {min_executions}",
+            eligible_for_change=False
+        )
+
+    rollback_rate = (rolled_back or 0) / executed
+    verification_rate = (verified or 0) / executed
+
+    # Any rollback in the window blocks downgrade
+    if rolled_back and rolled_back &gt; 0:
+        return TrustEvaluation(
+            action_class=action_class,
+            environment=environment,
+            current_tier=current_tier,
+            recommended_tier=min(current_tier + 1, 4),  # Escalate
+            reason=f"Rollback rate {rollback_rate:.1%} in last {lookback_days} days",
+            eligible_for_change=True
+        )
+
+    # High verification rate and confidence qualify for downgrade
+    if verification_rate &gt;= 0.90 and avg_confidence &gt;= 0.80 and current_tier &gt; 0:
+        return TrustEvaluation(
+            action_class=action_class,
+            environment=environment,
+            current_tier=current_tier,
+            recommended_tier=current_tier - 1,
+            reason=(
+                f"Verification rate {verification_rate:.1%}, "
+                f"avg confidence {avg_confidence:.2f} over {executed} executions"
+            ),
+            eligible_for_change=True
+        )
+
+    return TrustEvaluation(
+        action_class=action_class,
+        environment=environment,
+        current_tier=current_tier,
+        recommended_tier=current_tier,
+        reason=f"Metrics acceptable but below downgrade threshold",
+        eligible_for_change=False
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The recommended tier from this evaluation is never applied automatically. It is surfaced in a weekly trust review report, reviewed by a senior DBA or database reliability engineer, and applied through a version-controlled change to the policy configuration. The automation surfaces the recommendation; the human makes the decision. This is the correct division of labor for a system that is still accumulating its own operational history.</p>
+
+<p class="text-gray-300 leading-relaxed">Trust revocation, by contrast, can be automatic and immediate. A rollback event on a production database triggers an instant tier escalation for that action class in that environment, and that escalation holds until the trust evaluation explicitly recommends a reduction. This asymmetry — slow to grant, fast to revoke — reflects sound risk management for systems that operate at database layer.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Operator Interfaces: Designing for Clarity Under Pressure</h3>
+
+<p class="text-gray-300 leading-relaxed">Humans interacting with autonomous systems in production do so under cognitive load — during incidents, during on-call rotations, during post-mortems. The operator interface must be designed for those conditions, not for the calm of a product demonstration. Clarity under pressure is an engineering requirement, not a UX aspiration.</p>
+
+<p class="text-gray-300 leading-relaxed">The primary interface surfaces are: the approval notification (what the operator sees when a Tier 3 proposal arrives), the dashboard (what the operator reviews during routine oversight), and the incident view (what the operator needs when something is wrong).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Approval notification design.</strong> A proposal notification must answer five questions in the first three seconds of reading: What changed? Why did the system propose this? What happens if approved? What happens if rejected? How long do I have? Anything beyond those five elements belongs in a link to the full audit record, not in the notification itself.</p>
+
+<p class="text-gray-300 leading-relaxed">A well-structured Slack approval notification looks like this:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>🔧 *Autonomous Action Proposal* — Approval Required
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+*Database:*   prod-orders-pg01  (production)
+*Action:*     CREATE INDEX CONCURRENTLY on orders(customer_id, created_at)
+*Why:*        Seq scan rate on orders increased 340% over 4h; 
+              query P99 latency 8.2s, threshold 2.0s
+*If approved:* Index build ~18 min (CONCURRENT, no lock). 
+              P99 latency projected to drop to 0.9s.
+*If rejected:* No action taken. Re-proposed in 6h if condition persists.
+*Rollback:*   DROP INDEX available; estimated 45s to execute.
+*Confidence:* 91%  |  *Expires:* 47 min from now
+
+[✅ Approve]  [❌ Reject]  [📋 Full details]</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The numeric specificity — 340% increase, 8.2s latency, 18-minute build time, 0.9s projection — is drawn from the signals_observed and projected_outcome fields of the proposal record. These numbers are what allow a DBA to make an informed decision without opening a second tool. Generic language such as "performance degradation detected" is operationally useless.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dashboard design.</strong> The oversight dashboard serves two audiences with different needs: the on-call DBA who needs real-time situational awareness, and the database reliability engineer who needs trend analysis for trust model calibration. These should be separate views within the same dashboard, not separate dashboards.</p>
+
+<p class="text-gray-300 leading-relaxed">The real-time view surfaces: current autonomy gate status (halted or active), count of pending proposals by environment, most recent executed action and its outcome status, and any actions in rollback state. These four elements are sufficient for a rotating on-call engineer to assess system health in ten seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">The trend view surfaces: action class execution frequency over 30/60/90-day windows, outcome verification rates by action class, confidence score distributions, and tier distribution changes over time. These metrics directly feed the trust model evaluation process.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Incident view.</strong> When an autonomous action is suspected of contributing to a production incident, the operator needs a single view that shows: what actions executed in the preceding hour, in chronological order, with their full audit trails inline. The incident view is a time-scoped audit log with narrative summaries promoted to the primary display.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: incident retrospective query
+-- Returns all actions executed in a time window with narrative summaries
+SELECT
+    p.proposed_at,
+    p.action_class,
+    p.target_database,
+    p.proposed_sql,
+    p.confidence_score,
+    p.status,
+    a.executed_at,
+    a.execution_duration_ms,
+    a.outcome_verified,
+    a.outcome_signals,
+    a.execution_result       -- includes LLM narrative if generated
+FROM autonomous_action_proposals p
+JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
+WHERE p.target_database = $1
+  AND a.executed_at BETWEEN $2 AND $3
+ORDER BY a.executed_at ASC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
+SELECT
+    p.ProposedAt,
+    p.ActionClass,
+    p.TargetDatabase,
+    p.ProposedSQL,
+    p.ConfidenceScore,
+    p.Status,
+    a.ExecutedAt,
+    a.ExecutionDurationMs,
+    a.OutcomeVerified,
+    a.OutcomeSignals,
+    a.ExecutionResult
+FROM dbo.AutonomousActionProposals p
+JOIN dbo.AutonomousActionAudit a ON a.ProposalId = p.ProposalId
+WHERE p.TargetDatabase = @TargetDatabase
+  AND a.ExecutedAt BETWEEN @WindowStart AND @WindowEnd
+ORDER BY a.ExecutedAt ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The incident view is also where the contestability mechanism described earlier should be accessible. A button or command alongside each action row that lets the operator flag the decision as flawed — even if the outcome was technically acceptable — is what closes the feedback loop from production operations into the trust model.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Compliance, Regulatory, and Change Management Integration</h3>
+
+<p class="text-gray-300 leading-relaxed">Autonomous database systems operating in regulated environments — financial services, healthcare, government — face additional constraints beyond operational risk. Change management processes, regulatory audit requirements, and separation-of-duties controls all intersect with the autonomous action pipeline in ways that must be anticipated in the architecture, not retrofitted after deployment.</p>
+
+<p class="text-gray-300 leading-relaxed">Change management integration means that Tier 3 and Tier 4 proposals can be optionally linked to change management tickets in systems such as ServiceNow or Jira. The proposal record holds an external ticket ID, and approval in the autonomous system either mirrors approval in the change system or requires it as a prerequisite.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Change management integration: ServiceNow ticket creation for Tier 3 proposals
+import requests
+import os
+from typing import Optional
+
+def create_servicenow_change_request(
+    proposal: dict,
+    servicenow_instance: str,
+    servicenow_user: str,
+    servicenow_password: str
+) -&gt; Optional[str]:
+    """
+    Creates a Standard Change Request in ServiceNow for a Tier 3 proposal.
+    Returns the change request number (e.g., 'CHG0012345') or None on failure.
+    """
+    url = f"https://{servicenow_instance}.service-now.com/api/now/table/change_request"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+
+    payload = {
+        "short_description": (
+            f"[ADE] {proposal['action_class']} on {proposal['target_database']}"
+        ),
+        "description": (
+            f"Autonomous Database Engine proposal\n\n"
+            f"Proposal ID: {proposal['proposal_id']}\n"
+            f"Proposed SQL: {proposal.get('proposed_sql', 'N/A')}\n"
+            f"Triggering signal: {proposal['triggering_signal']}\n"
+            f"Projected outcome: {proposal['projected_outcome']}\n"
+            f"Rollback procedure: {proposal['rollback_procedure']}\n"
+            f"Confidence score: {proposal['confidence_score']}"
+        ),
+        "type": "standard",
+        "category": "Database",
+        "risk": "low" if proposal['confidence_score'] &gt;= 0.85 else "medium",
+        "impact": "2",   # Medium impact default for database changes
+        "urgency": "2",
+        "assignment_group": "Database Reliability Engineering",
+        "requested_by": "ade-service-account",
+    }
+
+    try:
+        response = requests.post(
+            url,
+            auth=(servicenow_user, servicenow_password),
+            headers=headers,
+            json=payload,
+            timeout=10
+        )
+        response.raise_for_status()
+        change_number = response.json()["result"]["number"]
+        return change_number
+    except Exception as exc:
+        # Log but do not block the proposal — ITSM integration failure
+        # should not prevent the autonomous system from proposing actions
+        import logging
+        logging.getLogger("ade.itsm").warning(
+            "ServiceNow ticket creation failed for proposal %s: %s",
+            proposal['proposal_id'], exc
+        )
+        return None</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Separation of duties in regulated environments often requires that the operator approving an autonomous action cannot be the same person who configured the policy that produced it. This constraint is enforced in the approval workflow by recording both the policy author and the approver, and rejecting approvals where those identities match.</p>
+
+<p class="text-gray-300 leading-relaxed">Regulatory audit requirements typically demand that every change to a production database be traceable to an authorized change request, an approver identity, and a documented business justification. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_action_proposals</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autonomous_action_audit</code> tables, if populated correctly, satisfy these requirements. The LLM-generated narrative serves as the business justification field. The approver identity is the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">approved_by</code> column. The change request linkage provides the authorization chain.</p>
+
+<p class="text-gray-300 leading-relaxed">Periodic evidence exports — for SOC 2 auditors, for example — can be generated directly from these tables:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: SOC 2 evidence export for a given audit period
+COPY (
+    SELECT
+        p.proposal_id,
+        p.action_class,
+        p.target_database,
+        p.target_environment,
+        p.proposed_sql,
+        p.confidence_score,
+        p.oversight_tier,
+        p.approved_by,
+        p.approved_at,
+        p.status,
+        a.executed_at,
+        a.outcome_verified,
+        a.execution_result
+    FROM autonomous_action_proposals p
+    LEFT JOIN autonomous_action_audit a ON a.proposal_id = p.proposal_id
+    WHERE p.target_environment = 'production'
+      AND p.proposed_at BETWEEN '2024-01-01' AND '2024-03-31'
+    ORDER BY p.proposed_at
+) TO '/tmp/ade_audit_Q1_2024.csv' WITH CSV HEADER;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The export is not the audit. The export is the artifact that demonstrates the audit trail exists and is complete. The underlying tables are the system of record, and their integrity — ensured by the append-only audit pattern and the foreign key relationships — is what gives the export evidentiary weight.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomy without oversight tiers is reckless automation.** Every autonomous action must carry a risk classification that routes it through an appropriate oversight model — from silent execution to human-only initiation — with escalation logic that responds to context: incident state, confidence score, and environmental boundaries.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Approval workflows that block are worse than no automation.** Proposal expiry timestamps, differentiated notification channels, and carefully gated auto-escalation paths ensure that human review remains meaningful without becoming a bottleneck that negates the system's operational value.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Explainability is a first-class engineering output, not a logging afterthought.** Decision-time rationale capture, LLM-generated narrative summaries, and structured audit trail queries allow operators to understand, contest, and learn from autonomous decisions — and that contestability loop feeds directly into the confidence model's continuous improvement.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Override and rollback infrastructure must be pre-built and exercised, not assembled under pressure.** A single-command autonomy halt via Redis, database-native session termination for in-progress actions, and pre-stored rollback SQL defined at proposal time are the three layers that allow human control to be restored in under sixty seconds regardless of what the system was doing.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Trust is earned action-class by action-class through measured outcomes, and revoked instantly on failure.** The oversight tier for a given action class drifts downward only after a human reviews a quantitative trust evaluation meeting verified-success and confidence thresholds; it escalates automatically and immediately on any rollback event, creating an asymmetry that keeps the system conservatively bounded as it earns expanded autonomy.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
