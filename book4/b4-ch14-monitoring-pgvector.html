@@ -6,6 +6,10 @@
   <title>Chapter 14: Monitoring and Diagnosing pgvector Query Performance — Vector Databases & AI</title>
   <meta name="description" content="Vector Databases & AI Chapter 14: Monitoring and Diagnosing pgvector Query Performance. pgvector, Pinecone, Weaviate, RAG pipelines — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -487,7 +491,361 @@ LIMIT 50;</code></pre>
 <p class="text-gray-300 leading-relaxed">|--------|---------|----------|--------|</p>
 <p class="text-gray-300 leading-relaxed">| Mean vector query latency | > 100ms | > 500ms | Check <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code>, index health, buffer hit ratio |</p>
 <p class="text-gray-300 leading-relaxed">| Index buffer hit ratio | < 95% | < 80% | Increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_buffers</code>, investigate eviction |</p>
-<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Rows Removed by Filter</code> ratio | > 50x LIMIT | > 200x LIMIT | Raise `ef</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Rows Removed by Filter</code> ratio | > 50x LIMIT | > 200x LIMIT | Raise <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code>, add partial index, or restructure query |</p>
+<p class="text-gray-300 leading-relaxed">| IVFFlat <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes</code> effectiveness | recall < 0.90 | recall < 0.75 | Rebuild index with higher <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lists</code>, increase <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">probes</code> |</p>
+<p class="text-gray-300 leading-relaxed">| Dead tuple ratio on documents table | > 10% | > 25% | Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM ANALYZE documents</code> |</p>
+<p class="text-gray-300 leading-relaxed">| Index build age (IVFFlat) | > 2x rows at build | > 5x rows at build | Schedule <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REINDEX CONCURRENTLY</code> |</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.6 Recall Measurement in Production</h3>
+
+<p class="text-gray-300 leading-relaxed">Latency and throughput are easy to measure with wall-clock time. Recall—the fraction of true nearest neighbors that your ANN query actually returns—is harder to measure but equally important. A query that returns in 5ms but surfaces the wrong documents is worse than a 50ms query that surfaces the right ones.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Offline recall estimation using ground truth</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Python
+import numpy as np
+import psycopg2
+from sklearn.metrics.pairwise import cosine_similarity
+from typing import List, Tuple, Dict
+
+def compute_exact_neighbors(
+    vectors: np.ndarray,
+    query_vectors: np.ndarray,
+    k: int
+) -&gt; List[List[int]]:
+    """
+    Brute-force exact nearest neighbors using sklearn.
+    Returns list of lists of row indices (0-based).
+    """
+    sims = cosine_similarity(query_vectors, vectors)
+    # argsort ascending gives furthest first; flip for nearest
+    return [
+        list(np.argsort(-row)[:k])
+        for row in sims
+    ]
+
+
+def measure_recall(
+    conn_string: str,
+    row_ids: List[int],
+    vectors: np.ndarray,
+    query_vectors: np.ndarray,
+    k: int = 10,
+    ef_search: int = 64,
+) -&gt; Dict[str, float]:
+    """
+    Compare ANN results from pgvector against exact brute-force results.
+    row_ids must correspond 1:1 with vectors (row_ids[i] is the DB id for vectors[i]).
+    """
+    exact_neighbors = compute_exact_neighbors(vectors, query_vectors, k)
+
+    conn = psycopg2.connect(conn_string)
+    cur = conn.cursor()
+    cur.execute(f"SET hnsw.ef_search = {ef_search}")
+
+    recall_scores: List[float] = []
+
+    for q_idx, qvec in enumerate(query_vectors):
+        vec_str = "[" + ",".join(str(round(float(v), 6)) for v in qvec) + "]"
+        cur.execute(
+            """
+            SELECT id
+            FROM documents
+            ORDER BY embedding &lt;=&gt; %s::vector
+            LIMIT %s
+            """,
+            (vec_str, k),
+        )
+        ann_ids = [row[0] for row in cur.fetchall()]
+
+        # Convert exact neighbor indices to DB ids
+        exact_ids = set(row_ids[idx] for idx in exact_neighbors[q_idx])
+        ann_ids_set = set(ann_ids)
+
+        overlap = len(exact_ids & ann_ids_set)
+        recall_scores.append(overlap / k)
+
+    cur.close()
+    conn.close()
+
+    recall_arr = np.array(recall_scores)
+    return {
+        "ef_search": ef_search,
+        "k": k,
+        "mean_recall": round(float(recall_arr.mean()), 4),
+        "min_recall": round(float(recall_arr.min()), 4),
+        "p10_recall": round(float(np.percentile(recall_arr, 10)), 4),
+        "queries_below_90pct": int((recall_arr &lt; 0.90).sum()),
+    }
+
+
+# Usage
+if __name__ == "__main__":
+    import os
+
+    conn_str = os.environ["PGVECTOR_CONN"]
+
+    # In practice, load these from your actual documents table
+    rng = np.random.default_rng(0)
+    n_docs = 50_000
+    dims = 1536
+    doc_vectors = rng.standard_normal((n_docs, dims)).astype(np.float32)
+    doc_vectors /= np.linalg.norm(doc_vectors, axis=1, keepdims=True)
+
+    # Simulate row IDs starting at 1
+    doc_ids = list(range(1, n_docs + 1))
+
+    n_queries = 100
+    query_vecs = rng.standard_normal((n_queries, dims)).astype(np.float32)
+    query_vecs /= np.linalg.norm(query_vecs, axis=1, keepdims=True)
+
+    print(f"{'ef_search':&gt;10} | {'mean_recall':&gt;12} | {'min_recall':&gt;10} | {'&lt;90% queries':&gt;12}")
+    print("-" * 55)
+    for ef in [20, 40, 64, 100, 200]:
+        result = measure_recall(
+            conn_str, doc_ids, doc_vectors, query_vecs,
+            k=10, ef_search=ef
+        )
+        print(
+            f"{result['ef_search']:&gt;10} | "
+            f"{result['mean_recall']:&gt;12.4f} | "
+            f"{result['min_recall']:&gt;10.4f} | "
+            f"{result['queries_below_90pct']:&gt;12}"
+        )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this script on a representative sample of real query vectors—not random ones—to understand actual production recall. Random vectors do not reflect the clustered distribution of real embeddings from a specific domain, and recall numbers derived from random queries will overestimate real-world accuracy.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">In-production recall proxy: result count consistency</strong></p>
+
+<p class="text-gray-300 leading-relaxed">You cannot easily run brute-force comparison on every production query, but you can measure an indirect recall proxy: the consistency of result set overlap between two consecutive identical queries at different <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> settings.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Inline recall check: run the same query at two ef_search levels
+-- and measure overlap. Automate this with a scheduled probe query.
+
+-- Low-fidelity run
+SET hnsw.ef_search = 40;
+SELECT array_agg(id ORDER BY distance) AS low_fidelity_ids
+INTO TEMP low_fi
+FROM (
+    SELECT id, embedding &lt;=&gt; '[0.021, -0.045, ...]'::vector AS distance
+    FROM documents
+    ORDER BY embedding &lt;=&gt; '[0.021, -0.045, ...]'::vector
+    LIMIT 20
+) s;
+
+-- High-fidelity run (treat as ground truth for this check)
+SET hnsw.ef_search = 300;
+SELECT array_agg(id ORDER BY distance) AS high_fidelity_ids
+INTO TEMP high_fi
+FROM (
+    SELECT id, embedding &lt;=&gt; '[0.021, -0.045, ...]'::vector AS distance
+    FROM documents
+    ORDER BY embedding &lt;=&gt; '[0.021, -0.045, ...]'::vector
+    LIMIT 20
+) s;
+RESET hnsw.ef_search;
+
+-- Compute overlap ratio
+SELECT
+    (
+        SELECT count(*)
+        FROM unnest((SELECT low_fidelity_ids FROM low_fi)) AS lf(id)
+        WHERE id = ANY((SELECT high_fidelity_ids FROM high_fi))
+    )::float / 20 AS recall_proxy;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Schedule this probe once per minute against a stable set of known query vectors. If <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">recall_proxy</code> drops below 0.85 on a representative set, it's a signal that the index has drifted (for IVFFlat) or that <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_search</code> is too low relative to current filter patterns.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.7 Index Maintenance Scheduling</h3>
+
+<p class="text-gray-300 leading-relaxed">Unlike B-tree indexes, which tolerate incremental inserts gracefully, both IVFFlat and HNSW indexes have specific maintenance considerations.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">HNSW: incremental inserts and graph quality</strong></p>
+
+<p class="text-gray-300 leading-relaxed">HNSW supports incremental inserts without a full rebuild. Each new vector is linked into the graph at build time using the current <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">m</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ef_construction</code> parameters. This means the graph quality remains consistent as rows are added—a significant operational advantage. However, deleted rows create dead entries in the graph that are only reclaimed by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM</code>. Monitor dead tuple counts to schedule vacuums proactively:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Check dead tuple accumulation on the documents table
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    round(100.0 * n_dead_tup / nullif(n_live_tup + n_dead_tup, 0), 2) AS dead_pct,
+    last_vacuum,
+    last_autovacuum,
+    autovacuum_count
+FROM pg_stat_user_tables
+WHERE relname = 'documents';
+
+-- If dead_pct &gt; 5% and autovacuum hasn't run recently, trigger manually
+VACUUM (ANALYZE, VERBOSE) documents;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For workloads with high delete or update rates (common in RAG pipelines where document chunks are re-ingested), consider lowering <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">autovacuum_vacuum_scale_factor</code> for the table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Make autovacuum more aggressive for the documents table
+ALTER TABLE documents SET (
+    autovacuum_vacuum_scale_factor = 0.01,    -- vacuum when 1% of rows are dead
+    autovacuum_analyze_scale_factor = 0.005   -- analyze when 0.5% of rows change
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">IVFFlat: rebuild scheduling</strong></p>
+
+<p class="text-gray-300 leading-relaxed">IVFFlat does not update its cluster centroids as new data arrives. Track the ratio of current rows to rows at index build time, and schedule a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REINDEX CONCURRENTLY</code> when that ratio exceeds 2:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL / pgvector
+-- Store index build row count for IVFFlat drift tracking
+CREATE TABLE IF NOT EXISTS ivfflat_index_registry (
+    index_name      text PRIMARY KEY,
+    table_name      text NOT NULL,
+    build_row_count bigint NOT NULL,
+    build_lists     int NOT NULL,
+    built_at        timestamptz DEFAULT now()
+);
+
+-- Populate at index build time (run immediately after CREATE INDEX)
+INSERT INTO ivfflat_index_registry
+    (index_name, table_name, build_row_count, build_lists)
+SELECT
+    'documents_embedding_ivfflat_idx',
+    'documents',
+    n_live_tup,
+    1000  -- match the lists parameter used in CREATE INDEX
+FROM pg_stat_user_tables
+WHERE relname = 'documents'
+ON CONFLICT (index_name) DO UPDATE
+    SET build_row_count = EXCLUDED.build_row_count,
+        built_at = now();
+
+-- Daily drift check query
+SELECT
+    r.index_name,
+    r.build_row_count,
+    s.n_live_tup AS current_rows,
+    round(s.n_live_tup::numeric / nullif(r.build_row_count, 0), 2) AS growth_ratio,
+    CASE
+        WHEN s.n_live_tup &gt; r.build_row_count * 2
+            THEN 'REINDEX RECOMMENDED'
+        WHEN s.n_live_tup &gt; r.build_row_count * 1.5
+            THEN 'REINDEX SOON'
+        ELSE 'OK'
+    END AS status
+FROM ivfflat_index_registry r
+JOIN pg_stat_user_tables s ON s.relname = r.table_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">14.8 Putting It Together: A Monitoring Runbook</h3>
+
+<p class="text-gray-300 leading-relaxed">Effective monitoring requires not just the right queries but a clear protocol for when to run them and what to do with the results. The following runbook covers the three most common investigation triggers: sudden latency increase, recall complaints, and index rebuild after bulk ingestion.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Symptom observed] --> B{Latency p95 > 200ms?}
+    B -->|Yes| C[Check buffer hit ratio<br/>and long-running queries]
+    A --> D{Recall complaint?}
+    D -->|Yes| E["Check Rows Removed by Filter,<br/>ef_search / probes settings"]
+    A --> F{After bulk ingestion?}
+    F -->|Yes| G[ANALYZE table,<br/>check IVFFlat drift,<br/>re-run recall probe]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The three most common investigation triggers and their first diagnostic step — detailed queries for each follow below.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Trigger 1: Sudden latency increase (p95 > 200ms)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Confirm the problem is vector queries, not general DB load
+SELECT
+    wait_event_type,
+    wait_event,
+    count(*) AS sessions
+FROM pg_stat_activity
+WHERE state != 'idle'
+GROUP BY wait_event_type, wait_event
+ORDER BY count(*) DESC;
+
+-- Step 2: Check if buffer hit ratio has dropped
+SELECT
+    relname,
+    round(100.0 * idx_blks_hit /
+        nullif(idx_blks_hit + idx_blks_read, 0), 2) AS idx_hit_pct
+FROM pg_statio_user_tables
+WHERE relname = 'documents';
+
+-- Step 3: Check for long-running vector queries blocking resources
+SELECT pid, now() - query_start AS age, state, left(query, 200)
+FROM pg_stat_activity
+WHERE query ILIKE '%&lt;=&gt;%' AND state != 'idle'
+ORDER BY age DESC;
+
+-- Step 4: If idx_hit_pct &lt; 90%, check shared_buffers utilization
+SHOW shared_buffers;
+
+-- Step 5: Check for bloated dead tuples causing index scan overhead
+SELECT n_dead_tup, n_live_tup FROM pg_stat_user_tables
+WHERE relname = 'documents';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Trigger 2: Application team reports poor search quality (recall degradation)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Confirm which index is being used
+EXPLAIN SELECT id FROM documents
+ORDER BY embedding &lt;=&gt; '[0.021, ...]'::vector LIMIT 10;
+
+-- Step 2: Check if a filtered query is exhausting ef_search candidates
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM documents
+WHERE tenant_id = $1
+ORDER BY embedding &lt;=&gt; $2::vector LIMIT 10;
+-- Look for large "Rows Removed by Filter" count
+
+-- Step 3: Check IVFFlat drift if index type is ivfflat
+SELECT * FROM ivfflat_index_registry;  -- compare build_row_count to current
+
+-- Step 4: Verify current ef_search / probes settings
+SHOW hnsw.ef_search;
+SHOW ivfflat.probes;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Trigger 3: Post-bulk-ingestion index validation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">After loading a large batch of new documents (common in RAG pipeline refresh cycles):</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Verify new rows are reflected in statistics
+ANALYZE documents;
+
+-- Step 2: Check dead tuple ratio after bulk insert
+SELECT n_live_tup, n_dead_tup FROM pg_stat_user_tables
+WHERE relname = 'documents';
+
+-- Step 3: For IVFFlat, check growth ratio and reindex if needed
+SELECT * FROM ivfflat_index_registry;
+
+-- Step 4: Run the recall probe with current ef_search
+-- (use the Python measure_recall() function from section 14.6)
+
+-- Step 5: If reindex is needed, execute concurrently
+REINDEX INDEX CONCURRENTLY documents_embedding_ivfflat_idx;
+-- Then update the registry
+UPDATE ivfflat_index_registry
+SET build_row_count = (
+    SELECT n_live_tup FROM pg_stat_user_tables WHERE relname = 'documents'
+),
+built_at = now()
+WHERE index_name = 'documents_embedding_ivfflat_idx';</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **EXPLAIN ANALYZE is your first tool, but `pg_stat_statements` is your continuous instrument.** Single-query EXPLAIN captures one execution; aggregate statistics from `pg_stat_statements` filtered on vector operator patterns (`<=>`, `<#>`, `<+>`) reveal the sustained latency profile and help you identify query variants that are underperforming in production traffic.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The scalar-filter interaction is pgvector's most common production performance trap.** When a `WHERE` clause filter is applied as a post-scan recheck on ANN results, a high `Rows Removed by Filter` count in EXPLAIN output is the diagnostic signal. Mitigation options—partial indexes per filter value, pre-filtering CTEs, or raising `ef_search`—should be chosen based on filter selectivity and the number of distinct filter values.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **IVFFlat indexes drift silently as data grows.** The cluster centroids are fixed at build time, so as the row count grows beyond roughly twice the build-time row count, search quality degrades without any error or warning. Track build-time row counts in a registry table and schedule `REINDEX CONCURRENTLY` when the growth ratio exceeds 2.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **HNSW's upper graph layers must stay in the buffer cache.** An `idx_hit_pct` below 90% on the documents table means the HNSW graph is being read from disk on frequent queries, pushing latency well above the single-digit millisecond range that HNSW is capable of. Monitor buffer hit ratios per index, tune `shared_buffers`, and use the `pg_prewarm` extension to reload the index into cache after a PostgreSQL restart.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Recall cannot be inferred from latency alone.** A fast query with low `ef_search` or a drifted IVFFlat index may be returning wrong results without any latency signal. Build an offline recall measurement pipeline using a sample of real production query vectors compared against brute-force ground truth, and complement it with a scheduled in-production recall proxy that compares low- and high-fidelity ANN results on stable probe vectors.</li>
     </div>
     <div class="mt-14 bg-cyan-950/40 border border-cyan-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
