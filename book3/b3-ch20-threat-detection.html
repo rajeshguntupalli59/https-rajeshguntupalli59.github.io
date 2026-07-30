@@ -6,6 +6,10 @@
   <title>Chapter 20: Autonomous Threat Detection — The ADE Handbook</title>
   <meta name="description" content="The ADE Handbook Chapter 20: Autonomous Threat Detection. Autonomous database engineering for PostgreSQL and SQL Server, by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -376,6 +380,24 @@ if __name__ == "__main__":
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Level 4 — Revoke and isolate.</strong> For the highest-confidence threats — novel query + off-hours connection + bulk data access simultaneously — the system revokes the role's login privilege entirely and creates a forensic snapshot of what was accessed.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Composite threat score] --> B{Score below 4.0?}
+    B -->|yes| M[MONITORING — log only]
+    B -->|no| C{Protected principal?}
+    C -->|yes| H[Escalate to human]
+    C -->|no| D{Score 4.0-5.5?}
+    D -->|yes| L1[Level 1: rate-limit session]
+    D -->|no| E{Score 5.5-7.0?}
+    E -->|yes| L2[Level 2: terminate query]
+    L2 -->|2 terminations in 5 min| L3
+    E -->|no| L3[Level 3: terminate session]
+    L3 --> Q{Quorum check: session over 60% of app pool?}
+    Q -->|yes| H
+    Q -->|no| F{Novel + off-hours + bulk access?}
+    F -->|yes| L4[Level 4: revoke login + forensic snapshot]
+    F -->|no| L3done[Session quarantined]</pre></div>
+<p class="text-gray-300 leading-relaxed">*The containment ladder proportions response to confidence — quorum and protected-principal checks are hard gates that route to a human before Level 3/4 actions fire.*</p>
+
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Level 1: Rate-limit suspicious session dynamically
 -- Executed by the monitoring user with pg_signal_backend privilege
@@ -461,7 +483,466 @@ GROUP BY qs.query_hash, qt.query_sql_text;</code></pre>
 
 <p class="text-gray-300 leading-relaxed">Two safety mechanisms prevent the autonomous system from taking catastrophic actions:</p>
 
-<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Protected principals list.</strong> The accounts used by the monitoring agent itself, replication users, backup agents, and named DBA accounts</p>
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Protected principals list.</strong> The accounts used by the monitoring agent itself, replication users, backup agents, and named DBA accounts are permanently excluded from autonomous containment. A compromised monitoring credential is still dangerous, but it should trigger a manual escalation path, not a self-terminating loop where the security agent kills itself.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Quorum check before Level 3 and Level 4 actions.</strong> Before terminating a session or revoking a login, the containment engine queries how many other sessions from the same application are currently active and healthy. If the target session represents more than 60% of an application's connection pool, autonomous termination is suppressed and the action is escalated to a human-approved queue instead. This prevents a miscalibrated score from causing an application outage by killing the majority of its connections.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def can_act_autonomously(
+    username: str,
+    session_id: str,
+    level: int,
+    conn_pg
+) -&gt; bool:
+    """
+    Returns True if autonomous action at the given level is safe.
+    Level 3+ requires quorum check.
+    """
+    PROTECTED = {"pg_monitor", "replication", "pg_backup_agent", "dba_monitor"}
+    if username in PROTECTED:
+        logger.warning("Skipping autonomous action: protected principal %s", username)
+        return False
+
+    if level &lt; 3:
+        return True
+
+    # Quorum check: how many sessions does this user account for?
+    with conn_pg.cursor() as cur:
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE usename = %s)  AS user_sessions,
+                COUNT(*)                               AS total_sessions
+            FROM pg_stat_activity
+            WHERE state != 'idle'
+              AND usename NOT IN ('postgres', 'replication')
+        """, (username,))
+        user_sessions, total_sessions = cur.fetchone()
+
+    if total_sessions == 0:
+        return True
+
+    ratio = user_sessions / total_sessions
+    if ratio &gt; 0.60:
+        logger.warning(
+            "Quorum check failed for %s: %.0f%% of active sessions — "
+            "escalating to human queue instead of autonomous Level %d action",
+            username, ratio * 100, level
+        )
+        return False
+
+    return True</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The containment actions are idempotent by design. Issuing <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_terminate_backend()</code> against a session that has already disconnected returns <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">false</code> without raising an error. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER LOGIN DISABLE</code> on an already-disabled login in SQL Server is a no-op. This means the system can retry actions on the 30-second polling loop without accumulating side effects.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.5 DDL and Privilege Escalation Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">Schema mutations and privilege changes are categorically different from query anomalies. They do not require statistical modeling — any <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">GRANT</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CREATE USER</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE</code>, or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">DROP</code> operation that occurs outside a defined change window is an unconditional high-severity signal. The autonomous system treats them with a separate detection path that bypasses the scoring model entirely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL event trigger for DDL detection:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create the forensic capture table
+CREATE TABLE IF NOT EXISTS security.ddl_audit (
+    event_id        BIGSERIAL PRIMARY KEY,
+    event_type      TEXT,
+    schema_name     TEXT,
+    object_name     TEXT,
+    object_type     TEXT,
+    executing_user  TEXT,
+    client_addr     INET,
+    client_port     INT,
+    application_name TEXT,
+    occurred_at     TIMESTAMPTZ DEFAULT now(),
+    in_change_window BOOLEAN,
+    command_tag     TEXT,
+    full_query      TEXT
+);
+
+-- Event trigger function
+CREATE OR REPLACE FUNCTION security.capture_ddl_event()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    obj           record;
+    in_window     BOOLEAN;
+    current_hour  INT;
+BEGIN
+    current_hour := EXTRACT(HOUR FROM now() AT TIME ZONE 'UTC');
+    -- Change window: 02:00–04:00 UTC Saturday (adjust to your policy)
+    in_window := (
+        EXTRACT(DOW FROM now() AT TIME ZONE 'UTC') = 6
+        AND current_hour BETWEEN 2 AND 3
+    );
+
+    FOR obj IN SELECT * FROM pg_event_trigger_ddl_commands()
+    LOOP
+        INSERT INTO security.ddl_audit (
+            event_type, schema_name, object_name, object_type,
+            executing_user, client_addr, client_port,
+            application_name, in_change_window, command_tag, full_query
+        )
+        VALUES (
+            TG_EVENT,
+            obj.schema_name,
+            obj.object_identity,
+            obj.object_type,
+            current_user,
+            (SELECT client_addr  FROM pg_stat_activity WHERE pid = pg_backend_pid()),
+            (SELECT client_port  FROM pg_stat_activity WHERE pid = pg_backend_pid()),
+            (SELECT application_name FROM pg_stat_activity WHERE pid = pg_backend_pid()),
+            in_window,
+            obj.command_tag,
+            current_query()
+        );
+
+        -- Outside change window: immediate autonomous alert, no scoring delay
+        IF NOT in_window THEN
+            PERFORM pg_notify(
+                'security_alert',
+                json_build_object(
+                    'severity',    'HIGH',
+                    'type',        'DDL_OUTSIDE_WINDOW',
+                    'user',        current_user,
+                    'command',     obj.command_tag,
+                    'object',      obj.object_identity,
+                    'occurred_at', now()
+                )::TEXT
+            );
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- Attach the trigger to all DDL events
+CREATE EVENT TRIGGER ddl_security_monitor
+    ON ddl_command_end
+    EXECUTE FUNCTION security.capture_ddl_event();</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_notify</code> call pushes the alert to any listening process — the scoring engine's notification handler — within milliseconds of the DDL completing. This is meaningfully faster than waiting for the next 30-second polling cycle.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server — DDL trigger equivalent:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Forensic table
+CREATE TABLE SecurityAudit.DdlEvents (
+    EventId         BIGINT IDENTITY PRIMARY KEY,
+    EventType       NVARCHAR(100),
+    ObjectName      NVARCHAR(256),
+    SchemaName      NVARCHAR(128),
+    LoginName       NVARCHAR(128),
+    HostName        NVARCHAR(128),
+    AppName         NVARCHAR(256),
+    OccurredAt      DATETIME2 DEFAULT SYSUTCDATETIME(),
+    InChangeWindow  BIT,
+    CommandText     NVARCHAR(MAX)
+);
+
+-- Server-scoped DDL trigger
+CREATE OR ALTER TRIGGER SecurityAudit.CaptureServerDDL
+ON ALL SERVER
+FOR CREATE_USER, ALTER_USER, DROP_USER,
+    GRANT_DATABASE, REVOKE_DATABASE, DENY_DATABASE,
+    CREATE_TABLE, ALTER_TABLE, DROP_TABLE,
+    CREATE_PROCEDURE, ALTER_PROCEDURE, DROP_PROCEDURE,
+    CREATE_LOGIN, ALTER_LOGIN, DROP_LOGIN
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @EventData XML     = EVENTDATA();
+    DECLARE @InWindow  BIT     = 0;
+    DECLARE @Hour      TINYINT = DATEPART(HOUR, SYSUTCDATETIME());
+    DECLARE @Dow       TINYINT = DATEPART(WEEKDAY, SYSUTCDATETIME()); -- 7=Saturday
+
+    -- Change window: Saturday 02:00–04:00 UTC
+    IF @Dow = 7 AND @Hour BETWEEN 2 AND 3
+        SET @InWindow = 1;
+
+    INSERT INTO SecurityAudit.DdlEvents (
+        EventType, ObjectName, SchemaName,
+        LoginName, HostName, AppName,
+        InChangeWindow, CommandText
+    )
+    SELECT
+        @EventData.value('(/EVENT_INSTANCE/EventType)[1]',    'NVARCHAR(100)'),
+        @EventData.value('(/EVENT_INSTANCE/ObjectName)[1]',   'NVARCHAR(256)'),
+        @EventData.value('(/EVENT_INSTANCE/SchemaName)[1]',   'NVARCHAR(128)'),
+        @EventData.value('(/EVENT_INSTANCE/LoginName)[1]',    'NVARCHAR(128)'),
+        HOST_NAME(),
+        APP_NAME(),
+        @InWindow,
+        @EventData.value('(/EVENT_INSTANCE/TSQLCommand/CommandText)[1]', 'NVARCHAR(MAX)');
+
+    -- Outside change window: write to alert queue for autonomous handler
+    IF @InWindow = 0
+    BEGIN
+        INSERT INTO SecurityAudit.AlertQueue (
+            Severity, AlertType, Details, QueuedAt
+        )
+        VALUES (
+            'HIGH',
+            'DDL_OUTSIDE_WINDOW',
+            @EventData.value('(/EVENT_INSTANCE/EventType)[1]', 'NVARCHAR(100)')
+                + ' ON '
+                + @EventData.value('(/EVENT_INSTANCE/ObjectName)[1]', 'NVARCHAR(256)'),
+            SYSUTCDATETIME()
+        );
+    END
+END;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Privilege escalation detection extends beyond DDL triggers. The scoring engine also runs a scheduled differential check every 5 minutes comparing current role memberships against the last-known-good snapshot:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Snapshot current role memberships
+CREATE TABLE IF NOT EXISTS security.role_membership_snapshot (
+    snapshot_id     BIGSERIAL,
+    captured_at     TIMESTAMPTZ DEFAULT now(),
+    member_role     TEXT,
+    granted_role    TEXT,
+    granted_by      TEXT,
+    admin_option    BOOLEAN
+);
+
+-- Differential: roles granted since last snapshot
+INSERT INTO security.role_membership_snapshot
+    (member_role, granted_role, granted_by, admin_option)
+SELECT
+    r.rolname   AS member_role,
+    g.rolname   AS granted_role,
+    gr.rolname  AS granted_by,
+    m.admin_option
+FROM pg_auth_members m
+JOIN pg_roles r  ON r.oid  = m.member
+JOIN pg_roles g  ON g.oid  = m.roleid
+JOIN pg_roles gr ON gr.oid = m.grantor
+WHERE NOT EXISTS (
+    SELECT 1 FROM security.role_membership_snapshot prev
+    WHERE prev.member_role   = r.rolname
+      AND prev.granted_role  = g.rolname
+      AND prev.captured_at   = (
+          SELECT MAX(captured_at)
+          FROM security.role_membership_snapshot
+      )
+);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Any newly appeared row in this differential is an unconditional alert. A role granted between scheduled windows without a corresponding change-management ticket in the external ITSM system (validated via an HTTP callback to the ITSM API) is escalated immediately to Level 4 autonomous containment.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.6 Integration with External Security Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">An autonomous detection system that operates entirely within the database perimeter is incomplete. Threats that originate at the application layer, succeed in part through the database, and then pivot to other infrastructure require correlation across multiple signal sources. The database-layer detection system must emit structured events that SIEM platforms, SOAR orchestrators, and zero-trust policy engines can consume.</p>
+
+<p class="text-gray-300 leading-relaxed">The canonical output format is structured JSON over a reliable transport. The scoring engine pushes events to three destinations simultaneously:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Prometheus Alertmanager</strong> for operational on-call routing (low latency, fire-and-forget)</p>
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">An append-only event log table</strong> in the database itself (durable, queryable for forensics)</p>
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">A message queue</strong> (Kafka topic or AWS SQS queue) for SIEM ingestion (ordered, replayable)</p>
+
+<p class="text-gray-300 leading-relaxed">The event schema follows the OCSF (Open Cybersecurity Schema Framework) database/datastore activity category to maximize compatibility with Splunk, Microsoft Sentinel, and Elastic SIEM without requiring custom parsers. The exact <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">class_uid</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">category_uid</code> values are versioned by the OCSF schema itself, so confirm them against the schema release you target before wiring up production ingestion — the values below are illustrative:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import json
+import datetime
+from dataclasses import asdict
+
+OCSF_CLASS_UID_DATABASE_ACTIVITY = 5001   # placeholder — verify against your OCSF schema version
+
+def build_ocsf_event(score: ThreatScore, action_taken: str) -&gt; dict:
+    """
+    Construct an OCSF-compatible Database Activity event from a threat score.
+    """
+    return {
+        "class_uid":      OCSF_CLASS_UID_DATABASE_ACTIVITY,
+        "class_name":     "Database Activity",
+        "category_uid":   5,
+        "category_name":  "Discovery",
+        "activity_id":    2,           # OCSF: Query
+        "severity_id":    (
+            5 if score.composite_score &gt;= 7.0 else
+            4 if score.composite_score &gt;= 5.5 else
+            3 if score.composite_score &gt;= 4.0 else
+            2
+        ),
+        "severity":       (
+            "Critical" if score.composite_score &gt;= 7.0 else
+            "High"     if score.composite_score &gt;= 5.5 else
+            "Medium"   if score.composite_score &gt;= 4.0 else
+            "Low"
+        ),
+        "status_id":      1,
+        "status":         "Success",
+        "time":           int(score.triggered_at.timestamp() * 1000),
+        "message":        (
+            f"Anomalous database session detected for user {score.username}. "
+            f"Composite threat score: {score.composite_score:.2f}."
+        ),
+        "actor": {
+            "user": {
+                "name":     score.username,
+                "uid_alt":  score.session_id
+            }
+        },
+        "metadata": {
+            "version":    "1.1.0",
+            "product": {
+                "name":    "Autonomous DB Threat Detection",
+                "version": "2.0"
+            }
+        },
+        "unmapped": {
+            "score_components": score.components,
+            "action_taken":     action_taken,
+            "composite_score":  score.composite_score
+        }
+    }
+
+def emit_to_kafka(event: dict, producer) -&gt; None:
+    producer.produce(
+        topic="db-security-events",
+        value=json.dumps(event).encode("utf-8"),
+        key=event["actor"]["user"]["name"].encode("utf-8")
+    )
+    producer.poll(0)   # non-blocking flush
+
+def emit_to_alert_table(event: dict, conn) -&gt; None:
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO security.ocsf_event_log
+                (class_uid, severity_id, event_time, actor_user, raw_json)
+            VALUES (%s, %s, to_timestamp(%s / 1000.0), %s, %s)
+        """, (
+            event["class_uid"],
+            event["severity_id"],
+            event["time"],
+            event["actor"]["user"]["name"],
+            json.dumps(event)
+        ))
+        conn.commit()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The SOAR integration layer consumes from the Kafka topic and applies playbook logic. Playbooks at this layer handle tasks the database engine itself cannot: creating a security incident ticket, notifying the user's manager, coordinating with network teams to geo-block the source IP, or triggering an AWS GuardDuty finding. The database-layer autonomous system handles only what it can do with certainty and speed — query termination, session disconnect, login suspension — and delegates everything requiring broader organizational context to the SOAR.</p>
+
+<p class="text-gray-300 leading-relaxed">One integration pattern worth implementing explicitly is the <strong class="text-white">feedback loop</strong>: when a SOAR playbook resolves an incident as a false positive, it sends a callback to the database security system's API endpoint. That callback marks the incident in the event log as a false positive and triggers a baseline recalibration for the affected user — slightly widening the anomaly thresholds to account for legitimate-but-unusual behavior. Without this feedback loop, an analyst who regularly runs large batch queries off-hours will generate persistent noise until the baseline naturally absorbs their behavior over 14 days. The feedback loop collapses that to seconds.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">20.7 Forensic Preservation and Post-Incident Analysis</h3>
+
+<p class="text-gray-300 leading-relaxed">When autonomous containment fires, forensic preservation must happen simultaneously — not afterward. Evidence that might survive in memory, in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code>, or in SQL Server's plan cache is volatile and can be lost as soon as the session ends and cache entries age out.</p>
+
+<p class="text-gray-300 leading-relaxed">The containment engine triggers forensic capture as part of every Level 3 and Level 4 action:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL — Comprehensive session forensic capture:</strong></p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Capture all available evidence before terminating the session
+CREATE OR REPLACE PROCEDURE security.capture_session_forensics(
+    p_incident_id   TEXT,
+    p_target_pid    INT,
+    p_target_user   TEXT
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+BEGIN
+    -- 1. Snapshot of current session state
+    INSERT INTO security.forensic_sessions (
+        incident_id, pid, usename, application_name,
+        client_addr, backend_start, query_start,
+        state, wait_event_type, wait_event,
+        query_snapshot, captured_at
+    )
+    SELECT
+        p_incident_id,
+        pid, usename, application_name,
+        client_addr, backend_start, query_start,
+        state, wait_event_type, wait_event,
+        query,
+        clock_timestamp()
+    FROM pg_stat_activity
+    WHERE pid = p_target_pid;
+
+    -- 2. All queries this user has run (from pg_stat_statements)
+    INSERT INTO security.forensic_query_history (
+        incident_id, usename, queryid, query,
+        calls, total_exec_time, rows,
+        captured_at
+    )
+    SELECT
+        p_incident_id,
+        r.rolname,
+        s.queryid,
+        s.query,
+        s.calls,
+        s.total_exec_time,
+        s.rows,
+        clock_timestamp()
+    FROM pg_stat_statements s
+    JOIN pg_roles r ON r.oid = s.userid
+    WHERE r.rolname = p_target_user;
+
+    -- 3. Any locks held by this session
+    INSERT INTO security.forensic_locks (
+        incident_id, pid, locktype, relation_name,
+        mode, granted, captured_at
+    )
+    SELECT
+        p_incident_id,
+        l.pid,
+        l.locktype,
+        c.relname,
+        l.mode,
+        l.granted,
+        clock_timestamp()
+    FROM pg_locks l
+    LEFT JOIN pg_class c ON c.oid = l.relation
+    WHERE l.pid = p_target_pid;
+
+    -- 4. Record the containment action
+    INSERT INTO security.containment_actions (
+        incident_id, action_type, target_user,
+        target_pid, executed_at, executed_by
+    )
+    VALUES (
+        p_incident_id, 'LEVEL3_TERMINATE', p_target_user,
+        p_target_pid, clock_timestamp(), current_user
+    );
+END;
+$$;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">After forensic capture, the post-incident analysis pipeline runs automatically within 2 minutes using the preserved evidence. It generates a structured incident report covering: timeline of the session, all queries executed during the incident window, tables accessed, data volume estimates, and the sequence of anomaly signals that triggered the response. This report goes directly to the SIEM as an OCSF Finding event and into a dedicated incident tracking table.</p>
+
+<p class="text-gray-300 leading-relaxed">The post-incident analysis also feeds a longer-horizon threat hunting query that examines whether the same anomaly pattern appeared in other sessions in the preceding 30 days — potentially revealing earlier reconnaissance that did not individually cross the detection threshold:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Threat hunt: find sessions with similar anomaly fingerprint
+-- within 30-day lookback window
+SELECT
+    el.actor_user,
+    el.event_time,
+    el.severity_id,
+    el.raw_json -&gt; 'unmapped' -&gt; 'score_components' AS components,
+    el.raw_json -&gt; 'unmapped' -&gt; 'composite_score'  AS score
+FROM security.ocsf_event_log el
+WHERE el.event_time &gt; now() - INTERVAL '30 days'
+  AND el.class_uid = 5001
+  AND (el.raw_json -&gt; 'unmapped' -&gt; 'score_components' -&gt; 'rows')::FLOAT
+      &gt; 2.0     -- similar row-volume anomaly
+  AND el.actor_user != :confirmed_threat_user
+ORDER BY el.event_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This pattern surfaces related actors that may be part of the same campaign — for instance, multiple application accounts compromised in a credential stuffing attack, each operating below the individual detection threshold but showing the same behavioral fingerprint.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Autonomous threat detection requires simultaneous instrumentation of all four observable planes** — authentication, query execution, schema mutation, and data volume — because attackers who have already passed the perimeter leave signals that only become conclusive when correlated across multiple dimensions. A single-plane monitoring approach produces both excessive noise and dangerous blind spots.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Behavioral baselining must be per-identity and decay-weighted**, not aggregate. A baseline that treats all users as a single population will miss insider threats and account compromise entirely. Exponential decay weighting ensures the model tracks genuine workload evolution without permanently absorbing attack behavior into the normal profile.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The scoring-to-action pipeline must be graduated and reversible.** A binary detect-or-ignore system either generates too many false positives to remain credible or sets thresholds so high that real threats pass unimpeded. The four-level containment ladder — rate-limit, query kill, session terminate, login revoke — proportions the response to confidence, and protected principal lists with quorum checks prevent autonomous actions from causing application outages worse than the attack itself.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **DDL and privilege escalation events bypass the statistical scoring model entirely.** Schema changes and role grants in production outside of defined change windows are unconditional high-severity signals. Event triggers and server-scoped DDL triggers fire synchronously within the transaction, providing sub-second detection latency that polling-based approaches cannot match.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Forensic preservation and SIEM emission must be atomic with the containment action**, not deferred. Evidence in plan caches, session state, and lock tables is volatile. Capturing it after termination means capturing nothing. Integrating forensics into the containment procedure, combined with OCSF-formatted event emission to a durable message queue, ensures that autonomous speed does not come at the cost of the post-incident visibility needed to understand the full scope of a threat.</li>
     </div>
     <div class="mt-14 bg-emerald-950/40 border border-emerald-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
