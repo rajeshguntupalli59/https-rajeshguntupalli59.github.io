@@ -5,6 +5,10 @@
   <title>Chapter 6: Building Your First Database Cost Dashboard — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 6: Building Your First Database Cost Dashboard. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -70,7 +74,7 @@
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Egress** — billed when data crosses regions or exits Google's network</li>
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Backup storage** — $0.08/GB-month for Cloud SQL automated backups</li>
 
-<p class="text-gray-300 leading-relaxed">The math that surprises most teams: a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> RDS instance in us-east-1 running 24/7 on-demand costs $0.48/hour × 730 hours = <strong class="text-white">$350.40/month</strong> for the instance alone. Add Multi-AZ ($700.80), 1TB gp2 storage ($115), backup retention across 7 days (~$95), and a conservative data transfer estimate ($40), and a single "medium" database costs approximately <strong class="text-white">$950/month</strong> before you have written a single query against it. A reserved instance purchase for that same class drops the hourly rate to roughly $0.286 for a 1-year no-upfront commitment — saving <strong class="text-white">$140/month per instance</strong>. With ten such instances, that is $1,680/year in savings from one configuration change.</p>
+<p class="text-gray-300 leading-relaxed">The math that surprises most teams: a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> RDS instance in us-east-1 running 24/7 on-demand costs $0.48/hour × 730 hours = <strong class="text-white">$350.40/month</strong> for the instance alone. Multi-AZ doubles that to <strong class="text-white">$700.80/month</strong>; add 1TB gp2 storage ($115), backup retention across 7 days (~$95), and a conservative data transfer estimate ($40), and a single "medium" database costs approximately <strong class="text-white">$950/month</strong> before you have written a single query against it. A reserved instance purchase for that same class drops the hourly rate to roughly $0.286 for a 1-year no-upfront commitment — saving <strong class="text-white">$140/month per instance</strong>. With ten such instances, that is $16,800/year in savings from one configuration change.</p>
 
 <p class="text-gray-300 leading-relaxed">Your dashboard must expose all of these dimensions independently. An aggregated "database cost" number is not actionable. A breakdown that shows backup storage growing 15% month-over-month while instance costs remain flat tells a DBA to look at retention policy configuration immediately.</p>
 
@@ -387,7 +391,1001 @@ CREATE TABLE dbfinops.query_cost_attribution (
 <p class="text-gray-300 leading-relaxed">A cost dashboard that shows only spend is a finance tool. A cost dashboard that shows spend alongside performance metrics — query latency, connection counts, CPU utilization, I/O wait — is an engineering tool that finance can also read. This section builds the queries and automation that populate that correlation layer.</p>
 
 <p class="text-gray-300 leading-relaxed">The following Python script pulls query statistics from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> on an RDS PostgreSQL instance, calculates a cost attribution per query based on its CPU share, and writes the results to the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_cost_attribution</code> table.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+query_cost_attribution.py
+
+Connects to a PostgreSQL database, pulls pg_stat_statements metrics,
+fetches the daily instance cost from dbfinops.daily_costs,
+calculates per-query cost attribution, and stores results.
+
+Schedule: daily at 01:00 UTC via cron or EventBridge
+
+Dependencies:
+    pip install psycopg2-binary boto3 python-dotenv
+
+Environment variables (via .env or Secrets Manager):
+    DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD
+    MONITORING_DB_HOST, MONITORING_DB_NAME, MONITORING_DB_USER, MONITORING_DB_PASSWORD
+"""
+
+import os
+import logging
+from datetime import date, timedelta
+from decimal import Decimal
+
+import psycopg2
+import psycopg2.extras
+from dotenv import load_dotenv
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+log = logging.getLogger(__name__)
+
+# ── Connection helpers ────────────────────────────────────────────────────────
+
+def get_source_conn():
+    """Connect to the database being analyzed."""
+    return psycopg2.connect(
+        host=os.environ["DB_HOST"],
+        port=int(os.environ.get("DB_PORT", 5432)),
+        dbname=os.environ["DB_NAME"],
+        user=os.environ["DB_USER"],
+        password=os.environ["DB_PASSWORD"],
+        connect_timeout=10,
+        options="-c statement_timeout=60000"
+    )
+
+def get_monitoring_conn():
+    """Connect to the monitoring database where dbfinops schema lives."""
+    return psycopg2.connect(
+        host=os.environ["MONITORING_DB_HOST"],
+        dbname=os.environ.get("MONITORING_DB_NAME", "dbfinops"),
+        user=os.environ["MONITORING_DB_USER"],
+        password=os.environ["MONITORING_DB_PASSWORD"],
+        connect_timeout=10
+    )
+
+# ── Query stats collection ────────────────────────────────────────────────────
+
+QUERY_STATS_SQL = """
+SELECT
+    queryid,
+    LEFT(query, 200)                                AS query_fingerprint,
+    calls,
+    ROUND((total_exec_time)::NUMERIC, 3)            AS total_exec_ms,
+    ROUND((mean_exec_time)::NUMERIC, 3)             AS mean_exec_ms,
+    rows                                            AS rows_returned,
+    shared_blks_hit,
+    shared_blks_read,
+    -- CPU share: this query's exec time as % of all queries' exec time
+    ROUND(
+        (total_exec_time / NULLIF(SUM(total_exec_time) OVER (), 0) * 100)::NUMERIC,
+        4
+    )                                               AS pct_of_total_exec_time
+FROM
+    pg_stat_statements
+WHERE
+    calls &gt; 10                          -- filter noise: queries called fewer than 10 times
+    AND total_exec_time &gt; 1000          -- filter noise: less than 1 second total exec time
+    AND query NOT LIKE '%pg_stat%'      -- exclude monitoring queries themselves
+ORDER BY
+    total_exec_time DESC
+LIMIT 100;
+"""
+
+def fetch_query_stats(conn) -&gt; list[dict]:
+    """Pull top query stats from pg_stat_statements."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT COUNT(*) FROM pg_extension WHERE extname = 'pg_stat_statements'")
+        if cur.fetchone()["count"] == 0:
+            log.warning("pg_stat_statements extension not installed on this database.")
+            return []
+        cur.execute(QUERY_STATS_SQL)
+        rows = cur.fetchall()
+        log.info("Fetched %d query stats rows", len(rows))
+        return [dict(r) for r in rows]
+
+# ── Daily cost lookup ─────────────────────────────────────────────────────────
+
+def fetch_daily_instance_cost(monitoring_conn, db_identifier: str,
+                               target_date: date) -&gt; Decimal:
+    """
+    Look up yesterday's instance cost for a given database identifier.
+    Returns 0 if no cost record found (handles new databases gracefully).
+    """
+    sql = """
+        SELECT COALESCE(SUM(unblended_cost), 0) AS instance_cost
+        FROM   dbfinops.daily_costs
+        WHERE  database_identifier = %s
+          AND  cost_date            = %s
+          AND  cost_dimension       = 'instance'
+    """
+    with monitoring_conn.cursor() as cur:
+        cur.execute(sql, (db_identifier, target_date))
+        result = cur.fetchone()
+        cost = Decimal(str(result[0])) if result else Decimal("0")
+        log.info("Daily instance cost for %s on %s: $%s", db_identifier, target_date, cost)
+        return cost
+
+# ── Cost attribution calculation ──────────────────────────────────────────────
+
+def calculate_storage_io_cost(blks_read: int, daily_storage_cost: Decimal) -&gt; Decimal:
+    """
+    Estimate the storage I/O cost attributed to a query based on blocks read.
+    daily_storage_cost is the total daily storage cost for the instance.
+    We use blocks read as a proxy for I/O pressure against the storage bill.
+    """
+    # A block in PostgreSQL is 8KB; convert to GB for cost estimation
+    gb_read = Decimal(str(blks_read)) * Decimal("8192") / Decimal("1073741824")
+    # Scale against daily storage cost — this is an approximation, not an exact split
+    return (gb_read * daily_storage_cost).quantize(Decimal("0.000001"))
+
+
+def attribute_costs(
+    query_stats: list[dict],
+    daily_instance_cost: Decimal,
+    daily_storage_cost: Decimal,
+) -&gt; list[dict]:
+    """
+    Merge query stats with cost data to produce per-query cost attribution records.
+    """
+    attributed = []
+    for row in query_stats:
+        pct = Decimal(str(row["pct_of_total_exec_time"] or 0))
+        instance_share = (pct / Decimal("100")) * daily_instance_cost
+        io_cost = calculate_storage_io_cost(
+            int(row["shared_blks_read"] or 0),
+            daily_storage_cost,
+        )
+        attributed.append({
+            "queryid":              row["queryid"],
+            "query_fingerprint":    row["query_fingerprint"],
+            "calls":                row["calls"],
+            "total_exec_ms":        row["total_exec_ms"],
+            "mean_exec_ms":         row["mean_exec_ms"],
+            "rows_returned":        row["rows_returned"],
+            "shared_blks_hit":      row["shared_blks_hit"],
+            "shared_blks_read":     row["shared_blks_read"],
+            "estimated_io_cost":    float(io_cost),
+            "pct_of_instance_cpu":  float(pct),
+            "attributed_cost_usd":  float(instance_share + io_cost),
+        })
+    return attributed
+
+
+# ── Write results to monitoring DB ───────────────────────────────────────────
+
+INSERT_SQL = """
+INSERT INTO dbfinops.query_cost_attribution (
+    sample_date, database_identifier, queryid, query_fingerprint,
+    calls, total_exec_ms, mean_exec_ms, rows_returned,
+    shared_blks_hit, shared_blks_read,
+    estimated_io_cost, pct_of_instance_cpu, attributed_cost_usd
+) VALUES (
+    %(sample_date)s, %(database_identifier)s, %(queryid)s, %(query_fingerprint)s,
+    %(calls)s, %(total_exec_ms)s, %(mean_exec_ms)s, %(rows_returned)s,
+    %(shared_blks_hit)s, %(shared_blks_read)s,
+    %(estimated_io_cost)s, %(pct_of_instance_cpu)s, %(attributed_cost_usd)s
+)
+ON CONFLICT DO NOTHING;
+"""
+
+def write_attributions(monitoring_conn, db_identifier: str,
+                        sample_date: date, rows: list[dict]) -&gt; int:
+    written = 0
+    with monitoring_conn.cursor() as cur:
+        for row in rows:
+            row["sample_date"] = sample_date
+            row["database_identifier"] = db_identifier
+            cur.execute(INSERT_SQL, row)
+            written += cur.rowcount
+    monitoring_conn.commit()
+    log.info("Wrote %d attribution rows for %s", written, db_identifier)
+    return written
+
+
+# ── Main entry point ─────────────────────────────────────────────────────────
+
+def main():
+    db_identifier = os.environ.get("DB_IDENTIFIER", os.environ["DB_HOST"].split(".")[0])
+    target_date   = date.today() - timedelta(days=1)
+
+    source_conn     = get_source_conn()
+    monitoring_conn = get_monitoring_conn()
+
+    try:
+        query_stats = fetch_query_stats(source_conn)
+        if not query_stats:
+            log.warning("No query stats available — skipping attribution run.")
+            return
+
+        daily_instance_cost = fetch_daily_instance_cost(
+            monitoring_conn, db_identifier, target_date
+        )
+        # Fetch storage cost using same pattern
+        daily_storage_cost = fetch_daily_instance_cost.__wrapped__(  # noqa — reuse pattern
+            monitoring_conn, db_identifier, target_date
+        ) if False else Decimal("0")  # placeholder; replace with a real lookup
+
+        # Direct storage cost lookup
+        with monitoring_conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT COALESCE(SUM(unblended_cost), 0)
+                FROM   dbfinops.daily_costs
+                WHERE  database_identifier = %s
+                  AND  cost_date            = %s
+                  AND  cost_dimension       = 'storage'
+                """,
+                (db_identifier, target_date),
+            )
+            daily_storage_cost = Decimal(str(cur.fetchone()[0]))
+
+        attributed = attribute_costs(query_stats, daily_instance_cost, daily_storage_cost)
+        write_attributions(monitoring_conn, db_identifier, target_date, attributed)
+
+    finally:
+        source_conn.close()
+        monitoring_conn.close()
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With this script running nightly, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">query_cost_attribution</code> table accumulates a rolling history that makes two previously invisible patterns visible: which queries are becoming more expensive over time as data volume grows, and which teams own the workloads driving the largest share of the monthly bill.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.5 The Core Dashboard Queries</h3>
+
+<p class="text-gray-300 leading-relaxed">The queries in this section are designed to be dropped directly into Grafana, Metabase, or any SQL-capable BI tool. Each answers a specific question that a DBA or an engineering manager will actually ask. They are written for PostgreSQL against the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dbfinops</code> schema defined earlier, but the logic translates directly to any ANSI SQL database.</p>
+
+<p class="text-gray-300 leading-relaxed">#### Query 1: Month-over-Month Cost Change by Database</p>
+
+<p class="text-gray-300 leading-relaxed">This is the first panel any database cost dashboard should show: are costs going up or down, and by how much, for each database.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Month-over-Month cost change per database
+-- Dashboard variable: :provider (aws | azure | gcp | all)
+-- Dashboard variable: :environment (prod | staging | dev | all)
+
+WITH monthly_costs AS (
+    SELECT
+        date_trunc('month', cost_date)       AS month,
+        provider,
+        database_identifier,
+        environment,
+        team,
+        SUM(unblended_cost)                  AS total_cost
+    FROM
+        dbfinops.daily_costs
+    WHERE
+        cost_date &gt;= date_trunc('month', CURRENT_DATE) - INTERVAL '2 months'
+        AND (:provider = 'all' OR provider = :provider)
+        AND (:environment = 'all' OR environment = :environment)
+    GROUP BY 1, 2, 3, 4, 5
+),
+with_lag AS (
+    SELECT
+        month,
+        provider,
+        database_identifier,
+        environment,
+        team,
+        total_cost,
+        LAG(total_cost) OVER (
+            PARTITION BY provider, database_identifier
+            ORDER BY month
+        )                                    AS prior_month_cost
+    FROM monthly_costs
+)
+SELECT
+    month,
+    provider,
+    database_identifier,
+    environment,
+    team,
+    ROUND(total_cost::NUMERIC, 2)            AS current_month_cost,
+    ROUND(prior_month_cost::NUMERIC, 2)      AS prior_month_cost,
+    ROUND(
+        (total_cost - prior_month_cost)::NUMERIC, 2
+    )                                        AS cost_delta,
+    ROUND(
+        CASE
+            WHEN prior_month_cost &gt; 0
+            THEN ((total_cost - prior_month_cost) / prior_month_cost * 100)
+            ELSE NULL
+        END::NUMERIC,
+        1
+    )                                        AS pct_change
+FROM
+    with_lag
+WHERE
+    month = date_trunc('month', CURRENT_DATE)
+ORDER BY
+    cost_delta DESC NULLS LAST;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Query 2: Cost Dimension Breakdown for a Single Database</p>
+
+<p class="text-gray-300 leading-relaxed">When a database's total cost spikes, this query reveals which dimension is responsible.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Cost breakdown by dimension for a specific database
+-- Dashboard variable: :db_identifier
+-- Dashboard variable: :num_days (default 30)
+
+SELECT
+    cost_date,
+    cost_dimension,
+    ROUND(SUM(unblended_cost)::NUMERIC, 4)   AS daily_cost,
+    ROUND(
+        SUM(SUM(unblended_cost)) OVER (
+            PARTITION BY cost_dimension
+            ORDER BY cost_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        )::NUMERIC,
+        4
+    )                                        AS cumulative_cost
+FROM
+    dbfinops.daily_costs
+WHERE
+    database_identifier = :db_identifier
+    AND cost_date &gt;= CURRENT_DATE - (:num_days || ' days')::INTERVAL
+GROUP BY
+    cost_date, cost_dimension
+ORDER BY
+    cost_date DESC, daily_cost DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Query 3: Reserved Instance / Commitment Coverage Gap</p>
+
+<p class="text-gray-300 leading-relaxed">This query surfaces databases running entirely on on-demand pricing — the highest priority targets for commitment purchases.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Identify databases with no commitment coverage
+-- Compares actual spend against commitment records
+
+WITH daily_spend AS (
+    SELECT
+        provider,
+        account_id,
+        database_identifier,
+        instance_class,
+        environment,
+        SUM(unblended_cost)                  AS monthly_spend
+    FROM
+        dbfinops.daily_costs
+    WHERE
+        cost_date &gt;= date_trunc('month', CURRENT_DATE)
+        AND cost_dimension = 'instance'
+    GROUP BY 1, 2, 3, 4, 5
+),
+covered AS (
+    SELECT DISTINCT
+        provider,
+        account_id,
+        instance_class
+    FROM
+        dbfinops.commitments
+    WHERE
+        end_date &gt;= CURRENT_DATE
+        AND utilization_pct &gt; 0
+)
+SELECT
+    ds.provider,
+    ds.database_identifier,
+    ds.instance_class,
+    ds.environment,
+    ROUND(ds.monthly_spend::NUMERIC, 2)      AS mtd_on_demand_spend,
+    ROUND((ds.monthly_spend * 12)::NUMERIC, 2) AS projected_annual_spend,
+    CASE
+        WHEN c.instance_class IS NOT NULL THEN 'Partially Covered'
+        ELSE 'No Coverage'
+    END                                      AS coverage_status,
+    -- Rough savings estimate for a 1-year no-upfront RI (approximately 30–35% discount)
+    ROUND((ds.monthly_spend * 12 * 0.32)::NUMERIC, 2) AS est_annual_ri_savings
+FROM
+    daily_spend ds
+LEFT JOIN covered c
+    ON  ds.provider       = c.provider
+    AND ds.account_id     = c.account_id
+    AND ds.instance_class = c.instance_class
+WHERE
+    ds.environment = 'prod'                  -- focus RI analysis on production
+ORDER BY
+    ds.monthly_spend DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Query 4: Storage Growth Rate and Projected Overage</p>
+
+<p class="text-gray-300 leading-relaxed">Storage costs tend to grow silently. This query computes a linear trend and projects when storage costs will breach a defined threshold.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Storage cost growth trend and projection
+-- Uses linear regression over the past 60 days to project forward 30 days
+
+WITH daily_storage AS (
+    SELECT
+        database_identifier,
+        provider,
+        cost_date,
+        SUM(unblended_cost)                          AS storage_cost,
+        EXTRACT(EPOCH FROM cost_date)                AS epoch_day
+    FROM
+        dbfinops.daily_costs
+    WHERE
+        cost_dimension = 'storage'
+        AND cost_date &gt;= CURRENT_DATE - INTERVAL '60 days'
+    GROUP BY 1, 2, 3, 4
+),
+regression AS (
+    SELECT
+        database_identifier,
+        provider,
+        -- Linear regression slope: cost change per second → per day
+        REGR_SLOPE(storage_cost, epoch_day)          AS slope_per_second,
+        REGR_INTERCEPT(storage_cost, epoch_day)      AS intercept,
+        REGR_R2(storage_cost, epoch_day)             AS r_squared,
+        MAX(storage_cost)                            AS latest_daily_cost,
+        MAX(cost_date)                               AS latest_date
+    FROM
+        daily_storage
+    GROUP BY 1, 2
+)
+SELECT
+    database_identifier,
+    provider,
+    ROUND(latest_daily_cost::NUMERIC, 4)             AS current_daily_storage_cost,
+    ROUND((latest_daily_cost * 30)::NUMERIC, 2)      AS current_monthly_projection,
+    -- Project 30 days forward using the regression slope
+    ROUND(
+        (latest_daily_cost
+         + slope_per_second * 86400 * 30)::NUMERIC,
+        2
+    )                                                AS projected_monthly_30d,
+    ROUND(r_squared::NUMERIC, 3)                     AS trend_confidence,
+    CASE
+        WHEN r_squared &gt; 0.85 AND slope_per_second * 86400 &gt; 0
+        THEN 'Consistent upward trend — review retention policy'
+        WHEN r_squared &gt; 0.85 AND slope_per_second * 86400 &lt; -0.001
+        THEN 'Declining — verify expected'
+        ELSE 'Variable — insufficient trend confidence'
+    END                                              AS recommendation
+FROM
+    regression
+ORDER BY
+    projected_monthly_30d DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">#### Query 5: Top Cost-Attributing Queries</p>
+
+<p class="text-gray-300 leading-relaxed">This query surfaces the queries responsible for the largest share of daily compute cost — the starting point for any query optimization effort tied directly to a cost outcome.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Top queries by attributed cost, past 7 days
+-- Requires query_cost_attribution table populated by nightly script
+
+SELECT
+    query_fingerprint,
+    database_identifier,
+    SUM(calls)                                       AS total_calls,
+    ROUND(SUM(total_exec_ms)::NUMERIC / 1000 / 60, 1) AS total_exec_minutes,
+    ROUND(AVG(mean_exec_ms)::NUMERIC, 1)             AS avg_exec_ms,
+    ROUND(SUM(attributed_cost_usd)::NUMERIC, 4)      AS total_attributed_cost,
+    ROUND(
+        (SUM(attributed_cost_usd) / NULLIF(
+            SUM(SUM(attributed_cost_usd)) OVER (), 0
+        ) * 100)::NUMERIC,
+        2
+    )                                                AS pct_of_total_cost,
+    ROUND(SUM(estimated_io_cost)::NUMERIC, 4)        AS total_io_cost,
+    MAX(sample_date)                                 AS last_seen
+FROM
+    dbfinops.query_cost_attribution
+WHERE
+    sample_date &gt;= CURRENT_DATE - INTERVAL '7 days'
+GROUP BY
+    query_fingerprint, database_identifier
+ORDER BY
+    total_attributed_cost DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.6 Automated Anomaly Detection</h3>
+
+<p class="text-gray-300 leading-relaxed">A dashboard that requires someone to look at it to catch a problem is only half a system. The anomaly detection layer fires alerts automatically when costs deviate from expected ranges, reducing the mean time to detect (MTTD) from days to hours.</p>
+
+<p class="text-gray-300 leading-relaxed">The following function implements a statistical anomaly detector using a 14-day rolling mean and standard deviation. It is designed to run nightly as a PostgreSQL function, populating the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost_anomalies</code> table, which then drives alert rules in Grafana or PagerDuty.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Anomaly detection function
+-- Detects cost spikes using rolling z-score against a 14-day baseline
+-- Call nightly: SELECT dbfinops.detect_cost_anomalies();
+
+CREATE OR REPLACE FUNCTION dbfinops.detect_cost_anomalies(
+    p_lookback_days    INT DEFAULT 14,
+    p_z_threshold_med  NUMERIC DEFAULT 2.0,   -- z-score for 'medium' severity
+    p_z_threshold_high NUMERIC DEFAULT 3.0,   -- z-score for 'high' severity
+    p_z_threshold_crit NUMERIC DEFAULT 4.0    -- z-score for 'critical' severity
+)
+RETURNS INT                                   -- returns count of anomalies inserted
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_target_date  DATE := CURRENT_DATE - 1;  -- analyze yesterday
+    v_inserted     INT  := 0;
+BEGIN
+    -- Remove any previously detected (unacknowledged) anomalies for target date
+    -- so re-runs are idempotent
+    DELETE FROM dbfinops.cost_anomalies
+    WHERE  cost_date    = v_target_date
+      AND  acknowledged = FALSE;
+
+    INSERT INTO dbfinops.cost_anomalies (
+        cost_date,
+        provider,
+        database_identifier,
+        cost_dimension,
+        expected_cost,
+        actual_cost,
+        deviation_pct,
+        severity
+    )
+    WITH baseline AS (
+        SELECT
+            provider,
+            database_identifier,
+            cost_dimension,
+            AVG(unblended_cost)    AS mean_cost,
+            STDDEV(unblended_cost) AS stddev_cost
+        FROM
+            dbfinops.daily_costs
+        WHERE
+            cost_date BETWEEN v_target_date - p_lookback_days
+                          AND v_target_date - 1   -- exclude target date from baseline
+        GROUP BY 1, 2, 3
+        HAVING COUNT(*) &gt;= 7   -- require at least a week of history for reliable stats
+    ),
+    yesterday AS (
+        SELECT
+            provider,
+            database_identifier,
+            cost_dimension,
+            SUM(unblended_cost) AS actual_cost
+        FROM
+            dbfinops.daily_costs
+        WHERE
+            cost_date = v_target_date
+        GROUP BY 1, 2, 3
+    )
+    SELECT
+        v_target_date,
+        y.provider,
+        y.database_identifier,
+        y.cost_dimension,
+        ROUND(b.mean_cost::NUMERIC, 6)          AS expected_cost,
+        ROUND(y.actual_cost::NUMERIC, 6)        AS actual_cost,
+        ROUND(
+            CASE WHEN b.mean_cost &gt; 0
+            THEN ((y.actual_cost - b.mean_cost) / b.mean_cost * 100)
+            ELSE NULL
+            END::NUMERIC,
+            2
+        )                                        AS deviation_pct,
+        CASE
+            WHEN b.stddev_cost = 0 OR b.stddev_cost IS NULL THEN 'low'
+            WHEN (y.actual_cost - b.mean_cost) / b.stddev_cost &gt;= p_z_threshold_crit
+                THEN 'critical'
+            WHEN (y.actual_cost - b.mean_cost) / b.stddev_cost &gt;= p_z_threshold_high
+                THEN 'high'
+            WHEN (y.actual_cost - b.mean_cost) / b.stddev_cost &gt;= p_z_threshold_med
+                THEN 'medium'
+            ELSE 'low'
+        END                                      AS severity
+    FROM
+        yesterday y
+        JOIN baseline b USING (provider, database_identifier, cost_dimension)
+    WHERE
+        -- Only flag upward anomalies (cost increases), not decreases
+        y.actual_cost &gt; b.mean_cost
+        AND (b.stddev_cost = 0 OR b.stddev_cost IS NULL
+             OR (y.actual_cost - b.mean_cost) / NULLIF(b.stddev_cost, 0)
+                &gt;= p_z_threshold_med)
+        -- Ignore tiny absolute amounts (less than $1/day) to reduce noise
+        AND y.actual_cost &gt; 1.0;
+
+    GET DIAGNOSTICS v_inserted = ROW_COUNT;
+
+    -- Refresh the MTD summary materialized view while we're here
+    REFRESH MATERIALIZED VIEW CONCURRENTLY dbfinops.mtd_cost_summary;
+
+    RETURN v_inserted;
+END;
+$$;
+
+-- Example: schedule with pg_cron (if available)
+-- SELECT cron.schedule('detect-cost-anomalies', '15 1 * * *',
+--     'SELECT dbfinops.detect_cost_anomalies()');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">To pair this with SQL Server for teams running Azure SQL, the equivalent logic uses a temporary table and window functions rather than a CTE chain with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RETURNING</code>:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server / Azure SQL: Cost anomaly detection stored procedure
+-- Equivalent logic to the PostgreSQL function above
+
+CREATE OR ALTER PROCEDURE dbfinops.DetectCostAnomalies
+    @LookbackDays    INT  = 14,
+    @ZThresholdMed   FLOAT = 2.0,
+    @ZThresholdHigh  FLOAT = 3.0,
+    @ZThresholdCrit  FLOAT = 4.0
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @TargetDate DATE = DATEADD(DAY, -1, CAST(GETUTCDATE() AS DATE));
+    DECLARE @BaselineStart DATE = DATEADD(DAY, -@LookbackDays, @TargetDate);
+
+    -- Remove unacknowledged anomalies for target date (idempotent re-runs)
+    DELETE FROM dbfinops.CostAnomalies
+    WHERE  CostDate    = @TargetDate
+      AND  Acknowledged = 0;
+
+    -- Compute baseline statistics
+    DROP TABLE IF EXISTS #Baseline;
+    SELECT
+        Provider,
+        DatabaseIdentifier,
+        CostDimension,
+        AVG(UnblendedCost)                          AS MeanCost,
+        STDEV(UnblendedCost)                        AS StddevCost,
+        COUNT(*)                                    AS DayCount
+    INTO #Baseline
+    FROM dbfinops.DailyCosts
+    WHERE CostDate BETWEEN @BaselineStart AND DATEADD(DAY, -1, @TargetDate)
+    GROUP BY Provider, DatabaseIdentifier, CostDimension
+    HAVING COUNT(*) &gt;= 7;
+
+    -- Compute yesterday's actuals
+    DROP TABLE IF EXISTS #Yesterday;
+    SELECT
+        Provider,
+        DatabaseIdentifier,
+        CostDimension,
+        SUM(UnblendedCost)                          AS ActualCost
+    INTO #Yesterday
+    FROM dbfinops.DailyCosts
+    WHERE CostDate = @TargetDate
+    GROUP BY Provider, DatabaseIdentifier, CostDimension;
+
+    -- Insert anomalies
+    INSERT INTO dbfinops.CostAnomalies (
+        CostDate, Provider, DatabaseIdentifier, CostDimension,
+        ExpectedCost, ActualCost, DeviationPct, Severity
+    )
+    SELECT
+        @TargetDate,
+        y.Provider,
+        y.DatabaseIdentifier,
+        y.CostDimension,
+        ROUND(b.MeanCost, 6)                        AS ExpectedCost,
+        ROUND(y.ActualCost, 6)                      AS ActualCost,
+        ROUND(
+            CASE WHEN b.MeanCost &gt; 0
+                 THEN (y.ActualCost - b.MeanCost) / b.MeanCost * 100.0
+                 ELSE NULL
+            END,
+            2
+        )                                           AS DeviationPct,
+        CASE
+            WHEN b.StddevCost = 0 OR b.StddevCost IS NULL
+                THEN 'low'
+            WHEN (y.ActualCost - b.MeanCost) / NULLIF(b.StddevCost, 0) &gt;= @ZThresholdCrit
+                THEN 'critical'
+            WHEN (y.ActualCost - b.MeanCost) / NULLIF(b.StddevCost, 0) &gt;= @ZThresholdHigh
+                THEN 'high'
+            WHEN (y.ActualCost - b.MeanCost) / NULLIF(b.StddevCost, 0) &gt;= @ZThresholdMed
+                THEN 'medium'
+            ELSE 'low'
+        END                                         AS Severity
+    FROM #Yesterday y
+    JOIN #Baseline  b
+        ON  y.Provider             = b.Provider
+        AND y.DatabaseIdentifier   = b.DatabaseIdentifier
+        AND y.CostDimension        = b.CostDimension
+    WHERE
+        y.ActualCost &gt; b.MeanCost
+        AND y.ActualCost &gt; 1.0
+        AND (
+            b.StddevCost IS NULL
+            OR b.StddevCost = 0
+            OR (y.ActualCost - b.MeanCost) / NULLIF(b.StddevCost, 0) &gt;= @ZThresholdMed
+        );
+
+    SELECT @@ROWCOUNT AS AnomaliesInserted;
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.7 Wiring Alerts to Grafana and PagerDuty</h3>
+
+<p class="text-gray-300 leading-relaxed">Anomalies sitting in a database table help no one. The final integration step connects the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost_anomalies</code> table to an alerting pipeline. The recommended pattern uses Grafana's built-in alerting engine, which can query PostgreSQL directly and route alerts to Slack, PagerDuty, or email based on severity.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Grafana alert rule definition (in Terraform format for reproducibility) creates a high-severity alert that fires when the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost_anomalies</code> table contains any unacknowledged critical or high anomalies detected in the last two hours.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># grafana_cost_alert.tf
+# Requires: Grafana Terraform provider, Grafana 9.x or later
+# grafana datasource must point to the dbfinops PostgreSQL instance
+
+resource "grafana_alert_rule" "db_cost_anomaly_critical" {
+  name            = "Database Cost Anomaly — High/Critical"
+  folder_uid      = grafana_folder.finops.uid
+  group_name      = "DatabaseCostAlerts"
+  for             = "5m"     # must be firing for 5 minutes before alert triggers
+  condition       = "threshold"
+  no_data_state   = "OK"
+  exec_err_state  = "Alerting"
+
+  data {
+    ref_id = "A"
+    query_type = ""
+    relative_time_range {
+      from = 7200   # 2 hours in seconds
+      to   = 0
+    }
+    datasource_uid = var.grafana_postgres_datasource_uid
+    model = jsonencode({
+      rawSql = &lt;&lt;-SQL
+        SELECT
+          COUNT(*)                          AS anomaly_count,
+          NOW()                             AS "time",
+          MAX(deviation_pct)                AS max_deviation_pct,
+          STRING_AGG(
+            database_identifier || ' (' || cost_dimension || '): '
+            || ROUND(deviation_pct::NUMERIC, 1) || '% above expected',
+            E'\n' ORDER BY deviation_pct DESC
+          )                                 AS anomaly_summary
+        FROM dbfinops.cost_anomalies
+        WHERE
+          severity IN ('critical', 'high')
+          AND acknowledged = FALSE
+          AND detected_at &gt;= NOW() - INTERVAL '2 hours'
+      SQL
+      format = "table"
+    })
+  }
+
+  data {
+    ref_id     = "threshold"
+    query_type = "expression"
+    datasource_uid = "-100"
+    model = jsonencode({
+      type       = "threshold"
+      refId      = "threshold"
+      expression = "A"
+      conditions = [{
+        evaluator = {
+          params = [0]
+          type   = "gt"
+        }
+        operator  = { type = "and" }
+        query     = { params = ["A"] }
+        reducer   = {
+          params = []
+          type   = "last"
+        }
+        type = "query"
+      }]
+    })
+  }
+
+  annotations = {
+    description = "One or more database cost anomalies at high or critical severity detected in the last 2 hours. Review the dbfinops.cost_anomalies table for details."
+    runbook_url = "https://wiki.internal/runbooks/db-cost-anomaly"
+    summary     = "Database cost anomaly detected — immediate review required"
+  }
+
+  labels = {
+    severity = "high"
+    team     = "platform"
+    category = "finops"
+  }
+
+  notification_settings {
+    contact_point   = "pagerduty-platform-oncall"
+    group_wait      = "30s"
+    group_interval  = "5m"
+    repeat_interval = "4h"
+    group_by        = ["database_identifier"]
+  }
+}
+
+resource "grafana_alert_rule" "db_cost_anomaly_medium" {
+  name            = "Database Cost Anomaly — Medium"
+  folder_uid      = grafana_folder.finops.uid
+  group_name      = "DatabaseCostAlerts"
+  for             = "15m"
+  condition       = "threshold"
+  no_data_state   = "OK"
+  exec_err_state  = "OK"
+
+  data {
+    ref_id = "A"
+    relative_time_range {
+      from = 7200
+      to   = 0
+    }
+    datasource_uid = var.grafana_postgres_datasource_uid
+    model = jsonencode({
+      rawSql = &lt;&lt;-SQL
+        SELECT COUNT(*) AS anomaly_count, NOW() AS "time"
+        FROM dbfinops.cost_anomalies
+        WHERE severity = 'medium'
+          AND acknowledged = FALSE
+          AND detected_at &gt;= NOW() - INTERVAL '2 hours'
+      SQL
+      format = "table"
+    })
+  }
+
+  data {
+    ref_id         = "threshold"
+    query_type     = "expression"
+    datasource_uid = "-100"
+    model = jsonencode({
+      type       = "threshold"
+      refId      = "threshold"
+      expression = "A"
+      conditions = [{
+        evaluator = { params = [0], type = "gt" }
+        operator  = { type = "and" }
+        query     = { params = ["A"] }
+        reducer   = { params = [], type = "last" }
+        type      = "query"
+      }]
+    })
+  }
+
+  annotations = {
+    description = "Medium-severity database cost anomaly detected. Review dbfinops.cost_anomalies."
+    summary     = "Database cost anomaly — medium severity"
+  }
+
+  labels = {
+    severity = "warning"
+    team     = "platform"
+    category = "finops"
+  }
+
+  notification_settings {
+    contact_point   = "slack-platform-alerts"
+    group_wait      = "2m"
+    group_interval  = "10m"
+    repeat_interval = "24h"
+    group_by        = ["database_identifier"]
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With this Terraform applied, critical anomalies page the on-call engineer within five minutes of detection, while medium anomalies post a Slack notification that the team can triage the following morning. The 4-hour repeat interval on the PagerDuty rule prevents alert fatigue while ensuring a critical anomaly does not silently persist across shifts.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.8 The Weekly Executive Report Query</h3>
+
+<p class="text-gray-300 leading-relaxed">The dashboard is a daily operational tool. Once a week, a different audience — engineering leadership, finance, or the CTO — needs a summary that does not require reading raw SQL output. The following query produces a weekly summary formatted for direct paste into a Markdown-friendly report or a simple HTML email template.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Weekly database cost executive summary
+-- Run every Monday covering the prior calendar week
+-- Produces one row per provider with key metrics
+
+WITH week_bounds AS (
+    SELECT
+        date_trunc('week', CURRENT_DATE) - INTERVAL '7 days'  AS week_start,
+        date_trunc('week', CURRENT_DATE) - INTERVAL '1 day'   AS week_end
+),
+this_week AS (
+    SELECT
+        provider,
+        SUM(unblended_cost)                                    AS week_cost,
+        COUNT(DISTINCT database_identifier)                       AS db_count
+    FROM dbfinops.daily_costs, week_bounds
+    WHERE cost_date BETWEEN week_start AND week_end
+    GROUP BY provider
+),
+prior_week AS (
+    SELECT
+        provider,
+        SUM(unblended_cost)                                    AS week_cost
+    FROM dbfinops.daily_costs, week_bounds
+    WHERE cost_date BETWEEN week_start - INTERVAL '7 days'
+                        AND week_end   - INTERVAL '7 days'
+    GROUP BY provider
+),
+anomaly_count AS (
+    SELECT
+        provider,
+        COUNT(*)                                               AS unacked_anomalies,
+        COUNT(*) FILTER (WHERE severity = 'critical')         AS critical_count
+    FROM dbfinops.cost_anomalies, week_bounds
+    WHERE detected_at::DATE BETWEEN week_start AND week_end
+      AND acknowledged = FALSE
+    GROUP BY provider
+),
+top_spender AS (
+    SELECT DISTINCT ON (provider)
+        provider,
+        database_identifier                                    AS top_db,
+        SUM(unblended_cost) OVER (PARTITION BY provider, database_identifier) AS db_cost
+    FROM dbfinops.daily_costs, week_bounds
+    WHERE cost_date BETWEEN week_start AND week_end
+    ORDER BY provider, db_cost DESC
+)
+SELECT
+    tw.provider,
+    tw.db_count                                                AS databases_tracked,
+    ROUND(tw.week_cost::NUMERIC, 2)                            AS total_week_cost,
+    ROUND(pw.week_cost::NUMERIC, 2)                            AS prior_week_cost,
+    ROUND((tw.week_cost - pw.week_cost)::NUMERIC, 2)           AS week_delta,
+    ROUND(
+        CASE WHEN pw.week_cost &gt; 0
+             THEN (tw.week_cost - pw.week_cost) / pw.week_cost * 100
+             ELSE NULL
+        END::NUMERIC, 1
+    )                                                          AS pct_change,
+    COALESCE(ac.unacked_anomalies, 0)                          AS open_anomalies,
+    COALESCE(ac.critical_count, 0)                             AS critical_anomalies,
+    ts.top_db                                                  AS highest_cost_database,
+    ROUND(ts.db_cost::NUMERIC, 2)                              AS highest_cost_db_spend
+FROM
+    this_week tw
+    LEFT JOIN prior_week pw      USING (provider)
+    LEFT JOIN anomaly_count ac   USING (provider)
+    LEFT JOIN top_spender ts     USING (provider)
+ORDER BY
+    tw.week_cost DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Pair this with a simple Python script that runs the query and sends the output via AWS SES, SendGrid, or an internal SMTP relay, and the weekly report becomes zero-effort for the people who need it most. The structure — total spend, week-over-week delta, open anomalies, top spender — answers the three questions leadership asks every week: "Are we spending more than last week?", "Is anything on fire?", and "What's our biggest database cost right now?"</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">6.9 Putting It All Together: The Dashboard Layout</h3>
+
+<p class="text-gray-300 leading-relaxed">The individual queries from section 6.5 compose into a dashboard with a clear visual hierarchy. The recommended layout for Grafana follows a three-row structure:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Row 1: Executive Summary\nMTD spend, WoW change, anomalies, RI coverage] --> B[Row 2: Provider & Database Breakdown\nMoM cost table + dimension drilldown]
+    B --> C[Row 3: Engineering Detail\nStorage trend, top cost queries, RI gap]
+    C --> D[Row 4: Anomaly Log\nfull cost_anomalies table with Acknowledge action]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The dashboard's visual hierarchy: each row narrows from a glanceable executive number down to the raw, actionable anomaly log.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 1 — Executive Summary (4 stat panels)</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Total MTD spend across all providers (single number, colored red/amber/green against budget threshold)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Week-over-week percentage change (sparkline + delta badge)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Open unacknowledged anomalies (count, red if any critical)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Reserved Instance / Commitment utilization percentage</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 2 — Provider and Database Breakdown (2 panels)</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Month-over-month cost change table (Query 1 from section 6.5), filterable by provider and environment</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cost dimension breakdown time series (Query 2), drilldown activated by clicking a database row in the adjacent table</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 3 — Engineering Detail (3 panels)</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Storage growth trend with 30-day projection (Query 4), one line per database</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Top cost-attributing queries table (Query 5), sortable by attributed cost or execution time</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> RI/commitment coverage gap table (Query 3), sorted by on-demand spend descending</li>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Row 4 — Anomaly Log (1 full-width panel)</strong></p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Raw table view of `cost_anomalies` with filters for severity, provider, and acknowledged status</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Includes an "Acknowledge" button wired to a Grafana panel action that sets `acknowledged = TRUE` and records the acknowledging user</li>
+
+<p class="text-gray-300 leading-relaxed">This layout works equally well as a static Metabase dashboard, a Tableau workbook, or a simple HTML page generated from cron-scheduled SQL queries — the choice of visualization tool matters less than the discipline of reviewing the dashboard consistently.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Visibility creates accountability**: a database cost dashboard does not save money directly, but it eliminates the weeks-long lag between a cost anomaly occurring and someone noticing it, which is where most avoidable cloud spend accumulates.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Normalize cost data across providers**: storing AWS, Azure, and GCP costs in a single `dbfinops.daily_costs` schema with consistent dimensions (provider, database_identifier, cost_dimension, environment, team) enables cross-cloud comparison and prevents costs from hiding in provider-specific abstractions.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Connect cost to workload**: populating `query_cost_attribution` with per-query cost estimates transforms a finance dashboard into an engineering tool — it lets a DBA point to a specific query and say "optimizing this saves us a measurable amount per month."</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate anomaly detection, not just reporting**: a rolling z-score function running nightly against the cost table catches unexpected spikes within 24 hours; without automation, the same spike might hide for a billing cycle.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Tailor alert routing to severity**: critical anomalies warrant immediate on-call paging; medium anomalies warrant a next-morning Slack notification; routing both to PagerDuty guarantees alert fatigue and guarantees the alerts get ignored.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
