@@ -5,6 +5,10 @@
   <title>Chapter 10: Idle Instance Detection and Automated Shutdown — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 10: Idle Instance Detection and Automated Shutdown. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -458,7 +462,1006 @@ ORDER BY projected_annual_cpu_waste_usd DESC;</code></pre>
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Check 1: Recent Snapshot or Backup Activity</strong></p>
 
 <p class="text-gray-300 leading-relaxed">An instance with a backup taken in the last 24 hours, even if idle by metrics, may be part of an active pipeline. Query RDS automated backups to verify.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# validate_backup_recency.sh
+# For each idle candidate, check the most recent automated snapshot.
+# If a snapshot was taken within 48 hours AND no other idle signals
+# exist, flag for manual review instead of automated action.
+
+CANDIDATES_FILE="/tmp/idle_instances.json"
+
+if [[ ! -f "$CANDIDATES_FILE" ]]; then
+    echo "Run idle_detector_aws.py first to generate candidates."
+    exit 1
+fi
+
+# Parse instance IDs from the JSON output of idle_detector_aws.py
+INSTANCE_IDS=$(python3 -c "
+import json
+with open('$CANDIDATES_FILE') as f:
+    data = json.load(f)
+print('\n'.join(i['instance_id'] for i in data))
+")
+
+NOW_EPOCH=$(date +%s)
+FORTY_EIGHT_HOURS=172800
+
+echo "Validating backup recency for idle candidates..."
+echo "-----------------------------------------------"
+
+while IFS= read -r INSTANCE_ID; do
+    [[ -z "$INSTANCE_ID" ]] && continue
+
+    # Get the most recent automated snapshot
+    LATEST_SNAPSHOT=$(aws rds describe-db-snapshots \
+        --db-instance-identifier "$INSTANCE_ID" \
+        --snapshot-type automated \
+        --query "sort_by(DBSnapshots, &SnapshotCreateTime)[-1].SnapshotCreateTime" \
+        --output text 2&gt;/dev/null)
+
+    if [[ "$LATEST_SNAPSHOT" == "None" ]] || [[ -z "$LATEST_SNAPSHOT" ]]; then
+        echo "  $INSTANCE_ID — NO SNAPSHOTS FOUND — safe to terminate"
+        continue
+    fi
+
+    # Convert ISO timestamp to epoch
+    SNAP_EPOCH=$(date -d "$LATEST_SNAPSHOT" +%s 2&gt;/dev/null || \
+                 date -jf "%Y-%m-%dT%H:%M:%S" \
+                     "${LATEST_SNAPSHOT%%.*}" +%s 2&gt;/dev/null)
+
+    AGE_SECONDS=$(( NOW_EPOCH - SNAP_EPOCH ))
+    AGE_HOURS=$(( AGE_SECONDS / 3600 ))
+
+    if (( AGE_SECONDS &lt; FORTY_EIGHT_HOURS )); then
+        echo "  $INSTANCE_ID — RECENT BACKUP ($AGE_HOURS hrs ago) — flag for review"
+    else
+        echo "  $INSTANCE_ID — STALE BACKUP ($AGE_HOURShrs ago) — safe for automated action"
+    fi
+
+done &lt;&lt;&lt; "$INSTANCE_IDS"</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Check 2: Tag-Based Exemptions</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Before acting on any candidate, re-verify tags at action time (not just at scan time). Tags can change between detection and enforcement. The following tag keys are the minimal exemption contract teams should agree on before deploying automation:</p>
+
+<p class="text-gray-300 leading-relaxed">| Tag Key | Value | Meaning |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AutoShutdown</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">false</code> | Never shut this instance down automatically |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Environment</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">production</code> | Exclude from any automated stop/terminate |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Schedule</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">quarterly</code> | Runs quarterly; extend idle window to 90 days |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Owner</code> | <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">team-name</code> | Notify this team before action |</p>
+<p class="text-gray-300 leading-relaxed">| <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LastKnownUse</code> | ISO date | Human-annotated last intentional use date |</p>
+
+<p class="text-gray-300 leading-relaxed">Any instance tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Environment=production</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AutoShutdown=false</code> must be excluded at the action stage even if it scored 4/4 on idleness. The detection query already filters these, but the action script enforces the same check independently to create a defense-in-depth pattern.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Check 3: Cross-Reference with Application Deployment Records</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If your organization uses a CMDB or deployment tagging convention (e.g., AWS Systems Manager Inventory, Azure Resource Graph, or GCP Asset Inventory), a cross-reference query can catch databases associated with active application deployments. The following Resource Graph query identifies Azure SQL databases where the parent logical server has an associated App Service or AKS cluster in the same resource group that was deployed or scaled in the past 30 days:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Azure Resource Graph: find SQL databases linked to recently active apps
+az graph query -q "
+Resources
+| where type == 'microsoft.sql/servers/databases'
+| where name != 'master'
+| project sqlDb=name, sqlServer=split(id, '/')[8],
+          resourceGroup, subscriptionId
+| join kind=leftouter (
+    Resources
+    | where type in (
+        'microsoft.web/sites',
+        'microsoft.containerservice/managedclusters'
+      )
+    | where properties.lastModifiedTimeUtc &gt;= ago(30d)
+    | project appName=name, resourceGroup, subscriptionId
+  ) on resourceGroup, subscriptionId
+| project sqlDb, sqlServer, resourceGroup,
+          linkedApp=appName
+| where isempty(linkedApp)
+" --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed">SQL databases that appear here — no linked active app in the same resource group — are stronger termination candidates. Databases that have a linked app are handed off to the application team for confirmation before any action.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.4 Automated Shutdown: Stop vs. Terminate vs. Snapshot-Then-Delete</h3>
+
+<p class="text-gray-300 leading-relaxed">The action vocabulary has three options, and choosing the wrong one is expensive in different ways:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Stop (RDS: <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop-db-instance</code>)</strong>: Preserves the instance configuration, keeps automated backups, retains storage. Compute billing stops. Storage billing continues. AWS automatically restarts stopped instances after 7 days — a frustrating default that must be accounted for in your automation. Cost saving: roughly 60–70% of the monthly bill depending on storage fraction.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Terminate with final snapshot</strong>: Creates a final automated snapshot, then permanently deletes the instance. Compute and storage billing both stop. Snapshot storage is charged at $0.095/GB-month (RDS) until explicitly deleted. This is the right choice for instances confirmed as truly decommissioned.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Snapshot-then-delete (manual pattern)</strong>: Take a manual snapshot first, tag it with metadata, then delete the instance. Gives you a recovery path without retaining the live instance. Manual snapshots persist until explicitly deleted, unlike automated snapshots that follow retention policies.</p>
+
+<p class="text-gray-300 leading-relaxed">The decision tree for which action to take:</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Idle candidate detected] --> B{idle_score == 4 AND\nalready stopped > 7 days?}
+    B -->|Yes| C[Notify owner 7 days prior\n-> final snapshot -> terminate\n-> delete snapshot after 90 days]
+    B -->|No| D{idle_score == 4 AND\nstatus == available?}
+    D -->|Yes| E{Environment != production AND\nAutoShutdown != false?}
+    E -->|Yes| F[Stop instance immediately\nre-check in 14 days]
+    D -->|No| G{idle_score == 3?}
+    G -->|Yes| H[Notify owner with evidence\nno action for 7 days]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The idle-shutdown decision tree — confidence level (idle_score) determines how aggressive the automated action is.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>idle_score == 4 AND status == "stopped" (already stopped &gt; 7 days)
+    → Owner notified 7 days prior
+    → Take final snapshot tagged with instance metadata
+    → Terminate instance
+    → Set snapshot lifecycle policy: delete after 90 days
+
+idle_score == 4 AND status == "available" (running but idle)
+    → Environment != production AND AutoShutdown != false
+    → Stop instance immediately
+    → Schedule re-check in 14 days
+    → If still idle after 14 days: escalate to terminate workflow
+
+idle_score == 3 (borderline idle)
+    → Send owner notification with metrics evidence
+    → No automated action for 7 days
+    → If no response: treat as score-4 path</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Implementing the Stop Action in AWS</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># shutdown_orchestrator.py
+# Reads /tmp/idle_instances.json and applies the stop/terminate decision tree.
+# Designed to run as a Lambda function or from the command line.
+# All actions are logged to CloudWatch Logs and a local audit trail.
+
+import boto3
+import json
+import sys
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+AUDIT_LOG = "/tmp/shutdown_audit.jsonl"
+DRY_RUN = "--dry-run" in sys.argv  # Pass --dry-run to preview actions safely
+
+PROTECTED_ENVIRONMENTS = {"production", "prod", "prd"}
+SNAPSHOT_RETENTION_DAYS = 90
+
+def load_candidates(path: str) -&gt; list[dict]:
+    with open(path) as f:
+        return json.load(f)
+
+def append_audit(record: dict):
+    with open(AUDIT_LOG, "a") as f:
+        f.write(json.dumps(record) + "\n")
+
+def verify_tags_at_action_time(rds_client, instance_id: str) -&gt; dict:
+    """Re-fetch tags at action time, not from the cached scan data."""
+    try:
+        arn_response = rds_client.describe_db_instances(
+            DBInstanceIdentifier=instance_id
+        )
+        db = arn_response["DBInstances"][0]
+        arn = db["DBInstanceArn"]
+        tag_response = rds_client.list_tags_for_resource(ResourceName=arn)
+        return {t["Key"]: t["Value"] for t in tag_response["TagList"]}
+    except Exception as e:
+        log.warning(f"Could not fetch tags for {instance_id}: {e}")
+        return {}
+
+def is_protected(tags: dict) -&gt; bool:
+    env = tags.get("Environment", "").lower()
+    if env in PROTECTED_ENVIRONMENTS:
+        return True
+    if tags.get("AutoShutdown", "").lower() == "false":
+        return True
+    return False
+
+def take_final_snapshot(rds_client, instance_id: str,
+                         tags: dict) -&gt; Optional[str]:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    snapshot_id = f"finops-final-{instance_id}-{timestamp}"
+    # Snapshot IDs max 255 chars; truncate instance_id if needed
+    snapshot_id = snapshot_id[:254]
+
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Would create snapshot: {snapshot_id}")
+        return snapshot_id
+
+    try:
+        rds_client.create_db_snapshot(
+            DBSnapshotIdentifier=snapshot_id,
+            DBInstanceIdentifier=instance_id,
+            Tags=[
+                {"Key": "CreatedBy",    "Value": "finops-idle-shutdown"},
+                {"Key": "InstanceId",   "Value": instance_id},
+                {"Key": "DeleteAfter",
+                 "Value": (datetime.now(timezone.utc).strftime("%Y-%m-%d"))},
+                {"Key": "OriginalEnv",  "Value": tags.get("Environment", "unknown")},
+            ]
+        )
+        log.info(f"Snapshot initiated: {snapshot_id}")
+        return snapshot_id
+    except Exception as e:
+        log.error(f"Snapshot failed for {instance_id}: {e}")
+        return None
+
+def stop_instance(rds_client, instance_id: str):
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Would stop: {instance_id}")
+        return
+    try:
+        rds_client.stop_db_instance(DBInstanceIdentifier=instance_id)
+        log.info(f"Stop issued: {instance_id}")
+    except Exception as e:
+        log.error(f"Stop failed for {instance_id}: {e}")
+
+def terminate_instance(rds_client, instance_id: str,
+                        take_snapshot: bool = True) -&gt; bool:
+    snapshot_id = None
+    if take_snapshot:
+        # Must wait for any in-progress snapshot to complete before delete
+        # In production, this becomes a Step Functions workflow; here we
+        # just request the snapshot and mark the termination as pending.
+        log.info(f"Termination pending snapshot completion: {instance_id}")
+        return False  # Caller should re-check after snapshot completes
+
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Would terminate: {instance_id}")
+        return True
+
+    try:
+        rds_client.delete_db_instance(
+            DBInstanceIdentifier=instance_id,
+            SkipFinalSnapshot=True,
+            DeleteAutomatedBackups=False  # Keep automated backups per policy
+        )
+        log.info(f"Terminate issued: {instance_id}")
+        return True
+    except Exception as e:
+        log.error(f"Terminate failed for {instance_id}: {e}")
+        return False
+
+def process_candidate(candidate: dict):
+    region = candidate.get("region", "us-east-1")
+    instance_id = candidate["instance_id"]
+    idle_score = candidate.get("idle_score", 0)
+    status = candidate.get("status", "available")
+    recommendation = candidate.get("recommendation", "")
+
+    rds = boto3.client("rds", region_name=region)
+
+    # Defense-in-depth tag check at action time
+    live_tags = verify_tags_at_action_time(rds, instance_id)
+    if is_protected(live_tags):
+        log.info(f"SKIPPED (protected by tags): {instance_id}")
+        append_audit({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "instance_id": instance_id,
+            "action": "SKIPPED",
+            "reason": "protected_tags",
+            "tags": live_tags
+        })
+        return
+
+    action_taken = "NONE"
+    notes = ""
+
+    if recommendation == "ALREADY_STOPPED_VERIFY_DELETION":
+        # Already stopped; take snapshot and plan deletion
+        snapshot_id = take_final_snapshot(rds, instance_id, live_tags)
+        action_taken = "SNAPSHOT_FOR_DELETION"
+        notes = f"snapshot={snapshot_id}; manual termination required after verification"
+
+    elif idle_score == 4 and status == "available":
+        stop_instance(rds, instance_id)
+        action_taken = "STOPPED"
+        notes = "Will re-check in 14 days for termination eligibility"
+
+    elif idle_score == 3:
+        action_taken = "NOTIFICATION_QUEUED"
+        notes = "Owner notification queued; no automated action for 7 days"
+
+    log.info(f"{action_taken}: {instance_id} — {notes}")
+    append_audit({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "instance_id": instance_id,
+        "region": region,
+        "idle_score": idle_score,
+        "status": status,
+        "action": action_taken,
+        "dry_run": DRY_RUN,
+        "notes": notes,
+        "monthly_cost_usd": candidate.get("monthly_cost_usd", 0),
+        "tags": live_tags
+    })
+
+def main():
+    candidates = load_candidates("/tmp/idle_instances.json")
+    log.info(f"Processing {len(candidates)} idle candidates "
+             f"({'DRY RUN' if DRY_RUN else 'LIVE'})")
+
+    for candidate in candidates:
+        process_candidate(candidate)
+
+    log.info(f"Audit log written to {AUDIT_LOG}")
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run in dry-run mode first, always:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>python3 shutdown_orchestrator.py --dry-run</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Review the audit log at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">/tmp/shutdown_audit.jsonl</code>, confirm the planned actions, then remove <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--dry-run</code> for the live pass.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.5 Implementing Scheduled Stop/Start for Non-Production Instances</h3>
+
+<p class="text-gray-300 leading-relaxed">For non-production instances that need to exist but only run during business hours, a scheduled stop/start pattern captures most of the savings without the risk of full termination. A database running 10 hours per day (business hours) instead of 24 incurs 42% of its original compute cost.</p>
+
+<p class="text-gray-300 leading-relaxed">The two main mechanisms are AWS Instance Scheduler and native EventBridge Scheduler rules for RDS.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">EventBridge Scheduler: Stop All Dev Instances at 19:00 UTC</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Create an EventBridge schedule to stop all RDS instances tagged Environment=dev
+# at 19:00 UTC Monday-Friday
+
+# Step 1: Create an IAM role that EventBridge Scheduler can assume
+aws iam create-role \
+  --role-name EventBridgeRDSSchedulerRole \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "scheduler.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+aws iam attach-role-policy \
+  --role-name EventBridgeRDSSchedulerRole \
+  --policy-arn arn:aws:iam::aws:policy/AmazonRDSFullAccess
+
+ROLE_ARN=$(aws iam get-role \
+  --role-name EventBridgeRDSSchedulerRole \
+  --query "Role.Arn" --output text)
+
+# Step 2: Create a Lambda function to stop tagged instances
+# (EventBridge Scheduler invokes Lambda; Lambda iterates tagged instances)
+# See lambda_rds_stop_tagged.py below for the function code
+
+FUNCTION_ARN="arn:aws:lambda:us-east-1:123456789012:function:rds-stop-dev-instances"
+
+# Step 3: Create the stop schedule (Mon-Fri 19:00 UTC)
+aws scheduler create-schedule \
+  --name "rds-stop-dev-weekdays-1900" \
+  --schedule-expression "cron(0 19 ? * MON-FRI *)" \
+  --schedule-expression-timezone "UTC" \
+  --target "{
+    \"Arn\": \"${FUNCTION_ARN}\",
+    \"RoleArn\": \"${ROLE_ARN}\",
+    \"Input\": \"{\\\"action\\\": \\\"stop\\\", \\\"tag_key\\\": \\\"Environment\\\", \\\"tag_value\\\": \\\"dev\\\"}\"
+  }" \
+  --flexible-time-window '{"Mode": "OFF"}'
+
+# Step 4: Create the start schedule (Mon-Fri 07:00 UTC)
+aws scheduler create-schedule \
+  --name "rds-start-dev-weekdays-0700" \
+  --schedule-expression "cron(0 7 ? * MON-FRI *)" \
+  --schedule-expression-timezone "UTC" \
+  --target "{
+    \"Arn\": \"${FUNCTION_ARN}\",
+    \"RoleArn\": \"${ROLE_ARN}\",
+    \"Input\": \"{\\\"action\\\": \\\"start\\\", \\\"tag_key\\\": \\\"Environment\\\", \\\"tag_value\\\": \\\"dev\\\"}\"
+  }" \
+  --flexible-time-window '{"Mode": "OFF"}'
+
+echo "Schedules created. Dev instances will stop at 19:00 UTC and start at 07:00 UTC, Mon-Fri."</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lambda Function: Stop/Start Instances by Tag</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># lambda_rds_stop_tagged.py
+# Invoked by EventBridge Scheduler with {"action": "stop"|"start",
+#   "tag_key": "...", "tag_value": "..."}
+# Deploy as a Lambda function with a 5-minute timeout.
+
+import boto3
+import logging
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+def handler(event, context):
+    action     = event.get("action", "stop")       # "stop" or "start"
+    tag_key    = event.get("tag_key", "Environment")
+    tag_value  = event.get("tag_value", "dev")
+    regions    = event.get("regions", ["us-east-1", "us-west-2"])
+
+    total_actioned = 0
+
+    for region in regions:
+        rds = boto3.client("rds", region_name=region)
+        paginator = rds.get_paginator("describe_db_instances")
+
+        for page in paginator.paginate():
+            for db in page["DBInstances"]:
+                db_id  = db["DBInstanceIdentifier"]
+                status = db["DBInstanceStatus"]
+                tags   = {t["Key"]: t["Value"] for t in db.get("TagList", [])}
+
+                # Tag filter
+                if tags.get(tag_key) != tag_value:
+                    continue
+
+                # Safety: never act on production regardless of tag_value match
+                if tags.get("Environment", "").lower() in \
+                        {"production", "prod", "prd"}:
+                    log.warning(f"Skipping production instance: {db_id}")
+                    continue
+
+                # AutoShutdown=false exemption
+                if tags.get("AutoShutdown", "").lower() == "false":
+                    log.info(f"Skipping AutoShutdown=false: {db_id}")
+                    continue
+
+                try:
+                    if action == "stop" and status == "available":
+                        rds.stop_db_instance(DBInstanceIdentifier=db_id)
+                        log.info(f"Stopped: {db_id} ({region})")
+                        total_actioned += 1
+                    elif action == "start" and status == "stopped":
+                        rds.start_db_instance(DBInstanceIdentifier=db_id)
+                        log.info(f"Started: {db_id} ({region})")
+                        total_actioned += 1
+                    else:
+                        log.info(f"No action needed: {db_id} status={status}")
+                except Exception as e:
+                    log.error(f"Failed to {action} {db_id}: {e}")
+
+    log.info(f"Total instances {action}ped: {total_actioned}")
+    return {"actioned": total_actioned}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: Serverless Auto-Pause</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL's Serverless tier handles this natively. For databases on the General Purpose or Hyperscale tiers that need periodic use without continuous running cost, migrating to Serverless with an auto-pause delay of 60 minutes achieves stop/start behavior automatically without any Lambda equivalent.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Migrate an existing Azure SQL database to Serverless compute tier
+# and configure auto-pause after 60 minutes of inactivity
+
+RESOURCE_GROUP="myResourceGroup"
+SERVER="my-sql-server"
+DATABASE="my-dev-database"
+
+az sql db update \
+  --resource-group "$RESOURCE_GROUP" \
+  --server "$SERVER" \
+  --name "$DATABASE" \
+  --compute-model Serverless \
+  --auto-pause-delay 60 \
+  --min-capacity 0.5 \
+  --capacity 4
+
+echo "Database $DATABASE migrated to Serverless with 60-minute auto-pause."
+echo "Billing pauses automatically during inactivity."</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The minimum vCore setting of 0.5 means the database can scale down to half a vCore while active, reducing costs for low-utilization periods as well. Combined with auto-pause, a database used for 2 hours per day on a 4-vCore SKU effectively costs what a continuous 0.5-vCore database costs on average — a reduction of roughly 80–90% compared to a continuously running General Purpose instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP Cloud SQL: Using Instance Scheduling with Cloud Scheduler</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Schedule Cloud SQL stop/start using Cloud Scheduler + Cloud Functions
+# Equivalent to the AWS EventBridge + Lambda pattern
+
+PROJECT_ID="your-project-id"
+REGION="us-central1"
+FUNCTION_NAME="cloud-sql-scheduler"
+
+# Deploy the Cloud Function
+gcloud functions deploy "$FUNCTION_NAME" \
+  --runtime python311 \
+  --trigger-http \
+  --region "$REGION" \
+  --entry-point handle_schedule \
+  --set-env-vars PROJECT_ID="$PROJECT_ID" \
+  --memory 256MB \
+  --timeout 300s \
+  --no-allow-unauthenticated
+
+FUNCTION_URL=$(gcloud functions describe "$FUNCTION_NAME" \
+  --region "$REGION" \
+  --format "value(serviceConfig.uri)" 2&gt;/dev/null || \
+  gcloud functions describe "$FUNCTION_NAME" \
+  --region "$REGION" \
+  --format "value(httpsTrigger.url)")
+
+# Create service account for Cloud Scheduler
+SA_EMAIL="cloud-sql-scheduler-sa@${PROJECT_ID}.iam.gserviceaccount.com"
+gcloud iam service-accounts create cloud-sql-scheduler-sa \
+  --display-name "Cloud SQL Scheduler"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${SA_EMAIL}" \
+  --role "roles/cloudfunctions.invoker"
+
+gcloud projects add-iam-policy-binding "$PROJECT_ID" \
+  --member "serviceAccount:${SA_EMAIL}" \
+  --role "roles/cloudsql.admin"
+
+# Stop job: weekdays at 19:00 UTC
+gcloud scheduler jobs create http cloud-sql-stop-dev \
+  --location "$REGION" \
+  --schedule "0 19 * * 1-5" \
+  --uri "$FUNCTION_URL" \
+  --message-body '{"action":"stop","label_key":"environment","label_value":"dev"}' \
+  --oidc-service-account-email "$SA_EMAIL" \
+  --time-zone "UTC"
+
+# Start job: weekdays at 07:00 UTC
+gcloud scheduler jobs create http cloud-sql-start-dev \
+  --location "$REGION" \
+  --schedule "0 7 * * 1-5" \
+  --uri "$FUNCTION_URL" \
+  --message-body '{"action":"start","label_key":"environment","label_value":"dev"}' \
+  --oidc-service-account-email "$SA_EMAIL" \
+  --time-zone "UTC"
+
+echo "Cloud SQL scheduler jobs created."</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># main.py — Cloud Function handler for Cloud SQL stop/start
+# Deploy alongside requirements.txt containing: google-cloud-sql-connector, google-auth
+
+import os
+import json
+import logging
+import functions_framework
+from googleapiclient import discovery
+from google.auth import default
+
+log = logging.getLogger()
+
+PROJECT_ID = os.environ.get("PROJECT_ID", "")
+
+@functions_framework.http
+def handle_schedule(request):
+    body = request.get_json(silent=True) or {}
+    action      = body.get("action", "stop")          # "stop" or "start"
+    label_key   = body.get("label_key", "environment")
+    label_value = body.get("label_value", "dev")
+
+    credentials, project = default()
+    sqladmin = discovery.build("sqladmin", "v1beta4",
+                               credentials=credentials)
+
+    instances_response = sqladmin.instances().list(
+        project=PROJECT_ID
+    ).execute()
+
+    instances = instances_response.get("items", [])
+    actioned = 0
+
+    for instance in instances:
+        instance_name = instance["name"]
+        labels = instance.get("settings", {}).get("userLabels", {})
+        state  = instance.get("state", "")
+
+        if labels.get(label_key) != label_value:
+            continue
+
+        # Safety exclusion
+        if labels.get("environment", "").lower() in \
+                {"production", "prod", "prd"}:
+            log.warning(f"Skipping production: {instance_name}")
+            continue
+
+        try:
+            if action == "stop" and state == "RUNNABLE":
+                sqladmin.instances().patch(
+                    project=PROJECT_ID,
+                    instance=instance_name,
+                    body={"settings": {"activationPolicy": "NEVER"}}
+                ).execute()
+                log.info(f"Stopped: {instance_name}")
+                actioned += 1
+
+            elif action == "start" and state != "RUNNABLE":
+                sqladmin.instances().patch(
+                    project=PROJECT_ID,
+                    instance=instance_name,
+                    body={"settings": {"activationPolicy": "ALWAYS"}}
+                ).execute()
+                log.info(f"Started: {instance_name}")
+                actioned += 1
+
+        except Exception as e:
+            log.error(f"Failed to {action} {instance_name}: {e}")
+
+    return json.dumps({"actioned": actioned}), 200, \
+           {"Content-Type": "application/json"}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.6 Measuring the Impact and Building an Ongoing Process</h3>
+
+<p class="text-gray-300 leading-relaxed">Shutting down instances once is table stakes. The real value comes from making idle detection a continuous process that prevents new idle instances from accumulating undetected.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Weekly Idle Instance Report</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The following query, run against the CloudWatch metrics stored in your detection pipeline's output or a central inventory table, provides a weekly digest for finance and engineering leadership:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Run against a PostgreSQL table populated by idle_detector_aws.py
+-- Create the table once:
+--
+-- CREATE TABLE rds_idle_scan_results (
+--   scan_date        DATE NOT NULL,
+--   instance_id      TEXT NOT NULL,
+--   region           TEXT,
+--   instance_class   TEXT,
+--   engine           TEXT,
+--   idle_score       INTEGER,
+--   avg_connections  NUMERIC(8,4),
+--   avg_cpu          NUMERIC(8,4),
+--   avg_read_iops    NUMERIC(8,4),
+--   avg_write_iops   NUMERIC(8,4),
+--   monthly_cost_usd NUMERIC(10,2),
+--   recommendation   TEXT,
+--   action_taken     TEXT,
+--   PRIMARY KEY (scan_date, instance_id)
+-- );
+
+-- Weekly trend: how many idle instances were detected and acted on?
+SELECT
+    DATE_TRUNC('week', scan_date)          AS week_start,
+    COUNT(*)                               AS total_scanned,
+    COUNT(*) FILTER (WHERE idle_score &gt;= 3) AS idle_candidates,
+    COUNT(*) FILTER (WHERE idle_score = 4)  AS high_confidence_idle,
+    SUM(monthly_cost_usd)
+        FILTER (WHERE idle_score &gt;= 3)      AS idle_monthly_cost_usd,
+    COUNT(*) FILTER (WHERE action_taken IN ('STOPPED', 'TERMINATED'))
+                                           AS actions_taken,
+    SUM(monthly_cost_usd)
+        FILTER (WHERE action_taken IN ('STOPPED', 'TERMINATED'))
+                                           AS savings_actioned_usd
+FROM rds_idle_scan_results
+WHERE scan_date &gt;= CURRENT_DATE - INTERVAL '90 days'
+GROUP BY 1
+ORDER BY 1 DESC;
+
+-- SQL Server equivalent:
+-- SELECT
+--     DATEADD(week, DATEDIFF(week, 0, scan_date), 0) AS week_start,
+--     COUNT(*)                                        AS total_scanned,
+--     SUM(CASE WHEN idle_score &gt;= 3 THEN 1 ELSE 0 END) AS idle_candidates,
+--     SUM(CASE WHEN idle_score = 4 THEN 1 ELSE 0 END)  AS high_confidence_idle,
+--     SUM(CASE WHEN idle_score &gt;= 3
+--              THEN monthly_cost_usd ELSE 0 END)      AS idle_monthly_cost_usd,
+--     SUM(CASE WHEN action_taken IN ('STOPPED','TERMINATED')
+--              THEN 1 ELSE 0 END)                     AS actions_taken,
+--     SUM(CASE WHEN action_taken IN ('STOPPED','TERMINATED')
+--              THEN monthly_cost_usd ELSE 0 END)      AS savings_actioned_usd
+-- FROM rds_idle_scan_results
+-- WHERE scan_date &gt;= DATEADD(day, -90, CAST(GETDATE() AS DATE))
+-- GROUP BY DATEADD(week, DATEDIFF(week, 0, scan_date), 0)
+-- ORDER BY week_start DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Drift Detection: Instances That Reappeared After Shutdown</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A stopped instance that restarts automatically (AWS's 7-day auto-restart, or a developer manually starting a stopped instance) will reappear in your next scan. The following query surfaces "drift" — instances that were actioned and came back:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: find instances that were stopped/terminated and then
+-- reappeared as available in a subsequent scan
+
+WITH actioned AS (
+    SELECT DISTINCT instance_id, MIN(scan_date) AS first_actioned_date
+    FROM rds_idle_scan_results
+    WHERE action_taken IN ('STOPPED', 'TERMINATED')
+    GROUP BY instance_id
+),
+reappeared AS (
+    SELECT r.instance_id, r.scan_date AS reappear_date,
+           r.idle_score, r.monthly_cost_usd
+    FROM rds_idle_scan_results r
+    JOIN actioned a ON r.instance_id = a.instance_id
+    WHERE r.scan_date &gt; a.first_actioned_date
+      AND r.action_taken NOT IN ('STOPPED', 'TERMINATED')
+      AND r.idle_score &lt; 3   -- reappeared and now looks active
+)
+SELECT
+    instance_id,
+    first_actioned_date,
+    reappear_date,
+    (reappear_date - first_actioned_date)  AS days_until_reappear,
+    idle_score                              AS current_idle_score,
+    monthly_cost_usd
+FROM reappeared
+ORDER BY days_until_reappear ASC;
+
+-- SQL Server equivalent:
+-- WITH actioned AS (
+--     SELECT DISTINCT instance_id, MIN(scan_date) AS first_actioned_date
+--     FROM rds_idle_scan_results
+--     WHERE action_taken IN ('STOPPED', 'TERMINATED')
+--     GROUP BY instance_id
+-- ),
+-- reappeared AS (
+--     SELECT r.instance_id, r.scan_date AS reappear_date,
+--            r.idle_score, r.monthly_cost_usd
+--     FROM rds_idle_scan_results r
+--     JOIN actioned a ON r.instance_id = a.instance_id
+--     WHERE r.scan_date &gt; a.first_actioned_date
+--       AND r.action_taken NOT IN ('STOPPED', 'TERMINATED')
+--       AND r.idle_score &lt; 3
+-- )
+-- SELECT
+--     instance_id,
+--     first_actioned_date,
+--     reappear_date,
+--     DATEDIFF(day, first_actioned_date, reappear_date) AS days_until_reappear,
+--     idle_score                                         AS current_idle_score,
+--     monthly_cost_usd
+-- FROM reappeared
+-- ORDER BY days_until_reappear ASC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Instances that consistently reappear as active within a day or two of being stopped are likely hitting AWS's 7-day auto-restart (someone is keeping them alive by starting them periodically). These are escalation candidates: the automation correctly identifies them as idle, but a human keeps restarting them, suggesting the instance has a legitimate owner who simply hasn't responded to notifications. The appropriate response is a direct conversation with the tagged owner, not repeated automated shutdowns.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting Up CloudWatch Alarms to Prevent New Idle Accumulation</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Rather than only running the detection scan on a schedule, you can configure real-time alarms that fire when an instance transitions into an idle state. This catches newly abandoned instances within hours rather than waiting for the next weekly scan.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# create_idle_alarms.sh```bash
+# create_idle_alarms.sh (continued)
+# Creates CloudWatch alarms on all running RDS instances to detect
+# sustained low CPU, which triggers a notification to the FinOps SNS topic.
+# Run this after provisioning any new RDS instance, or weekly to catch
+# new instances that don't yet have alarms.
+
+FINOPS_SNS_TOPIC_ARN="arn:aws:sns:us-east-1:123456789012:finops-idle-alerts"
+REGION="us-east-1"
+CPU_THRESHOLD=1.0          # percent
+EVALUATION_PERIODS=48      # 48 × 30-minute periods = 24 hours sustained
+DATAPOINTS_TO_ALARM=40     # 40 of 48 periods must breach (allows brief spikes)
+
+rds_paginator() {
+    aws rds describe-db-instances \
+        --region "$REGION" \
+        --query "DBInstances[?DBInstanceStatus=='available'].[DBInstanceIdentifier]" \
+        --output text
+}
+
+while IFS= read -r INSTANCE_ID; do
+    [[ -z "$INSTANCE_ID" ]] && continue
+
+    ALARM_NAME="FinOps-IdleCPU-${INSTANCE_ID}"
+
+    aws cloudwatch put-metric-alarm \
+        --region "$REGION" \
+        --alarm-name "$ALARM_NAME" \
+        --alarm-description "CPU below ${CPU_THRESHOLD}% for 24h — possible idle instance" \
+        --metric-name CPUUtilization \
+        --namespace AWS/RDS \
+        --dimensions "Name=DBInstanceIdentifier,Value=${INSTANCE_ID}" \
+        --statistic Average \
+        --period 1800 \
+        --evaluation-periods "$EVALUATION_PERIODS" \
+        --datapoints-to-alarm "$DATAPOINTS_TO_ALARM" \
+        --threshold "$CPU_THRESHOLD" \
+        --comparison-operator LessThanThreshold \
+        --treat-missing-data notBreaching \
+        --alarm-actions "$FINOPS_SNS_TOPIC_ARN" \
+        --ok-actions "$FINOPS_SNS_TOPIC_ARN"
+
+    echo "Alarm created/updated: $ALARM_NAME"
+
+done &lt; &lt;(rds_paginator)
+
+echo ""
+echo "All idle CPU alarms configured."
+echo "Alerts will fire to: $FINOPS_SNS_TOPIC_ARN"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--treat-missing-data notBreaching</code> setting is important here: if an instance is already stopped, CloudWatch will see missing data for CPU metrics. Without this setting, missing data would trigger the alarm — generating false alerts for instances you already shut down. With <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">notBreaching</code>, stopped instances stay quiet until they return to a running state and produce new metric data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Connecting Alarms to the Detection Pipeline</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The SNS topic receiving idle alarms can trigger the detection Lambda directly, creating an event-driven path alongside the scheduled scan:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># sns_triggered_scan.py
+# Lambda handler: triggered by SNS when a CloudWatch idle alarm fires.
+# Runs a targeted scan on the specific instance mentioned in the alarm,
+# then writes to the same /tmp/idle_instances.json format for the
+# shutdown_orchestrator to consume.
+
+import json
+import boto3
+import logging
+from datetime import datetime, timezone
+
+log = logging.getLogger()
+log.setLevel(logging.INFO)
+
+# Import from the detection module (package both files in the Lambda layer)
+from idle_detector_aws import scan_single_instance, score_instance
+
+def handler(event, context):
+    for record in event.get("Records", []):
+        sns_message = json.loads(record["Sns"]["Message"])
+        alarm_name  = sns_message.get("AlarmName", "")
+        alarm_state = sns_message.get("NewStateValue", "")
+
+        # Only act on ALARM transitions (not OK)
+        if alarm_state != "ALARM":
+            log.info(f"Ignoring non-ALARM state: {alarm_state} for {alarm_name}")
+            continue
+
+        # Extract instance ID from alarm name convention: FinOps-IdleCPU-&lt;instance_id&gt;
+        if not alarm_name.startswith("FinOps-IdleCPU-"):
+            log.warning(f"Unexpected alarm name format: {alarm_name}")
+            continue
+
+        instance_id = alarm_name.replace("FinOps-IdleCPU-", "")
+        region = sns_message.get("Region", "us-east-1")
+
+        log.info(f"Idle alarm fired for {instance_id} in {region}")
+
+        # Run the full metric scan for this single instance
+        result = scan_single_instance(instance_id, region)
+        if result is None:
+            log.warning(f"Could not scan {instance_id} — may have been deleted already")
+            return
+
+        scored = score_instance(result)
+        log.info(f"Score for {instance_id}: {scored.idle_score}/4 "
+                 f"— {scored.recommendation}")
+
+        # Write to DynamoDB for the shutdown orchestrator to pick up
+        dynamodb = boto3.resource("dynamodb", region_name=region)
+        table    = dynamodb.Table("finops-idle-candidates")
+
+        table.put_item(Item={
+            "instance_id":      scored.instance_id,
+            "detected_at":      datetime.now(timezone.utc).isoformat(),
+            "idle_score":       scored.idle_score,
+            "avg_connections":  str(scored.avg_connections),
+            "avg_cpu":          str(scored.avg_cpu),
+            "avg_read_iops":    str(scored.avg_read_iops),
+            "avg_write_iops":   str(scored.avg_write_iops),
+            "monthly_cost_usd": str(scored.monthly_cost_usd),
+            "recommendation":   scored.recommendation,
+            "region":           region,
+            "ttl":              int(datetime.now(timezone.utc).timestamp()) + 604800
+        })
+
+        log.info(f"Candidate written to DynamoDB: {instance_id}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This event-driven extension means a newly abandoned instance — one that drops to near-zero CPU after a project wraps up — will appear in your idle candidate table within 24 hours, compared to up to 7 days waiting for the next scheduled scan.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">10.7 Avoiding the Common Failure Modes</h3>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 1: Stopping Read Replicas Without Stopping the Primary</strong></p>
+
+<p class="text-gray-300 leading-relaxed">RDS read replicas cannot be stopped independently while their primary is running. Attempting to stop a replica while the primary is available returns an error. The shutdown orchestrator must check whether an instance is a read replica before issuing a stop command, and if so, handle the primary-replica pair together:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def is_read_replica(rds_client, instance_id: str) -&gt; tuple[bool, str]:
+    """
+    Returns (True, primary_instance_id) if this is a read replica,
+    (False, "") otherwise.
+    """
+    try:
+        response = rds_client.describe_db_instances(
+            DBInstanceIdentifier=instance_id
+        )
+        db = response["DBInstances"][0]
+        source = db.get("ReadReplicaSourceDBInstanceIdentifier", "")
+        if source:
+            return True, source
+        return False, ""
+    except Exception as e:
+        log.warning(f"Could not determine replica status for {instance_id}: {e}")
+        return False, ""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">When the orchestrator encounters a read replica with idle score 4, it should flag the primary for review rather than attempting to stop the replica alone. If both the primary and all its replicas score 4/4, the correct sequence is: stop replicas first (if the primary is also being stopped — though RDS does not allow stopping replicas independently), or more practically, stop the primary, at which point replicas automatically stop receiving replication and will show as stopped as well.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 2: Aurora Clusters Require Cluster-Level Actions</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Aurora instances are part of a cluster; you cannot stop an individual Aurora instance. The stop action must target the DB cluster identifier, not the DB instance identifier:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def stop_aurora_cluster(rds_client, cluster_id: str):
+    if DRY_RUN:
+        log.info(f"[DRY-RUN] Would stop Aurora cluster: {cluster_id}")
+        return
+    try:
+        rds_client.stop_db_cluster(DBClusterIdentifier=cluster_id)
+        log.info(f"Aurora cluster stop issued: {cluster_id}")
+    except Exception as e:
+        log.error(f"Failed to stop Aurora cluster {cluster_id}: {e}")
+
+def get_cluster_id(rds_client, instance_id: str) -&gt; str:
+    """Returns the cluster identifier for an Aurora instance, or '' for non-Aurora."""
+    try:
+        response = rds_client.describe_db_instances(
+            DBInstanceIdentifier=instance_id
+        )
+        db = response["DBInstances"][0]
+        return db.get("DBClusterIdentifier", "")
+    except Exception:
+        return ""</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The scan_region function in Section 10.2 should be extended to record cluster membership so that the shutdown orchestrator can deduplicate: if three Aurora instances all belong to the same cluster and all score 4/4, the action is one <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_db_cluster</code> call, not three <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">stop_db_instance</code> calls.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 3: Multi-AZ Failover During Shutdown</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Stopping a Multi-AZ RDS instance triggers a brief failover as the instance transitions states. For instances tagged <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Environment=staging</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Environment=qa</code>, applications connected at shutdown time will see a brief connection drop. The mitigation is to notify application owners via the SNS topic before acting, with a configurable delay:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>import time
+
+def notify_and_wait(sns_client, topic_arn: str, instance_id: str,
+                    action: str, delay_minutes: int = 15):
+    """
+    Sends a pre-action notification and waits the specified delay.
+    In production, replace time.sleep with a Step Functions wait state.
+    """
+    message = (
+        f"FinOps Automated Action Pending\n"
+        f"Instance : {instance_id}\n"
+        f"Action   : {action}\n"
+        f"Delay    : {delay_minutes} minutes\n"
+        f"To cancel: tag the instance AutoShutdown=false within "
+        f"{delay_minutes} minutes."
+    )
+    sns_client.publish(
+        TopicArn=topic_arn,
+        Subject=f"[FinOps] Pending {action}: {instance_id}",
+        Message=message
+    )
+    log.info(f"Notification sent. Waiting {delay_minutes} minutes before {action}.")
+    time.sleep(delay_minutes * 60)
+
+    # Re-check tags after the delay — owner may have opted out
+    return  # Caller re-verifies tags before proceeding</code></pre>
+
+<p class="text-gray-300 leading-relaxed">In a production Step Functions workflow, the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">time.sleep</code> is replaced by a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Wait</code> state, which is far more reliable than sleeping inside a Lambda function that may time out.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Failure Mode 4: Snapshots Not Completing Before Deletion Proceeds</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When the shutdown orchestrator issues <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">create_db_snapshot</code> and then immediately calls <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">delete_db_instance</code>, the deletion will fail because a snapshot is in progress. The orchestrator must poll for snapshot completion. In a Step Functions workflow, this is a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Wait</code> + <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Choice</code> state loop. In the simple Lambda version, a waiter handles it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def wait_for_snapshot(rds_client, snapshot_id: str, timeout_minutes: int = 60):
+    """
+    Polls until the snapshot reaches 'available' status.
+    Use a Step Functions Wait state in production instead of polling in Lambda.
+    """
+    waiter = rds_client.get_waiter("db_snapshot_available")
+    log.info(f"Waiting for snapshot {snapshot_id} to complete...")
+    try:
+        waiter.wait(
+            DBSnapshotIdentifier=snapshot_id,
+            WaiterConfig={"Delay": 30, "MaxAttempts": timeout_minutes * 2}
+        )
+        log.info(f"Snapshot complete: {snapshot_id}")
+        return True
+    except Exception as e:
+        log.error(f"Snapshot wait failed for {snapshot_id}: {e}")
+        return False</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Idle detection requires four signals, not one.** Connection count alone produces false positives due to connection poolers and monitoring agents. Combining DatabaseConnections, CPU utilization, combined IOPS, and network throughput over a 7-day rolling window gives reliable idle candidates with minimal false positives.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Validate before acting, and validate again at action time.** The detection scan and the shutdown action should both independently verify tag-based exemptions. A tag added between scan time and action time must be respected; defense-in-depth tag checking at both stages prevents unintended shutdowns of newly protected instances.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Stop and terminate are different tools for different situations.** Stopping preserves the instance for potential restart, saves compute costs, but continues storage billing and auto-restarts after 7 days on AWS. Termination with a final snapshot eliminates all ongoing costs but requires a deliberate recovery process. Match the action to the confidence level: stop for score-3 candidates, terminate only for confirmed decommissions.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Schedule stop/start for non-production instances rather than relying solely on idle detection.** A database that runs batch jobs unpredictably will evade idle detection during active weeks. Scheduled shutdown during off-hours (evenings, weekends) captures consistent savings without the risk of accidentally stopping a legitimately used instance. Azure SQL Serverless auto-pause handles this automatically without custom scheduling infrastructure.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Make idle detection continuous, not a one-time exercise.** CloudWatch alarms on CPU thresholds catch newly abandoned instances within 24 hours rather than waiting for a weekly scan. Drift detection queries surface instances that were stopped and restarted, enabling targeted conversations with owners who are manually overriding automation. The ongoing process prevents idle debt from accumulating again after the initial cleanup.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
