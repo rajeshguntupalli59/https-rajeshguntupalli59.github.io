@@ -5,6 +5,10 @@
   <title>Chapter 16: Compressing Data at Rest: Savings and Tradeoffs — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 16: Compressing Data at Rest: Savings and Tradeoffs. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -309,7 +313,1150 @@ SELECT pg_stat_statements_reset();
 -- Use RDS Performance Insights to correlate CPU spikes with compression events</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Monitoring Compression CPU Impact with CloudWatch and Python</strong></p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+compression_impact_monitor.py
+
+Monitors CPU and I/O metrics before and after enabling database compression
+using CloudWatch for RDS instances. Runs on a schedule via AWS Lambda or cron.
+
+Requirements: boto3, pandas
+Usage: python compression_impact_monitor.py --instance-id your-rds-instance \
+           --period-hours 24 --output compression_report.json
+"""
+
+import boto3
+import json
+import argparse
+from datetime import datetime, timedelta, timezone
+from statistics import mean, stdev
+
+
+def get_rds_metrics(instance_id: str, metric_name: str,
+                    start_time: datetime, end_time: datetime,
+                    period_seconds: int = 300) -&gt; list[dict]:
+    """Retrieve CloudWatch RDS metrics for a given time window."""
+    cw = boto3.client('cloudwatch')
+
+    response = cw.get_metric_statistics(
+        Namespace='AWS/RDS',
+        MetricName=metric_name,
+        Dimensions=[
+            {'Name': 'DBInstanceIdentifier', 'Value': instance_id}
+        ],
+        StartTime=start_time,
+        EndTime=end_time,
+        Period=period_seconds,
+        Statistics=['Average', 'Maximum', 'Minimum']
+    )
+
+    return sorted(response['Datapoints'], key=lambda x: x['Timestamp'])
+
+
+def analyze_compression_impact(instance_id: str, baseline_hours: int,
+                                post_compression_hours: int) -&gt; dict:
+    """
+    Compare key metrics between a baseline period and post-compression period.
+    Assumes compression was applied between the two periods.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Define time windows
+    # Baseline: older period before compression
+    baseline_end = now - timedelta(hours=post_compression_hours)
+    baseline_start = baseline_end - timedelta(hours=baseline_hours)
+
+    # Post-compression: most recent period
+    post_start = now - timedelta(hours=post_compression_hours)
+    post_end = now
+
+    metrics_to_compare = [
+        'CPUUtilization',
+        'ReadIOPS',
+        'WriteIOPS',
+        'ReadLatency',
+        'WriteLatency',
+        'FreeStorageSpace',
+        'DatabaseConnections'
+    ]
+
+    results = {
+        'instance_id': instance_id,
+        'analysis_timestamp': now.isoformat(),
+        'baseline_window': {
+            'start': baseline_start.isoformat(),
+            'end': baseline_end.isoformat(),
+            'hours': baseline_hours
+        },
+        'post_compression_window': {
+            'start': post_start.isoformat(),
+            'end': post_end.isoformat(),
+            'hours': post_compression_hours
+        },
+        'metrics': {}
+    }
+
+    for metric in metrics_to_compare:
+        baseline_data = get_rds_metrics(instance_id, metric, baseline_start, baseline_end)
+        post_data = get_rds_metrics(instance_id, metric, post_start, post_end)
+
+        if not baseline_data or not post_data:
+            results['metrics'][metric] = {'error': 'Insufficient data'}
+            continue
+
+        baseline_avg_values = [p['Average'] for p in baseline_data]
+        post_avg_values = [p['Average'] for p in post_data]
+
+        baseline_mean = mean(baseline_avg_values)
+        post_mean = mean(post_avg_values)
+        delta_pct = ((post_mean - baseline_mean) / baseline_mean * 100
+                     if baseline_mean != 0 else 0)
+
+        results['metrics'][metric] = {
+            'baseline_mean': round(baseline_mean, 4),
+            'post_compression_mean': round(post_mean, 4),
+            'delta_percent': round(delta_pct, 2),
+            'direction': 'INCREASED' if delta_pct &gt; 0 else 'DECREASED',
+            'concern': (
+                'HIGH' if metric == 'CPUUtilization' and delta_pct &gt; 20 else
+                'MEDIUM' if metric == 'CPUUtilization' and delta_pct &gt; 10 else
+                'POSITIVE' if metric == 'FreeStorageSpace' and delta_pct &gt; 0 else
+                'NORMAL'
+            )
+        }
+
+    # Calculate estimated monthly storage savings
+    free_storage_metric = results['metrics'].get('FreeStorageSpace', {})
+    if 'baseline_mean' in free_storage_metric:
+        baseline_free_gb = free_storage_metric['baseline_mean'] / (1024 ** 3)
+        post_free_gb = free_storage_metric['post_compression_mean'] / (1024 ** 3)
+        storage_freed_gb = post_free_gb - baseline_free_gb
+
+        # AWS gp3 pricing: $0.115/GB-month, doubled for Multi-AZ
+        savings_single_az = storage_freed_gb * 0.115
+        savings_multi_az = storage_freed_gb * 0.115 * 2
+
+        results['estimated_savings'] = {
+            'storage_freed_gb': round(storage_freed_gb, 2),
+            'monthly_savings_single_az_usd': round(savings_single_az, 2),
+            'monthly_savings_multi_az_usd': round(savings_multi_az, 2),
+            'annual_savings_multi_az_usd': round(savings_multi_az * 12, 2)
+        }
+
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Monitor compression impact on RDS')
+    parser.add_argument('--instance-id', required=True, help='RDS instance identifier')
+    parser.add_argument('--baseline-hours', type=int, default=168,
+                        help='Hours of baseline data to use (default: 168 = 1 week)')
+    parser.add_argument('--post-hours', type=int, default=24,
+                        help='Hours of post-compression data to compare')
+    parser.add_argument('--output', default='compression_impact.json',
+                        help='Output file for results')
+    args = parser.parse_args()
+
+    print(f"Analyzing compression impact for {args.instance_id}...")
+    results = analyze_compression_impact(
+        args.instance_id,
+        args.baseline_hours,
+        args.post_hours
+    )
+
+    with open(args.output, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nResults written to {args.output}")
+    print("\n=== SUMMARY ===")
+
+    cpu_metric = results['metrics'].get('CPUUtilization', {})
+    if 'delta_percent' in cpu_metric:
+        print(f"CPU Change: {cpu_metric['delta_percent']:+.1f}% "
+              f"({cpu_metric['concern']})")
+
+    savings = results.get('estimated_savings', {})
+    if savings:
+        print(f"Storage Freed: {savings.get('storage_freed_gb', 0):.1f} GB")
+        print(f"Monthly Savings (Multi-AZ): ${savings.get('monthly_savings_multi_az_usd', 0):.2f}")
+        print(f"Annual Savings (Multi-AZ):  ${savings.get('annual_savings_multi_az_usd', 0):.2f}")
+
+
+if __name__ == '__main__':
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Measuring Compression Impact via DMVs</strong></p>
+
+<p class="text-gray-300 leading-relaxed">SQL Server's Dynamic Management Views expose buffer pool pressure and CPU cost of compression operations. Capture these before and after applying compression to any large table:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Baseline CPU and I/O snapshot before compression
+-- Save output to a table or capture externally
+
+-- 1. Index usage stats for tables you plan to compress
+SELECT
+    OBJECT_SCHEMA_NAME(i.object_id) AS schema_name,
+    OBJECT_NAME(i.object_id) AS table_name,
+    i.name AS index_name,
+    s.user_seeks,
+    s.user_scans,
+    s.user_lookups,
+    s.user_updates,
+    s.last_user_seek,
+    s.last_user_scan,
+    -- Heavy update workloads feel page compression more than read workloads
+    CASE
+        WHEN s.user_updates &gt; s.user_seeks + s.user_scans
+        THEN 'UPDATE-HEAVY: prefer ROW compression'
+        ELSE 'READ-HEAVY: PAGE compression viable'
+    END AS compression_recommendation
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_index_usage_stats s
+    ON i.object_id = s.object_id
+    AND i.index_id = s.index_id
+    AND s.database_id = DB_ID()
+WHERE OBJECT_NAME(i.object_id) IN ('OrderLineItems', 'AuditLog', 'EventStream')
+ORDER BY s.user_updates DESC;
+
+-- 2. Buffer pool pressure: pages in memory vs total pages
+SELECT
+    OBJECT_SCHEMA_NAME(p.object_id) AS schema_name,
+    OBJECT_NAME(p.object_id) AS table_name,
+    i.name AS index_name,
+    p.data_compression_desc AS compression,
+    COUNT(b.page_id) AS pages_in_buffer,
+    SUM(a.total_pages) AS total_pages,
+    ROUND(COUNT(b.page_id) * 100.0 / NULLIF(SUM(a.total_pages), 0), 1)
+        AS pct_in_buffer_pool
+FROM sys.partitions p
+INNER JOIN sys.indexes i
+    ON p.object_id = i.object_id AND p.index_id = i.index_id
+INNER JOIN sys.allocation_units a
+    ON p.partition_id = a.container_id
+LEFT JOIN sys.dm_os_buffer_descriptors b
+    ON a.allocation_unit_id = b.allocation_unit_id
+    AND b.database_id = DB_ID()
+WHERE OBJECT_NAME(p.object_id) IN ('OrderLineItems', 'AuditLog', 'EventStream')
+GROUP BY p.object_id, i.name, p.data_compression_desc
+ORDER BY total_pages DESC;
+
+-- 3. After applying compression, check if query plans changed
+-- Look for new sort or hash spill warnings in execution plans,
+-- which indicate that compressed pages are using more CPU than expected
+SELECT TOP 20
+    qs.total_worker_time / qs.execution_count AS avg_cpu_microseconds,
+    qs.total_elapsed_time / qs.execution_count AS avg_elapsed_microseconds,
+    qs.execution_count,
+    qs.total_logical_reads / qs.execution_count AS avg_logical_reads,
+    LEFT(st.text, 200) AS query_text
+FROM sys.dm_exec_query_stats qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) st
+WHERE st.text LIKE '%OrderLineItems%'
+   OR st.text LIKE '%AuditLog%'
+ORDER BY avg_cpu_microseconds DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting the Accept/Reject Threshold</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Before any compression project begins, define the ceiling on acceptable CPU increase. A workable rule of thumb: if average CPU is currently below 40%, accept compression if the post-compression CPU remains below 55%. If current CPU is 40–60%, row compression only and reject page compression if the delta exceeds 8 percentage points. If current CPU is above 60%, do not apply page compression at all — the instance is already under pressure and compression will push it into throttling territory on Azure SQL DTU-based tiers.</p>
+
+<p class="text-gray-300 leading-relaxed">Encode this rule into the monitoring script by adding a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gate_compression</code> function that queries the baseline CPU from the analysis results and outputs a go/no-go recommendation before any production ALTER TABLE runs.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart TD
+    A[Measure current baseline CPU utilization] --> B{Below 40%?}
+    B -->|Yes| C[Accept compression if post-compression CPU stays below 55%]
+    B -->|No| D{40-60%?}
+    D -->|Yes| E["Row compression only.<br/>Reject page compression if CPU delta exceeds 8pp"]
+    D -->|No — above 60%| F[Do not apply page compression.<br/>Instance is already under pressure]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The compression accept/reject gate: current baseline CPU utilization determines which compression level, if any, is safe to apply.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.4 Compressing Backups and Snapshots</h3>
+
+<p class="text-gray-300 leading-relaxed">Backup storage is frequently the hidden multiplier in storage cost analysis. An RDS instance with 14-day automated backup retention stores roughly 4–5× the database size across all daily snapshots when the database is write-heavy, because each daily snapshot captures changed blocks incrementally but still accumulates quickly. Compressing the live database reduces each incremental snapshot proportionally, so backup savings compound the primary storage savings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">RDS Automated Backup Compression</strong></p>
+
+<p class="text-gray-300 leading-relaxed">RDS does not expose a direct "compress backups" toggle because automated backups are stored as S3 snapshots at the block level. The compression happens indirectly: a smaller primary volume produces smaller snapshots. Enabling compression on a 3 TB database that shrinks to 1.2 TB means each daily incremental snapshot writes fewer changed blocks, and the initial full snapshot in the next retention cycle stores 1.2 TB rather than 3 TB.</p>
+
+<p class="text-gray-300 leading-relaxed">For manual snapshots exported to S3 via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws rds start-export-task</code>, the exported data is stored as Parquet files in S3, which applies Snappy compression by default. You do not control this, but you benefit from it automatically. A 3 TB Parquet export of typical relational OLTP data commonly stores in 600–900 GB of S3 space due to Snappy compression plus Parquet's columnar encoding. That S3 storage at $0.023/GB-month is substantially cheaper than RDS snapshot storage at $0.095/GB-month for long-term archival.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL WAL Compression for Logical Replication</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For Aurora PostgreSQL or RDS PostgreSQL instances using logical replication to feed downstream consumers (analytics databases, Kafka, CDC pipelines), enabling WAL-level compression reduces replication bandwidth costs:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Check current WAL settings relevant to compression
+-- On RDS, these are set via parameter groups, not directly in psql
+SHOW wal_compression;
+SHOW wal_level;
+
+-- If wal_compression is 'off', request a parameter group change:
+-- wal_compression = lz4   (PostgreSQL 14+ supports lz4 and zstd)
+-- This reduces WAL segment sizes by 30-60% for text-heavy workloads
+-- and directly reduces cross-AZ replication traffic costs
+
+-- Measure current WAL generation rate to estimate savings
+SELECT
+    pg_current_wal_lsn() AS current_lsn,
+    pg_walfile_name(pg_current_wal_lsn()) AS current_wal_file,
+    -- Run this query twice, 60 seconds apart, and subtract LSN values
+    -- to get bytes of WAL generated per minute
+    pg_wal_lsn_diff(
+        pg_current_wal_lsn(),
+        '0/0'::pg_lsn
+    ) AS total_wal_bytes_generated
+;
+
+-- Cross-AZ data transfer pricing on AWS: $0.02/GB
+-- If WAL compression reduces replication traffic by 40% on a database
+-- generating 50 GB/day of WAL, that is 20 GB/day saved = $0.40/day = $12/month
+-- For a write-intensive database generating 500 GB/day, savings reach $120/month</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: Built-in Backup Compression</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL Database and Azure SQL Managed Instance compress backups automatically using a built-in compression algorithm. You cannot disable it, and you do not tune it. The practical implication is that applying page or row compression to your tables reduces the pre-compression data volume fed into Azure's backup pipeline, which in turn reduces the compressed backup size and the backup storage billed. The effect is multiplicative rather than additive: if page compression reduces your table data by 50% and Azure's backup compression reduces that by an additional 30%, your backup storage is roughly 65% smaller than the uncompressed baseline.</p>
+
+<p class="text-gray-300 leading-relaxed">To monitor Azure SQL backup storage consumption and project savings:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL: Check backup storage usage and estimate compression benefit
+-- Run against master database on Azure SQL Managed Instance,
+-- or use Azure portal for Azure SQL Database (single database)
+
+-- On Managed Instance, this view is available:
+SELECT
+    database_name,
+    backup_start_date,
+    backup_finish_date,
+    DATEDIFF(SECOND, backup_start_date, backup_finish_date) AS duration_seconds,
+    backup_size / 1024 / 1024 AS backup_size_mb,
+    compressed_backup_size / 1024 / 1024 AS compressed_size_mb,
+    ROUND(
+        (1 - compressed_backup_size * 1.0 / NULLIF(backup_size, 0)) * 100, 1
+    ) AS compression_pct,
+    type AS backup_type  -- D=full, I=differential, L=log
+FROM msdb.dbo.backupset
+WHERE database_name = 'YourDatabase'
+  AND backup_start_date &gt; DATEADD(DAY, -7, GETDATE())
+ORDER BY backup_start_date DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.5 Automating Compression Enforcement Across a Fleet</h3>
+
+<p class="text-gray-300 leading-relaxed">One-off compression projects decay. Engineers create new tables without compression settings, schema changes introduce uncompressed columns, and within six months the storage savings erode as new data accumulates uncompressed. Automation that enforces compression standards at table creation and identifies drift on a schedule is what converts a project into compounding savings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Event Trigger to Enforce TOAST Compression on New Tables</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Deploy this to each PostgreSQL database in your fleet
+-- It fires on CREATE TABLE and ALTER TABLE ADD COLUMN,
+-- automatically setting lz4 compression on all text/json/jsonb columns
+
+CREATE OR REPLACE FUNCTION enforce_lz4_compression()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    obj record;
+    col record;
+    schema_name text;
+    table_name text;
+BEGIN
+    FOR obj IN
+        SELECT * FROM pg_event_trigger_ddl_commands()
+        WHERE command_tag IN ('CREATE TABLE', 'ALTER TABLE')
+          AND object_type = 'table'
+    LOOP
+        -- Parse schema and table from object_identity
+        schema_name := split_part(obj.object_identity, '.', 1);
+        table_name  := split_part(obj.object_identity, '.', 2);
+
+        -- Skip system schemas
+        IF schema_name IN ('pg_catalog', 'information_schema', 'pg_toast') THEN
+            CONTINUE;
+        END IF;
+
+        -- Set lz4 compression on all compressible columns
+        FOR col IN
+            SELECT attname, attstorage
+            FROM pg_attribute
+            WHERE attrelid = obj.objid
+              AND attnum &gt; 0
+              AND NOT attisdropped
+              AND atttypid IN (
+                  'text'::regtype,
+                  'varchar'::regtype,
+                  'json'::regtype,
+                  'jsonb'::regtype,
+                  'xml'::regtype,
+                  'bytea'::regtype
+              )
+              AND attcompression != 'l'  -- not already lz4
+        LOOP
+            EXECUTE format(
+                'ALTER TABLE %I.%I ALTER COLUMN %I SET COMPRESSION lz4',
+                schema_name, table_name, col.attname
+            );
+        END LOOP;
+    END LOOP;
+END;
+$$;
+
+-- Create the event trigger (runs in all databases where deployed)
+DROP EVENT TRIGGER IF EXISTS enforce_compression_on_ddl;
+CREATE EVENT TRIGGER enforce_compression_on_ddl
+    ON ddl_command_end
+    WHEN TAG IN ('CREATE TABLE', 'ALTER TABLE')
+    EXECUTE FUNCTION enforce_lz4_compression();
+
+-- Verify the trigger is active
+SELECT evtname, evtevent, evtenabled, evtfoid::regproc AS function
+FROM pg_event_trigger
+WHERE evtname = 'enforce_compression_on_ddl';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Fleet-Wide Compression Drift Detection Script</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The event trigger handles new objects, but it does not retroactively fix existing tables or catch tables created before the trigger was deployed. A scheduled drift detection job handles the remediation side:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+compression_drift_detector.py
+
+Scans a fleet of PostgreSQL databases for tables with compressible columns
+that are not using lz4 compression. Outputs a remediation script and
+optionally posts findings to an SNS topic for alerting.
+
+Designed to run as an AWS Lambda function on a weekly schedule via
+EventBridge, or as a cron job on a bastion host.
+
+Requirements: psycopg2-binary, boto3
+"""
+
+import json
+import os
+import boto3
+import psycopg2
+import psycopg2.extras
+from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+
+@dataclass
+class CompressionDrift:
+    host: str
+    database: str
+    schema_name: str
+    table_name: str
+    column_name: str
+    current_compression: str
+    table_size_mb: float
+    remediation_sql: str
+
+
+def get_database_endpoints(tag_key: str = 'compression-managed',
+                           tag_value: str = 'true') -&gt; list[dict]:
+    """
+    Discover RDS instances tagged for compression management.
+    Returns list of connection info dicts.
+    """
+    rds = boto3.client('rds')
+    paginator = rds.get_paginator('describe_db_instances')
+    endpoints = []
+
+    for page in paginator.paginate():
+        for instance in page['DBInstances']:
+            # Check tags
+            tags = {t['Key']: t['Value'] for t in instance.get('TagList', [])}
+            if tags.get(tag_key) != tag_value:
+                continue
+            if instance['Engine'] not in ('postgres', 'aurora-postgresql'):
+                continue
+            if instance['DBInstanceStatus'] != 'available':
+                continue
+
+            endpoints.append({
+                'host': instance['Endpoint']['Address'],
+                'port': instance['Endpoint']['Port'],
+                'instance_id': instance['DBInstanceIdentifier'],
+                'engine': instance['Engine'],
+                'databases': tags.get('monitored-databases', 'postgres').split(',')
+            })
+
+    return endpoints
+
+
+def get_secret(secret_name: str) -&gt; dict:
+    """Retrieve database credentials from AWS Secrets Manager."""
+    client = boto3.client('secretsmanager')
+    response = client.get_secret_value(SecretId=secret_name)
+    return json.loads(response['SecretString'])
+
+
+def scan_database_for_drift(host: str, port: int, database: str,
+                             credentials: dict,
+                             min_table_size_mb: float = 10.0) -&gt; list[CompressionDrift]:
+    """
+    Connect to a PostgreSQL database and find compressible columns
+    not using lz4 compression.
+    """
+    drifts = []
+
+    try:
+        conn = psycopg2.connect(
+            host=host,
+            port=port,
+            dbname=database,
+            user=credentials['username'],
+            password=credentials['password'],
+            connect_timeout=10,
+            sslmode='require'
+        )
+        conn.set_session(readonly=True, autocommit=True)
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cursor.execute("""
+            SELECT
+                n.nspname AS schema_name,
+                c.relname AS table_name,
+                a.attname AS column_name,
+                CASE a.attcompression
+                    WHEN '' THEN 'default'
+                    WHEN 'p' THEN 'pglz'
+                    WHEN 'l' THEN 'lz4'
+                    ELSE a.attcompression
+                END AS current_compression,
+                ROUND(pg_total_relation_size(c.oid) / 1024.0 / 1024.0, 2)
+                    AS table_size_mb
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            JOIN pg_namespace n ON c.relnamespace = n.oid
+            WHERE a.attnum &gt; 0
+              AND NOT a.attisdropped
+              AND c.relkind = 'r'
+              AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast')
+              AND a.atttypid IN (
+                  'text'::regtype,
+                  'varchar'::regtype,
+                  'json'::regtype,
+                  'jsonb'::regtype,
+                  'xml'::regtype,
+                  'bytea'::regtype
+              )
+              AND a.attstorage IN ('x', 'm', 'e')
+              AND a.attcompression != 'l'  -- not already lz4
+              AND pg_total_relation_size(c.oid) &gt; %s * 1024 * 1024
+            ORDER BY pg_total_relation_size(c.oid) DESC
+        """, (min_table_size_mb,))
+
+        for row in cursor.fetchall():
+            remediation = (
+                f"ALTER TABLE {row['schema_name']}.{row['table_name']} "
+                f"ALTER COLUMN {row['column_name']} SET COMPRESSION lz4;"
+            )
+            drifts.append(CompressionDrift(
+                host=host,
+                database=database,
+                schema_name=row['schema_name'],
+                table_name=row['table_name'],
+                column_name=row['column_name'],
+                current_compression=row['current_compression'],
+                table_size_mb=float(row['table_size_mb']),
+                remediation_sql=remediation
+            ))
+
+        cursor.close()
+        conn.close()
+
+    except psycopg2.OperationalError as e:
+        print(f"  Connection failed to {host}/{database}: {e}")
+
+    return drifts
+
+
+def publish_drift_report(drifts: list[CompressionDrift],
+                          sns_topic_arn: Optional[str] = None) -&gt; None:
+    """Publish drift findings to SNS and write remediation SQL to stdout."""
+    if not drifts:
+        print("No compression drift detected.")
+        return
+
+    total_affected_tables = len({(d.host, d.database, d.schema_name, d.table_name)
+                                  for d in drifts})
+    total_size_mb = sum(d.table_size_mb for d in drifts)
+
+    print(f"\n=== COMPRESSION DRIFT REPORT ===")
+    print(f"Affected columns: {len(drifts)}")
+    print(f"Affected tables:  {total_affected_tables}")
+    print(f"Total table size: {total_size_mb / 1024:.1f} GB")
+    print(f"\n-- REMEDIATION SQL --")
+    for drift in drifts:
+        print(f"-- {drift.host}/{drift.database} | {drift.table_size_mb:.0f} MB")
+        print(drift.remediation_sql)
+
+    if sns_topic_arn:
+        sns = boto3.client('sns')
+        summary = {
+            'alert': 'compression_drift_detected',
+            'affected_columns': len(drifts),
+            'affected_tables': total_affected_tables,
+            'total_size_gb': round(total_size_mb / 1024, 2),
+            'sample_remediations': [d.remediation_sql for d in drifts[:5]]
+        }
+        sns.publish(
+            TopicArn=sns_topic_arn,
+            Subject='Database Compression Drift Detected',
+            Message=json.dumps(summary, indent=2)
+        )
+        print(f"\nAlert published to SNS: {sns_topic_arn}")
+
+
+def lambda_handler(event: dict, context) -&gt; dict:
+    """AWS Lambda entry point."""
+    secret_name = os.environ.get('DB_SECRET_NAME', 'rds/compression-monitor/credentials')
+    sns_topic_arn = os.environ.get('SNS_TOPIC_ARN')
+    min_size_mb = float(os.environ.get('MIN_TABLE_SIZE_MB', '10'))
+
+    credentials = get_secret(secret_name)
+    endpoints = get_database_endpoints()
+
+    all_drifts = []
+    for endpoint in endpoints:
+        for database in endpoint['databases']:
+            print(f"Scanning {endpoint['host']}/{database}...")
+            drifts = scan_database_for_drift(
+                host=endpoint['host'],
+                port=endpoint['port'],
+                database=database.strip(),
+                credentials=credentials,
+                min_table_size_mb=min_size_mb
+            )
+            all_drifts.extend(drifts)
+            print(f"  Found {len(drifts)} uncompressed compressible columns")
+
+    publish_drift_report(all_drifts, sns_topic_arn)
+
+    return {
+        'statusCode': 200,
+        'drifts_found': len(all_drifts),
+        'affected_tables': len({(d.host, d.database, d.schema_name, d.table_name)
+                                 for d in all_drifts})
+    }
+
+
+if __name__ == '__main__':
+    # Local execution for testing
+    lambda_handler({}, None)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server: Scheduled Job to Apply and Verify Compression</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server fleets on Azure SQL Managed Instance or RDS for SQL Server, use SQL Server Agent to run a weekly compression audit job. The job identifies tables that have grown beyond a threshold and have not yet been compressed, then applies row compression automatically and logs the result:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a compression audit and auto-apply stored procedure
+-- Deploy to each managed instance or RDS SQL Server instance
+
+CREATE OR ALTER PROCEDURE dbo.usp_AutoApplyRowCompression
+    @size_threshold_mb INT = 100,       -- Only compress tables &gt; this size
+    @dry_run BIT = 1,                   -- 1 = report only, 0 = apply compression
+    @max_tables_per_run INT = 10        -- Limit tables per execution to control duration
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Temp table to hold candidates
+    CREATE TABLE #compression_candidates (
+        schema_name SYSNAME,
+        table_name SYSNAME,
+        size_mb DECIMAL(10, 2),
+        current_compression NVARCHAR(60),
+        rows BIGINT,
+        processed BIT DEFAULT 0
+    );
+
+    INSERT INTO #compression_candidates (schema_name, table_name, size_mb,
+                                          current_compression, rows)
+    SELECT
+        s.name,
+        t.name,
+        SUM(a.total_pages) * 8.0 / 1024,
+        MAX(p.data_compression_desc),
+        SUM(p.rows)
+    FROM sys.tables t
+    INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
+    INNER JOIN sys.partitions p ON t.object_id = p.object_id AND p.index_id IN (0,1)
+    INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+    GROUP BY s.name, t.name
+    HAVING MAX(p.data_compression_desc) = 'NONE'
+       AND SUM(a.total_pages) * 8.0 / 1024 &gt; @size_threshold_mb
+    ORDER BY SUM(a.total_pages) DESC;
+
+    DECLARE @schema  SYSNAME,
+            @table   SYSNAME,
+            @size_mb DECIMAL(10,2),
+            @sql     NVARCHAR(500),
+            @count   INT = 0;
+
+    WHILE @count &lt; @max_tables_per_run
+    BEGIN
+        SELECT TOP 1
+            @schema  = schema_name,
+            @table   = table_name,
+            @size_mb = size_mb
+        FROM #compression_candidates
+        WHERE processed = 0
+        ORDER BY size_mb DESC;
+
+        IF @@ROWCOUNT = 0 BREAK;
+
+        IF @dry_run = 1
+        BEGIN
+            PRINT CONCAT('DRY RUN - Would compress: ', @schema, '.', @table,
+                         ' (', @size_mb, ' MB)');
+        END
+        ELSE
+        BEGIN
+            SET @sql = CONCAT(
+                'ALTER TABLE ', QUOTENAME(@schema), '.', QUOTENAME(@table),
+                ' REBUILD WITH (DATA_COMPRESSION = ROW)'
+            );
+
+            BEGIN TRY
+                EXEC sp_executesql @sql;
+                INSERT INTO dbo.compression_audit_log
+                    (schema_name, table_name, size_before_mb,
+                     compression_applied, applied_at)
+                VALUES (@schema, @table, @size_mb, 'ROW', GETUTCDATE());
+
+                PRINT CONCAT('Compressed: ', @schema, '.', @table);
+            END TRY
+            BEGIN CATCH
+                PRINT CONCAT('FAILED: ', @schema, '.', @table,
+                             ' - ', ERROR_MESSAGE());
+            END CATCH;
+        END;
+
+        UPDATE #compression_candidates
+        SET processed = 1
+        WHERE schema_name = @schema AND table_name = @table;
+
+        SET @count += 1;
+    END;
+
+    -- Return summary
+    SELECT
+        schema_name,
+        table_name,
+        size_mb,
+        current_compression,
+        rows,
+        CASE processed WHEN 1 THEN 'PROCESSED' ELSE 'PENDING' END AS status
+    FROM #compression_candidates
+    ORDER BY size_mb DESC;
+
+    DROP TABLE #compression_candidates;
+END;
+GO
+
+-- Create the audit log table if it does not exist
+IF OBJECT_ID('dbo.compression_audit_log') IS NULL
+BEGIN
+    CREATE TABLE dbo.compression_audit_log (
+        log_id               INT IDENTITY PRIMARY KEY,
+        schema_name          SYSNAME,
+        table_name           SYSNAME,
+        size_before_mb       DECIMAL(10, 2),
+        compression_applied  NVARCHAR(10),
+        applied_at           DATETIME2 DEFAULT GETUTCDATE()
+    );
+END;
+GO
+
+-- Run in dry-run mode first to see what would be compressed
+EXEC dbo.usp_AutoApplyRowCompression @size_threshold_mb = 100, @dry_run = 1;
+
+-- Run live against the first 10 qualifying tables
+-- EXEC dbo.usp_AutoApplyRowCompression @size_threshold_mb = 100, @dry_run = 0;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.6 Columnar Storage as an Extreme Compression Strategy</h3>
+
+<p class="text-gray-300 leading-relaxed">For tables that are primarily read by analytics queries — monthly aggregations, compliance reports, audit trails — columnar storage achieves compression ratios that row-based compression cannot approach. Columnar encoding stores all values of the same column contiguously, which means run-length encoding, dictionary encoding, and delta encoding can compress similar values far more aggressively than page compression applied to mixed row data.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server Columnstore Indexes on Azure SQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">A nonclustered columnstore index on a large fact table commonly achieves 5–10× compression relative to an uncompressed rowstore, and 3–5× relative to a page-compressed rowstore. For a 500 GB audit log table that is written once and read weekly, adding a columnstore index can reduce the effective storage footprint of those reads to under 100 GB while eliminating most individual page reads:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Add a nonclustered columnstore index for analytics queries on a large table
+-- This coexists with the existing rowstore clustered index
+-- Writes go to the rowstore; analytics queries use the columnstore automatically
+
+-- First, check if the query workload is analytics-suitable
+-- (large scans, aggregations, group bys rather than single-row lookups)
+SELECT
+    t.name AS table_name,
+    SUM(s.user_scans) AS total_scans,
+    SUM(s.user_seeks) AS total_seeks,
+    SUM(s.user_scans) * 100.0 /
+        NULLIF(SUM(s.user_scans) + SUM(s.user_seeks), 0) AS pct_scans,
+    CASE
+        WHEN SUM(s.user_scans) * 100.0 /
+             NULLIF(SUM(s.user_scans) + SUM(s.user_seeks), 0) &gt; 60
+        THEN 'Columnstore candidate'
+        ELSE 'Primarily point-lookup: skip columnstore'
+    END AS recommendation
+FROM sys.tables t
+JOIN sys.indexes i ON t.object_id = i.object_id
+LEFT JOIN sys.dm_db_index_usage_stats s
+    ON i.object_id = s.object_id AND i.index_id = s.index_id
+    AND s.database_id = DB_ID()
+WHERE i.index_id IN (0, 1)
+GROUP BY t.name
+ORDER BY total_scans DESC;
+
+-- Create nonclustered columnstore index on AuditLog
+CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_AuditLog_Analytics
+ON dbo.AuditLog (
+    event_date, user_id, action_type, resource_id,
+    old_value, new_value, ip_address, session_id
+)
+WITH (DATA_COMPRESSION = COLUMNSTORE_ARCHIVE)  -- Maximum compression for cold data
+-- Use DATA_COMPRESSION = COLUMNSTORE for hot analytics data (faster decompression)
+;
+
+-- Measure actual compression ratio after index creation
+SELECT
+    i.name AS index_name,
+    i.type_desc,
+    SUM(a.total_pages) * 8 / 1024 AS index_size_mb,
+    -- Compare to the rowstore size from earlier query
+    p.data_compression_desc
+FROM sys.indexes i
+JOIN sys.partitions p ON i.object_id = p.object_id AND i.index_id = p.index_id
+JOIN sys.allocation_units a ON p.partition_id = a.container_id
+WHERE OBJECT_NAME(i.object_id) = 'AuditLog'
+GROUP BY i.name, i.type_desc, p.data_compression_desc
+ORDER BY SUM(a.total_pages) DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL: Partitioning + pg_partman + Columnar Extension (Citus / Hydra)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Standard PostgreSQL does not include a native columnar storage engine for on-disk row format compression at the columnar level, but the Hydra columnar extension (available on Aurora PostgreSQL via custom parameter groups in some configurations) and Citus columnar (available on Azure Database for PostgreSQL – Flexible Server) both provide columnar access methods. For workloads running on those platforms, columnar tables achieve similar compression ratios to SQL Server columnstore indexes.</p>
+
+<p class="text-gray-300 leading-relaxed">For RDS PostgreSQL without columnar extensions, the practical equivalent is aggressive partitioning by time combined with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CLUSTER</code> on the most selective column and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">VACUUM FULL</code> on older partitions. This does not achieve columnar compression ratios, but it does concentrate similar data on each page, making PGLZ and LZ4 TOAST compression more effective, and it enables detaching and archiving cold partitions to cheaper storage tiers.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.7 Building a Compression Savings Dashboard</h3>
+
+<p class="text-gray-300 leading-relaxed">Tracking compression savings over time closes the feedback loop between engineering effort and financial outcome. The dashboard below feeds from CloudWatch, Azure Monitor, or GCP Cloud Monitoring and produces a monthly savings summary suitable for a FinOps review meeting.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Savings Calculation Model</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The model requires four inputs per database instance:</p>
+<p class="text-gray-300 leading-relaxed">1. Current allocated storage (GB)</p>
+<p class="text-gray-300 leading-relaxed">2. Storage size before compression project began (GB from historical CloudWatch <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">FreeStorageSpace</code> metric and allocated volume size)</p>
+<p class="text-gray-300 leading-relaxed">3. Per-GB storage price for that instance's region, tier, and replication factor</p>
+<p class="text-gray-300 leading-relaxed">4. Backup retention days (to calculate multiplier on backup savings)</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+compression_savings_dashboard.py
+
+Generates a monthly compression savings report across a fleet of RDS instances
+by comparing current storage utilization to a pre-compression baseline stored
+in AWS Systems Manager Parameter Store.
+
+Usage:
+    python compression_savings_dashboard.py --region us-east-1 --output dashboard.json
+
+Requirements: boto3
+"""
+
+import boto3
+import json
+import argparse
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+
+# Storage pricing per GB-month by region and engine (approximate, verify current rates)
+STORAGE_PRICING = {
+    'us-east-1': {
+        'gp3_single_az': 0.115,
+        'gp3_multi_az': 0.230,    # primary + standby volumes
+        'backup_s3': 0.095,
+        'aurora_single': 0.10,
+        'aurora_multi': 0.10,     # Aurora charges per-GB regardless of AZ config
+    },
+    'eu-west-1': {
+        'gp3_single_az': 0.131,
+        'gp3_multi_az': 0.262,
+        'backup_s3': 0.095,
+        'aurora_single': 0.114,
+        'aurora_multi': 0.114,
+    },
+    'ap-southeast-1': {
+        'gp3_single_az': 0.138,
+        'gp3_multi_az': 0.276,
+        'backup_s3': 0.095,
+        'aurora_single': 0.122,
+        'aurora_multi': 0.122,
+    }
+}
+
+
+def get_baseline_from_ssm(instance_id: str, region: str) -&gt; Optional[dict]:
+    """
+    Retrieve pre-compression storage baseline stored in SSM Parameter Store.
+    Baseline is stored when a compression project begins via:
+        aws ssm put-parameter \
+            --name /finops/compression-baseline/my-rds-instance \
+            --value '{"allocated_gb": 3000, "used_gb": 2800, "recorded_at": "2024-01-15"}' \
+            --type String
+    """
+    ssm = boto3.client('ssm', region_name=region)
+    try:
+        response = ssm.get_parameter(
+            Name=f'/finops/compression-baseline/{instance_id}'
+        )
+        return json.loads(response['Parameter']['Value'])
+    except ssm.exceptions.ParameterNotFound:
+        return None
+
+
+def get_current_storage_gb(instance_id: str, region: str) -&gt; dict:
+    """
+    Get current allocated and used storage for an RDS instance.
+    Returns allocated_gb and estimated used_gb from CloudWatch.
+    """
+    rds = boto3.client('rds', region_name=region)
+    cw = boto3.client('cloudwatch', region_name=region)
+
+    # Get allocated storage from RDS describe
+    response = rds.describe_db_instances(DBInstanceIdentifier=instance_id)
+    instance = response['DBInstances'][0]
+    allocated_gb = instance['AllocatedStorage']
+    multi_az = instance['MultiAZ']
+    engine = instance['Engine']
+
+    # Get free storage from CloudWatch (last 24h average)
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(hours=24)
+
+    cw_response = cw.get_metric_statistics(
+        Namespace='AWS/RDS',
+        MetricName='FreeStorageSpace',
+        Dimensions=[{'Name': 'DBInstanceIdentifier', 'Value': instance_id}],
+        StartTime=start,
+        EndTime=end,
+        Period=3600,
+        Statistics=['Average']
+    )
+
+    free_bytes = 0
+    if cw_response['Datapoints']:
+        free_bytes = max(p['Average'] for p in cw_response['Datapoints'])
+
+    free_gb = free_bytes / (1024 ** 3)
+    used_gb = allocated_gb - free_gb
+
+    return {
+        'allocated_gb': allocated_gb,
+        'used_gb': round(used_gb, 2),
+        'free_gb': round(free_gb, 2),
+        'multi_az': multi_az,
+        'engine': engine
+    }
+
+
+def calculate_monthly_savings(instance_id: str, region: str,
+                               backup_retention_days: int = 7) -&gt; dict:
+    """
+    Calculate monthly storage savings by comparing current state to baseline.
+    """
+    baseline = get_baseline_from_ssm(instance_id, region)
+    current = get_current_storage_gb(instance_id, region)
+
+    if not baseline:
+        return {
+            'instance_id': instance_id,
+            'status': 'no_baseline',
+            'message': (
+                f'Store baseline with: aws ssm put-parameter '
+                f'--name /finops/compression-baseline/{instance_id} '
+                f'--value \'{{"allocated_gb": {current["allocated_gb"]}, '
+                f'"used_gb": {current["used_gb"]}, '
+                f'"recorded_at": "{datetime.now().date().isoformat()}"}}\' '
+                f'--type String'
+            )
+        }
+
+    pricing = STORAGE_PRICING.get(region, STORAGE_PRICING['us-east-1'])
+    multi_az = current['multi_az']
+    engine = current['engine']
+
+    # Determine per-GB rate based on engine and AZ configuration
+    if 'aurora' in engine:
+        rate_per_gb = pricing['aurora_multi']  # Aurora always effectively multi-AZ
+    elif multi_az:
+        rate_per_gb = pricing['gp3_multi_az']
+    else:
+        rate_per_gb = pricing['gp3_single_az']
+
+    # Storage saved (GB)
+    baseline_used = baseline['used_gb']
+    current_used = current['used_gb']
+    storage_saved_gb = max(0, baseline_used - current_used)
+    compression_ratio = (
+        (1 - current_used / baseline_used) * 100 if baseline_used &gt; 0 else 0
+    )
+
+    # Monthly primary storage savings
+    primary_savings_monthly = storage_saved_gb * rate_per_gb
+
+    # Backup savings: compressed data generates proportionally smaller backups
+    # Rough model: daily incremental backups average ~5% of total DB size,
+    # plus one full snapshot per retention period
+    # This is a conservative estimate; write-heavy DBs save proportionally more
+    daily_incremental_gb = current_used * 0.05
+    backup_total_gb = (daily_incremental_gb * backup_retention_days
+                       + baseline_used)  # one full snapshot worth
+    backup_saved_gb = storage_saved_gb * (backup_total_gb / baseline_used
+                                           if baseline_used &gt; 0 else 0)
+    backup_savings_monthly = backup_saved_gb * pricing['backup_s3']
+
+    total_monthly = primary_savings_monthly + backup_savings_monthly
+    total_annual = total_monthly * 12
+
+    return {
+        'instance_id': instance_id,
+        'region': region,
+        'engine': engine,
+        'multi_az': multi_az,
+        'baseline': {
+            'used_gb': baseline_used,
+            'recorded_at': baseline.get('recorded_at', 'unknown')
+        },
+        'current': {
+            'allocated_gb': current['allocated_gb'],
+            'used_gb': current_used,
+            'free_gb': current['free_gb']
+        },
+        'compression_result': {
+            'storage_saved_gb': round(storage_saved_gb, 2),
+            'compression_pct': round(compression_ratio, 1)
+        },
+        'monthly_savings_usd': {
+            'primary_storage': round(primary_savings_monthly, 2),
+            'backup_storage': round(backup_savings_monthly, 2),
+            'total': round(total_monthly, 2)
+        },
+        'annual_savings_usd': round(total_annual, 2),
+        'rate_per_gb_month': rate_per_gb
+    }
+
+
+def generate_fleet_dashboard(instance_ids: list[str], region: str,
+                              backup_retention_days: int = 7) -&gt; dict:
+    """Generate a savings summary across a fleet of instances."""
+    results = []
+    for iid in instance_ids:
+        print(f"  Processing {iid}...")
+        result = calculate_monthly_savings(iid, region, backup_retention_days)
+        results.append(result)
+
+    # Fleet-level totals (only instances with baselines)
+    valid = [r for r in results if r.get('status') != 'no_baseline']
+    total_saved_gb = sum(r['compression_result']['storage_saved_gb']
+                         for r in valid)
+    total_monthly = sum(r['monthly_savings_usd']['total'] for r in valid)
+    total_annual = sum(r['annual_savings_usd'] for r in valid)
+
+    return {
+        'generated_at': datetime.now(timezone.utc).isoformat(),
+        'region': region,
+        'fleet_summary': {
+            'instances_analyzed': len(results),
+            'instances_with_baseline': len(valid),
+            'total_storage_saved_gb': round(total_saved_gb, 2),
+            'total_monthly_savings_usd': round(total_monthly, 2),
+            'total_annual_savings_usd': round(total_annual, 2)
+        },
+        'instance_details': results
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Generate compression savings dashboard for RDS fleet'
+    )
+    parser.add_argument('--region', default='us-east-1')
+    parser.add_argument('--instances', nargs='+',
+                        help='RDS instance IDs (space-separated). '
+                             'If omitted, discovers tagged instances.')
+    parser.add_argument('--backup-retention', type=int, default=7)
+    parser.add_argument('--output', default='dashboard.json')
+    args = parser.parse_args()
+
+    if args.instances:
+        instance_ids = args.instances
+    else:
+        # Auto-discover instances tagged compression-managed=true
+        rds = boto3.client('rds', region_name=args.region)
+        paginator = rds.get_paginator('describe_db_instances')
+        instance_ids = []
+        for page in paginator.paginate():
+            for inst in page['DBInstances']:
+                tags = {t['Key']: t['Value'] for t in inst.get('TagList', [])}
+                if tags.get('compression-managed') == 'true':
+                    instance_ids.append(inst['DBInstanceIdentifier'])
+
+    print(f"Generating compression dashboard for {len(instance_ids)} instances...")
+    dashboard = generate_fleet_dashboard(
+        instance_ids, args.region, args.backup_retention
+    )
+
+    with open(args.output, 'w') as f:
+        json.dump(dashboard, f, indent=2)
+
+    print(f"\nDashboard written to {args.output}")
+    summary = dashboard['fleet_summary']
+    print(f"\n=== FLEET SUMMARY ===")
+    print(f"Instances analyzed:    {summary['instances_analyzed']}")
+    print(f"Instances with baseline: {summary['instances_with_baseline']}")
+    print(f"Total storage saved:   {summary['total_storage_saved_gb']:.1f} GB")
+    print(f"Monthly savings:       ${summary['total_monthly_savings_usd']:,.2f}")
+    print(f"Annual savings:        ${summary['total_annual_savings_usd']:,.2f}")
+
+
+if __name__ == '__main__':
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">16.8 When Not to Compress</h3>
+
+<p class="text-gray-300 leading-relaxed">Compression is not universally beneficial, and applying it indiscriminately creates operational debt. The following patterns are where compression reliably harms more than it helps.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Already-compressed data</strong>: JPEG, PNG, MP4, PDF, ZIP, AES-encrypted payloads, and other binary formats stored as BLOBs are already maximally compressed or encrypted to appear random. Enabling page compression on a table holding these types wastes CPU on compression attempts that save zero bytes. Identify these columns with the data type scan in section 16.1 and explicitly exclude them.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Extremely high write throughput tables</strong>: A table receiving sustained INSERT rates above roughly 50,000 rows per second with page compression enabled will experience measurable write latency increases because each page rebuild requires decompression, modification, and recompression. For these tables, benchmark first with row compression (lower overhead) and reject page compression entirely if write latency degrades.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Very small tables</strong>: Tables under 10 MB cost almost nothing to store and are frequently hot in the buffer pool. The management overhead of tracking compression settings, testing changes, and handling upgrade regressions is not justified by single-digit MB savings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tables used for in-flight streaming</strong>: Tables that serve as intermediate buffers for real-time event processing — where rows are written, read once, and deleted within seconds — spend no time on disk in a meaningful sense. The buffer pool absorbs nearly all I/O, so physical storage compression has no effect on costs.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">High-cardinality columns with random data</strong>: Page compression's prefix and dictionary compression steps achieve nothing on columns with UUID values, hash outputs, random tokens, or base64-encoded nonces. Row compression still eliminates padding from fixed-length types, so it remains viable, but page compression adds CPU overhead with negligible storage benefit. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sp_estimate_data_compression_savings</code> or a TOAST size comparison before applying page compression to any table with UUIDs as primary or foreign keys.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Storage savings multiply across layers**: Compressing primary data reduces not just the primary EBS or managed disk volume but also the standby replica volume (in Multi-AZ deployments), automated backup snapshots, and WAL or log replication traffic. The actual cost reduction is often two to three times the primary storage saving in isolation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **LZ4 is the correct default for PostgreSQL 14+ TOAST columns**: LZ4 compresses and decompresses three to five times faster than the older PGLZ algorithm with comparable or better compression ratios for the text and JSON workloads that dominate most OLTP schemas. Switching existing databases requires an explicit ALTER COLUMN plus VACUUM FULL or pg_repack to rewrite existing TOAST entries.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQL Server row versus page compression is a CPU budget decision**: Row compression saves 10–25% with minimal CPU overhead and is safe for nearly all tables. Page compression saves 30–60% but can add 15–25% CPU overhead on write-heavy tables. On vCore-based Azure SQL tiers, calculate whether the CPU cost of page compression exceeds the storage savings at current pricing before applying it.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automation prevents savings erosion**: A compression project without drift detection and enforcement via event triggers (PostgreSQL) or a scheduled audit job (SQL Server) will see its gains diluted within months as new uncompressed tables accumulate. The event trigger in section 16.5 costs nothing to run and applies lz4 to every new compressible column automatically.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Know when to stop**: Already-compressed binary formats, extremely high write-throughput tables, sub-10 MB tables, and columns with high-cardinality random values are not compression candidates. Applying compression to these patterns wastes CPU, increases write latency, and produces no meaningful storage savings, converting a cost optimization project into a performance incident.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
