@@ -5,6 +5,10 @@
   <title>Chapter 7: Right-Sizing Instances: The Methodology — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 7: Right-Sizing Instances: The Methodology. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -35,7 +39,7 @@
     </div>
     <div class="space-y-4 text-sm"><h2 class="text-xl font-bold text-white mt-10 mb-4">Chapter 7: Right-Sizing Instances: The Methodology</h2>
 
-<p class="text-gray-300 leading-relaxed">Organizations running cloud databases consistently overpay by 30–40% on compute alone. The root cause is almost always the same: instances were sized for peak load at launch, workloads evolved, and nobody went back to revisit the original choices. A single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> on AWS RDS running at 12% average CPU costs roughly $1,847/month on-demand. Downsizing to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code> with a one-year Reserved Instance brings that to $412/month — a saving of $1,435 per month, per instance, without touching a line of application code. This chapter gives you the complete methodology: how to collect the right metrics, how to analyze them without being fooled by outliers, how to build the business case, and how to automate the entire process so right-sizing becomes a continuous operational discipline rather than a quarterly fire drill.</p>
+<p class="text-gray-300 leading-relaxed">Organizations running cloud databases consistently overpay by 30–40% on compute alone. The root cause is almost always the same: instances were sized for peak load at launch, workloads evolved, and nobody went back to revisit the original choices. A single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.4xlarge</code> on AWS RDS running at 12% average CPU costs roughly $700.80/month on-demand. Downsizing to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.xlarge</code> with a one-year Reserved Instance brings that to $108.62/month — a saving of $592.18 per month, per instance, without touching a line of application code. This chapter gives you the complete methodology: how to collect the right metrics, how to analyze them without being fooled by outliers, how to build the business case, and how to automate the entire process so right-sizing becomes a continuous operational discipline rather than a quarterly fire drill.</p>
 
 <p class="text-gray-300 leading-relaxed">---</p>
 
@@ -254,6 +258,15 @@ WHERE
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">The three-tier analysis framework</strong></p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Tier 1: Baseline\nP50 over 30 days — the sizing floor] --> B[Tier 2: Sustained peak\nP95 — the target utilization ceiling]
+    B --> C[Tier 3: Burst events\nP99/max — schedulable or unpredictable?]
+    C --> D{Periodic and\nschedulable?}
+    D -->|Yes| E[Offload to read replica\nor scheduled scaling]
+    D -->|No| F[Keep true headroom\nin the primary]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The three-tier analysis framework: each tier answers a different sizing question, and conflating them is how right-sizing breaks payroll.*</p>
+
 <p class="text-gray-300 leading-relaxed">Tier 1 — <strong class="text-white">Baseline:</strong> What does the instance look like during normal business hours on a typical weekday? Use the 50th percentile (median) across a 30-day window. This is the floor for sizing.</p>
 
 <p class="text-gray-300 leading-relaxed">Tier 2 — <strong class="text-white">Sustained peak:</strong> What is the P95 over the same window? This is the target utilization ceiling. If P95 CPU is 35%, the instance should be sized so that 35% CPU represents roughly 70% of its actual capacity, leaving a 2× headroom buffer.</p>
@@ -285,7 +298,564 @@ Required RAM   = ceil(working_set_GB / 0.75)</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">7.4 Building the Right-Sizing Recommendation Engine</h3>
 
 <p class="text-gray-300 leading-relaxed">Manual monthly reviews do not scale across a portfolio of dozens of databases. The following Python script connects to AWS Cost Explorer and CloudWatch, pulls 30 days of data for all RDS instances in an account, applies the headroom formula, and outputs a prioritized recommendation report with estimated monthly savings. Run it on a schedule using AWS Lambda or a cron job.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+rds_rightsizing_advisor.py
+
+Automated right-sizing recommendations for AWS RDS instances.
+Pulls 30 days of CloudWatch metrics, applies headroom formula,
+and cross-references current instance pricing.
+
+Requirements: boto3, pandas
+Schedule: AWS Lambda (EventBridge trigger, 1st of month) or cron
+
+Usage:
+    python rds_rightsizing_advisor.py --region us-east-1 --output recommendations.csv
+"""
+
+import argparse
+import json
+import math
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+import boto3
+import pandas as pd
+
+# ---------------------------------------------------------------------------
+# Instance pricing map (on-demand, us-east-1, Linux, single-AZ, USD/hour)
+# Update quarterly from https://aws.amazon.com/rds/mysql/pricing/
+# ---------------------------------------------------------------------------
+RDS_PRICING = {
+    "db.t4g.micro":    0.016,  "db.t4g.small":    0.034,
+    "db.t4g.medium":   0.068,  "db.t4g.large":    0.136,
+    "db.t4g.xlarge":   0.272,  "db.t4g.2xlarge":  0.544,
+    "db.m7g.large":    0.192,  "db.m7g.xlarge":   0.384,
+    "db.m7g.2xlarge":  0.768,  "db.m7g.4xlarge":  1.536,
+    "db.m7g.8xlarge":  3.072,  "db.m7g.12xlarge": 4.608,
+    "db.r7g.large":    0.300,  "db.r7g.xlarge":   0.600,
+    "db.r7g.2xlarge":  1.200,  "db.r7g.4xlarge":  2.400,
+    "db.r7g.8xlarge":  4.800,  "db.r7g.12xlarge": 7.200,
+}
+
+# Instance specs: vCPUs and RAM (GB)
+INSTANCE_SPECS = {
+    "db.t4g.micro":    (2,  1),   "db.t4g.small":    (2,  2),
+    "db.t4g.medium":   (2,  4),   "db.t4g.large":    (2,  8),
+    "db.t4g.xlarge":   (4,  16),  "db.t4g.2xlarge":  (8,  32),
+    "db.m7g.large":    (2,  8),   "db.m7g.xlarge":   (4,  16),
+    "db.m7g.2xlarge":  (8,  32),  "db.m7g.4xlarge":  (16, 64),
+    "db.m7g.8xlarge":  (32, 128), "db.m7g.12xlarge": (48, 192),
+    "db.r7g.large":    (2,  16),  "db.r7g.xlarge":   (4,  32),
+    "db.r7g.2xlarge":  (8,  64),  "db.r7g.4xlarge":  (16, 128),
+    "db.r7g.8xlarge":  (32, 256), "db.r7g.12xlarge": (48, 384),
+}
+
+HOURS_PER_MONTH = 730
+LOOKBACK_DAYS   = 30
+CPU_HEADROOM    = 0.70   # target: P95 CPU uses no more than 70% of capacity
+MEM_HEADROOM    = 0.75   # target: working set uses no more than 75% of RAM
+
+
+def get_metric_statistics(
+    cw_client,
+    instance_id: str,
+    metric_name: str,
+    stat: str,
+    period: int = 3600,
+) -&gt; list[float]:
+    """Fetch hourly metric values for a given RDS instance over LOOKBACK_DAYS."""
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(days=LOOKBACK_DAYS)
+
+    response = cw_client.get_metric_statistics(
+        Namespace="AWS/RDS",
+        MetricName=metric_name,
+        Dimensions=[{"Name": "DBInstanceIdentifier", "Value": instance_id}],
+        StartTime=start,
+        EndTime=end,
+        Period=period,
+        Statistics=[stat],
+    )
+    return [dp[stat] for dp in response.get("Datapoints", [])]
+
+
+def percentile(values: list[float], pct: float) -&gt; float:
+    if not values:
+        return 0.0
+    sorted_vals = sorted(values)
+    idx = int(math.ceil(pct / 100.0 * len(sorted_vals))) - 1
+    return sorted_vals[max(idx, 0)]
+
+
+def recommend_instance(
+    current_class: str,
+    p95_cpu: float,
+    min_freeable_gb: float,
+    family_preference: str = "same",
+) -&gt; Optional[str]:
+    """
+    Return the smallest instance that satisfies the headroom constraints,
+    or None if the current instance is already right-sized.
+    """
+    if current_class not in INSTANCE_SPECS:
+        return None
+
+    current_vcpu, current_ram = INSTANCE_SPECS[current_class]
+
+    # Determine required capacity
+    required_vcpu = math.ceil(p95_cpu / 100.0 / CPU_HEADROOM * current_vcpu)
+    required_vcpu = max(required_vcpu, 2)  # floor at 2 vCPU
+
+    # Estimate working set from freeable memory
+    # freeable = RAM not used by buffer pool; working set ≈ RAM - freeable
+    working_set_gb = max(current_ram - min_freeable_gb, 4)
+    required_ram   = math.ceil(working_set_gb / MEM_HEADROOM)
+
+    # Find candidate instances smaller than current that meet requirements
+    current_price = RDS_PRICING.get(current_class, 0)
+    best_candidate = None
+    best_price     = current_price
+
+    for inst, (vcpu, ram) in INSTANCE_SPECS.items():
+        price = RDS_PRICING.get(inst, 0)
+        if price &gt;= current_price:
+            continue  # not cheaper, skip
+        if vcpu &lt; required_vcpu:
+            continue
+        if ram &lt; required_ram:
+            continue
+        if price &lt; best_price:
+            best_price     = price
+            best_candidate = inst
+
+    return best_candidate
+
+
+def analyze_account(region: str) -&gt; pd.DataFrame:
+    rds = boto3.client("rds",        region_name=region)
+    cw  = boto3.client("cloudwatch", region_name=region)
+
+    paginator = rds.get_paginator("describe_db_instances")
+    instances = []
+    for page in paginator.paginate():
+        instances.extend(page["DBInstances"])
+
+    rows = []
+    for db in instances:
+        iid   = db["DBInstanceIdentifier"]
+        itype = db["DBInstanceClass"]
+        print(f"  Analyzing {iid} ({itype}) ...")
+
+        cpu_values = get_metric_statistics(cw, iid, "CPUUtilization",  "Average")
+        mem_values = get_metric_statistics(cw, iid, "FreeableMemory",  "Minimum")
+
+        if not cpu_values:
+            print(f"    No metrics found for {iid}, skipping.")
+            continue
+
+        avg_cpu    = sum(cpu_values) / len(cpu_values)
+        p95_cpu    = percentile(cpu_values, 95)
+        min_mem_gb = (min(mem_values) / 1_073_741_824) if mem_values else 0.0
+
+        current_price   = RDS_PRICING.get(itype, 0)
+        current_monthly = current_price * HOURS_PER_MONTH
+
+        recommendation  = recommend_instance(itype, p95_cpu, min_mem_gb)
+        rec_price       = RDS_PRICING.get(recommendation, current_price) if recommendation else current_price
+        rec_monthly     = rec_price * HOURS_PER_MONTH
+        monthly_saving  = current_monthly - rec_monthly
+
+        rows.append({
+            "instance_id":       iid,
+            "current_class":     itype,
+            "avg_cpu_pct":       round(avg_cpu, 1),
+            "p95_cpu_pct":       round(p95_cpu, 1),
+            "min_freeable_gb":   round(min_mem_gb, 1),
+            "current_monthly":   round(current_monthly, 2),
+            "recommended_class": recommendation or "no change",
+            "rec_monthly":       round(rec_monthly, 2),
+            "monthly_saving":    round(monthly_saving, 2),
+            "annual_saving":     round(monthly_saving * 12, 2),
+        })
+
+    df = pd.DataFrame(rows).sort_values("monthly_saving", ascending=False)
+    return df
+
+
+def main():
+    parser = argparse.ArgumentParser(description="RDS Right-Sizing Advisor")
+    parser.add_argument("--region", default="us-east-1", help="AWS region")
+    parser.add_argument("--output", default="recommendations.csv", help="Output CSV path")
+    args = parser.parse_args()
+
+    print(f"RDS Right-Sizing Advisor")
+    print(f"Region: {args.region}")
+    print(f"Lookback: {LOOKBACK_DAYS} days")
+    print(f"{'='*60}")
+
+    df = analyze_account(args.region)
+
+    if df.empty:
+        print("No instances with sufficient metric data found.")
+        return
+
+    # Summary
+    total_current  = df["current_monthly"].sum()
+    total_rec      = df["rec_monthly"].sum()
+    total_saving   = df["monthly_saving"].sum()
+    candidates     = df[df["monthly_saving"] &gt; 0]
+
+    print(f"\n{'='*60}")
+    print(f"SUMMARY")
+    print(f"{'='*60}")
+    print(f"Total instances analyzed : {len(df)}")
+    print(f"Instances with savings   : {len(candidates)}")
+    print(f"Current monthly spend    : ${total_current:,.2f}")
+    print(f"Optimized monthly spend  : ${total_rec:,.2f}")
+    print(f"Monthly saving           : ${total_saving:,.2f}")
+    print(f"Annual saving            : ${total_saving * 12:,.2f}")
+    print(f"\nTop 10 opportunities:")
+    print(
+        candidates.head(10)[
+            ["instance_id", "current_class", "p95_cpu_pct",
+             "min_freeable_gb", "recommended_class", "monthly_saving"]
+        ].to_string(index=False)
+    )
+
+    df.to_csv(args.output, index=False)
+    print(f"\nFull report written to {args.output}")
+
+
+if __name__ == "__main__":
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Adapting the engine for Azure SQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure SQL exposes equivalent metrics through Azure Monitor. The pattern is the same — pull DTU or vCore utilization, memory pressure, and connection counts — but the SDK and metric names differ.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># azure_sql_rightsizing.py (excerpt)
+# Full script follows the same structure as the AWS version above.
+# Requires: azure-mgmt-monitor, azure-mgmt-sql, azure-identity
+
+from azure.identity import DefaultAzureCredential
+from azure.mgmt.monitor import MonitorManagementClient
+from azure.mgmt.sql import SqlManagementClient
+from datetime import datetime, timedelta, timezone
+
+LOOKBACK_DAYS = 30
+
+def get_azure_sql_metrics(
+    subscription_id: str,
+    resource_group: str,
+    server_name: str,
+    database_name: str,
+) -&gt; dict:
+    credential    = DefaultAzureCredential()
+    monitor_client = MonitorManagementClient(credential, subscription_id)
+
+    resource_uri = (
+        f"/subscriptions/{subscription_id}/resourceGroups/{resource_group}"
+        f"/providers/Microsoft.Sql/servers/{server_name}"
+        f"/databases/{database_name}"
+    )
+
+    end   = datetime.now(timezone.utc)
+    start = end - timedelta(days=LOOKBACK_DAYS)
+
+    # Metrics available: cpu_percent, dtu_consumption_percent,
+    # memory_usage_percent, connection_successful, storage_percent
+    metrics_response = monitor_client.metrics.list(
+        resource_uri=resource_uri,
+        timespan=f"{start.isoformat()}/{end.isoformat()}",
+        interval="PT1H",
+        metricnames="cpu_percent,memory_usage_percent,connection_successful",
+        aggregation="Average,Maximum",
+    )
+
+    result = {}
+    for metric in metrics_response.value:
+        values = []
+        for ts in metric.timeseries:
+            for dp in ts.data:
+                if dp.average is not None:
+                    values.append(dp.average)
+        result[metric.name.value] = values
+
+    return result</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For Azure SQL, the right-sizing logic maps to service tier selection rather than instance class. The General Purpose tier offers 1:5.1 vCore-to-RAM ratio; Business Critical offers 1:5.1 with local SSD and higher IOPS. A workload running at low DTU consumption with modest storage throughput is a candidate for dropping from Business Critical to General Purpose, which typically reduces the compute cost by 40–50% for the same vCore count.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.5 The Resize Operation: Executing Safely</h3>
+
+<p class="text-gray-300 leading-relaxed">Collecting recommendations is the easy part. Executing the resize without causing an incident requires a structured runbook.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Pre-resize checklist</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Confirm the metric window covers at least one full business cycle.</strong> For most workloads that is four weeks. For quarterly-reporting businesses (finance, healthcare) it may be 13 weeks.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Check for scheduled jobs that run at non-business hours.</strong> Nightly ETL, weekly statistics updates, and monthly purges can all create CPU or I/O spikes that appear in P99 but are invisible in daily averages. Query the job scheduler directly.</p>
+
+<p class="text-gray-300 leading-relaxed">   ```sql</p>
+<p class="text-gray-300 leading-relaxed">   -- PostgreSQL: check pg_cron scheduled jobs (if pg_cron extension is installed)</p>
+<p class="text-gray-300 leading-relaxed">   SELECT</p>
+<p class="text-gray-300 leading-relaxed">       jobid,</p>
+<p class="text-gray-300 leading-relaxed">       schedule,</p>
+<p class="text-gray-300 leading-relaxed">       command,</p>
+<p class="text-gray-300 leading-relaxed">       nodename,</p>
+<p class="text-gray-300 leading-relaxed">       active</p>
+<p class="text-gray-300 leading-relaxed">   FROM</p>
+<p class="text-gray-300 leading-relaxed">       cron.job</p>
+<p class="text-gray-300 leading-relaxed">   ORDER BY</p>
+<p class="text-gray-300 leading-relaxed">       jobid;</p>
+<p class="text-gray-300 leading-relaxed">   ```</p>
+
+<p class="text-gray-300 leading-relaxed">   ```sql</p>
+<p class="text-gray-300 leading-relaxed">   -- SQL Server: list SQL Agent jobs and their last run duration</p>
+<p class="text-gray-300 leading-relaxed">   SELECT</p>
+<p class="text-gray-300 leading-relaxed">       j.name                                      AS job_name,</p>
+<p class="text-gray-300 leading-relaxed">       ja.run_requested_date,</p>
+<p class="text-gray-300 leading-relaxed">       ja.stop_execution_date,</p>
+<p class="text-gray-300 leading-relaxed">       DATEDIFF(SECOND, ja.run_requested_date,</p>
+<p class="text-gray-300 leading-relaxed">                ja.stop_execution_date)             AS duration_sec,</p>
+<p class="text-gray-300 leading-relaxed">       ja.last_executed_step_id</p>
+<p class="text-gray-300 leading-relaxed">   FROM</p>
+<p class="text-gray-300 leading-relaxed">       msdb.dbo.sysjobs            AS j</p>
+<p class="text-gray-300 leading-relaxed">       JOIN msdb.dbo.sysjobactivity AS ja</p>
+<p class="text-gray-300 leading-relaxed">           ON j.job_id = ja.job_id</p>
+<p class="text-gray-300 leading-relaxed">   WHERE</p>
+<p class="text-gray-300 leading-relaxed">       ja.run_requested_date IS NOT NULL</p>
+<p class="text-gray-300 leading-relaxed">   ORDER BY</p>
+<p class="text-gray-300 leading-relaxed">       ja.run_requested_date DESC;</p>
+<p class="text-gray-300 leading-relaxed">   ```</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Take a manual snapshot before the resize.</strong> Even though RDS takes an automated snapshot at resize time, a manual snapshot with a descriptive name (<code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pre-rightsize-2024-11-01</code>) is faster to locate under pressure.</p>
+
+<p class="text-gray-300 leading-relaxed">4. <strong class="text-white">Notify stakeholders.</strong> A right-sizing operation on a Multi-AZ RDS instance triggers a failover, which causes roughly 30–60 seconds of interrupted connections. Application teams need to verify their connection retry logic handles this gracefully. If they do not have retry logic, the resize window becomes a deployment event, not just a DBA task.</p>
+
+<p class="text-gray-300 leading-relaxed">5. <strong class="text-white">Plan the rollback.</strong> Resizing back up is always possible but takes the same time as the original resize. Set a rollback decision deadline — typically 24 hours post-resize. If any key performance metric degrades beyond an agreed threshold within that window, resize back without debate.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Executing the resize on AWS RDS</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Step 1: Modify the instance class (change takes effect at next maintenance window
+# unless --apply-immediately is specified)
+aws rds modify-db-instance \
+  --db-instance-identifier mydb-prod \
+  --db-instance-class db.r7g.xlarge \
+  --apply-immediately \
+  --region us-east-1
+
+# Step 2: Poll until the instance is available again
+echo "Waiting for instance to become available..."
+aws rds wait db-instance-available \
+  --db-instance-identifier mydb-prod \
+  --region us-east-1
+
+echo "Resize complete. Verifying instance class..."
+aws rds describe-db-instances \
+  --db-instance-identifier mydb-prod \
+  --region us-east-1 \
+  --query 'DBInstances[0].{Class:DBInstanceClass,Status:DBInstanceStatus,Engine:Engine,EngineVersion:EngineVersion}' \
+  --output table</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Post-resize validation queries</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Run these in the first 15 minutes after the resize and again at the 24-hour mark.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: confirm buffer cache is recovering after restart
+-- Expected: hit ratio climbs back above 95% within 30 minutes as cache warms
+SELECT
+    now()                                           AS check_time,
+    round(
+        100.0 * sum(heap_blks_hit)
+        / nullif(sum(heap_blks_hit) + sum(heap_blks_read), 0),
+        2
+    )                                               AS buffer_hit_ratio_pct,
+    sum(heap_blks_read)                             AS total_disk_reads
+FROM
+    pg_statio_user_tables;
+
+-- Compare query latency percentiles to pre-resize baseline
+-- Run this before the resize and save the output, then re-run after
+SELECT
+    left(query, 80)                                 AS query_snippet,
+    calls,
+    round(mean_exec_time::numeric, 2)               AS mean_ms,
+    round(stddev_exec_time::numeric, 2)             AS stddev_ms,
+    round(
+        percentile_cont(0.95) WITHIN GROUP
+        (ORDER BY total_exec_time / calls),
+        2
+    )                                               AS p95_ms_estimate
+FROM
+    pg_stat_statements
+WHERE
+    calls &gt; 50
+ORDER BY
+    mean_exec_time DESC
+LIMIT 20;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: post-resize health check
+-- Confirm PLE has recovered and there is no memory pressure
+SELECT
+    'PLE'                                           AS metric,
+    cntr_value                                      AS value,
+    CASE
+        WHEN cntr_value &gt; 300  THEN 'OK'
+        WHEN cntr_value &gt; 100  THEN 'WARNING'
+        ELSE 'CRITICAL'
+    END                                             AS status
+FROM
+    sys.dm_os_performance_counters
+WHERE
+    counter_name = 'Page life expectancy'
+    AND object_name LIKE '%Buffer Manager%'
+
+UNION ALL
+
+-- Confirm no runaway waits have appeared
+SELECT TOP 10
+    wait_type                                       AS metric,
+    wait_time_ms                                    AS value,
+    'CHECK'                                         AS status
+FROM
+    sys.dm_os_wait_stats
+WHERE
+    wait_type NOT IN (
+        'SLEEP_TASK', 'BROKER_TO_FLUSH', 'BROKER_TASK_STOP',
+        'CLR_AUTO_EVENT', 'DISPATCHER_QUEUE_SEMAPHORE',
+        'FT_IFTS_SCHEDULER_IDLE_WAIT', 'HADR_WORK_QUEUE',
+        'ONDEMAND_TASK_QUEUE', 'REQUEST_FOR_DEADLOCK_SEARCH',
+        'RESOURCE_QUEUE', 'SERVER_IDLE_CHECK', 'SLEEP_DBSTARTUP',
+        'SLEEP_DBRECOVER', 'SLEEP_MASTERDBREADY', 'SLEEP_MASTERMDREADY',
+        'SLEEP_MASTERUPGRADED', 'SLEEP_MSDBSTARTUP', 'SLEEP_SYSTEMTASK',
+        'SLEEP_TEMPDBSTARTUP', 'SNI_HTTP_ACCEPT', 'SP_SERVER_DIAGNOSTICS_SLEEP',
+        'SQLTRACE_BUFFER_FLUSH', 'WAITFOR', 'XE_DISPATCHER_WAIT',
+        'XE_TIMER_EVENT'
+    )
+ORDER BY
+    wait_time_ms DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.6 Handling Edge Cases</h3>
+
+<p class="text-gray-300 leading-relaxed">No methodology survives contact with a real production estate without encountering anomalies. The following cases are the most common.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The bursty dev/test instance that looks like prod</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Development and test databases often have low average utilization but periodic spikes caused by CI/CD pipelines running integration tests. These spikes are real but they are not customer-facing. The right response is to move the instance to a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t4g</code> burstable family and let it accumulate CPU credits during idle periods to spend during test runs. For a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.m7g.xlarge</code> running CI workloads, switching to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.t4g.xlarge</code> reduces cost by approximately 29% with no performance degradation in practice.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The connection-saturated instance with low CPU</strong></p>
+
+<p class="text-gray-300 leading-relaxed">An instance at 8% CPU and 95% connection utilization is not oversized — it is under-pooled. Before recommending a downsize, check whether the application is using a connection pooler. On PostgreSQL, the standard recommendation is PgBouncer in transaction-pooling mode. Deploying PgBouncer can reduce the effective connection count by 10× without changing the instance class, and it unblocks the downsize decision by removing the false constraint.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: diagnose connection waste
+-- "idle" connections holding slots but doing no work
+SELECT
+    count(*)                                        AS idle_connections,
+    min(now() - state_change)                       AS shortest_idle,
+    max(now() - state_change)                       AS longest_idle,
+    avg(now() - state_change)                       AS avg_idle_time
+FROM
+    pg_stat_activity
+WHERE
+    state = 'idle'
+    AND backend_type = 'client backend';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The instance with high I/O and low CPU</strong></p>
+
+<p class="text-gray-300 leading-relaxed">This pattern indicates either a missing index causing full table scans, or a workload that is genuinely I/O-bound (large analytical queries, bulk exports). Before concluding the instance needs more I/O-optimized storage, check whether adding an index eliminates the scans.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: tables with high sequential scans relative to index scans
+-- A high seq_scan/idx_scan ratio on large tables is the fingerprint
+-- of a missing index opportunity
+SELECT
+    schemaname,
+    tablename,
+    seq_scan,
+    idx_scan,
+    n_live_tup                                      AS live_rows,
+    round(
+        100.0 * seq_scan / nullif(seq_scan + idx_scan, 0),
+        1
+    )                                               AS seq_scan_pct,
+    pg_size_pretty(pg_total_relation_size(
+        quote_ident(schemaname) || '.' || quote_ident(tablename)
+    ))                                              AS total_size
+FROM
+    pg_stat_user_tables
+WHERE
+    seq_scan &gt; 100
+    AND n_live_tup &gt; 10000
+ORDER BY
+    seq_scan DESC
+LIMIT 20;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: missing index recommendations from the DMV
+SELECT TOP 20
+    migs.avg_total_user_cost *
+    migs.avg_user_impact *
+    (migs.user_seeks + migs.user_scans)             AS improvement_measure,
+    mid.statement                                   AS table_name,
+    mid.equality_columns,
+    mid.inequality_columns,
+    mid.included_columns,
+    migs.user_seeks,
+    migs.user_scans,
+    round(migs.avg_total_user_cost, 2)              AS avg_query_cost,
+    round(migs.avg_user_impact, 2)                  AS estimated_improvement_pct
+FROM
+    sys.dm_db_missing_index_group_stats AS migs
+    JOIN sys.dm_db_missing_index_groups AS mig
+        ON migs.group_handle = mig.index_group_handle
+    JOIN sys.dm_db_missing_index_details AS mid
+        ON mig.index_handle = mid.index_handle
+ORDER BY
+    improvement_measure DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The read replica that mirrors primary sizing</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Read replicas are frequently cloned from the primary at the same instance class and then left unchanged. Many analytical queries that drive a replica's load are selective and cache-friendly once the working set is established. Replicas are often candidates for smaller instance classes than the primary, or for a different family (memory-optimized for analytics vs. balanced for OLTP). Profile the replica independently — do not assume it needs the same resources as the primary.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">7.7 Embedding Right-Sizing into the Operating Model</h3>
+
+<p class="text-gray-300 leading-relaxed">One-time right-sizing captures immediate savings but does not prevent the problem from recurring. The goal is a continuous process.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monthly automated scan.</strong> The Python script from Section 7.4 should run on the first of every month and post results to a Slack channel or Teams webhook, tagged to the owning team. Visibility changes behavior — when teams see their instance in a "no change needed" status, they understand why. When they see it flagged, they have the data to act.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tagging discipline.</strong> Every RDS instance should carry tags for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">environment</code> (prod/staging/dev/test), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">owner</code> (team or squad name), <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">workload-type</code> (oltp/analytics/reporting/batch), and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rightsizing-reviewed</code> (date of last review). The monthly scan should filter by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">environment=prod</code> for immediate savings focus and log all others for weekly review.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Change freeze windows.</strong> Define a calendar of blackout periods when right-sizing operations cannot be executed — typically the last two weeks of a fiscal quarter, major product release dates, and the period around public holidays. The recommendation engine should flag instances as "eligible" or "frozen" based on this calendar.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Linking to Reserved Instance purchases.</strong> Right-sizing must precede RI commitments. An organization that buys a three-year RI for <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7g.4xlarge</code> and then discovers six months later that the workload fits on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r7g.xlarge</code> has locked in the savings of neither. The workflow should be:</p>
+
+<p class="text-gray-300 leading-relaxed">1. Right-size the instance on-demand.</p>
+<p class="text-gray-300 leading-relaxed">2. Observe for 30 days.</p>
+<p class="text-gray-300 leading-relaxed">3. Purchase the RI at the right-sized tier.</p>
+
+<p class="text-gray-300 leading-relaxed">This sequencing is easy to describe and often ignored under budget deadline pressure. Building it into the process as a gate — the RI purchase form requires a field for "last right-sizing review date" — enforces the discipline without relying on individual vigilance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Feedback loop to architecture.</strong> Right-sizing data is valuable beyond cost optimization. An instance that cannot be downsized despite low utilization often reveals an architectural constraint: a schema with no partitioning that requires a full-table scan during purges, a connection count problem that points to missing pooling infrastructure, or a buffer cache sensitivity that signals data model inefficiency. Feed these findings back to the architecture review process. The right-sizing program pays for itself twice: once in direct savings, and once in the architectural improvements it surfaces.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Right-sizing requires four dimensions, not one.** CPU alone misleads. Collect P95 CPU, buffer cache hit ratio, minimum freeable memory, and peak connection count before making any resize decision. An instance with low CPU but a 99% buffer hit ratio will suffer a serious performance regression if its RAM is reduced.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The headroom formula prevents under-sizing.** Size the instance so that P95 CPU represents no more than 70% of its capacity, and so that the estimated working set occupies no more than 75% of available RAM. This 30% and 25% headroom absorbs legitimate burst traffic without requiring the instance to be oversized for average load.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Burst classification determines the right response.** Periodic, schedulable bursts (ETL, month-end reports) do not require headroom in the primary instance — they can be offloaded to a read replica or accommodated by temporary scaling. Unpredictable bursts require true headroom. Conflating the two leads to either chronic oversizing or preventable incidents.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate the scan, humanize the decision.** The recommendation engine in Section 7.4 can identify and quantify every right-sizing opportunity in an account in minutes. The actual resize decision still requires human review — checking the business calendar, validating the metric window, and confirming rollback readiness. Automation handles the tedious data collection; judgment handles the risk assessment.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Right-sizing must precede Reserved Instance purchases.** Committing to a three-year RI at the wrong instance class eliminates the flexibility to capture compute savings later. The correct sequence is: resize on-demand, observe for 30 days, then purchase the commitment. Building this sequence into the procurement workflow as a required step prevents the most common FinOps mistake in the database cost domain.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
