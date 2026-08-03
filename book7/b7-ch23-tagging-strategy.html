@@ -5,6 +5,10 @@
   <title>Chapter 23: Tagging Strategy for Database Cost Allocation — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 23: Tagging Strategy for Database Cost Allocation. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -547,7 +551,1342 @@ ORDER BY
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS Config Rule: Detect Existing Noncompliant Resources</strong></p>
 
 <p class="text-gray-300 leading-relaxed">The SCP only catches new resources. For existing resources, use an AWS Config managed rule:</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Deploy the required-tags Config rule via CLI
+# This checks all existing RDS instances for tag compliance on a schedule
+
+aws configservice put-config-rule \
+  --config-rule '{
+    "ConfigRuleName": "rds-required-tags",
+    "Description": "Checks that all RDS DB instances have the required mandatory tags",
+    "Scope": {
+      "ComplianceResourceTypes": [
+        "AWS::RDS::DBInstance",
+        "AWS::RDS::DBCluster"
+      ]
+    },
+    "Source": {
+      "Owner": "AWS",
+      "SourceIdentifier": "REQUIRED_TAGS"
+    },
+    "InputParameters": "{\"tag1Key\":\"env\",\"tag2Key\":\"team\",\"tag3Key\":\"cost-center\",\"tag4Key\":\"project\",\"tag5Key\":\"application\"}"
+  }'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Add an auto-remediation action using AWS Config Remediation + SSM Automation to notify the resource owner via SNS when a noncompliant resource is detected. A full block on existing resources creates operational disruption; notification-first remediation is more sustainable.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure: Policy Assignment to Require Tags on Azure SQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure Policy can be assigned at the management group, subscription, or resource group level. The following ARM-format policy definition enforces the presence of mandatory tags on Azure SQL database resources.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
+  "properties": {
+    "displayName": "Require mandatory tags on Azure SQL databases",
+    "description": "Denies creation of Azure SQL databases without all mandatory FinOps tags.",
+    "mode": "Indexed",
+    "parameters": {
+      "tagNames": {
+        "type": "Array",
+        "metadata": {
+          "displayName": "Required Tag Names",
+          "description": "List of tag keys that must be present on Azure SQL databases."
+        },
+        "defaultValue": ["env", "team", "cost-center", "project", "application"]
+      }
+    },
+    "policyRule": {
+      "if": {
+        "allOf": [
+          {
+            "field": "type",
+            "equals": "Microsoft.Sql/servers/databases"
+          },
+          {
+            "count": {
+              "value": "[parameters('tagNames')]",
+              "name": "tagName",
+              "where": {
+                "field": "[concat('tags[', current('tagName'), ']')]",
+                "exists": false
+              }
+            },
+            "greater": 0
+          }
+        ]
+      },
+      "then": {
+        "effect": "deny"
+      }
+    }
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Deploy this policy definition and then assign it to your management group:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Save the policy to a file, then deploy via Azure CLI
+az policy definition create \
+  --name "require-sql-mandatory-tags" \
+  --display-name "Require mandatory tags on Azure SQL databases" \
+  --description "Denies Azure SQL database creation without mandatory FinOps tags" \
+  --rules policy_rule.json \
+  --mode Indexed
+
+# Assign at the management group level
+az policy assignment create \
+  --name "enforce-sql-tags" \
+  --policy "require-sql-mandatory-tags" \
+  --scope "/providers/Microsoft.Management/managementGroups/YOUR_MG_ID" \
+  --enforcement-mode Default</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For brownfield environments where existing databases lack tags, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">--enforcement-mode DoNotEnforce</code> initially and switch to <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Default</code> after a 30-day remediation window.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP: Organization Policy to Require Labels on Cloud SQL</strong></p>
+
+<p class="text-gray-300 leading-relaxed">GCP's Organization Policies operate differently from AWS SCPs and Azure Policy. The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">constraints/sql.restrictCloudSQLInstanceToConfiguredZone</code> style constraints exist for specific behaviors, but label enforcement at the organization policy level requires a custom constraint (available in GCP Organization Policy Service v2).</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># custom_constraint_cloudsql_labels.yaml
+# Custom Organization Policy constraint requiring labels on Cloud SQL instances
+# Requires: Organization Policy Service API enabled
+# Deploy with: gcloud org-policies set-custom-constraint
+
+name: organizations/YOUR_ORG_ID/customConstraints/custom.requireCloudSQLLabels
+resourceTypes:
+  - sqladmin.googleapis.com/Instance
+methodTypes:
+  - CREATE
+  - UPDATE
+condition: &gt;
+  resource.settings.userLabels.exists(k, k == "env") &&
+  resource.settings.userLabels.exists(k, k == "team") &&
+  resource.settings.userLabels.exists(k, k == "cost-center") &&
+  resource.settings.userLabels.exists(k, k == "project") &&
+  resource.settings.userLabels.exists(k, k == "application")
+actionType: ALLOW
+displayName: Require mandatory labels on Cloud SQL instances
+description: &gt;
+  Cloud SQL instances must have all five mandatory FinOps labels
+  (env, team, cost-center, project, application) before they can
+  be created or updated.</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Deploy the custom constraint
+gcloud org-policies set-custom-constraint custom_constraint_cloudsql_labels.yaml
+
+# Create the policy that enforces the constraint at the org level
+cat &gt; enforce_cloudsql_labels_policy.yaml &lt;&lt; 'EOF'
+name: organizations/YOUR_ORG_ID/policies/custom.requireCloudSQLLabels
+spec:
+  rules:
+    - enforce: true
+EOF
+
+gcloud org-policies set-policy enforce_cloudsql_labels_policy.yaml</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.5 Tagging Automation: Applying Tags Programmatically to Existing Resources</h3>
+
+<p class="text-gray-300 leading-relaxed">After the audit from 23.2 and policies from 23.4 are in place, you still have a backlog of untagged existing resources. Manually tagging hundreds of instances is error-prone and time-consuming. The following scripts automate bulk tagging based on existing metadata—instance name patterns, VPC placement, account structure, or a CSV input file.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS: Bulk Tag RDS Instances from a CSV Input</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The input CSV format:</p>
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>db_instance_identifier,region,env,team,cost-center,project,application
+orders-prod-01,us-east-1,prod,payments,CC-4421,checkout-v2,order-service
+analytics-rds,us-west-2,prod,analytics,CC-0012,data-warehouse,reporting-api
+dev-scratch-db,eu-west-1,dev,platform,CC-0099,internal,scratch</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+bulk_tag_rds.py
+Reads a CSV of RDS instances and applies tags to each one.
+Performs a dry-run by default; pass --apply to execute changes.
+
+Usage:
+  python3 bulk_tag_rds.py --input tags.csv --dry-run
+  python3 bulk_tag_rds.py --input tags.csv --apply
+"""
+
+import argparse
+import boto3
+import csv
+import sys
+from botocore.exceptions import ClientError
+
+MANDATORY_KEYS = ["env", "team", "cost-center", "project", "application"]
+
+def get_instance_arn(rds_client, db_instance_id: str) -&gt; str | None:
+    try:
+        response = rds_client.describe_db_instances(
+            DBInstanceIdentifier=db_instance_id
+        )
+        return response["DBInstances"][0]["DBInstanceArn"]
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "DBInstanceNotFound":
+            return None
+        raise
+
+
+def apply_tags(rds_client, arn: str, tags: dict, dry_run: bool) -&gt; None:
+    tag_list = [{"Key": k, "Value": v} for k, v in tags.items() if v]
+    if dry_run:
+        print(f"  [DRY RUN] Would apply tags to {arn}:")
+        for tag in tag_list:
+            print(f"    {tag['Key']} = {tag['Value']}")
+    else:
+        rds_client.add_tags_to_resource(
+            ResourceName=arn,
+            Tags=tag_list
+        )
+        print(f"  [APPLIED] Tags applied to {arn}")
+
+
+def process_csv(input_file: str, dry_run: bool) -&gt; None:
+    session_cache: dict[str, boto3.client] = {}
+
+    with open(input_file, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    print(f"\nProcessing {len(rows)} instances. dry_run={dry_run}\n")
+    success, skipped, errors = 0, 0, 0
+
+    for row in rows:
+        db_id  = row.get("db_instance_identifier", "").strip()
+        region = row.get("region", "us-east-1").strip()
+
+        if not db_id:
+            print(f"  [SKIP] Empty db_instance_identifier in row: {row}")
+            skipped += 1
+            continue
+
+        # Reuse boto3 client per region
+        if region not in session_cache:
+            session_cache[region] = boto3.client("rds", region_name=region)
+        rds = session_cache[region]
+
+        print(f"Instance: {db_id} ({region})")
+        arn = get_instance_arn(rds, db_id)
+        if not arn:
+            print(f"  [ERROR] Instance not found: {db_id} in {region}")
+            errors += 1
+            continue
+
+        tags = {k: row.get(k, "").strip() for k in MANDATORY_KEYS}
+        missing = [k for k, v in tags.items() if not v]
+        if missing:
+            print(f"  [WARN] Missing values for tags: {missing} — skipping")
+            skipped += 1
+            continue
+
+        try:
+            apply_tags(rds, arn, tags, dry_run)
+            success += 1
+        except ClientError as e:
+            print(f"  [ERROR] Failed to tag {db_id}: {e}")
+            errors += 1
+
+    print(f"\nSummary: {success} applied, {skipped} skipped, {errors} errors")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bulk tag RDS instances from CSV")
+    parser.add_argument("--input",    required=True, help="Path to input CSV")
+    parser.add_argument("--dry-run",  action="store_true", default=True)
+    parser.add_argument("--apply",    action="store_true", help="Execute tagging")
+    args = parser.parse_args()
+
+    dry_run = not args.apply
+    process_csv(args.input, dry_run=dry_run)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">GCP: Bulk Label Cloud SQL Instances from a CSV</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+bulk_label_cloudsql.py
+Reads a CSV and applies labels to Cloud SQL instances using the Cloud SQL Admin API.
+Requires: google-cloud-sql-connector or google-api-python-client
+  pip install google-api-python-client google-auth
+
+Usage:
+  python3 bulk_label_cloudsql.py --input labels.csv --dry-run
+  python3 bulk_label_cloudsql.py --input labels.csv --apply
+"""
+
+import argparse
+import csv
+import sys
+from googleapiclient import discovery
+from googleapiclient.errors import HttpError
+from google.auth import default as google_auth_default
+
+MANDATORY_KEYS = ["env", "team", "cost-center", "project", "application"]
+
+def get_sqladmin_service():
+    credentials, _ = google_auth_default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    return discovery.build("sqladmin", "v1beta4", credentials=credentials)
+
+
+def get_existing_labels(service, project: str, instance: str) -&gt; dict:
+    try:
+        result = service.instances().get(project=project, instance=instance).execute()
+        return result.get("settings", {}).get("userLabels", {})
+    except HttpError as e:
+        print(f"  [ERROR] Could not fetch {instance}: {e}")
+        return {}
+
+
+def apply_labels(service, project: str, instance: str,
+                 new_labels: dict, dry_run: bool) -&gt; None:
+    existing = get_existing_labels(service, project, instance)
+    merged = {**existing, **new_labels}  # new labels win on collision
+
+    if dry_run:
+        print(f"  [DRY RUN] Would patch {project}/{instance} with labels:")
+        for k, v in new_labels.items():
+            print(f"    {k} = {v}")
+        return
+
+    patch_body = {
+        "settings": {
+            "userLabels": merged
+        }
+    }
+    try:
+        service.instances().patch(
+            project=project, instance=instance, body=patch_body
+        ).execute()
+        print(f"  [APPLIED] Labels applied to {project}/{instance}")
+    except HttpError as e:
+        print(f"  [ERROR] Patch failed for {instance}: {e}")
+        raise
+
+
+def process_csv(input_file: str, dry_run: bool) -&gt; None:
+    service = get_sqladmin_service()
+
+    with open(input_file, newline="") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    print(f"\nProcessing {len(rows)} Cloud SQL instances. dry_run={dry_run}\n")
+    success, skipped, errors = 0, 0, 0
+
+    for row in rows:
+        project  = row.get("project_id", "").strip()
+        instance = row.get("instance_name", "").strip()
+
+        if not project or not instance:
+            print(f"  [SKIP] Missing project_id or instance_name: {row}")
+            skipped += 1
+            continue
+
+        # GCP label keys must be lowercase, hyphenated; values same
+        labels = {
+            k.lower().replace("_", "-"): v.strip().lower()
+            for k, v in row.items()
+            if k in MANDATORY_KEYS and v.strip()
+        }
+        missing = [k for k in MANDATORY_KEYS if k not in labels]
+        if missing:
+            print(f"  [WARN] {project}/{instance} missing label values: {missing} — skipping")
+            skipped += 1
+            continue
+
+        print(f"Instance: {project}/{instance}")
+        try:
+            apply_labels(service, project, instance, labels, dry_run)
+            success += 1
+        except Exception:
+            errors += 1
+
+    print(f"\nSummary: {success} applied, {skipped} skipped, {errors} errors")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Bulk label Cloud SQL instances from CSV")
+    parser.add_argument("--input",   required=True, help="Path to input CSV")
+    parser.add_argument("--dry-run", action="store_true", default=True)
+    parser.add_argument("--apply",   action="store_true")
+    args = parser.parse_args()
+
+    process_csv(args.input, dry_run=not args.apply)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.6 Scheduled Tag Compliance Audit Pipeline</h3>
+
+<p class="text-gray-300 leading-relaxed">A one-time audit degrades quickly. Instances are created, cloned, and restored without tags every week. The audit must run on a schedule and produce a compliance score that is tracked over time. The following section builds a serverless audit pipeline on AWS (the pattern is replicable on Azure Functions and GCP Cloud Run).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Architecture Overview</strong></p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart TD
+    A["EventBridge<br/>(weekly schedule)"] --> B["Lambda: audit_tag_compliance"]
+    B --> C["Scan all RDS instances<br/>across all regions"]
+    C --> D["Calculate per-instance<br/>tag scores"]
+    D --> E["Write report to S3<br/>(CSV + JSON)"]
+    D --> F["Update DynamoDB<br/>compliance history"]
+    D --> G["Post Slack alert if<br/>compliance < threshold"]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The weekly tag compliance audit pipeline.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>EventBridge (weekly schedule)
+    └─► Lambda: audit_tag_compliance
+            ├─► Scans all RDS instances across all regions
+            ├─► Calculates per-instance tag scores
+            ├─► Writes compliance report → S3 (CSV + JSON)
+            ├─► Updates DynamoDB compliance history table
+            └─► Posts Slack alert if compliance &lt; threshold</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lambda Function: Tag Compliance Auditor</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+lambda_tag_audit.py
+AWS Lambda handler for weekly RDS tag compliance auditing.
+
+Environment variables:
+  MANDATORY_TAGS        Comma-separated list of required tag keys
+  COMPLIANCE_THRESHOLD  Float 0–100; trigger alert if score drops below (default: 95)
+  S3_BUCKET             S3 bucket name for report storage
+  S3_PREFIX             S3 key prefix (default: 'tag-audit/')
+  DYNAMODB_TABLE        DynamoDB table for compliance history (optional)
+  SLACK_WEBHOOK_URL     Slack incoming webhook (optional)
+
+IAM permissions required:
+  rds:DescribeDBInstances (all regions)
+  rds:ListTagsForResource
+  s3:PutObject
+  dynamodb:PutItem (if DYNAMODB_TABLE set)
+"""
+
+import boto3
+import csv
+import io
+import json
+import os
+import urllib.request
+from datetime import datetime, timezone
+from collections import defaultdict
+from botocore.exceptions import ClientError
+
+MANDATORY_TAGS = [t.strip() for t in
+                  os.environ.get("MANDATORY_TAGS",
+                                 "env,team,cost-center,project,application").split(",")]
+COMPLIANCE_THRESHOLD = float(os.environ.get("COMPLIANCE_THRESHOLD", "95"))
+S3_BUCKET  = os.environ.get("S3_BUCKET", "")
+S3_PREFIX  = os.environ.get("S3_PREFIX", "tag-audit/")
+DDB_TABLE  = os.environ.get("DYNAMODB_TABLE", "")
+SLACK_URL  = os.environ.get("SLACK_WEBHOOK_URL", "")
+
+
+def get_all_regions() -&gt; list[str]:
+    ec2 = boto3.client("ec2", region_name="us-east-1")
+    return [r["RegionName"] for r in ec2.describe_regions()["Regions"]]
+
+
+def audit_region(region: str) -&gt; list[dict]:
+    rds = boto3.client("rds", region_name=region)
+    records = []
+
+    paginator = rds.get_paginator("describe_db_instances")
+    for page in paginator.paginate():
+        for inst in page["DBInstances"]:
+            db_id  = inst["DBInstanceIdentifier"]
+            db_arn = inst["DBInstanceArn"]
+            db_cls = inst["DBInstanceClass"]
+            engine = inst["Engine"]
+
+            try:
+                tag_response = rds.list_tags_for_resource(ResourceName=db_arn)
+                existing_keys = {
+                    t["Key"].lower() for t in tag_response["TagList"]
+                }
+            except ClientError:
+                existing_keys = set()
+
+            present  = [t for t in MANDATORY_TAGS if t in existing_keys]
+            missing  = [t for t in MANDATORY_TAGS if t not in existing_keys]
+            score    = len(present) / len(MANDATORY_TAGS) * 100
+
+            records.append({
+                "region":         region,
+                "db_instance_id": db_id,
+                "db_class":       db_cls,
+                "engine":         engine,
+                "tags_present":   ",".join(present),
+                "tags_missing":   ",".join(missing),
+                "tag_score":      round(score, 1),
+                "status":         "COMPLIANT" if score == 100 else "NONCOMPLIANT"
+            })
+    return records
+
+
+def calculate_summary(records: list[dict]) -&gt; dict:
+    total     = len(records)
+    compliant = sum(1 for r in records if r["status"] == "COMPLIANT")
+    score     = (compliant / total * 100) if total &gt; 0 else 0
+
+    by_region = defaultdict(lambda: {"total": 0, "compliant": 0})
+    for r in records:
+        by_region[r["region"]]["total"]     += 1
+        by_region[r["region"]]["compliant"] += (1 if r["status"] == "COMPLIANT" else 0)
+
+    missing_counts = defaultdict(int)
+    for r in records:
+        for tag in r["tags_missing"].split(","):
+            if tag:
+                missing_counts[tag] += 1
+
+    return {
+        "total_instances":      total,
+        "compliant_instances":  compliant,
+        "noncompliant_instances": total - compliant,
+        "compliance_score_pct": round(score, 2),
+        "by_region":            dict(by_region),
+        "missing_tag_frequency": dict(sorted(
+            missing_counts.items(), key=lambda x: x[1], reverse=True
+        ))
+    }
+
+
+def write_to_s3(records: list[dict], summary: dict, run_ts: str) -&gt; str:
+    s3 = boto3.client("s3")
+    date_prefix = run_ts[:10]  # YYYY-MM-DD
+
+    # Write CSV
+    csv_key = f"{S3_PREFIX}{date_prefix}/compliance_report.csv"
+    buf = io.StringIO()
+    if records:
+        writer = csv.DictWriter(buf, fieldnames=records[0].keys())
+        writer.writeheader()
+        writer.writerows(records)
+    s3.put_object(Bucket=S3_BUCKET, Key=csv_key,
+                  Body=buf.getvalue().encode(),
+                  ContentType="text/csv")
+
+    # Write JSON summary
+    json_key = f"{S3_PREFIX}{date_prefix}/summary.json"
+    s3.put_object(Bucket=S3_BUCKET, Key=json_key,
+                  Body=json.dumps(summary, indent=2).encode(),
+                  ContentType="application/json")
+
+    print(f"Reports written to s3://{S3_BUCKET}/{S3_PREFIX}{date_prefix}/")
+    return f"s3://{S3_BUCKET}/{S3_PREFIX}{date_prefix}/"
+
+
+def write_to_dynamodb(summary: dict, run_ts: str) -&gt; None:
+    if not DDB_TABLE:
+        return
+    ddb = boto3.resource("dynamodb")
+    table = ddb.Table(DDB_TABLE)
+    table.put_item(Item={
+        "run_date":              run_ts[:10],
+        "run_timestamp":         run_ts,
+        "compliance_score_pct":  str(summary["compliance_score_pct"]),
+        "total_instances":       summary["total_instances"],
+        "compliant_instances":   summary["compliant_instances"],
+        "noncompliant_instances":summary["noncompliant_instances"]
+    })
+
+
+def post_slack_alert(summary: dict, s3_path: str) -&gt; None:
+    if not SLACK_URL:
+        return
+    score = summary["compliance_score_pct"]
+    status_emoji = "✅" if score &gt;= COMPLIANCE_THRESHOLD else "🚨"
+    top_missing = list(summary["missing_tag_frequency"].items())[:3]
+    missing_str = ", ".join(f"`{k}` ({v})" for k, v in top_missing)
+
+    text = (
+        f"{status_emoji} *RDS Tag Compliance Report*\n"
+        f"Compliance Score: *{score}%* "
+        f"(threshold: {COMPLIANCE_THRESHOLD}%)\n"
+        f"Instances: {summary['total_instances']} total, "
+        f"{summary['noncompliant_instances']} noncompliant\n"
+        f"Most missing tags: {missing_str}\n"
+        f"Full report: `{s3_path}`"
+    )
+
+    payload = json.dumps({"text": text}).encode()
+    req = urllib.request.Request(
+        SLACK_URL, data=payload,
+        headers={"Content-Type": "application/json"}
+    )
+    urllib.request.urlopen(req)
+
+
+def lambda_handler(event, context):
+    run_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"Tag compliance audit started at {run_ts}")
+
+    all_records = []
+    regions = get_all_regions()
+    print(f"Auditing {len(regions)} regions...")
+
+    for region in regions:
+        try:
+            region_records = audit_region(region)
+            all_records.extend(region_records)
+            print(f"  {region}: {len(region_records)} instances")
+        except Exception as e:
+            print(f"  [WARN] Could not audit {region}: {e}")
+
+    summary  = calculate_summary(all_records)
+    s3_path  = write_to_s3(all_records, summary, run_ts) if S3_BUCKET else "N/A"
+    write_to_dynamodb(summary, run_ts)
+    post_slack_alert(summary, s3_path)
+
+    print(f"\nCompliance score: {summary['compliance_score_pct']}%")
+    print(f"Noncompliant: {summary['noncompliant_instances']} instances")
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps(summary)
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">EventBridge Schedule (CloudFormation)</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># eventbridge_tag_audit_schedule.yaml
+# Deploys the Lambda + EventBridge schedule for weekly tag compliance auditing
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Weekly RDS tag compliance audit pipeline"
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: S3 bucket for audit report storage
+  SlackWebhookUrl:
+    Type: String
+    NoEcho: true
+    Default: ""
+  ComplianceThreshold:
+    Type: Number
+    Default: 95
+
+Resources:
+
+  AuditLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: rds-tag-audit-lambda-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RDSTagAuditPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  - ec2:DescribeRegions
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "arn:aws:s3:::${S3BucketName}/tag-audit/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ComplianceHistoryTable.Arn
+
+  AuditLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rds-tag-compliance-audit
+      Runtime: python3.12
+      Handler: lambda_tag_audit.lambda_handler
+      Role: !GetAtt AuditLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          MANDATORY_TAGS:         "env,team,cost-center,project,application"
+          COMPLIANCE_THRESHOLD:   !Ref ComplianceThreshold
+          S3_BUCKET:              !Ref S3BucketName
+          S3_PREFIX:              "tag-audit/"
+          DYNAMODB_TABLE:         !Ref ComplianceHistoryTable
+          SLACK_WEBHOOK_URL:      !Ref SlackWebhookUrl
+
+  WeeklyAuditSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: rds-tag-audit-weekly
+      Description: "Triggers weekly RDS tag compliance audit every Monday at 07:00 UTC"
+      ScheduleExpression: "cron(0 7 ? * MON *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AuditLambdaFunction.Arn
+          Id: TagAuditLambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuditLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyAuditSchedule.Arn
+
+  ComplianceHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: rds-tag-compliance-history
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: run_date
+          AttributeType: S
+        - AttributeName: run_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: run_date
+          KeyType: HASH
+        - AttributeName: run_timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The DynamoDB table stores a weekly row, giving you a 52-week trailing history of compliance scores. A simple query against this table in CloudWatch Metrics Insights or Athena produces a trend chart that makes compliance regressions visible—a new team creates three untagged RDS instances in week 34, and the score drops from 98% to 94%, triggering the Slack alert before Finance notices it in the monthly billing report.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.7 Multi-Cloud Tag Normalization: When Teams Span AWS, Azure, and GCP</h3>
+
+<p class="text-gray-300 leading-relaxed">Organizations with workloads on multiple clouds frequently end up with fragmented tagging strategies: the AWS team uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost-center</code>, the Azure team uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CostCenter</code>, and the GCP team uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost_center</code>. The billing export from each cloud goes to a central data warehouse, and none of the keys join cleanly.</p>
+
+<p class="text-gray-300 leading-relaxed">Normalization must happen at the data warehouse layer—you cannot force tag key consistency retroactively across clouds without re-running tagging automation against every resource. The following SQL pattern implements a normalization view in your central analytics warehouse (syntax shown for BigQuery; adapt <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">LOWER</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">REGEXP_REPLACE</code> for Snowflake or Redshift as needed).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">BigQuery: Unified Cross-Cloud Database Cost View</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- unified_db_cost_view.sql
+-- Creates a unified view of database costs across AWS RDS, Azure SQL, and GCP Cloud SQL
+-- by normalizing tag/label keys to a canonical schema.
+-- Store as a BigQuery view: your_project.finops_dataset.v_unified_db_costs
+
+CREATE OR REPLACE VIEW `your_project.finops_dataset.v_unified_db_costs` AS
+
+WITH
+
+-- ── AWS RDS costs from CUR (Cost and Usage Report) exported to S3 → BigQuery ──
+aws_rds AS (
+  SELECT
+    FORMAT_DATE('%Y-%m', DATE(line_item_usage_start_date))  AS billing_month,
+    'AWS'                                                    AS cloud,
+    'RDS'                                                    AS db_service,
+    line_item_resource_id                                    AS resource_id,
+    line_item_usage_type                                     AS sku,
+
+    -- Normalize tag keys: CUR tags use resource_tags_ prefix
+    LOWER(COALESCE(
+      resource_tags_user_team,
+      resource_tags_user_Team,
+      resource_tags_user_TEAM
+    ))                                                        AS team,
+
+    LOWER(COALESCE(
+      resource_tags_user_env,
+      resource_tags_user_Env,
+      resource_tags_user_environment
+    ))                                                        AS env,
+
+    LOWER(COALESCE(
+      resource_tags_user_cost_center,
+      `resource_tags_user_cost-center`
+    ))                                                        AS cost_center,
+
+    LOWER(COALESCE(
+      resource_tags_user_project,
+      resource_tags_user_Project
+    ))                                                        AS project,
+
+    LOWER(COALESCE(
+      resource_tags_user_application,
+      resource_tags_user_Application
+    ))                                                        AS application,
+
+    SUM(line_item_unblended_cost)                            AS cost_usd
+
+  FROM `your_project.aws_cur_dataset.aws_cur_*`
+  WHERE
+    line_item_product_code = 'AmazonRDS'
+    AND line_item_line_item_type NOT IN ('Credit', 'Refund', 'Tax')
+  GROUP BY
+    billing_month, cloud, db_service, resource_id, sku,
+    team, env, cost_center, project, application
+),-- ── Azure SQL costs from Azure Cost Export exported to Blob → BigQuery ──
+azure_sql AS (
+  SELECT
+    FORMAT_DATE('%Y-%m', DATE(UsageDateTime))                AS billing_month,
+    'Azure'                                                   AS cloud,
+    'Azure SQL'                                               AS db_service,
+    InstanceId                                                AS resource_id,
+    MeterName                                                 AS sku,
+
+    -- Azure tag keys are stored as JSON strings; normalize with LOWER
+    LOWER(COALESCE(
+      JSON_VALUE(Tags, '$.team'),
+      JSON_VALUE(Tags, '$.Team'),
+      JSON_VALUE(Tags, '$.TEAM')
+    ))                                                        AS team,
+
+    LOWER(COALESCE(
+      JSON_VALUE(Tags, '$.env'),
+      JSON_VALUE(Tags, '$.Env'),
+      JSON_VALUE(Tags, '$.environment'),
+      JSON_VALUE(Tags, '$.Environment')
+    ))                                                        AS env,
+
+    LOWER(COALESCE(
+      JSON_VALUE(Tags, '$.cost-center'),
+      JSON_VALUE(Tags, '$.CostCenter'),
+      JSON_VALUE(Tags, '$.costcenter'),
+      JSON_VALUE(Tags, '$.cost_center')
+    ))                                                        AS cost_center,
+
+    LOWER(COALESCE(
+      JSON_VALUE(Tags, '$.project'),
+      JSON_VALUE(Tags, '$.Project')
+    ))                                                        AS project,
+
+    LOWER(COALESCE(
+      JSON_VALUE(Tags, '$.application'),
+      JSON_VALUE(Tags, '$.Application')
+    ))                                                        AS application,
+
+    SUM(PreTaxCost)                                           AS cost_usd
+
+  FROM `your_project.azure_billing_dataset.azure_cost_export_*`
+  WHERE
+    -- Filter to SQL-family services
+    (MeterCategory IN ('SQL Database', 'SQL Managed Instance',
+                       'Azure SQL Database', 'Azure Database for PostgreSQL',
+                       'Azure Database for MySQL')
+     OR ServiceName LIKE '%SQL%')
+    AND ChargeType NOT IN ('Refund', 'Credit')
+  GROUP BY
+    billing_month, cloud, db_service, resource_id, sku,
+    team, env, cost_center, project, application
+),
+
+-- ── GCP Cloud SQL costs from GCP Billing Export in BigQuery ──
+gcp_cloudsql AS (
+  SELECT
+    invoice.month                                             AS billing_month,
+    'GCP'                                                     AS cloud,
+    'Cloud SQL'                                               AS db_service,
+    -- GCP resource name is in the resource labels or the resource.name field
+    resource.name                                             AS resource_id,
+    sku.description                                           AS sku,
+
+    -- GCP labels are already lowercase by convention; COALESCE handles missing ones
+    MAX(IF(label.key = 'team',         label.value, NULL))   AS team,
+    MAX(IF(label.key = 'env',          label.value, NULL))   AS env,
+    MAX(IF(label.key = 'cost-center',  label.value, NULL))   AS cost_center,
+    MAX(IF(label.key = 'project',      label.value, NULL))   AS project,
+    MAX(IF(label.key = 'application',  label.value, NULL))   AS application,
+
+    SUM(cost)                                                 AS cost_usd
+
+  FROM `your_project.billing_dataset.gcp_billing_export_v1_XXXXXX`,
+  UNNEST(labels) AS label
+
+  WHERE
+    service.description LIKE '%Cloud SQL%'
+    AND cost_type NOT IN ('rounding_error')
+  GROUP BY
+    billing_month, cloud, db_service, resource_id, sku
+),
+
+-- ── Union all three sources ──
+combined AS (
+  SELECT * FROM aws_rds
+  UNION ALL
+  SELECT * FROM azure_sql
+  UNION ALL
+  SELECT * FROM gcp_cloudsql
+)
+
+-- ── Final output with normalization flag ──
+SELECT
+  billing_month,
+  cloud,
+  db_service,
+  resource_id,
+  sku,
+
+  COALESCE(team,        'UNTAGGED')   AS team,
+  COALESCE(env,         'unknown')    AS env,
+  COALESCE(cost_center, 'UNTAGGED')   AS cost_center,
+  COALESCE(project,     'UNTAGGED')   AS project,
+  COALESCE(application, 'UNTAGGED')   AS application,
+
+  -- Tag completeness score
+  (CASE WHEN team        IS NOT NULL THEN 1 ELSE 0 END +
+   CASE WHEN env         IS NOT NULL THEN 1 ELSE 0 END +
+   CASE WHEN cost_center IS NOT NULL THEN 1 ELSE 0 END +
+   CASE WHEN project     IS NOT NULL THEN 1 ELSE 0 END +
+   CASE WHEN application IS NOT NULL THEN 1 ELSE 0 END
+  )                                   AS tag_score,
+
+  ROUND(SUM(cost_usd), 2)             AS cost_usd
+
+FROM combined
+
+GROUP BY
+  billing_month,
+  cloud,
+  db_service,
+  resource_id,
+  sku,
+  team,
+  env,
+  cost_center,
+  project,
+  application,
+  tag_score
+
+ORDER BY
+  billing_month DESC,
+  cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Once this view exists, Finance can query it from any BI tool—Looker, Tableau, Power BI, or Looker Studio—without understanding the differences between CUR column naming conventions and GCP billing export label schema. A single <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">WHERE team = 'payments'</code> filter returns every database dollar spent by that team across all three clouds in a given month.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tag Normalization Lookup Table</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For organizations with dozens of teams applying tag values inconsistently (e.g., <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pay</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payments</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">Payments</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">PYMT</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">payment-service</code>), a normalization lookup table prevents the per-team cost view from fracturing into dozens of near-duplicate rows.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- tag_normalization_map.sql
+-- A reference table mapping raw tag values to canonical values.
+-- Maintain this table as source-of-truth in your FinOps data warehouse.
+-- Populate initially from the audit output; update as new aliases appear.
+
+CREATE TABLE IF NOT EXISTS `your_project.finops_dataset.tag_normalization_map` (
+  tag_key       STRING   NOT NULL,   -- e.g., 'team'
+  raw_value     STRING   NOT NULL,   -- e.g., 'pay', 'PYMT', 'payment-service'
+  canonical_value STRING NOT NULL,   -- e.g., 'payments'
+  added_date    DATE,
+  added_by      STRING
+);
+
+-- Sample rows (insert your own based on audit findings)
+INSERT INTO `your_project.finops_dataset.tag_normalization_map`
+  (tag_key, raw_value, canonical_value, added_date, added_by)
+VALUES
+  ('team', 'pay',              'payments',  CURRENT_DATE(), 'finops-team'),
+  ('team', 'PYMT',             'payments',  CURRENT_DATE(), 'finops-team'),
+  ('team', 'payment-service',  'payments',  CURRENT_DATE(), 'finops-team'),
+  ('team', 'Payments',         'payments',  CURRENT_DATE(), 'finops-team'),
+  ('team', 'analytics-team',   'analytics', CURRENT_DATE(), 'finops-team'),
+  ('team', 'bi',               'analytics', CURRENT_DATE(), 'finops-team'),
+  ('env',  'production',       'prod',      CURRENT_DATE(), 'finops-team'),
+  ('env',  'PROD',             'prod',      CURRENT_DATE(), 'finops-team'),
+  ('env',  'prd',              'prod',      CURRENT_DATE(), 'finops-team'),
+  ('env',  'development',      'dev',       CURRENT_DATE(), 'finops-team'),
+  ('env',  'DEV',              'dev',       CURRENT_DATE(), 'finops-team');</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Join this table into the unified view's <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">COALESCE</code> chain to replace raw tag values with their canonical equivalents before the grouping step. The lookup table becomes a living document that the FinOps team updates as new tag value variants surface in the audit output.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.8 Integrating Tag Compliance into IaC Pipelines</h3>
+
+<p class="text-gray-300 leading-relaxed">The most durable place to enforce tagging is the deployment pipeline. An instance that cannot pass a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">terraform plan</code> validation step or a CloudFormation stack policy check without the correct tags never reaches production in a noncompliant state. The approaches in this section work in concert with the cloud-native policies from section 23.4—defense in depth rather than relying on a single enforcement layer.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Terraform: Variable Validation for Mandatory Tags</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># modules/rds/variables.tf
+# Shared Terraform module for RDS instances.
+# All mandatory tags must be provided by the calling module.
+# This prevents the plan from succeeding without complete tags.
+
+variable "mandatory_tags" {
+  description = "Mandatory FinOps tags required on all RDS resources."
+  type = object({
+    env          = string
+    team         = string
+    cost_center  = string
+    project      = string
+    application  = string
+  })
+
+  validation {
+    condition     = contains(["prod", "staging", "dev", "sandbox"], var.mandatory_tags.env)
+    error_message = "env must be one of: prod, staging, dev, sandbox."
+  }
+
+  validation {
+    condition     = length(var.mandatory_tags.team) &gt;= 2
+    error_message = "team must be at least 2 characters."
+  }
+
+  validation {
+    condition     = can(regex("^CC-[0-9]{4}$", var.mandatory_tags.cost_center))
+    error_message = "cost_center must match format CC-XXXX (e.g., CC-4421)."
+  }
+
+  validation {
+    condition     = length(var.mandatory_tags.project) &gt;= 3
+    error_message = "project must be at least 3 characters."
+  }
+
+  validation {
+    condition     = length(var.mandatory_tags.application) &gt;= 3
+    error_message = "application must be at least 3 characters."
+  }
+}
+
+variable "optional_tags" {
+  description = "Optional enrichment tags. Merged with mandatory_tags at resource creation."
+  type        = map(string)
+  default     = {}
+}
+
+# Compose the full tag map used on every resource in this module
+locals {
+  all_tags = merge(
+    {
+      env         = var.mandatory_tags.env
+      team        = var.mandatory_tags.team
+      "cost-center" = var.mandatory_tags.cost_center   # normalize hyphen form
+      project     = var.mandatory_tags.project
+      application = var.mandatory_tags.application
+      managed-by  = "terraform"
+    },
+    var.optional_tags
+  )
+}</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># modules/rds/main.tf
+# Example RDS instance resource using the validated tag block
+
+resource "aws_db_instance" "this" {
+  identifier        = var.db_identifier
+  engine            = var.engine
+  engine_version    = var.engine_version
+  instance_class    = var.instance_class
+  allocated_storage = var.allocated_storage
+  db_name           = var.db_name
+  username          = var.master_username
+  password          = var.master_password
+
+  # ... other required parameters ...
+
+  tags = local.all_tags
+}
+
+resource "aws_db_subnet_group" "this" {
+  name       = "${var.db_identifier}-subnet-group"
+  subnet_ids = var.subnet_ids
+  tags       = local.all_tags
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A calling module that omits <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cost_center</code> or provides an invalid value fails at <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">terraform validate</code> before any AWS API calls are made. This is the cheapest enforcement point.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Conftest / OPA Policy for Terraform Plan Output</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For organizations using Open Policy Agent in their CI pipeline, the following Rego policy evaluates the Terraform plan JSON and fails the build if any <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws_db_instance</code> resource is missing mandatory tags.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># policies/rds_mandatory_tags.rego
+# Evaluates terraform plan output (JSON) and enforces mandatory tag presence
+# on all aws_db_instance and aws_db_cluster resources.
+#
+# Usage in CI (after terraform plan -out=plan.tfplan && terraform show -json plan.tfplan &gt; plan.json):
+#   conftest test plan.json --policy policies/
+
+package rds_mandatory_tags
+
+import future.keywords.in
+
+mandatory_tags := {
+  "env",
+  "team",
+  "cost-center",
+  "project",
+  "application",
+}
+
+rds_resource_types := {
+  "aws_db_instance",
+  "aws_db_cluster",
+  "aws_rds_cluster",
+}
+
+# Collect all RDS resources being created or updated in the plan
+rds_resources[name] := config {
+  resource := input.resource_changes[_]
+  resource.type in rds_resource_types
+  resource.change.actions[_] in {"create", "update"}
+  config := resource.change.after
+  name := resource.address
+}
+
+# For each RDS resource, find which mandatory tags are missing
+missing_tags[resource_addr] := absent {
+  config := rds_resources[resource_addr]
+  applied_tags := {lower(k) | config.tags[k]}
+  absent := mandatory_tags - applied_tags
+  count(absent) &gt; 0
+}
+
+# Deny rule: fail if any resource has missing mandatory tags
+deny[msg] {
+  resource_addr := missing_tags[_]
+  absent := missing_tags[resource_addr]
+  msg := sprintf(
+    "Resource %v is missing mandatory tags: %v",
+    [resource_addr, concat(", ", absent)]
+  )
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Add this to your CI pipeline after the Terraform plan step:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># .github/workflows/terraform_tag_check.yml (excerpt)
+- name: Convert Terraform plan to JSON
+  run: terraform show -json tfplan &gt; plan.json
+
+- name: Run OPA tag compliance check
+  uses: open-policy-agent/conftest-action@v3
+  with:
+    files: plan.json
+    policy: policies/</code></pre>
+
+<p class="text-gray-300 leading-relaxed">A failed OPA check blocks the pull request merge. Engineers see the exact tag they missed and the exact resource address that violated the policy, which is far more actionable than a cryptic AWS <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AccessDenied</code> error from the SCP.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">23.9 Chargeback and Showback Workflows</h3>
+
+<p class="text-gray-300 leading-relaxed">Tagging alone does not produce chargeback. Chargeback requires a workflow: the tagged cost data flows to a report, the report is distributed to team leads or finance BPs, and there is an agreed mechanism for attributing those costs to a budget. The following describes a minimal chargeback workflow suitable for a 10–50 team organization.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Showback vs. Chargeback</strong></p>
+
+<p class="text-gray-300 leading-relaxed">*Showback* means: "Here is what your team consumed; no money actually moves." Showback is politically safe and builds team awareness of their database costs. Start here.</p>
+
+<p class="text-gray-300 leading-relaxed">*Chargeback* means: "Here is what your team consumed; your budget is debited by this amount." Chargeback requires buy-in from finance leadership, a mapping from cloud cost centers to internal GL codes, and a process for handling disputes. It motivates optimization far more strongly than showback but requires more governance infrastructure.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monthly Chargeback Report Generator</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The following Python script generates per-team chargeback reports from the AWS Cost Explorer data and distributes them by email (or Slack). It reads the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds_cost_by_team.py</code> output and formats it into a per-team summary that can be sent directly to each team's engineering lead.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+generate_chargeback_reports.py
+Generates and distributes monthly per-team RDS chargeback reports.
+
+Reads cost data from the output of rds_cost_by_team.py (CSV) or
+calls Cost Explorer directly. Emails each team lead using SES.
+
+Requirements:
+  boto3, jinja2
+  pip install boto3 jinja2
+
+Configuration:
+  TEAM_CONTACTS_FILE  Path to JSON file mapping team names to email addresses
+  FROM_EMAIL          Verified SES sender address
+  REPORT_MONTH        YYYY-MM format; defaults to previous month
+"""
+
+import boto3
+import csv
+import json
+import os
+from collections import defaultdict
+from datetime import datetime, date
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from jinja2 import Template
+
+TEAM_CONTACTS_FILE = os.environ.get("TEAM_CONTACTS_FILE", "team_contacts.json")
+FROM_EMAIL         = os.environ.get("FROM_EMAIL", "finops@yourcompany.com")
+REPORT_MONTH       = os.environ.get("REPORT_MONTH", "")  # defaults to last month below
+
+
+EMAIL_TEMPLATE = """
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;body style="font-family: Arial, sans-serif; color: #333;"&gt;
+&lt;h2&gt;📊 RDS Cost Chargeback Report — {{ month }}&lt;/h2&gt;
+&lt;p&gt;Hello {{ team_lead_name }},&lt;/p&gt;
+&lt;p&gt;Below is the database cost summary for the &lt;strong&gt;{{ team }}&lt;/strong&gt; team for {{ month }}.&lt;/p&gt;
+
+&lt;table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;"&gt;
+  &lt;thead style="background-color: #f0f0f0;"&gt;
+    &lt;tr&gt;
+      &lt;th&gt;Usage Type&lt;/th&gt;
+      &lt;th&gt;Cost (USD)&lt;/th&gt;
+      &lt;th&gt;% of Team Total&lt;/th&gt;
+    &lt;/tr&gt;
+  &lt;/thead&gt;
+  &lt;tbody&gt;
+    {% for row in usage_rows %}
+    &lt;tr&gt;
+      &lt;td&gt;{{ row.usage_type }}&lt;/td&gt;
+      &lt;td&gt;${{ "%.2f"|format(row.cost_usd) }}&lt;/td&gt;
+      &lt;td&gt;{{ "%.1f"|format(row.pct) }}%&lt;/td&gt;
+    &lt;/tr&gt;
+    {% endfor %}
+  &lt;/tbody&gt;
+  &lt;tfoot style="background-color: #f8f8f8; font-weight: bold;"&gt;
+    &lt;tr&gt;
+      &lt;td&gt;TOTAL&lt;/td&gt;
+      &lt;td&gt;${{ "%.2f"|format(team_total) }}&lt;/td&gt;
+      &lt;td&gt;100%&lt;/td&gt;
+    &lt;/tr&gt;
+  &lt;/tfoot&gt;
+&lt;/table&gt;
+
+&lt;p style="margin-top: 16px;"&gt;
+  &lt;strong&gt;Untagged resources cost:&lt;/strong&gt;
+  ${{ "%.2f"|format(untagged_cost) }} — these are not included in team totals
+  and represent optimization opportunities.
+&lt;/p&gt;
+
+&lt;p&gt;
+  Questions? Contact the FinOps team at &lt;a href="mailto:finops@yourcompany.com"&gt;finops@yourcompany.com&lt;/a&gt;
+  or review the full report in the
+  &lt;a href="{{ dashboard_url }}"&gt;FinOps Dashboard&lt;/a&gt;.
+&lt;/p&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+"""
+
+
+def get_report_month() -&gt; str:
+    if REPORT_MONTH:
+        return REPORT_MONTH
+    today = date.today()
+    # Default to previous month
+    if today.month == 1:
+        return f"{today.year - 1}-12"
+    return f"{today.year}-{today.month - 1:02d}"
+
+
+def load_team_contacts(path: str) -&gt; dict:
+    """
+    team_contacts.json format:
+    {
+      "payments": {"email": "lead@payments.co", "name": "Alice Chen"},
+      "analytics": {"email": "lead@analytics.co", "name": "Bob Patel"},
+      ...
+    }
+    """
+    with open(path) as f:
+        return json.load(f)
+
+
+def load_cost_data_from_csv(csv_path: str, month: str) -&gt; list[dict]:
+    rows = []
+    with open(csv_path, newline="") as f:
+        for row in csv.DictReader(f):
+            if row.get("month", "").startswith(month):
+                rows.append(row)
+    return rows
+
+
+def aggregate_by_team(rows: list[dict]) -&gt; dict:
+    team_data = defaultdict(list)
+    for row in rows:
+        team_data[row["team"]].append({
+            "usage_type": row["usage_type"],
+            "cost_usd":   float(row["cost_usd"])
+        })
+    return team_data
+
+
+def send_email_ses(to_addr: str, from_addr: str,
+                   subject: str, html_body: str) -&gt; None:
+    ses = boto3.client("ses", region_name="us-east-1")
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = from_addr
+    msg["To"]      = to_addr
+    msg.attach(MIMEText(html_body, "html"))
+
+    ses.send_raw_email(
+        Source=from_addr,
+        Destinations=[to_addr],
+        RawMessage={"Data": msg.as_string()}
+    )
+    print(f"  Email sent to {to_addr}")
+
+
+def generate_and_distribute(csv_path: str, dry_run: bool = True) -&gt; None:
+    month         = get_report_month()
+    team_contacts = load_team_contacts(TEAM_CONTACTS_FILE)
+    rows          = load_cost_data_from_csv(csv_path, month)
+    team_data     = aggregate_by_team(rows)
+    template      = Template(EMAIL_TEMPLATE)
+    dashboard_url = os.environ.get("DASHBOARD_URL", "https://finops.yourcompany.com")
+
+    untagged_cost = sum(
+        r["cost_usd"] for r in team_data.get("UNTAGGED", [])
+    )
+
+    print(f"\nGenerating chargeback reports for {month}...")
+    print(f"Teams with data: {sorted(team_data.keys())}\n")
+
+    for team, contact in team_contacts.items():
+        usage_rows = team_data.get(team, [])
+        if not usage_rows:
+            print(f"  [SKIP] No cost data for team '{team}' in {month}")
+            continue
+
+        team_total = sum(r["cost_usd"] for r in usage_rows)
+        for r in usage_rows:
+            r["pct"] = (r["cost_usd"] / team_total * 100) if team_total &gt; 0 else 0
+        usage_rows.sort(key=lambda r: r["cost_usd"], reverse=True)
+
+        html = template.render(
+            month=month,
+            team=team,
+            team_lead_name=contact["name"],
+            usage_rows=usage_rows,
+            team_total=team_total,
+            untagged_cost=untagged_cost,
+            dashboard_url=dashboard_url
+        )
+
+        subject = f"RDS Cost Chargeback — {team} — {month} — ${team_total:,.2f}"
+
+        if dry_run:
+            print(f"  [DRY RUN] Would email {contact['email']}: {subject}")
+        else:
+            send_email_ses(contact["email"], FROM_EMAIL, subject, html)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv",     required=True, help="Path to cost CSV from rds_cost_by_team.py")
+    parser.add_argument("--apply",   action="store_true", help="Send emails (default: dry run)")
+    args = parser.parse_args()
+    generate_and_distribute(args.csv, dry_run=not args.apply)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this on the third business day of each month, after Cost Explorer data for the prior month has settled. Send the emails to engineering leads first, give them a week to raise disputes, then send the final version to Finance for budget reconciliation.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A tag schema must serve both Finance and Engineering simultaneously.** A small mandatory set (five to six keys covering environment, team, cost center, project, and application) paired with an optional enrichment set is more durable than either a sprawling mandated list or a purely operational tagging convention that Finance cannot use for budget allocation.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Untagged database spend is not a tagging problem—it is an ownership problem.** The first step after discovering untagged resources is assigning an owner, not applying a tag. Without ownership, the tag will be inaccurate or drift over time. Use the audit pipeline to surface the cost of untagged resources explicitly and make it visible to leadership; financial visibility is the most reliable forcing function for ownership.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Enforce at creation time, audit continuously, and remediate through pipeline gates.** Cloud-native policies (AWS SCPs, Azure Policy, GCP Organization Policy custom constraints) block noncompliant resources at the API level. IaC validation (Terraform variable validation, OPA/Conftest in CI) catches problems before API calls are made. The weekly audit Lambda catches drift between deployments. Each layer compensates for the gaps of the others.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Multi-cloud tag normalization belongs in the data warehouse, not in each cloud's tagging convention.** You cannot retroactively harmonize `CostCenter`, `cost-center`, and `cost_center` across three clouds, but you can normalize them in a unified billing view. A tag normalization lookup table that maps raw values to canonical values prevents per-team cost views from fragmenting due to minor capitalization or delimiter inconsistencies.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Showback precedes chargeback.** Begin by distributing read-only monthly reports that show teams what they consumed without moving budget. Once teams can see their costs clearly, they will identify optimization opportunities themselves. Introduce financial accountability through chargeback only after the tagging data quality is high enough that teams can trust—and if necessary, dispute—the numbers they are being charged.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
