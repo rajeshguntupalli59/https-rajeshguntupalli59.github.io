@@ -5,6 +5,10 @@
   <title>Chapter 22: Separating Analytics from OLTP: The Financial Case — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 22: Separating Analytics from OLTP: The Financial Case. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -392,7 +396,7 @@ aws compute-optimizer get-rds-database-recommendations \
 # Summarize total potential savings
 echo ""
 echo "Summary of potential monthly savings:"
-python3 - &lt;&lt;'PYEOF'
+python3 - &lt;&lt;PYEOF
 import json, sys
 
 with open("${OUTPUT_FILE}") as f:
@@ -422,7 +426,314 @@ PYEOF</code></pre>
 <h3 class="text-lg font-semibold text-white mt-8 mb-3">Automation: Continuous Workload Classification and Alerting</h3>
 
 <p class="text-gray-300 leading-relaxed">One-time separation is not enough. New features ship, developers run queries, and analytics workload creeps back onto the OLTP instance within weeks if nobody is watching. The following automation runs as a scheduled Lambda (or GitHub Actions workflow for non-AWS shops) and posts an alert when analytics load on the primary instance exceeds a configured threshold.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+workload_drift_monitor.py
+
+Monitors pg_stat_statements on RDS PostgreSQL via a read-only connection
+and alerts via SNS when analytics query load exceeds threshold.
+
+Intended deployment: AWS Lambda, triggered every 15 minutes via EventBridge.
+Environment variables:
+  DB_SECRET_ARN   - Secrets Manager ARN with {host, port, dbname, username, password}
+  SNS_TOPIC_ARN   - SNS topic for alerts
+  ALERT_THRESHOLD - Analytics share of total exec time that triggers alert (default 0.25)
+"""
+
+import json
+import os
+import boto3
+import psycopg2
+from datetime import datetime, timezone
+
+sns     = boto3.client("sns")
+secrets = boto3.client("secretsmanager")
+
+ALERT_THRESHOLD = float(os.environ.get("ALERT_THRESHOLD", "0.25"))
+SNS_TOPIC_ARN   = os.environ["SNS_TOPIC_ARN"]
+DB_SECRET_ARN   = os.environ["DB_SECRET_ARN"]
+
+ANALYTICS_CLASSIFICATION_QUERY = """
+WITH stmt_stats AS (
+    SELECT
+        queryid,
+        left(query, 200)                                    AS query_snippet,
+        total_exec_time,
+        calls,
+        rows,
+        mean_exec_time,
+        rows / NULLIF(calls, 0)                            AS avg_rows_per_call,
+        -- Classify heuristically; tune thresholds for your workload
+        CASE
+            WHEN mean_exec_time &gt; 3000
+                 AND rows / NULLIF(calls, 0) &gt; 5000        THEN 'ANALYTICS'
+            WHEN query ILIKE '%group by%'
+                 AND mean_exec_time &gt; 1000                 THEN 'ANALYTICS'
+            WHEN query ILIKE '%partition by%'              THEN 'ANALYTICS'
+            WHEN query ILIKE '%date_trunc%'
+                 AND rows / NULLIF(calls, 0) &gt; 500         THEN 'ANALYTICS'
+            ELSE 'OLTP'
+        END                                                 AS workload_class
+    FROM pg_stat_statements
+    WHERE calls &gt; 5
+      AND query NOT LIKE '%pg_stat_statements%'
+),
+totals AS (
+    SELECT
+        workload_class,
+        SUM(total_exec_time)                               AS class_exec_time,
+        COUNT(*)                                           AS query_count
+    FROM stmt_stats
+    GROUP BY workload_class
+)
+SELECT
+    workload_class,
+    class_exec_time,
+    query_count,
+    ROUND(
+        class_exec_time / SUM(class_exec_time) OVER () * 100,
+        2
+    )                                                       AS pct_of_total_time
+FROM totals
+ORDER BY class_exec_time DESC;
+"""
+
+
+def get_db_credentials(secret_arn: str) -&gt; dict:
+    resp = secrets.get_secret_value(SecretId=secret_arn)
+    return json.loads(resp["SecretString"])
+
+
+def query_workload_distribution(creds: dict) -&gt; list[dict]:
+    conn = psycopg2.connect(
+        host=creds["host"],
+        port=creds.get("port", 5432),
+        dbname=creds["dbname"],
+        user=creds["username"],
+        password=creds["password"],
+        connect_timeout=10,
+        sslmode="require",
+    )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(ANALYTICS_CLASSIFICATION_QUERY)
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def build_alert_message(rows: list[dict], analytics_pct: float) -&gt; str:
+    lines = [
+        f"⚠  WORKLOAD DRIFT ALERT — {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
+        f"Analytics queries consume {analytics_pct:.1f}% of total execution time",
+        f"(threshold: {ALERT_THRESHOLD * 100:.0f}%)",
+        "",
+        "Breakdown by workload class:",
+    ]
+    for row in rows:
+        lines.append(
+            f"  {row['workload_class']:&lt;12} "
+            f"{row['pct_of_total_time']:&gt;6}%  "
+            f"({row['query_count']} queries)"
+        )
+    lines += [
+        "",
+        "Action: Review pg_stat_statements on the OLTP instance and confirm",
+        "analytical queries have not been re-routed to the primary.",
+        "Runbook: https://wiki.internal/db-finops/workload-separation-runbook",
+    ]
+    return "\n".join(lines)
+
+
+def lambda_handler(event, context):
+    creds = get_db_credentials(DB_SECRET_ARN)
+    rows  = query_workload_distribution(creds)
+
+    if not rows:
+        return {"status": "no_data"}
+
+    analytics_row = next(
+        (r for r in rows if r["workload_class"] == "ANALYTICS"), None
+    )
+    analytics_pct = float(analytics_row["pct_of_total_time"]) / 100 if analytics_row else 0.0
+
+    result = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "analytics_fraction": analytics_pct,
+        "alert_fired": False,
+        "distribution": rows,
+    }
+
+    if analytics_pct &gt;= ALERT_THRESHOLD:
+        message = build_alert_message(rows, analytics_pct * 100)
+        sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=f"[DB FinOps] Analytics workload drift detected — {analytics_pct * 100:.1f}%",
+            Message=message,
+        )
+        result["alert_fired"] = True
+
+    return result</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Deploy this Lambda with a 128 MB memory allocation — the function itself is lightweight; all the work happens inside the database. At 15-minute intervals, the Lambda invocation cost is negligible (approximately 2,880 invocations per month, well within the free tier). Set the EventBridge rule to disable itself if the Lambda errors three consecutive times to avoid alert fatigue from transient network issues.</p>
+
+<p class="text-gray-300 leading-relaxed">The equivalent for SQL Server environments uses a stored procedure that writes to a monitoring table, queried by an Azure Monitor workbook or CloudWatch custom metric:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Stored procedure to log workload distribution to a monitoring table
+-- Schedule via SQL Server Agent or Azure Elastic Jobs every 15 minutes
+
+IF OBJECT_ID('dbo.LogWorkloadDistribution', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.LogWorkloadDistribution;
+GO
+
+CREATE PROCEDURE dbo.LogWorkloadDistribution
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- Ensure monitoring table exists
+    IF OBJECT_ID('dbo.WorkloadDistributionLog', 'U') IS NULL
+    BEGIN
+        CREATE TABLE dbo.WorkloadDistributionLog (
+            log_id              INT IDENTITY(1,1) PRIMARY KEY,
+            captured_at         DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+            workload_class      NVARCHAR(20) NOT NULL,
+            total_elapsed_sec   DECIMAL(18,2) NOT NULL,
+            query_count         INT NOT NULL,
+            pct_of_total        DECIMAL(6,2) NOT NULL
+        );
+        CREATE INDEX IX_WorkloadLog_CapturedAt
+            ON dbo.WorkloadDistributionLog (captured_at DESC);
+    END;
+
+    WITH classified AS (
+        SELECT
+            CASE
+                WHEN qs.total_elapsed_time / NULLIF(qs.execution_count, 0) &gt; 3000000
+                     AND qs.total_rows / NULLIF(qs.execution_count, 0) &gt; 5000
+                                                        THEN 'ANALYTICS'
+                WHEN qs.total_logical_reads
+                     / NULLIF(qs.execution_count, 0)  &gt; 50000
+                                                        THEN 'ANALYTICS'
+                ELSE 'OLTP'
+            END                                         AS workload_class,
+            qs.total_elapsed_time                       AS elapsed_us,
+            1                                           AS query_count
+        FROM sys.dm_exec_query_stats qs
+        WHERE qs.execution_count &gt; 5
+    ),
+    aggregated AS (
+        SELECT
+            workload_class,
+            SUM(elapsed_us)                             AS class_elapsed_us,
+            SUM(query_count)                            AS query_count
+        FROM classified
+        GROUP BY workload_class
+    ),
+    with_pct AS (
+        SELECT
+            workload_class,
+            class_elapsed_us,
+            query_count,
+            ROUND(
+                CAST(class_elapsed_us AS FLOAT)
+                / NULLIF(SUM(class_elapsed_us) OVER (), 0) * 100,
+                2
+            )                                           AS pct_of_total
+        FROM aggregated
+    )
+    INSERT INTO dbo.WorkloadDistributionLog
+        (workload_class, total_elapsed_sec, query_count, pct_of_total)
+    SELECT
+        workload_class,
+        ROUND(class_elapsed_us / 1e6, 2),
+        query_count,
+        pct_of_total
+    FROM with_pct;
+
+    -- Raise an alert event if analytics load exceeds 25%
+    IF EXISTS (
+        SELECT 1
+        FROM dbo.WorkloadDistributionLog
+        WHERE captured_at &gt;= DATEADD(MINUTE, -16, SYSUTCDATETIME())
+          AND workload_class = 'ANALYTICS'
+          AND pct_of_total   &gt; 25.0
+    )
+    BEGIN
+        RAISERROR(
+            'WORKLOAD DRIFT: Analytics queries exceed 25%% of total elapsed time. Review sys.dm_exec_query_stats.',
+            10, -- severity (informational; raise to 16+ to break jobs)
+            1
+        ) WITH LOG;  -- writes to SQL Server error log, picked up by Azure Monitor / CloudWatch
+    END;
+
+    -- Prune log older than 90 days
+    DELETE FROM dbo.WorkloadDistributionLog
+    WHERE captured_at &lt; DATEADD(DAY, -90, SYSUTCDATETIME());
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Wire the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">RAISERROR ... WITH LOG</code> output to an Azure Monitor alert rule (for Azure SQL Managed Instance) or a CloudWatch Logs metric filter (for RDS SQL Server) that pages on-call when triggered outside business hours. This closes the feedback loop: the team migrates analytics, the monitor watches for drift, and any re-introduction of analytical load triggers a ticket before it accumulates into a billing surprise.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Building the Executive Business Case</h3>
+
+<p class="text-gray-300 leading-relaxed">The technical evidence assembled above — query classification tables, cost attribution scripts, and Compute Optimizer recommendations — flows naturally into a one-page financial summary for executive sign-off. Structure it in three columns: current state cost, future state cost, and net monthly saving. Keep the narrative out; executives respond to numbers.</p>
+
+<p class="text-gray-300 leading-relaxed">A template that works:</p>
+
+<p class="text-gray-300 leading-relaxed">| Line Item | Current Monthly Cost | Post-Separation Cost | Monthly Saving |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| OLTP instance (Multi-AZ) | $2,196 | $1,098 (downsized) | $1,098 |</p>
+<p class="text-gray-300 leading-relaxed">| OLTP Reserved Instance discount (1yr no-upfront) | — | −$412 vs. on-demand | $412 |</p>
+<p class="text-gray-300 leading-relaxed">| Analytics on OLTP (attributed share) | $769 | $0 (offloaded) | $769 |</p>
+<p class="text-gray-300 leading-relaxed">| Analytics target (Redshift Serverless / Athena) | $0 | $120 | −$120 |</p>
+<p class="text-gray-300 leading-relaxed">| S3 storage for analytics export | $0 | $12 | −$12 |</p>
+<p class="text-gray-300 leading-relaxed">| <strong class="text-white">Total</strong> | <strong class="text-white">$2,965</strong> | <strong class="text-white">$818</strong> | <strong class="text-white">$2,147</strong> |</p>
+
+<p class="text-gray-300 leading-relaxed">The annualized figure of roughly $25,700 in this example is the number that moves a project from "interesting idea" to "approved and scheduled." Present it with a 90-day implementation timeline and a named DBA responsible for each phase. Vague proposals die in committees; specific ones with owners get resourced.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Implementation Sequencing</h3>
+
+<p class="text-gray-300 leading-relaxed">Sequence the work to capture savings quickly while minimizing risk. Do not attempt a big-bang cutover.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 1–2</strong>: Run the classification queries and cost attribution script. Produce the financial exhibit. Identify the top five analytics queries by total execution time. Get buy-in.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 3–4</strong>: Provision the analytics target infrastructure (read replica, Redshift Serverless workspace, or Athena data lake). Run the daily export script. Validate that query results on the analytics target match the OLTP source within acceptable tolerance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 5–6</strong>: Redirect one non-critical BI tool or report to the analytics target. Monitor for latency regressions and data freshness complaints. Keep the OLTP route as fallback.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 7–8</strong>: Migrate remaining analytics workloads. Confirm with Performance Insights that analytics load on the primary has dropped. Request a Compute Optimizer recommendation pull.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 9–10</strong>: Resize the OLTP instance during a low-traffic maintenance window. For RDS, this is a Multi-AZ failover-based resize — downtime is typically under 60 seconds when done correctly. Verify application connection pool behavior post-resize.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 11–12</strong>: Purchase Reserved Instances for the new, smaller OLTP tier. Enable the workload drift monitor Lambda. Document the runbook.</p>
+
+<p class="text-gray-300 leading-relaxed">Each phase has a clear deliverable and a defined rollback path. The two-week cadence allows teams with normal sprint rhythms to absorb the work without dedicated project staffing.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart LR
+    A["Wk 1-2<br/>Classify + build<br/>financial case"] --> B["Wk 3-4<br/>Provision target,<br/>validate"]
+    B --> C["Wk 5-6<br/>Redirect one<br/>report, monitor"]
+    C --> D["Wk 7-8<br/>Migrate rest,<br/>confirm load drop"]
+    D --> E["Wk 9-10<br/>Resize OLTP<br/>instance"]
+    E --> F["Wk 11-12<br/>Buy RI, enable<br/>drift monitor"]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The 12-week phased rollout — each phase has a defined deliverable and rollback path before the next begins.*</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Mixed workloads are a billing multiplier.** Analytics queries running on OLTP infrastructure force you to pay row-store prices for column-store workloads. Measuring the split with `pg_stat_statements` or `sys.dm_exec_query_stats` is the necessary first step before any cost conversation.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The financial case has three compounding layers**: offloading analytics reduces attributed compute cost, lower sustained load allows an instance downsize, and a smaller instance purchases at a lower Reserved Instance tier. Each layer multiplies the previous saving.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Choose the analytics target by query pattern, not by vendor familiarity.** Near-real-time dashboards belong on a read replica. Batch aggregations over large historical data belong on a columnar MPP engine. Ad-hoc analyst queries against exported snapshots belong on Athena or BigQuery. Routing everything to a single alternative is a common mistake that recreates the original cost problem.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Separation without monitoring drifts back.** Workload classification alerts — whether a Lambda querying `pg_stat_statements` or a SQL Server Agent job writing to a log table — are the operational control that prevents analytics load from silently re-accumulating on the primary over subsequent release cycles.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Sequence implementation over 10–12 weeks with explicit rollback paths.** Instance resizes and RI purchases are irreversible commitments. Validate workload behavior at each phase before proceeding to the next, and keep the original routing available as fallback until query results and latency have been confirmed stable on the new target.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
