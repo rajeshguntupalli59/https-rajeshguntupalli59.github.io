@@ -5,6 +5,10 @@
   <title>Chapter 8: Reserved Instances vs Savings Plans vs On-Demand: The Math — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 8: Reserved Instances vs Savings Plans vs On-Demand: The Math. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -245,7 +249,859 @@ H &lt; 453 hours/month</code></pre>
 <p class="text-gray-300 leading-relaxed">Any instance running more than 453 hours per month (roughly 61% of the month) is cheaper under a 1-year RI. Most production databases run 720+ hours. The math is decisive.</p>
 
 <p class="text-gray-300 leading-relaxed">The Python script below automates this calculation across your entire fleet using AWS pricing data:</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+ri_break_even_calculator.py
+
+Calculates RI break-even points and projected annual savings across
+the RDS fleet by comparing actual On-Demand spend to RI pricing.
+Reads active instances from AWS and fetches pricing from the Pricing API.
+
+Requirements: boto3, pandas
+pip install boto3 pandas
+"""
+
+import boto3
+import json
+import pandas as pd
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
+
+# AWS pricing API is only available in us-east-1
+PRICING_CLIENT = boto3.client("pricing", region_name="us-east-1")
+CE_CLIENT      = boto3.client("ce",      region_name="us-east-1")
+RDS_CLIENT     = boto3.client("rds",     region_name="us-east-1")
+
+
+def get_rds_on_demand_price(
+    instance_class: str,
+    engine: str,
+    region: str = "US East (N. Virginia)",
+    multi_az: bool = False
+) -&gt; Optional[float]:
+    """
+    Fetch On-Demand hourly price for an RDS instance from the Pricing API.
+    Returns price in USD/hour or None if not found.
+    """
+    deployment = "Multi-AZ" if multi_az else "Single-AZ"
+
+    # Map engine short names to pricing API descriptions
+    engine_map = {
+        "postgres":  "PostgreSQL",
+        "mysql":     "MySQL",
+        "mariadb":   "MariaDB",
+        "oracle-se2": "Oracle (SE2)",
+        "sqlserver-se": "SQL Server (SE)",
+    }
+    engine_desc = engine_map.get(engine, engine)
+
+    filters = [
+        {"Type": "TERM_MATCH", "Field": "instanceType",       "Value": instance_class},
+        {"Type": "TERM_MATCH", "Field": "databaseEngine",     "Value": engine_desc},
+        {"Type": "TERM_MATCH", "Field": "location",           "Value": region},
+        {"Type": "TERM_MATCH", "Field": "deploymentOption",   "Value": deployment},
+    ]
+
+    try:
+        response = PRICING_CLIENT.get_products(
+            ServiceCode="AmazonRDS",
+            Filters=filters,
+            MaxResults=10
+        )
+    except Exception as e:
+        print(f"  [pricing API error] {instance_class}/{engine}: {e}")
+        return None
+
+    for price_item_str in response.get("PriceList", []):
+        price_item = json.loads(price_item_str)
+        terms = price_item.get("terms", {}).get("OnDemand", {})
+        for term in terms.values():
+            for dimension in term.get("priceDimensions", {}).values():
+                try:
+                    price = float(dimension["pricePerUnit"]["USD"])
+                    if price &gt; 0:
+                        return price
+                except (KeyError, ValueError):
+                    continue
+    return None
+
+
+def get_ri_pricing_estimates(
+    instance_class: str,
+    engine: str,
+    multi_az: bool = False
+) -&gt; Dict[str, float]:
+    """
+    Return hardcoded RI discount factors by term and payment option.
+    In production, replace with calls to describe-reserved-db-instances-offerings.
+    Discounts are representative of us-east-1 r6g/m6g families as of mid-2024.
+    """
+    # These are discount multipliers applied to On-Demand price
+    # to derive the effective RI hourly rate
+    return {
+        "1yr_no_upfront":  0.371,   # ~37% discount
+        "1yr_partial":     0.393,   # ~39% when accounting for partial upfront savings
+        "1yr_all_upfront": 0.410,   # ~41%
+        "3yr_no_upfront":  0.520,   # ~52%
+        "3yr_partial":     0.560,
+        "3yr_all_upfront": 0.600,   # ~60%
+    }
+
+
+def get_instance_monthly_hours_from_ce(
+    instance_class: str,
+    days_back: int = 90
+) -&gt; float:
+    """
+    Query Cost Explorer to get average monthly On-Demand hours for an instance class.
+    Uses UsageQuantity grouped by instance type over the last N days.
+    """
+    end   = datetime.utcnow().date()
+    start = end - timedelta(days=days_back)
+
+    try:
+        response = CE_CLIENT.get_cost_and_usage(
+            TimePeriod={
+                "Start": start.isoformat(),
+                "End":   end.isoformat()
+            },
+            Granularity="MONTHLY",
+            Filter={
+                "And": [
+                    {
+                        "Dimensions": {
+                            "Key":    "SERVICE",
+                            "Values": ["Amazon Relational Database Service"]
+                        }
+                    },
+                    {
+                        "Dimensions": {
+                            "Key":    "INSTANCE_TYPE",
+                            "Values": [instance_class]
+                        }
+                    },
+                    {
+                        "Dimensions": {
+                            "Key":    "PURCHASE_TYPE",
+                            "Values": ["On Demand"]
+                        }
+                    }
+                ]
+            },
+            GroupBy=[{"Type": "DIMENSION", "Key": "INSTANCE_TYPE"}],
+            Metrics=["UsageQuantity"]
+        )
+    except Exception as e:
+        print(f"  [CE error for {instance_class}]: {e}")
+        return 0.0
+
+    monthly_hours = []
+    for period in response.get("ResultsByTime", []):
+        for group in period.get("Groups", []):
+            try:
+                hours = float(group["Metrics"]["UsageQuantity"]["Amount"])
+                monthly_hours.append(hours)
+            except (KeyError, ValueError):
+                pass
+
+    return sum(monthly_hours) / len(monthly_hours) if monthly_hours else 0.0
+
+
+def analyze_fleet() -&gt; pd.DataFrame:
+    """
+    Pull all active RDS instances, fetch pricing, and compute
+    break-even and projected savings for each RI term.
+    """
+    paginator = RDS_CLIENT.get_paginator("describe_db_instances")
+    instances = []
+
+    for page in paginator.paginate():
+        for db in page["DBInstances"]:
+            if db["DBInstanceStatus"] != "available":
+                continue
+            instances.append({
+                "identifier":    db["DBInstanceIdentifier"],
+                "instance_class": db["DBInstanceClass"],
+                "engine":        db["Engine"],
+                "multi_az":      db["MultiAZ"],
+                "region":        RDS_CLIENT.meta.region_name,
+            })
+
+    records = []
+    for inst in instances:
+        ic      = inst["instance_class"]
+        engine  = inst["engine"]
+        multi   = inst["multi_az"]
+
+        on_demand_hourly = get_rds_on_demand_price(ic, engine, multi_az=multi)
+        if not on_demand_hourly:
+            print(f"  Skipping {inst['identifier']}: could not fetch On-Demand price")
+            continue
+
+        monthly_hours    = get_instance_monthly_hours_from_ce(ic) or 720.0
+        on_demand_monthly = on_demand_hourly * monthly_hours
+
+        discounts = get_ri_pricing_estimates(ic, engine, multi)
+
+        for term_key, discount_pct in discounts.items():
+            ri_effective_hourly  = on_demand_hourly * (1 - discount_pct)
+            ri_monthly_effective = ri_effective_hourly * 720   # normalize to full month
+
+            # Hours below which On-Demand is cheaper than the RI commitment
+            if (on_demand_hourly - ri_effective_hourly) &gt; 0:
+                break_even_hours = ri_monthly_effective / (
+                    on_demand_hourly - ri_effective_hourly
+                )
+            else:
+                break_even_hours = 0.0
+
+            monthly_savings  = on_demand_monthly - ri_monthly_effective
+            annual_savings   = monthly_savings * 12
+
+            records.append({
+                "identifier":         inst["identifier"],
+                "instance_class":     ic,
+                "engine":             engine,
+                "multi_az":           multi,
+                "avg_monthly_hours":  round(monthly_hours, 1),
+                "on_demand_hourly":   round(on_demand_hourly, 4),
+                "on_demand_monthly":  round(on_demand_monthly, 2),
+                "ri_term":            term_key,
+                "ri_effective_hourly": round(ri_effective_hourly, 4),
+                "ri_monthly_cost":    round(ri_monthly_effective, 2),
+                "break_even_hours":   round(break_even_hours, 1),
+                "monthly_savings":    round(monthly_savings, 2),
+                "annual_savings":     round(annual_savings, 2),
+                "discount_pct":       f"{discount_pct*100:.0f}%",
+            })
+
+    df = pd.DataFrame(records)
+    return df
+
+
+def print_summary(df: pd.DataFrame) -&gt; None:
+    """Print a ranked savings report for the 1-year No Upfront term."""
+    if df.empty:
+        print("No data to display. Check IAM permissions and Cost Explorer setup.")
+        return
+
+    one_yr = df[df["ri_term"] == "1yr_no_upfront"].copy()
+    one_yr = one_yr[one_yr["avg_monthly_hours"] &gt; 450]  # Only qualify persistent instances
+    one_yr = one_yr.sort_values("annual_savings", ascending=False)
+
+    total_annual_opportunity = one_yr["annual_savings"].sum()
+    print("\n" + "="*80)
+    print("RDS Reserved Instance Opportunity Report — 1-Year No Upfront")
+    print(f"Generated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+    print("="*80)
+    print(f"\n  Total Annual Savings Opportunity: ${total_annual_opportunity:,.2f}")
+    print(f"  Instances qualifying (&gt;450 hrs/mo On-Demand): {len(one_yr)}\n")
+
+    cols = ["identifier","instance_class","engine",
+            "on_demand_monthly","ri_monthly_cost","monthly_savings","annual_savings","discount_pct"]
+    print(one_yr[cols].to_string(index=False))
+    print("\n")
+
+    # Also show 3-year comparison for top 5
+    top_ids = one_yr["identifier"].head(5).tolist()
+    three_yr = df[
+        (df["ri_term"] == "3yr_all_upfront") &
+        (df["identifier"].isin(top_ids))
+    ].sort_values("annual_savings", ascending=False)
+
+    if not three_yr.empty:
+        print("Top 5 Instances — 3-Year All Upfront Comparison:")
+        print(three_yr[cols].to_string(index=False))
+
+
+if __name__ == "__main__":
+    print("Fetching RDS fleet and pricing data...")
+    df = analyze_fleet()
+    print_summary(df)
+
+    # Export full results to CSV for spreadsheet review or Jira attachment
+    output_file = f"ri_analysis_{datetime.utcnow().strftime('%Y%m%d')}.csv"
+    df.to_csv(output_file, index=False)
+    print(f"\nFull results exported to: {output_file}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Run this script with an IAM role that has <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds:DescribeDBInstances</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ce:GetCostAndUsage</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pricing:GetProducts</code> permissions. The output ranks every On-Demand instance in your fleet by annual savings opportunity and flags the ones where a 3-year commitment materially outperforms the 1-year option.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.4 Matching Commitment Models to Workload Archetypes</h3>
+
+<p class="text-gray-300 leading-relaxed">Not every database is a good RI candidate. The analysis becomes more nuanced when you segment your fleet by workload behavior. Five archetypes cover the vast majority of real-world cases.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph TD
+    A[Classify instance] --> B{Dev/staging?}
+    B -->|Yes| C[Archetype 4: No RI\nuse start/stop scheduling]
+    B -->|No| D{Migration/upgrade\nwithin 6 months?}
+    D -->|Yes| E[Archetype 5: No RI]
+    D -->|No| F{Seasonal or\nbursty load?}
+    F -->|Yes| G[Archetype 3: On-Demand\nor Serverless for peaks]
+    F -->|No| H{Stable 12+ months,\nno planned sunset?}
+    H -->|Yes| I[Archetype 1: Evergreen\n3-year All Upfront RI]
+    H -->|No| J[Archetype 2: Growing\n1-year No Upfront RI]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Five workload archetypes and their recommended commitment strategy — utilization alone is not enough to decide.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Archetype 1: Evergreen Production Databases</strong></p>
+
+<p class="text-gray-300 leading-relaxed">These instances have run continuously for more than 12 months, host a critical application, and have no planned migration or sunset in the next 18 months. Examples include the primary PostgreSQL cluster for an e-commerce platform, the reporting MySQL replica, or the SQL Server database backing an internal ERP system.</p>
+
+<p class="text-gray-300 leading-relaxed">Recommendation: 3-year All Upfront RI (AWS), 3-year Reserved Capacity (Azure), 3-year CUD (GCP). The discount is maximized and the risk of waste is minimal because the workload is stable and long-lived. The All Upfront payment requires cash outlay but eliminates hourly billing entirely for the reserved portion — on a fleet of 20 instances this often justifies a conversation with finance about prepaying from the capital budget rather than treating it as operating expense.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Archetype 2: Growing Workloads with Predictable Trajectory</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The database exists today and is growing at a known rate. You added two <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">db.r6g.2xlarge</code> instances this quarter and expect to add two more next quarter.</p>
+
+<p class="text-gray-300 leading-relaxed">Recommendation: 1-year No Upfront RI for current instances. Do not try to pre-buy RIs for instances that do not yet exist — the instance type you need in six months may differ from what you need today. Review and renew annually. Use Convertible RIs if you anticipate instance family changes as the workload matures.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Archetype 3: Seasonal or Burst Workloads</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Tax preparation software, seasonal retail platforms, and quarterly analytics workloads that run heavily for 2–4 months and lightly for the remainder of the year. A database that runs at full capacity in November and December and at 20% capacity the rest of the year will not benefit from an RI sized for peak capacity.</p>
+
+<p class="text-gray-300 leading-relaxed">Recommendation: No RI for instances provisioned exclusively for seasonal peaks. Use On-Demand or RDS Serverless v2 (with Aurora) for burst capacity. If you have a minimum always-on fleet (even a smaller instance that handles off-season traffic), RI that minimum fleet and handle peaks with On-Demand.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Archetype 4: Development and Staging</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Dev/staging databases are frequently resized, cloned, snapshotted, and terminated as engineers iterate. They are also frequently left running when they should be stopped — which is a separate problem addressed in Chapter 11.</p>
+
+<p class="text-gray-300 leading-relaxed">Recommendation: No RI. Dev/staging instances are candidates for automated start/stop scheduling (saving 65–70% compared to always-on) rather than RI commitments. An RI on a dev database that gets replaced with a different instance type next sprint is pure waste.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Archetype 5: Instances Scheduled for Migration or Upgrade</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If you have a MySQL 5.7 database targeted for migration to Aurora MySQL 3.x in the next six months, buying a 1-year RI for the source instance may overlap with the migration window, leaving you with a committed RI for an instance you no longer run.</p>
+
+<p class="text-gray-300 leading-relaxed">Recommendation: No new RI purchases within 6 months of a confirmed migration. If the migration slips past 6 months (as they often do), revisit the RI purchase at that point.</p>
+
+<p class="text-gray-300 leading-relaxed">The SQL queries below help classify your RDS instances into these archetypes by age and stability:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Query pg_stat_activity and age-related catalog info
+-- to identify long-running databases that are strong RI candidates
+-- (Run against your RDS inventory tracking database, not the application DB)
+
+-- Assuming you maintain an rds_inventory table populated by your discovery tooling:
+-- CREATE TABLE rds_inventory (
+--   instance_id        TEXT PRIMARY KEY,
+--   instance_class     TEXT,
+--   engine             TEXT,
+--   multi_az           BOOLEAN,
+--   creation_date      DATE,
+--   environment        TEXT,   -- 'production','staging','development','analytics'
+--   planned_migration  DATE,   -- NULL if no migration planned
+--   avg_monthly_hours  NUMERIC,
+--   monthly_od_cost    NUMERIC,
+--   last_updated       TIMESTAMPTZ DEFAULT NOW()
+-- );
+
+SELECT
+    i.instance_id,
+    i.instance_class,
+    i.engine,
+    i.environment,
+    i.creation_date,
+    DATE_PART('day', NOW() - i.creation_date::TIMESTAMPTZ) / 30.0  AS age_months,
+    i.avg_monthly_hours,
+    i.monthly_od_cost,
+    CASE
+        WHEN i.environment IN ('development','staging')
+            THEN 'Archetype 4: Dev/Staging — No RI'
+        WHEN i.planned_migration IS NOT NULL
+             AND i.planned_migration &lt;= CURRENT_DATE + INTERVAL '6 months'
+            THEN 'Archetype 5: Pending Migration — No RI'
+        WHEN i.avg_monthly_hours &gt;= 700
+             AND DATE_PART('day', NOW() - i.creation_date::TIMESTAMPTZ) &gt;= 365
+            THEN 'Archetype 1: Evergreen — 3yr RI recommended'
+        WHEN i.avg_monthly_hours &gt;= 450
+             AND DATE_PART('day', NOW() - i.creation_date::TIMESTAMPTZ) &gt;= 90
+            THEN 'Archetype 2: Growing — 1yr RI recommended'
+        WHEN i.avg_monthly_hours &lt; 450
+            THEN 'Archetype 3: Seasonal/Burst — On-Demand'
+        ELSE 'Unclassified — Manual review required'
+    END                                                             AS ri_recommendation,
+    ROUND(i.monthly_od_cost * 0.371 * 12, 2)                       AS est_1yr_annual_savings,
+    ROUND(i.monthly_od_cost * 0.600 * 12, 2)                       AS est_3yr_annual_savings
+FROM
+    rds_inventory i
+WHERE
+    i.last_updated &gt;= NOW() - INTERVAL '7 days'
+ORDER BY
+    i.monthly_od_cost DESC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent using a comparable inventory table
+-- (SQL Server Management Studio or Azure Data Studio)
+
+-- Assuming equivalent table: dbo.rds_inventory
+SELECT
+    i.instance_id,
+    i.instance_class,
+    i.engine,
+    i.environment,
+    i.creation_date,
+    DATEDIFF(DAY, i.creation_date, GETUTCDATE()) / 30.0            AS age_months,
+    i.avg_monthly_hours,
+    i.monthly_od_cost,
+    CASE
+        WHEN i.environment IN ('development', 'staging')
+            THEN 'Archetype 4: Dev/Staging — No RI'
+        WHEN i.planned_migration IS NOT NULL
+             AND i.planned_migration &lt;= DATEADD(MONTH, 6, GETUTCDATE())
+            THEN 'Archetype 5: Pending Migration — No RI'
+        WHEN i.avg_monthly_hours &gt;= 700
+             AND DATEDIFF(DAY, i.creation_date, GETUTCDATE()) &gt;= 365
+            THEN 'Archetype 1: Evergreen — 3yr RI recommended'
+        WHEN i.avg_monthly_hours &gt;= 450
+             AND DATEDIFF(DAY, i.creation_date, GETUTCDATE()) &gt;= 90
+            THEN 'Archetype 2: Growing — 1yr RI recommended'
+        WHEN i.avg_monthly_hours &lt; 450
+            THEN 'Archetype 3: Seasonal/Burst — On-Demand'
+        ELSE 'Unclassified — Manual review required'
+    END                                                             AS ri_recommendation,
+    ROUND(i.monthly_od_cost * 0.371 * 12, 2)                       AS est_1yr_annual_savings,
+    ROUND(i.monthly_od_cost * 0.600 * 12, 2)                       AS est_3yr_annual_savings
+FROM
+    dbo.rds_inventory i
+WHERE
+    i.last_updated &gt;= DATEADD(DAY, -7, GETUTCDATE())
+ORDER BY
+    i.monthly_od_cost DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.5 AWS Compute Savings Plans and Their Database Relevance</h3>
+
+<p class="text-gray-300 leading-relaxed">Compute Savings Plans deserve specific treatment because the overlap with database workloads is frequently misunderstood, leading teams either to miss legitimate savings or to assume coverage that does not exist.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">What Compute Savings Plans cover:</strong> EC2 instances, Fargate, and Lambda compute charges. They do not cover RDS provisioned instances. If you are running a fleet of EC2-based self-managed PostgreSQL or SQL Server instances, Compute Savings Plans apply directly. If you migrated those workloads to RDS, the Savings Plan provides no coverage for RDS charges.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The Aurora Serverless v2 exception:</strong> Aurora Serverless v2 charges are based on Aurora Capacity Units (ACUs) per second. These charges fall under the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AmazonRDS</code> service in Cost Explorer and are not covered by Compute Savings Plans either. Aurora Serverless v2 does have its own Reserved Capacity offering under standard RDS RI terms when you provision the minimum capacity units — but many teams running pure serverless Aurora workloads skip this analysis entirely.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The practical implication:</strong> If your organization has a large EC2 Savings Plan commitment and you are evaluating a lift-and-shift of self-managed databases to RDS, be aware that moving to RDS will reduce your Savings Plan utilization. The EC2 Savings Plan dollar commitment you made does not transfer to RDS compute. Factor this into the migration cost model: the savings from eliminating self-managed overhead and improving availability may still outweigh the lost Savings Plan discount, but the math needs to be explicit.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">When Savings Plans do apply to your database budget:</strong> Many FinOps teams manage compute and database budgets together. If your application servers (EC2 or Fargate) run in front of RDS, Savings Plans covering those tiers still reduce total application infrastructure cost. The database RI and the application Savings Plan are complementary, not competing — budget them separately with separate coverage targets.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.6 Azure Reserved Capacity: Subscription Sharing and Scope Management</h3>
+
+<p class="text-gray-300 leading-relaxed">Azure Reserved Capacity for SQL introduces a scoping dimension that AWS RIs do not have in the same way: reservations can be scoped to a single subscription, a resource group, or shared across all subscriptions in a billing account (Management Group).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Single-subscription scope</strong> is the default. The reservation applies only to matching resources within the subscription where it was purchased. This is safe and easy to reason about but limits flexibility if your SQL workloads span multiple subscriptions (which is common in enterprise Azure architectures with separate subscriptions for production, staging, and development environments).</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Shared scope</strong> allows the reservation to apply to any matching vCore usage across all subscriptions associated with the billing account. This is generally the better choice for organizations with stable multi-subscription architectures, because it maximizes utilization — if one subscription underuses its allocation, another can absorb the discount. The risk is visibility: teams managing individual subscriptions may not see why their costs look lower than expected, complicating internal chargeback.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Management group scope</strong> (available in some Azure enrollment types) allows finer-grained scoping between single-subscription and full-account sharing.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Azure CLI sequence demonstrates how to check current reservation scope and modify it:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># List all reservations and their current scope
+az reservations reservation list-all \
+  --output table \
+  --query "[?contains(properties.reservedResourceType,'SqlDatabases') ||
+            contains(properties.reservedResourceType,'SqlManagedInstances')].{
+    Name:name,
+    ResourceType:properties.reservedResourceType,
+    Scope:properties.appliedScopeType,
+    AppliedScopes:properties.appliedScopes,
+    Quantity:properties.quantity,
+    ExpiryDate:properties.expiryDate,
+    UtilizationPct:properties.utilizationAggregates[0].value
+  }"
+
+# Update a reservation to shared scope (apply across all subscriptions)
+# Replace &lt;reservation-order-id&gt; and &lt;reservation-id&gt; with actual values
+az reservations reservation update \
+  --reservation-order-id &lt;reservation-order-id&gt; \
+  --reservation-id &lt;reservation-id&gt; \
+  --applied-scope-type Shared</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Hybrid Benefit layering:</strong> Azure Reserved Capacity discounts stack with Azure Hybrid Benefit (AHB), which allows you to apply existing on-premises SQL Server licenses with Software Assurance to Azure SQL, reducing the license component of your Azure SQL cost. The interaction is:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Reserved Capacity discounts the compute (vCore) cost</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Azure Hybrid Benefit eliminates the SQL Server license cost on top of that</li>
+
+<p class="text-gray-300 leading-relaxed">Using both together on a Business Critical tier SQL Managed Instance can reduce total costs by 55–80% compared to pay-as-you-go with included license, depending on the vCore count and term. This combination is one of the strongest cost arguments for organizations with significant on-premises SQL Server License Mobility agreements migrating workloads to Azure SQL Managed Instance.</p>
+
+<p class="text-gray-300 leading-relaxed">The calculation:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>Pay-as-you-go with license (8 vCore Business Critical): ~$11.78/hr
+After AHB (bring own license):                          ~$5.15/hr  (~56% reduction)
+After AHB + 3yr Reserved Capacity:                      ~$2.32/hr  (~80% total reduction)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">These rates are representative and vary by region and current Azure pricing — always validate against the Azure Pricing Calculator with your specific configuration before committing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.7 Google Cloud CUDs: Resource-Based vs. Spend-Based</h3>
+
+<p class="text-gray-300 leading-relaxed">GCP's Committed Use Discounts for Cloud SQL come in two forms, and choosing between them has meaningful implications for how rigidly you need to forecast.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Resource-based CUDs</strong> commit to a specific quantity of vCPU and memory (in GB) for 1 or 3 years. You receive a discount on that resource quantity regardless of which Cloud SQL instance consumes it, as long as it falls within the committed region. If you commit to 16 vCPUs and 128 GB of RAM in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">us-central1</code>, any combination of Cloud SQL instances in that region consuming up to that capacity receives the committed price. This is more flexible than AWS standard RIs at the instance type level, since you are not locked to a specific machine type.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Spend-based CUDs</strong> (available for certain services including Cloud SQL in some configurations) commit to spending a minimum dollar amount per hour. They offer slightly lower discounts than resource-based CUDs but require no capacity planning — you simply commit to a spend floor.</p>
+
+<p class="text-gray-300 leading-relaxed">For most teams with predictable Cloud SQL workloads, resource-based CUDs are the better value. The following BigQuery query models the CUD opportunity from your billing export:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- GCP BigQuery: Estimate CUD savings opportunity for Cloud SQL
+-- Compares current On-Demand spend against modeled CUD rates
+-- Adjust discount_1yr and discount_3yr based on current GCP pricing for your region
+
+WITH cloud_sql_spend AS (
+  SELECT
+    DATE_TRUNC(usage_start_time, MONTH)                          AS billing_month,
+    project.id                                                   AS project_id,
+    resource.name                                                AS instance_name,
+    sku.description                                              AS sku_description,
+    SUM(usage.amount)                                            AS total_vcpu_hours,
+    SUM(cost)                                                    AS total_cost_usd
+  FROM
+    `your-project.your_dataset.gcp_billing_export_v1_XXXXXX`
+  WHERE
+    service.description = 'Cloud SQL'
+    AND LOWER(sku.description) NOT LIKE '%commit%'
+    AND LOWER(sku.description) NOT LIKE '%storage%'
+    AND LOWER(sku.description) NOT LIKE '%network%'
+    AND LOWER(sku.description) NOT LIKE '%ip%'
+    AND DATE(usage_start_time) &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 90 DAY)
+    AND cost &gt; 0
+  GROUP BY 1, 2, 3, 4
+),
+monthly_avg AS (
+  SELECT
+    project_id,
+    instance_name,
+    AVG(total_cost_usd)                                          AS avg_monthly_od_cost
+  FROM cloud_sql_spend
+  GROUP BY 1, 2
+)
+SELECT
+  m.project_id,
+  m.instance_name,
+  ROUND(m.avg_monthly_od_cost, 2)                               AS avg_monthly_on_demand_usd,
+  ROUND(m.avg_monthly_od_cost * (1 - 0.30), 2)                 AS modeled_1yr_cud_monthly,
+  ROUND(m.avg_monthly_od_cost * (1 - 0.46), 2)                 AS modeled_3yr_cud_monthly,
+  ROUND(m.avg_monthly_od_cost * 0.30 * 12, 2)                  AS est_1yr_annual_savings,
+  ROUND(m.avg_monthly_od_cost * 0.46 * 12, 2)                  AS est_3yr_annual_savings,
+  ROUND(m.avg_monthly_od_cost * 0.46 * 36, 2)                  AS est_3yr_total_savings
+FROM
+  monthly_avg m
+WHERE
+  m.avg_monthly_od_cost &gt; 50   -- Filter out negligible instances
+ORDER BY
+  est_3yr_annual_savings DESC
+LIMIT 50;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.8 Building an Automated RI Renewal and Coverage Monitor</h3>
+
+<p class="text-gray-300 leading-relaxed">Purchasing RIs is a one-time decision that decays. Instances get resized, engines get upgraded, new On-Demand instances appear while RI commitments sit idle. The only way to stay optimized is to monitor coverage continuously and trigger reviews before RIs expire.</p>
+
+<p class="text-gray-300 leading-relaxed">The following Lambda function (deployable as a scheduled CloudWatch Events rule) monitors RDS RI coverage weekly and posts a Slack notification when coverage drops below a configurable threshold or when RIs are within 60 days of expiry:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+ri_coverage_monitor.py
+
+AWS Lambda function that monitors RDS RI coverage and expiry.
+Deploy with a CloudWatch Events schedule (e.g., cron(0 9 ? * MON *))
+to run every Monday morning.
+
+Environment variables:
+  SLACK_WEBHOOK_URL     - Slack incoming webhook URL
+  COVERAGE_THRESHOLD    - Minimum acceptable coverage % (default: 80)
+  EXPIRY_ALERT_DAYS     - Days before expiry to alert (default: 60)
+  AWS_REGION_TARGET     - Region to analyze (default: us-east-1)
+"""
+
+import boto3
+import json
+import os
+import urllib.request
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any
+
+
+SLACK_WEBHOOK   = os.environ.get("SLACK_WEBHOOK_URL", "")
+THRESHOLD       = float(os.environ.get("COVERAGE_THRESHOLD", "80"))
+EXPIRY_DAYS     = int(os.environ.get("EXPIRY_ALERT_DAYS", "60"))
+TARGET_REGION   = os.environ.get("AWS_REGION_TARGET", "us-east-1")
+
+rds = boto3.client("rds",  region_name=TARGET_REGION)
+ce  = boto3.client("ce",   region_name="us-east-1")
+
+
+def get_active_ris() -&gt; List[Dict[str, Any]]:
+    """Return all active RDS Reserved Instances."""
+    response = rds.describe_reserved_db_instances(Filters=[
+        {"Name": "state", "Values": ["active"]}
+    ])
+    return response.get("ReservedDBInstances", [])
+
+
+def get_expiring_ris(ris: List[Dict], days: int) -&gt; List[Dict]:
+    """Return RIs expiring within `days` days."""
+    cutoff = datetime.now(timezone.utc) + timedelta(days=days)
+    expiring = []
+    for ri in ris:
+        start    = ri["StartTime"]
+        duration = ri["Duration"]            # seconds
+        expiry   = start + timedelta(seconds=duration)
+        if expiry &lt;= cutoff:
+            expiring.append({
+                "id":           ri["ReservedDBInstanceId"],
+                "class":        ri["DBInstanceClass"],
+                "engine":       ri["ProductDescription"],
+                "count":        ri["DBInstanceCount"],
+                "expiry":       expiry.strftime("%Y-%m-%d"),
+                "days_left":    (expiry - datetime.now(timezone.utc)).days,
+            })
+    return expiring
+
+
+def get_coverage_percentage() -&gt; Dict[str, float]:
+    """Query Cost Explorer for RI coverage over the last 30 days."""
+    end   = datetime.utcnow().date()
+    start = end - timedelta(days=30)
+
+    response = ce.get_reservation_coverage(
+        TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+        Granularity="MONTHLY",
+        Filter={
+            "Dimensions": {
+                "Key":    "SERVICE",
+                "Values": ["Amazon Relational Database Service"]
+            }
+        }
+    )
+
+    coverage_data = {}
+    for period in response.get("CoveragesByTime", []):
+        period_start = period["TimePeriod"]["Start"]
+        coverage     = period.get("Total", {}).get("CoverageHours", {})
+        try:
+            pct = float(coverage.get("CoverageHoursPercentage", 0))
+        except (ValueError, TypeError):
+            pct = 0.0
+        coverage_data[period_start] = pct
+
+    return coverage_data
+
+
+def get_utilization_percentage() -&gt; Dict[str, Dict]:
+    """Query Cost Explorer for RI utilization over the last 30 days."""
+    end   = datetime.utcnow().date()
+    start = end - timedelta(days=30)
+
+    response = ce.get_reservation_utilization(
+        TimePeriod={"Start": start.isoformat(), "End": end.isoformat()},
+        Granularity="MONTHLY",
+        Filter={
+            "Dimensions": {
+                "Key":    "SERVICE",
+                "Values": ["Amazon Relational Database Service"]
+            }
+        }
+    )
+
+    util_data = {}
+    for period in response.get("UtilizationsByTime", []):
+        period_start = period["TimePeriod"]["Start"]
+        total        = period.get("Total", {})
+        util_data[period_start] = {
+            "utilization_pct":    total.get("UtilizationPercentage", "0"),
+            "used_hours":         total.get("UsedHours", "0"),
+            "unused_hours":       total.get("UnusedHours", "0"),
+            "realized_savings":   total.get("RealizedSavings", {}).get("Amount", "0"),
+            "unrealized_savings": total.get("UnrealizedSavings", {}).get("Amount", "0"),
+        }
+    return util_data
+
+
+def build_slack_message(
+    coverage:  Dict[str, float],
+    utilization: Dict[str, Dict],
+    expiring:  List[Dict],
+) -&gt; Dict:
+    """Construct a Slack Block Kit message with the monitoring summary."""
+    now_str  = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    blocks   = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f":bar_chart: RDS RI Coverage Report — {now_str}"
+            }
+        },
+        {"type": "divider"}
+    ]
+
+    # Coverage section
+    coverage_lines = []
+    alerts = []
+    for period, pct in sorted(coverage.items()):
+        icon = ":white_check_mark:" if pct &gt;= THRESHOLD else ":red_circle:"
+        coverage_lines.append(f"{icon}  {period}:  *{pct:.1f}%* RI coverage")
+        if pct &lt; THRESHOLD:
+            alerts.append(f"Coverage {pct:.1f}% is below threshold ({THRESHOLD:.0f}%)")
+
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "*RI Coverage (last 30 days)*\n" + "\n".join(coverage_lines)
+        }
+    })
+
+    # Utilization section
+    util_lines = []
+    for period, data in sorted(utilization.items()):
+        util_pct   = float(data["utilization_pct"])
+        icon       = ":white_check_mark:" if util_pct &gt;= 80 else ":warning:"
+        real_sav   = float(data["realized_savings"])
+        unreal_sav = float(data["unrealized_savings"])
+        util_lines.append(
+            f"{icon}  {period}:  *{util_pct:.1f}%* utilized  |  "
+            f"Realized: ${real_sav:,.0f}  |  Unrealized (waste): ${unreal_sav:,.0f}"
+        )
+        if util_pct &lt; 60:
+            alerts.append(
+                f"Utilization {util_pct:.1f}% for {period} — "
+                f"${unreal_sav:,.0f} in committed but unused capacity"
+            )
+
+    blocks.append({
+        "type": "section",
+        "text": {
+            "type": "mrkdwn",
+            "text": "*RI Utilization (last 30 days)*\n" + "\n".join(util_lines)
+        }
+    })
+
+    # Expiring RIs section
+    if expiring:
+        expiry_lines = []
+        for ri in sorted(expiring, key=lambda x: x["days_left"]):
+            icon = ":rotating_light:" if ri["days_left"] &lt;= 30 else ":warning:"
+            expiry_lines.append(
+                f"{icon}  `{ri['id']}`  {ri['class']} ({ri['engine']})  "
+                f"x{ri['count']}  —  expires *{ri['expiry']}*  "
+                f"({ri['days_left']} days)"
+            )
+            if ri["days_left"] &lt;= 30:
+                alerts.append(
+                    f"RI {ri['id']} ({ri['class']}) expires in {ri['days_left']} days — "
+                    "renewal decision needed immediately"
+                )
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Expiring within {EXPIRY_DAYS} days*\n" + "\n".join(expiry_lines)
+            }
+        })
+    else:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f":white_check_mark:  *No RIs expiring within {EXPIRY_DAYS} days*"
+            }
+        })
+
+    # Alerts summary
+    if alerts:
+        alert_text = "*:rotating_light: Action Required*\n" + \
+                     "\n".join(f"• {a}" for a in alerts)
+        blocks.append({"type": "divider"})
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": alert_text}
+        })
+
+    return {"blocks": blocks}
+
+
+def post_to_slack(message: Dict) -&gt; None:
+    """Post message to Slack via incoming webhook."""
+    if not SLACK_WEBHOOK:
+        print("SLACK_WEBHOOK_URL not set — printing message to stdout")
+        print(json.dumps(message, indent=2))
+        return
+
+    payload = json.dumps(message).encode("utf-8")
+    req = urllib.request.Request(
+        SLACK_WEBHOOK,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            print(f"Slack response: {resp.status}")
+    except Exception as e:
+        print(f"Slack post failed: {e}")
+
+
+def lambda_handler(event, context):
+    """Lambda entry point."""
+    print(f"Starting RDS RI coverage monitor for region: {TARGET_REGION}")
+
+    active_ris   = get_active_ris()
+    expiring     = get_expiring_ris(active_ris, EXPIRY_DAYS)
+    coverage     = get_coverage_percentage()
+    utilization  = get_utilization_percentage()
+
+    message = build_slack_message(coverage, utilization, expiring)
+    post_to_slack(message)
+
+    return {
+        "statusCode": 200,
+        "active_ri_count":   len(active_ris),
+        "expiring_ri_count": len(expiring),
+        "coverage_periods":  len(coverage),
+    }
+
+
+# Allow local testing
+if __name__ == "__main__":
+    lambda_handler({}, None)</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Deploy this function with a weekly CloudWatch Events schedule. The IAM role requires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">rds:DescribeReservedDBInstances</code>, <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ce:GetReservationCoverage</code>, and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ce:GetReservationUtilization</code>. The Slack webhook is stored in Systems Manager Parameter Store and injected as an environment variable at deploy time — never hardcoded.</p>
+
+<p class="text-gray-300 leading-relaxed">The alert logic fires when:</p>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> RI coverage drops below the configured threshold (default 80%)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> RI utilization drops below 60% (indicating committed but unused capacity)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Any RI is within 60 days of expiry (default) or 30 days (critical alert)</li>
+
+<p class="text-gray-300 leading-relaxed">Teams that deploy this monitor and respond to its alerts typically maintain coverage above 85% and eliminate the low-utilization waste that accumulates silently in unmonitored RI portfolios.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">8.9 Making the Purchase Decision: A Structured Process</h3>
+
+<p class="text-gray-300 leading-relaxed">The math in this chapter is only as useful as the process it feeds. Without a structured review cycle, RI purchases happen reactively — someone notices a large bill, buys an RI in a hurry, and the portfolio drifts into misalignment again within a year. The following cadence works for most engineering and FinOps teams:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Monthly (15 minutes):</strong> Run the coverage monitor output, verify utilization is above threshold, check for any new significant On-Demand spend that has appeared in the fleet. No purchase decisions at this stage — just anomaly detection.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Quarterly (2–3 hours):</strong> Run the full break-even analysis against the current fleet. Identify instances that have now passed 90 days of continuous On-Demand operation and qualify for Archetype 2 treatment. Identify any Archetype 1 instances approaching RI expiry. Prepare a purchase recommendation memo with projected savings and risk factors for each candidate. Get approval and execute purchases.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Annual (half-day):</strong> Full portfolio review. Map every active RI to the instance it is covering. Identify orphaned RIs (commitments with no matching instance). Review Convertible RI exchange opportunities. Model the coming year's fleet growth and whether to shift any Archetype 2 instances to Archetype 1 (3-year) treatment. Validate that Azure reservation scoping is still appropriate as subscription structures may have changed.</p>
+
+<p class="text-gray-300 leading-relaxed">The purchase recommendation memo does not need to be long. A one-page table with columns for instance ID, current monthly On-Demand cost, recommended RI term, projected monthly cost under RI, annual savings, and the expiry date of the existing RI if applicable is sufficient for engineering leads and finance to review and approve in a single meeting.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **On-Demand is appropriate for fewer workloads than most teams assume.** Any database instance running more than roughly 60% of the hours in a month is mathematically cheaper under a 1-year No Upfront RI, and most production databases run at or near 100% uptime.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Workload archetype determines commitment strategy, not just utilization.** Evergreen production databases warrant 3-year All Upfront commitments for maximum savings; dev/staging instances and pending migrations should remain On-Demand regardless of how many hours they run.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **RI portfolios decay without active management.** Instance resizes, engine changes, and workload terminations silently erode utilization. Automated weekly coverage monitoring with expiry alerts is the minimum viable governance layerfor an RI program.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Azure Reserved Capacity and Azure Hybrid Benefit stack multiplicatively.** Organizations with existing on-premises SQL Server licenses can achieve cost reductions that significantly exceed what either mechanism provides independently — always model both together when evaluating Azure SQL migrations.</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Google Cloud CUDs offer more flexibility than AWS standard RIs** because they commit to vCPU and memory resources rather than specific instance types, reducing the risk that a machine type change leaves you with an orphaned commitment.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
