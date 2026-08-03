@@ -5,6 +5,10 @@
   <title>Chapter 24: Per-Team, Per-App, Per-Feature Cost Reporting — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 24: Per-Team, Per-App, Per-Feature Cost Reporting. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -476,7 +480,1135 @@ JOIN inventory i ON p.product_id = i.product_id
 WHERE p.product_id = ANY($1);</code></pre>
 
 <p class="text-gray-300 leading-relaxed">With that convention in place, extract per-feature query costs from PostgreSQL:</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Per-feature query cost attribution using pg_stat_statements
+-- Run on the PostgreSQL instance (works on RDS, Aurora, Cloud SQL, Azure Flexible Server)
+-- Requires pg_stat_statements to be enabled in shared_preload_libraries
+
+-- Step 1: Extract query metadata and compute a cost proxy score
+-- Cost proxy = (total_exec_time * calls) weighted by shared_blks_hit and shared_blks_read
+-- This is not a dollar amount but a relative CPU/IO weight useful for attribution
+
+WITH parsed_queries AS (
+    SELECT
+        queryid,
+        query,
+        calls,
+        total_exec_time,
+        mean_exec_time,
+        rows,
+        shared_blks_hit,
+        shared_blks_read,
+        shared_blks_written,
+        local_blks_read,
+        temp_blks_written,
+        -- Extract team from comment pattern /* team:X */
+        COALESCE(
+            (regexp_match(query, '/\*[^*]*team:(\S+)[^*]*\*/'))[1],
+            'untagged'
+        ) AS team,
+        -- Extract app from comment pattern /* app:X */
+        COALESCE(
+            (regexp_match(query, '/\*[^*]*app:(\S+)[^*]*\*/'))[1],
+            'untagged'
+        ) AS app,
+        -- Extract feature from comment pattern /* feature:X */
+        COALESCE(
+            (regexp_match(query, '/\*[^*]*feature:(\S+)[^*]*\*/'))[1],
+            'untagged'
+        ) AS feature,
+        -- Compute a cost proxy: CPU time + IO weight
+        -- Tune the IO multiplier based on your storage tier cost ratio
+        (total_exec_time + (shared_blks_read * 8.0)) AS cost_proxy
+    FROM pg_stat_statements
+    WHERE query NOT LIKE '%pg_stat%'  -- exclude meta-queries
+),
+totals AS (
+    SELECT SUM(cost_proxy) AS total_cost_proxy FROM parsed_queries
+),
+team_attribution AS (
+    SELECT
+        team,
+        app,
+        feature,
+        COUNT(*) AS distinct_query_count,
+        SUM(calls) AS total_calls,
+        ROUND(SUM(total_exec_time)::numeric / 1000, 2) AS total_exec_seconds,
+        ROUND(AVG(mean_exec_time)::numeric, 2) AS avg_exec_ms,
+        SUM(shared_blks_read) AS total_blks_read,
+        SUM(shared_blks_hit) AS total_blks_hit,
+        ROUND(SUM(cost_proxy)::numeric, 2) AS team_cost_proxy,
+        ROUND(
+            (SUM(cost_proxy) / NULLIF((SELECT total_cost_proxy FROM totals), 0) * 100)::numeric,
+            2
+        ) AS pct_of_total_db_cost
+    FROM parsed_queries
+    GROUP BY team, app, feature
+)
+SELECT
+    team,
+    app,
+    feature,
+    distinct_query_count,
+    total_calls,
+    total_exec_seconds,
+    avg_exec_ms,
+    total_blks_read,
+    team_cost_proxy,
+    pct_of_total_db_cost,
+    -- If your monthly RDS bill for this instance is known, multiply by pct
+    -- to get an estimated dollar attribution per team/feature
+    ROUND((pct_of_total_db_cost / 100.0 * 3200.00)::numeric, 2) AS estimated_monthly_usd
+    -- Replace 3200.00 with the actual monthly cost of this RDS instance
+FROM team_attribution
+ORDER BY pct_of_total_db_cost DESC;
+
+
+-- Step 2: Find the top 10 most expensive queries per feature (for optimization targeting)
+SELECT
+    COALESCE(
+        (regexp_match(query, '/\*[^*]*feature:(\S+)[^*]*\*/'))[1],
+        'untagged'
+    ) AS feature,
+    COALESCE(
+        (regexp_match(query, '/\*[^*]*team:(\S+)[^*]*\*/'))[1],
+        'untagged'
+    ) AS team,
+    calls,
+    ROUND((total_exec_time / 1000)::numeric, 2) AS total_exec_seconds,
+    ROUND(mean_exec_time::numeric, 2) AS mean_exec_ms,
+    shared_blks_read AS blks_read,
+    -- Fingerprint: first 120 chars of normalized query
+    LEFT(regexp_replace(query, '\s+', ' ', 'g'), 120) AS query_fingerprint
+FROM pg_stat_statements
+WHERE query NOT LIKE '%pg_stat%'
+ORDER BY total_exec_time DESC
+LIMIT 10;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The equivalent attribution query for SQL Server uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_query_stats</code> paired with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">sys.dm_exec_sql_text</code> to retrieve the query text, then parses the embedded comment:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server: Per-team query cost attribution using dm_exec_query_stats
+-- Works on RDS for SQL Server, Azure SQL Database, and SQL Server on GCE
+
+WITH query_text AS (
+    SELECT
+        qs.sql_handle,
+        qs.query_hash,
+        qs.total_elapsed_time,         -- microseconds
+        qs.execution_count,
+        qs.total_logical_reads,
+        qs.total_logical_writes,
+        qs.total_worker_time,          -- CPU microseconds
+        qs.total_rows,
+        SUBSTRING(
+            st.text,
+            (qs.statement_start_offset / 2) + 1,
+            ((CASE qs.statement_end_offset
+                WHEN -1 THEN DATALENGTH(st.text)
+                ELSE qs.statement_end_offset
+              END - qs.statement_start_offset) / 2) + 1
+        ) AS statement_text
+    FROM sys.dm_exec_query_stats AS qs
+    CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS st
+    WHERE st.text NOT LIKE '%dm_exec%'
+),
+parsed AS (
+    SELECT
+        query_hash,
+        total_elapsed_time,
+        execution_count,
+        total_logical_reads,
+        total_worker_time,
+        -- Extract team tag from comment pattern /* team:X */
+        COALESCE(
+            (SELECT TOP 1 m.match
+             FROM (
+                 SELECT value AS match
+                 FROM STRING_SPLIT(statement_text, ' ')
+             ) m
+             WHERE m.match LIKE 'team:%'
+            ),
+            'untagged'
+        ) AS team_raw,
+        -- Simpler pattern: use PATINDEX + SUBSTRING for SQL Server compatibility
+        CASE
+            WHEN statement_text LIKE '%team:%'
+            THEN SUBSTRING(
+                    statement_text,
+                    PATINDEX('%team:%', statement_text) + 5,
+                    CHARINDEX(' ', statement_text + ' ',
+                        PATINDEX('%team:%', statement_text) + 5)
+                    - PATINDEX('%team:%', statement_text) - 5
+                 )
+            ELSE 'untagged'
+        END AS team,
+        CASE
+            WHEN statement_text LIKE '%feature:%'
+            THEN SUBSTRING(
+                    statement_text,
+                    PATINDEX('%feature:%', statement_text) + 8,
+                    CHARINDEX(' ', statement_text + ' ',
+                        PATINDEX('%feature:%', statement_text) + 8)
+                    - PATINDEX('%feature:%', statement_text) - 8
+                 )
+            ELSE 'untagged'
+        END AS feature,
+        CASE
+            WHEN statement_text LIKE '%app:%'
+            THEN SUBSTRING(
+                    statement_text,
+                    PATINDEX('%app:%', statement_text) + 4,
+                    CHARINDEX(' ', statement_text + ' ',
+                        PATINDEX('%app:%', statement_text) + 4)
+                    - PATINDEX('%app:%', statement_text) - 4
+                 )
+            ELSE 'untagged'
+        END AS app,
+        -- Cost proxy: CPU time + weighted logical reads
+        (total_worker_time + (total_logical_reads * 8.0)) AS cost_proxy,
+        LEFT(LTRIM(RTRIM(REPLACE(statement_text, CHAR(10), ' '))), 120) AS query_fingerprint
+    FROM query_text
+),
+totals AS (
+    SELECT SUM(cost_proxy) AS total_proxy FROM parsed
+),
+attribution AS (
+    SELECT
+        team,
+        app,
+        feature,
+        COUNT(DISTINCT query_hash)          AS distinct_queries,
+        SUM(execution_count)                AS total_executions,
+        ROUND(SUM(total_elapsed_time) / 1e6, 2) AS total_elapsed_seconds,
+        ROUND(SUM(total_worker_time) / 1e6, 2)  AS total_cpu_seconds,
+        SUM(total_logical_reads)            AS total_logical_reads,
+        ROUND(SUM(cost_proxy), 2)           AS team_cost_proxy,
+        ROUND(
+            SUM(cost_proxy) / NULLIF((SELECT total_proxy FROM totals), 0) * 100,
+            2
+        ) AS pct_of_total
+    FROM parsed
+    GROUP BY team, app, feature
+)
+SELECT
+    team,
+    app,
+    feature,
+    distinct_queries,
+    total_executions,
+    total_elapsed_seconds,
+    total_cpu_seconds,
+    total_logical_reads,
+    team_cost_proxy,
+    pct_of_total,
+    -- Replace 4800.00 with actual monthly cost of this SQL Server instance
+    ROUND(pct_of_total / 100.0 * 4800.00, 2) AS estimated_monthly_usd
+FROM attribution
+ORDER BY pct_of_total DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">estimated_monthly_usd</code> column is only as accurate as the base cost you supply. Pull the actual monthly instance cost from the billing extraction scripts in section 24.2 and substitute it here. When you join both layers—infrastructure billing data from the cloud provider and query-level attribution from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> or <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dm_exec_query_stats</code>—you get a complete picture: the team's total database spend, and which of their features and queries are responsible for it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.4 Building the Cost Attribution Schema</h3>
+
+<p class="text-gray-300 leading-relaxed">The billing extracts and query attribution data both need to land somewhere before they can feed a dashboard. A simple star schema in PostgreSQL handles this well and works whether your reporting database is on RDS, Cloud SQL, or a self-managed instance.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Create the cost attribution reporting schema
+-- This schema stores both infrastructure costs (from billing APIs)
+-- and query-level costs (from pg_stat_statements snapshots)
+
+CREATE SCHEMA IF NOT EXISTS finops;
+
+-- Dimension: teams
+CREATE TABLE IF NOT EXISTS finops.dim_teams (
+    team_id     SERIAL PRIMARY KEY,
+    team_slug   TEXT NOT NULL UNIQUE,  -- e.g. 'payments', 'ml-platform'
+    team_name   TEXT NOT NULL,
+    cost_center TEXT,
+    lead_email  TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Dimension: applications
+CREATE TABLE IF NOT EXISTS finops.dim_apps (
+    app_id      SERIAL PRIMARY KEY,
+    app_slug    TEXT NOT NULL UNIQUE,  -- e.g. 'checkout-service'
+    app_name    TEXT NOT NULL,
+    team_id     INT REFERENCES finops.dim_teams(team_id),
+    repo_url    TEXT,
+    created_at  TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Dimension: features
+CREATE TABLE IF NOT EXISTS finops.dim_features (
+    feature_id   SERIAL PRIMARY KEY,
+    feature_slug TEXT NOT NULL,
+    app_id       INT REFERENCES finops.dim_apps(app_id),
+    description  TEXT,
+    created_at   TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (feature_slug, app_id)
+);
+
+-- Dimension: database instances
+CREATE TABLE IF NOT EXISTS finops.dim_db_instances (
+    instance_id      SERIAL PRIMARY KEY,
+    provider         TEXT NOT NULL CHECK (provider IN ('aws', 'azure', 'gcp')),
+    account_id       TEXT,                -- AWS account, Azure subscription, GCP project
+    region           TEXT,
+    instance_identifier TEXT NOT NULL,
+    engine           TEXT,               -- postgres, mysql, sqlserver, aurora-postgresql
+    instance_class   TEXT,               -- db.r6g.2xlarge, etc.
+    environment      TEXT,               -- prod, staging, dev
+    team_id          INT REFERENCES finops.dim_teams(team_id),
+    app_id           INT REFERENCES finops.dim_apps(app_id),
+    monthly_base_cost_usd NUMERIC(12,2), -- updated monthly from billing extract
+    created_at       TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (provider, account_id, instance_identifier)
+);
+
+-- Fact: infrastructure costs by team/app from cloud billing APIs
+CREATE TABLE IF NOT EXISTS finops.fact_infra_costs (
+    id              BIGSERIAL PRIMARY KEY,
+    period_start    DATE NOT NULL,
+    period_end      DATE NOT NULL,
+    provider        TEXT NOT NULL CHECK (provider IN ('aws', 'azure', 'gcp')),
+    account_id      TEXT,
+    team_id         INT REFERENCES finops.dim_teams(team_id),
+    app_id          INT REFERENCES finops.dim_apps(app_id),
+    instance_id     INT REFERENCES finops.dim_db_instances(instance_id),
+    cost_category   TEXT,   -- ComputeUsage, StorageUsage, IOUsage, DataTransfer, Backup
+    cost_usd        NUMERIC(14,4) NOT NULL,
+    usage_quantity  NUMERIC(16,4),
+    usage_unit      TEXT,
+    extracted_at    TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (period_start, provider, account_id, team_id, app_id, cost_category)
+);
+
+-- Fact: query-level cost attribution from pg_stat_statements snapshots
+CREATE TABLE IF NOT EXISTS finops.fact_query_costs (
+    id                  BIGSERIAL PRIMARY KEY,
+    snapshot_ts         TIMESTAMPTZ NOT NULL,
+    instance_id         INT REFERENCES finops.dim_db_instances(instance_id),
+    team_id             INT REFERENCES finops.dim_teams(team_id),
+    app_id              INT REFERENCES finops.dim_apps(app_id),
+    feature_id          INT REFERENCES finops.dim_features(feature_id),
+    queryid             BIGINT,             -- pg_stat_statements queryid
+    calls               BIGINT,
+    total_exec_seconds  NUMERIC(14,4),
+    mean_exec_ms        NUMERIC(10,4),
+    total_blks_read     BIGINT,
+    total_blks_hit      BIGINT,
+    cost_proxy          NUMERIC(16,4),
+    pct_of_instance     NUMERIC(6,2),
+    estimated_cost_usd  NUMERIC(12,4),
+    query_fingerprint   TEXT,
+    created_at          TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index the fact tables for the reporting queries that follow
+CREATE INDEX IF NOT EXISTS idx_fact_infra_team_period
+    ON finops.fact_infra_costs (team_id, period_start);
+
+CREATE INDEX IF NOT EXISTS idx_fact_infra_app_period
+    ON finops.fact_infra_costs (app_id, period_start);
+
+CREATE INDEX IF NOT EXISTS idx_fact_query_instance_snapshot
+    ON finops.fact_query_costs (instance_id, snapshot_ts);
+
+CREATE INDEX IF NOT EXISTS idx_fact_query_team_feature
+    ON finops.fact_query_costs (team_id, feature_id);</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With that schema populated by the extraction scripts from section 24.2 and the pg_stat_statements snapshot pipeline from section 24.3, the reporting queries become straightforward.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart LR
+    A["Cloud billing APIs<br/>(Cost Explorer / Cost Mgmt / BigQuery)"] --> C["finops star schema<br/>fact_infra_costs"]
+    B["pg_stat_statements /<br/>dm_exec_query_stats"] --> D["finops star schema<br/>fact_query_costs"]
+    C --> E[Weekly digest email]
+    D --> E
+    C --> F[Grafana dashboard]
+    D --> F</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*Two independent data sources feed the same reporting schema: infrastructure billing tells you what a team spent, query-level attribution tells you which features drove it.*</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Monthly infrastructure cost rollup per team with MoM trend
+-- Run against the finops reporting database
+
+WITH monthly_costs AS (
+    SELECT
+        DATE_TRUNC('month', fic.period_start) AS month,
+        dt.team_slug,
+        dt.team_name,
+        dt.lead_email,
+        SUM(fic.cost_usd) AS total_cost_usd
+    FROM finops.fact_infra_costs fic
+    JOIN finops.dim_teams dt ON fic.team_id = dt.team_id
+    WHERE fic.period_start &gt;= DATE_TRUNC('month', NOW() - INTERVAL '3 months')
+    GROUP BY 1, 2, 3, 4
+),
+with_trend AS (
+    SELECT
+        month,
+        team_slug,
+        team_name,
+        lead_email,
+        total_cost_usd,
+        LAG(total_cost_usd) OVER (
+            PARTITION BY team_slug ORDER BY month
+        ) AS prior_month_cost_usd
+    FROM monthly_costs
+)
+SELECT
+    month,
+    team_slug,
+    team_name,
+    lead_email,
+    ROUND(total_cost_usd, 2)        AS total_cost_usd,
+    ROUND(prior_month_cost_usd, 2)  AS prior_month_cost_usd,
+    ROUND(
+        CASE
+            WHEN prior_month_cost_usd IS NULL OR prior_month_cost_usd = 0 THEN NULL
+            ELSE ((total_cost_usd - prior_month_cost_usd) / prior_month_cost_usd) * 100
+        END, 1
+    )                               AS mom_change_pct
+FROM with_trend
+ORDER BY month DESC, total_cost_usd DESC;
+
+
+-- SQL Server equivalent: Monthly infrastructure cost rollup per team with MoM trend
+WITH monthly_costs AS (
+    SELECT
+        DATEADD(MONTH, DATEDIFF(MONTH, 0, fic.period_start), 0) AS month,
+        dt.team_slug,
+        dt.team_name,
+        dt.lead_email,
+        SUM(fic.cost_usd) AS total_cost_usd
+    FROM finops.fact_infra_costs fic
+    JOIN finops.dim_teams dt ON fic.team_id = dt.team_id
+    WHERE fic.period_start &gt;= DATEADD(MONTH, -3, DATEADD(MONTH, DATEDIFF(MONTH, 0, GETDATE()), 0))
+    GROUP BY
+        DATEADD(MONTH, DATEDIFF(MONTH, 0, fic.period_start), 0),
+        dt.team_slug,
+        dt.team_name,
+        dt.lead_email
+),
+with_trend AS (
+    SELECT
+        month,
+        team_slug,
+        team_name,
+        lead_email,
+        total_cost_usd,
+        LAG(total_cost_usd) OVER (
+            PARTITION BY team_slug ORDER BY month
+        ) AS prior_month_cost_usd
+    FROM monthly_costs
+)
+SELECT
+    month,
+    team_slug,
+    team_name,
+    lead_email,
+    ROUND(total_cost_usd, 2)        AS total_cost_usd,
+    ROUND(prior_month_cost_usd, 2)  AS prior_month_cost_usd,
+    ROUND(
+        CASE
+            WHEN prior_month_cost_usd IS NULL OR prior_month_cost_usd = 0 THEN NULL
+            ELSE ((total_cost_usd - prior_month_cost_usd) / prior_month_cost_usd) * 100.0
+        END, 1
+    )                               AS mom_change_pct
+FROM with_trend
+ORDER BY month DESC, total_cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.5 Automated Weekly Cost Digest Emails</h3>
+
+<p class="text-gray-300 leading-relaxed">The most effective forcing function for cost awareness is a weekly email that lands in an engineering lead's inbox without requiring any action on their part. The email answers three questions: what did my team spend on databases this week, how does that compare to last week, and which specific queries or instances are driving the biggest costs. The goal is to surface the information at the moment it is most actionable—before it becomes a budget overrun problem at the end of the month.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+Weekly database cost digest email generator.
+Queries the finops reporting database, builds an HTML email per team lead,
+and sends via SES (AWS), SendGrid, or SMTP.
+
+Schedule: Run every Monday at 08:00 local time via EventBridge, Cloud Scheduler,
+or a cron job on a management host.
+
+Requirements: psycopg2-binary, boto3 (for SES), jinja2
+"""
+
+import psycopg2
+import psycopg2.extras
+import boto3
+import logging
+from datetime import datetime, timedelta
+from jinja2 import Template
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+REPORTING_DB_CONN = "host=reporting-db.internal dbname=finops user=finops_reader password=REPLACE"
+SES_REGION = "us-east-1"
+FROM_EMAIL = "finops-noreply@yourcompany.com"
+CURRENCY_SYMBOL = "$"
+
+
+TEAM_WEEKLY_SQL = """
+WITH current_week AS (
+    SELECT
+        dt.team_id,
+        dt.team_slug,
+        dt.team_name,
+        dt.lead_email,
+        COALESCE(SUM(fic.cost_usd), 0) AS week_cost
+    FROM finops.dim_teams dt
+    LEFT JOIN finops.fact_infra_costs fic
+        ON dt.team_id = fic.team_id
+        AND fic.period_start &gt;= %(week_start)s
+        AND fic.period_start &lt; %(week_end)s
+    GROUP BY dt.team_id, dt.team_slug, dt.team_name, dt.lead_email
+),
+prior_week AS (
+    SELECT
+        dt.team_id,
+        COALESCE(SUM(fic.cost_usd), 0) AS prior_week_cost
+    FROM finops.dim_teams dt
+    LEFT JOIN finops.fact_infra_costs fic
+        ON dt.team_id = fic.team_id
+        AND fic.period_start &gt;= %(prior_week_start)s
+        AND fic.period_start &lt; %(prior_week_end)s
+    GROUP BY dt.team_id
+)
+SELECT
+    cw.team_slug,
+    cw.team_name,
+    cw.lead_email,
+    ROUND(cw.week_cost::numeric, 2)       AS week_cost,
+    ROUND(pw.prior_week_cost::numeric, 2)  AS prior_week_cost,
+    ROUND(
+        CASE
+            WHEN pw.prior_week_cost = 0 THEN NULL
+            ELSE ((cw.week_cost - pw.prior_week_cost) / pw.prior_week_cost * 100)
+        END::numeric, 1
+    ) AS wow_change_pct
+FROM current_week cw
+JOIN prior_week pw ON cw.team_id = pw.team_id
+WHERE cw.lead_email IS NOT NULL
+ORDER BY cw.week_cost DESC;
+"""
+
+TOP_QUERIES_SQL = """
+SELECT
+    df.feature_slug,
+    fqc.query_fingerprint,
+    ROUND(SUM(fqc.estimated_cost_usd)::numeric, 2) AS est_cost_usd,
+    SUM(fqc.calls)                                  AS total_calls,
+    ROUND(AVG(fqc.mean_exec_ms)::numeric, 2)        AS avg_exec_ms
+FROM finops.fact_query_costs fqc
+JOIN finops.dim_teams dt ON fqc.team_id = dt.team_id
+LEFT JOIN finops.dim_features df ON fqc.feature_id = df.feature_id
+WHERE dt.team_slug = %(team_slug)s
+  AND fqc.snapshot_ts &gt;= %(week_start)s
+  AND fqc.snapshot_ts &lt; %(week_end)s
+GROUP BY df.feature_slug, fqc.query_fingerprint
+ORDER BY est_cost_usd DESC
+LIMIT 5;
+"""
+
+TOP_INSTANCES_SQL = """
+SELECT
+    ddi.instance_identifier,
+    ddi.engine,
+    ddi.instance_class,
+    ddi.environment,
+    ROUND(SUM(fic.cost_usd)::numeric, 2) AS week_cost
+FROM finops.fact_infra_costs fic
+JOIN finops.dim_db_instances ddi ON fic.instance_id = ddi.instance_id
+JOIN finops.dim_teams dt ON fic.team_id = dt.team_id
+WHERE dt.team_slug = %(team_slug)s
+  AND fic.period_start &gt;= %(week_start)s
+  AND fic.period_start &lt; %(week_end)s
+GROUP BY ddi.instance_identifier, ddi.engine, ddi.instance_class, ddi.environment
+ORDER BY week_cost DESC
+LIMIT 5;
+"""
+
+EMAIL_TEMPLATE = """
+&lt;!DOCTYPE html&gt;
+&lt;html&gt;
+&lt;head&gt;
+&lt;meta charset="utf-8"&gt;
+&lt;style&gt;
+  body { font-family: Arial, sans-serif; font-size: 14px; color: #333; }
+  h1 { color: #1a56db; font-size: 20px; }
+  h2 { color: #374151; font-size: 16px; margin-top: 24px; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+  th { background: #f3f4f6; text-align: left; padding: 8px 12px; border: 1px solid #e5e7eb; font-size: 12px; }
+  td { padding: 8px 12px; border: 1px solid #e5e7eb; font-size: 13px; }
+  .up   { color: #dc2626; font-weight: bold; }
+  .down { color: #16a34a; font-weight: bold; }
+  .flat { color: #6b7280; }
+  .hero { font-size: 28px; font-weight: bold; color: #1a56db; }
+  .meta { font-size: 12px; color: #6b7280; margin-bottom: 24px; }
+  .footer { margin-top: 32px; font-size: 11px; color: #9ca3af; }
+&lt;/style&gt;
+&lt;/head&gt;
+&lt;body&gt;
+&lt;h1&gt;Database Cost Digest — {{ team_name }}&lt;/h1&gt;
+&lt;p class="meta"&gt;Week of {{ week_start }} · Generated {{ generated_at }}&lt;/p&gt;
+
+&lt;p&gt;
+  This week your team spent
+  &lt;span class="hero"&gt;{{ currency }}{{ week_cost }}&lt;/span&gt;
+  on cloud databases.
+  {% if wow_change_pct is not none %}
+    {% if wow_change_pct &gt; 5 %}
+      &lt;span class="up"&gt;▲ {{ wow_change_pct }}% vs last week&lt;/span&gt;
+    {% elif wow_change_pct &lt; -5 %}
+      &lt;span class="down"&gt;▼ {{ wow_change_pct|abs }}% vs last week&lt;/span&gt;
+    {% else %}
+      &lt;span class="flat"&gt;≈ flat vs last week ({{ wow_change_pct }}%)&lt;/span&gt;
+    {% endif %}
+  {% endif %}
+&lt;/p&gt;
+
+{% if top_instances %}
+&lt;h2&gt;Top Instances by Cost This Week&lt;/h2&gt;
+&lt;table&gt;
+  &lt;tr&gt;
+    &lt;th&gt;Instance&lt;/th&gt;&lt;th&gt;Engine&lt;/th&gt;&lt;th&gt;Class&lt;/th&gt;&lt;th&gt;Env&lt;/th&gt;&lt;th&gt;Cost&lt;/th&gt;
+  &lt;/tr&gt;
+  {% for inst in top_instances %}
+  &lt;tr&gt;
+    &lt;td&gt;{{ inst.instance_identifier }}&lt;/td&gt;
+    &lt;td&gt;{{ inst.engine }}&lt;/td&gt;
+    &lt;td&gt;{{ inst.instance_class }}&lt;/td&gt;
+    &lt;td&gt;{{ inst.environment }}&lt;/td&gt;
+    &lt;td&gt;{{ currency }}{{ inst.week_cost }}&lt;/td&gt;
+  &lt;/tr&gt;
+  {% endfor %}
+&lt;/table&gt;
+{% endif %}
+
+{% if top_queries %}
+&lt;h2&gt;Top Queries by Estimated Cost This Week&lt;/h2&gt;
+&lt;table&gt;
+  &lt;tr&gt;
+    &lt;th&gt;Feature&lt;/th&gt;&lt;th&gt;Query (truncated)&lt;/th&gt;&lt;th&gt;Est. Cost&lt;/th&gt;
+    &lt;th&gt;Total Calls&lt;/th&gt;&lt;th&gt;Avg ms&lt;/th&gt;
+  &lt;/tr&gt;
+  {% for q in top_queries %}
+  &lt;tr&gt;
+    &lt;td&gt;{{ q.feature_slug or 'untagged' }}&lt;/td&gt;
+    &lt;td style="font-family:monospace;font-size:11px;"&gt;{{ q.query_fingerprint }}&lt;/td&gt;
+    &lt;td&gt;{{ currency }}{{ q.est_cost_usd }}&lt;/td&gt;
+    &lt;td&gt;{{ "{:,}".format(q.total_calls) }}&lt;/td&gt;
+    &lt;td&gt;{{ q.avg_exec_ms }}&lt;/td&gt;
+  &lt;/tr&gt;
+  {% endfor %}
+&lt;/table&gt;
+{% endif %}
+
+&lt;p style="margin-top:24px;"&gt;
+  &lt;a href="https://finops.yourcompany.internal/dashboard?team={{ team_slug }}"&gt;
+    View full dashboard →
+  &lt;/a&gt;
+&lt;/p&gt;
+
+&lt;div class="footer"&gt;
+  This report was generated automatically by the FinOps platform.
+  Tag questions or attribution corrections: #finops-help in Slack.
+&lt;/div&gt;
+&lt;/body&gt;
+&lt;/html&gt;
+"""
+
+
+def send_ses_email(to_address: str, subject: str, html_body: str) -&gt; None:
+    client = boto3.client("ses", region_name=SES_REGION)
+    client.send_email(
+        Source=FROM_EMAIL,
+        Destination={"ToAddresses": [to_address]},
+        Message={
+            "Subject": {"Data": subject, "Charset": "UTF-8"},
+            "Body": {"Html": {"Data": html_body, "Charset": "UTF-8"}}
+        }
+    )
+    logger.info(f"Email sent to {to_address}")
+
+
+def run_weekly_digest() -&gt; None:
+    today = datetime.utcnow().date()
+    # Week runs Mon–Sun; send on Monday covering the prior Mon–Sun
+    week_end = today - timedelta(days=today.weekday())          # this Monday
+    week_start = week_end - timedelta(days=7)                   # last Monday
+    prior_week_start = week_start - timedelta(days=7)
+    prior_week_end = week_start
+
+    params = {
+        "week_start": week_start.isoformat(),
+        "week_end": week_end.isoformat(),
+        "prior_week_start": prior_week_start.isoformat(),
+        "prior_week_end": prior_week_end.isoformat(),
+    }
+
+    conn = psycopg2.connect(REPORTING_DB_CONN)
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute(TEAM_WEEKLY_SQL, params)
+    teams = cur.fetchall()
+    logger.info(f"Sending digests to {len(teams)} team leads")
+
+    template = Template(EMAIL_TEMPLATE)
+    generated_at = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    for team in teams:
+        # Fetch top instances for this team
+        cur.execute(TOP_INSTANCES_SQL, {
+            "team_slug": team["team_slug"],
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+        })
+        top_instances = cur.fetchall()
+
+        # Fetch top queries for this team
+        cur.execute(TOP_QUERIES_SQL, {
+            "team_slug": team["team_slug"],
+            "week_start": week_start.isoformat(),
+            "week_end": week_end.isoformat(),
+        })
+        top_queries = cur.fetchall()
+
+        html_body = template.render(
+            team_name=team["team_name"],
+            team_slug=team["team_slug"],
+            week_start=week_start.isoformat(),
+            generated_at=generated_at,
+            week_cost=team["week_cost"],
+            wow_change_pct=team["wow_change_pct"],
+            top_instances=top_instances,
+            top_queries=top_queries,
+            currency=CURRENCY_SYMBOL,
+        )
+
+        subject = (
+            f"DB Cost Digest – {team['team_name']} – "
+            f"${team['week_cost']} this week"
+        )
+        send_ses_email(team["lead_email"], subject, html_body)
+
+    cur.close()
+    conn.close()
+    logger.info("Weekly digest run complete")
+
+
+if __name__ == "__main__":
+    run_weekly_digest()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Schedule this script using EventBridge Scheduler on AWS, Cloud Scheduler on GCP, or Azure Logic Apps. The simplest deployment is a container image pushed to ECR or Artifact Registry, triggered on a cron expression every Monday morning.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># AWS: Schedule the digest Lambda every Monday at 08:00 UTC
+aws events put-rule \
+  --name "weekly-db-cost-digest" \
+  --schedule-expression "cron(0 8 ? * MON *)" \
+  --state ENABLED
+
+# GCP: Schedule via Cloud Scheduler targeting a Cloud Run job
+gcloud scheduler jobs create http weekly-db-cost-digest \
+  --location us-central1 \
+  --schedule "0 8 * * 1" \
+  --uri "https://us-central1-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/YOUR_PROJECT/jobs/db-cost-digest:run" \
+  --message-body '{}' \
+  --oauth-service-account-email finops-scheduler@YOUR_PROJECT.iam.gserviceaccount.com
+
+# Azure: Logic App trigger (simplified CLI representation)
+# In practice, create via ARM template or portal for Logic Apps
+az logic workflow create \
+  --resource-group finops-rg \
+  --name weekly-db-cost-digest \
+  --definition @digest-workflow-definition.json</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.6 Grafana Dashboard for Per-Team Cost Visibility</h3>
+
+<p class="text-gray-300 leading-relaxed">The weekly email is the push mechanism. The Grafana dashboard is the pull mechanism—what engineering leads open when they want to investigate a spike or prepare for a budget conversation. The dashboard should answer five questions without clicking through multiple panels: how much is my team spending this month, what is the trend over the past 90 days, which instances are consuming most of the budget, which features are the most expensive at the query level, and which queries have degraded in performance or cost since last week.</p>
+
+<p class="text-gray-300 leading-relaxed">The following panel definitions assume the finops PostgreSQL reporting database defined in section 24.4 as a Grafana data source named <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finops-db</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Grafana Panel 1: Total monthly spend by team (bar chart, last 6 months)
+-- Variable: $team (multi-value, populated from dim_teams.team_slug)
+
+SELECT
+    DATE_TRUNC('month', period_start) AS time,
+    SUM(cost_usd)                     AS "Database Cost (USD)"
+FROM finops.fact_infra_costs fic
+JOIN finops.dim_teams dt ON fic.team_id = dt.team_id
+WHERE dt.team_slug = ANY(ARRAY[$team]::text[])
+  AND period_start &gt;= $__timeFrom()::date
+  AND period_start &lt;  $__timeTo()::date
+GROUP BY 1
+ORDER BY 1;
+
+
+-- Grafana Panel 2: Cost breakdown by cost_category (stacked bar)
+-- Shows ComputeUsage vs StorageUsage vs IOUsage vs Backup
+
+SELECT
+    DATE_TRUNC('month', period_start) AS time,
+    cost_category                      AS metric,
+    SUM(cost_usd)                      AS value
+FROM finops.fact_infra_costs fic
+JOIN finops.dim_teams dt ON fic.team_id = dt.team_id
+WHERE dt.team_slug = ANY(ARRAY[$team]::text[])
+  AND period_start &gt;= $__timeFrom()::date
+  AND period_start &lt;  $__timeTo()::date
+GROUP BY 1, 2
+ORDER BY 1, 2;
+
+
+-- Grafana Panel 3: Top 10 most expensive instances for this team (table panel)
+
+SELECT
+    ddi.instance_identifier,
+    ddi.engine,
+    ddi.instance_class,
+    ddi.environment,
+    ROUND(SUM(fic.cost_usd)::numeric, 2) AS total_cost_usd
+FROM finops.fact_infra_costs fic
+JOIN finops.dim_teams dt ON fic.team_id = dt.team_id
+JOIN finops.dim_db_instances ddi ON fic.instance_id = ddi.instance_id
+WHERE dt.team_slug = ANY(ARRAY[$team]::text[])
+  AND period_start &gt;= $__timeFrom()::date
+  AND period_start &lt;  $__timeTo()::date
+GROUP BY ddi.instance_identifier, ddi.engine, ddi.instance_class, ddi.environment
+ORDER BY total_cost_usd DESC
+LIMIT 10;
+
+
+-- Grafana Panel 4: Feature-level query cost breakdown (pie chart or bar)
+
+SELECT
+    COALESCE(df.feature_slug, 'untagged') AS feature,
+    ROUND(SUM(fqc.estimated_cost_usd)::numeric, 2) AS estimated_cost_usd
+FROM finops.fact_query_costs fqc
+JOIN finops.dim_teams dt ON fqc.team_id = dt.team_id
+LEFT JOIN finops.dim_features df ON fqc.feature_id = df.feature_id
+WHERE dt.team_slug = ANY(ARRAY[$team]::text[])
+  AND fqc.snapshot_ts &gt;= $__timeFrom()
+  AND fqc.snapshot_ts &lt;  $__timeTo()
+GROUP BY 1
+ORDER BY 2 DESC
+LIMIT 10;
+
+
+-- Grafana Panel 5: Week-over-week query cost change (table with threshold coloring)
+-- Highlight queries that have increased cost by more than 20%
+
+WITH this_week AS (
+    SELECT
+        fqc.queryid,
+        fqc.query_fingerprint,
+        COALESCE(df.feature_slug, 'untagged') AS feature,
+        SUM(fqc.estimated_cost_usd) AS cost_this_week,
+        AVG(fqc.mean_exec_ms)       AS avg_exec_ms_this_week
+    FROM finops.fact_query_costs fqc
+    JOIN finops.dim_teams dt ON fqc.team_id = dt.team_id
+    LEFT JOIN finops.dim_features df ON fqc.feature_id = df.feature_id
+    WHERE dt.team_slug = ANY(ARRAY[$team]::text[])
+      AND fqc.snapshot_ts &gt;= NOW() - INTERVAL '7 days'
+    GROUP BY fqc.queryid, fqc.query_fingerprint, feature
+),
+last_week AS (
+    SELECT
+        fqc.queryid,
+        SUM(fqc.estimated_cost_usd) AS cost_last_week,
+        AVG(fqc.mean_exec_ms)       AS avg_exec_ms_last_week
+    FROM finops.fact_query_costs fqc
+    JOIN finops.dim_teams dt ON fqc.team_id = dt.team_id
+    WHERE dt.team_slug = ANY(ARRAY[$team]::text[])
+      AND fqc.snapshot_ts &gt;= NOW() - INTERVAL '14 days'
+      AND fqc.snapshot_ts &lt;  NOW() - INTERVAL '7 days'
+    GROUP BY fqc.queryid
+)
+SELECT
+    tw.feature,
+    tw.query_fingerprint,
+    ROUND(tw.cost_this_week::numeric, 4)      AS cost_this_week_usd,
+    ROUND(lw.cost_last_week::numeric, 4)      AS cost_last_week_usd,
+    ROUND(tw.avg_exec_ms_this_week::numeric, 2) AS avg_ms_this_week,
+    ROUND(lw.avg_exec_ms_last_week::numeric, 2) AS avg_ms_last_week,
+    ROUND(
+        CASE
+            WHEN lw.cost_last_week = 0 OR lw.cost_last_week IS NULL THEN NULL
+            ELSE ((tw.cost_this_week - lw.cost_last_week) / lw.cost_last_week * 100)
+        END::numeric, 1
+    ) AS wow_cost_change_pct
+FROM this_week tw
+LEFT JOIN last_week lw ON tw.queryid = lw.queryid
+ORDER BY cost_this_week_usd DESC
+LIMIT 20;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For the week-over-week panel, set a Grafana threshold on <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">wow_cost_change_pct</code>: green below 10, yellow between 10 and 25, red above 25. This turns the table into a quick triage view—engineering leads can scan for red rows and immediately see which queries to hand to their team for optimization.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Dashboard variable configuration</strong> worth noting: the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">$team</code> variable should be backed by this query against the finops database:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Grafana variable query: populate $team dropdown
+SELECT DISTINCT team_slug AS __value, team_name AS __text
+FROM finops.dim_teams
+ORDER BY team_name;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Set it to multi-value and include an "All" option. When a FinOps analyst is reviewing cross-team spend, they select all teams; when a lead opens the link from their weekly digest email, the URL pre-selects their team slug via a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">?var-team=payments</code> query parameter.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.7 Handling Shared Infrastructure and Allocation Splits</h3>
+
+<p class="text-gray-300 leading-relaxed">Not all database costs map cleanly to a single team. A shared Aurora cluster used by three services, a central Redis-compatible ElastiCache cluster, or a data warehouse instance accessed by both the analytics team and the product team all present the same challenge: the billing tag can only carry one value, but the cost needs to be split.</p>
+
+<p class="text-gray-300 leading-relaxed">There are three approaches, in order of increasing accuracy and implementation complexity:</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">1. Even split:</strong> Divide the shared instance cost equally among all teams that use it. Easy to implement, defensible in team budget conversations, and almost certainly wrong—but consistently wrong in a way that teams can predict and plan around.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">2. Weighted split by query execution time:</strong> Use the query attribution data from section 24.3 to calculate what fraction of total database CPU each team consumed, then apply that fraction to the infrastructure cost. This requires the query comment tagging convention to be in place on the shared instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">3. Weighted split by row access:</strong> For workloads where CPU time is not a reliable proxy for cost (for example, large sequential scans that are cheap on CPU but expensive on storage I/O), weight by <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">shared_blks_read</code> from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> instead.</p>
+
+<p class="text-gray-300 leading-relaxed">The following query implements option 2 (query-time weighted split) for a shared instance:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Compute the cost allocation split for a shared database instance
+-- Replace 'shared-aurora-cluster-01' with your instance identifier
+-- Replace 4200.00 with the actual monthly cost of the shared instance
+
+WITH instance_query_costs AS (
+    SELECT
+        dt.team_slug,
+        SUM(fqc.total_exec_seconds) AS team_exec_seconds,
+        SUM(fqc.total_blks_read)    AS team_blks_read
+    FROM finops.fact_query_costs fqc
+    JOIN finops.dim_teams dt ON fqc.team_id = dt.team_id
+    JOIN finops.dim_db_instances ddi ON fqc.instance_id = ddi.instance_id
+    WHERE ddi.instance_identifier = 'shared-aurora-cluster-01'
+      AND fqc.snapshot_ts &gt;= DATE_TRUNC('month', NOW())
+      AND fqc.snapshot_ts &lt;  DATE_TRUNC('month', NOW()) + INTERVAL '1 month'
+    GROUP BY dt.team_slug
+),
+totals AS (
+    SELECT
+        SUM(team_exec_seconds) AS total_exec_seconds,
+        SUM(team_blks_read)    AS total_blks_read
+    FROM instance_query_costs
+)
+SELECT
+    iqc.team_slug,
+    ROUND(iqc.team_exec_seconds::numeric, 2)                    AS exec_seconds,
+    ROUND(
+        (iqc.team_exec_seconds / NULLIF(t.total_exec_seconds, 0) * 100)::numeric, 2
+    )                                                            AS pct_by_cpu,
+    ROUND(
+        (iqc.team_exec_seconds / NULLIF(t.total_exec_seconds, 0) * 4200.00)::numeric, 2
+    )                                                            AS allocated_cost_usd,
+    ROUND(iqc.team_blks_read::numeric, 0)                       AS blks_read,
+    ROUND(
+        (iqc.team_blks_read / NULLIF(t.total_blks_read, 0) * 100)::numeric, 2
+    )                                                            AS pct_by_io
+FROM instance_query_costs iqc
+CROSS JOIN totals t
+ORDER BY allocated_cost_usd DESC;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent: Shared instance cost allocation split
+-- Replace 'shared-sql-instance-01' and 8600.00 with actual values
+
+WITH instance_query_costs AS (
+    SELECT
+        dt.team_slug,
+        SUM(fqc.total_exec_seconds) AS team_exec_seconds,
+        SUM(fqc.total_blks_read)    AS team_blks_read
+    FROM finops.fact_query_costs fqc
+    JOIN finops.dim_teams dt ON fqc.team_id = dt.team_id
+    JOIN finops.dim_db_instances ddi ON fqc.instance_id = ddi.instance_id
+    WHERE ddi.instance_identifier = 'shared-sql-instance-01'
+      AND fqc.snapshot_ts &gt;= DATEADD(DAY, 1 - DAY(GETDATE()), CAST(GETDATE() AS DATE))
+      AND fqc.snapshot_ts &lt; DATEADD(MONTH, 1,
+            DATEADD(DAY, 1 - DAY(GETDATE()), CAST(GETDATE() AS DATE)))
+    GROUP BY dt.team_slug
+),
+totals AS (
+    SELECT
+        SUM(team_exec_seconds) AS total_exec_seconds,
+        SUM(team_blks_read)    AS total_blks_read
+    FROM instance_query_costs
+)
+SELECT
+    iqc.team_slug,
+    ROUND(CAST(iqc.team_exec_seconds AS NUMERIC), 2)             AS exec_seconds,
+    ROUND(
+        CAST(iqc.team_exec_seconds AS NUMERIC)
+        / NULLIF(CAST(t.total_exec_seconds AS NUMERIC), 0) * 100, 2
+    )                                                             AS pct_by_cpu,
+    ROUND(
+        CAST(iqc.team_exec_seconds AS NUMERIC)
+        / NULLIF(CAST(t.total_exec_seconds AS NUMERIC), 0) * 8600.00, 2
+    )                                                             AS allocated_cost_usd,
+    iqc.team_blks_read                                            AS blks_read,
+    ROUND(
+        CAST(iqc.team_blks_read AS NUMERIC)
+        / NULLIF(CAST(t.total_blks_read AS NUMERIC), 0) * 100, 2
+    )                                                             AS pct_by_io
+FROM instance_query_costs iqc
+CROSS JOIN totals t
+ORDER BY allocated_cost_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Store the allocation results in a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finops.fact_shared_allocations</code> table alongside the direct costs in <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">finops.fact_infra_costs</code>, and union them in your reporting queries. Teams that work primarily on shared infrastructure will see their allocated share rather than a zero on the dashboard—which is exactly the behavioral nudge that motivates them to optimize their query patterns and eventually request dedicated infrastructure when the economics justify it.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">24.8 Escalation Thresholds and Budget Alerts</h3>
+
+<p class="text-gray-300 leading-relaxed">Automated reports are most useful when they are quiet until something needs attention. A weekly digest that always says "costs are flat" trains leads to stop reading it. The same digest with a clear escalation signal—"your team's database spend increased 40% this week, here are the three queries driving it"—gets read every time.</p>
+
+<p class="text-gray-300 leading-relaxed">The threshold logic below runs as part of the weekly digest pipeline and determines the email subject line, the opening paragraph emphasis, and whether a Slack notification fires in addition to the email.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+Escalation threshold evaluator for the weekly database cost digest.
+Called from run_weekly_digest() before sending emails.
+Sends a Slack alert in addition to email when thresholds are breached.
+
+Thresholds (tune to your organization's norms):
+  - wow_increase_pct &gt; 20: yellow alert (noted in email subject)
+  - wow_increase_pct &gt; 40: red alert (Slack notification + email)
+  - absolute_week_cost &gt; team_budget_weekly: budget breach alert
+"""
+
+import json
+import urllib.request
+import logging
+
+logger = logging.getLogger(__name__)
+
+SLACK_WEBHOOK_URL = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+ALERT_CHANNEL = "#finops-alerts"
+
+
+def evaluate_thresholds(team: dict, top_queries: list) -&gt; dict:
+    """
+    Evaluate cost thresholds for a team's weekly report.
+    Returns a dict with alert_level ('ok', 'warn', 'critical'),
+    alert_reason, and email_subject_prefix.
+    """
+    wow = team.get("wow_change_pct")
+    week_cost = float(team.get("week_cost", 0))
+    team_name = team["team_name"]
+
+    alert_level = "ok"
+    alert_reason = None
+
+    if wow is not None:
+        if wow &gt; 40:
+            alert_level = "critical"
+            alert_reason = f"Database spend increased {wow}% week-over-week"
+        elif wow &gt; 20:
+            alert_level = "warn"
+            alert_reason = f"Database spend increased {wow}% week-over-week"
+
+    # Check if any single query accounts for more than 30% of the team's weekly cost
+    if top_queries:
+        top_query_cost = float(top_queries[0].get("est_cost_usd", 0))
+        if week_cost &gt; 0 and (top_query_cost / week_cost) &gt; 0.30:
+            if alert_level != "critical":
+                alert_level = "warn"
+            alert_reason = (
+                (alert_reason or "") +
+                f". Single query accounts for "
+                f"{round(top_query_cost / week_cost * 100, 1)}% of team spend"
+            ).strip(". ")
+
+    subject_prefix = {
+        "ok": "✅",
+        "warn": "⚠️",
+        "critical": "🚨"
+    }.get(alert_level, "")
+
+    return {
+        "alert_level": alert_level,
+        "alert_reason": alert_reason,
+        "subject_prefix": subject_prefix
+    }
+
+
+def send_slack_alert(team: dict, threshold_result: dict, top_queries: list) -&gt; None:
+    """Send a Slack notification for critical or warn-level cost events."""
+    if threshold_result["alert_level"] == "ok":
+        return
+
+    wow = team.get("wow_change_pct", "N/A")
+    week_cost = team.get("week_cost", 0)
+    color = "#ff0000" if threshold_result["alert_level"] == "critical" else "#ffaa00"
+
+    top_query_text = ""
+    if top_queries:
+        q = top_queries[0]
+        top_query_text = (
+            f"\n*Top query ({q.get('feature_slug', 'untagged')})* — "
+            f"est. ${q.get('est_cost_usd', 0)} | "
+            f"{q.get('total_calls', 0):,} calls | "
+            f"avg {q.get('avg_exec_ms', 0)}ms\n"
+            f"```{q.get('query_fingerprint', '')[:100]}```"
+        )
+
+    payload = {
+        "channel": ALERT_CHANNEL,
+        "attachments": [
+            {
+                "color": color,
+                "title": f"Database Cost Alert — {team['team_name']}",
+                "text": (
+                    f"{threshold_result['alert_reason']}\n"
+                    f"*This week:* ${week_cost} | "
+                    f"*WoW change:* {wow}%"
+                    f"{top_query_text}"
+                ),
+                "footer": "FinOps Platform",
+                "actions": [
+                    {
+                        "type": "button",
+                        "text": "View Dashboard",
+                        "url": f"https://finops.yourcompany.internal/dashboard?team={team['team_slug']}"
+                    }
+                ]
+            }
+        ]
+    }
+
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            SLACK_WEBHOOK_URL,
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        urllib.request.urlopen(req, timeout=5)
+        logger.info(f"Slack alert sent for team {team['team_name']} (level: {threshold_result['alert_level']})")
+    except Exception as e:
+        logger.error(f"Failed to send Slack alert: {e}")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Integrate this into <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">run_weekly_digest()</code> by calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">evaluate_thresholds()</code> before rendering the email template, passing the result into the template context to conditionally render an alert banner, and calling <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">send_slack_alert()</code> for any team at warn or critical level. The Slack message links directly to the Grafana dashboard pre-filtered for that team, so whoever picks it up in the channel can go straight to the data without logging into the FinOps portal first.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **A five-tag taxonomy applied consistently outperforms a twenty-tag taxonomy applied inconsistently.** Start with `team`, `app`, `environment`, `feature`, and `cost-center`. Enforce them at resource creation using SCPs (AWS), Azure Policy, or GCP Organization Policy. Untagged resources must have a consequence—a shared pool chargeback—to close the behavioral loop.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Infrastructure billing data and query-level attribution serve different purposes and must be combined.** Cloud billing APIs tell you what each team spends on instance hours, storage, and I/O. `pg_stat_statements` and `sys.dm_exec_query_stats` tell you which features and queries within a team are consuming the infrastructure. Neither layer alone is sufficient to drive optimization conversations.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Embedding team and feature metadata directly in SQL comments is the lowest-friction path to query-level attribution.** Query planners ignore comments, so there is no performance cost. The metadata is captured by `pg_stat_statements` and `dm_exec_query_stats` automatically, requiring no changes to monitoring infrastructure once the comment convention is adopted in application code.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The weekly cost digest email is the primary behavioral intervention.** Dashboards are consulted reactively; emails arrive proactively. When an engineering lead sees their team's database spend alongside the specific queries driving cost every Monday morning, optimization decisions become self-motivating rather than requiring top-down pressure from a FinOps team.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Shared infrastructure requires explicit allocation logic, not ignored cost.** Splitting a shared cluster's cost by query execution time or block reads—using the same `pg_stat_statements` data already collected—produces defensible, team-visible allocations that motivate teams to reduce their share rather than treating shared resources as free.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
