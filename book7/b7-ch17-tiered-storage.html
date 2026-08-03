@@ -5,6 +5,10 @@
   <title>Chapter 17: Tiered Storage: Moving Cold Data Cheaply — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 17: Tiered Storage: Moving Cold Data Cheaply. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -55,7 +59,7 @@
 <p class="text-gray-300 leading-relaxed">| S3 Glacier Instant | $0.004 |</p>
 <p class="text-gray-300 leading-relaxed">| S3 Glacier Deep Archive | $0.00099 |</p>
 
-<p class="text-gray-300 leading-relaxed">The math is straightforward. A 1 TB volume on gp2 costs $117.76/month. That same 1 TB on S3 Glacier Deep Archive costs $1.01/month. The gap is 116x. Even moving to S3 Standard-IA costs 10x less than gp2.</p>
+<p class="text-gray-300 leading-relaxed">The math is straightforward. A 1 TB volume on gp2 costs $115.00/month. That same 1 TB on S3 Glacier Deep Archive costs $0.99/month. The gap is 116x. Even moving to S3 Standard-IA costs 10x less than gp2.</p>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL / Blob pricing (East US, 2024):</strong></p>
 
@@ -309,6 +313,15 @@ ORDER BY
 
 <p class="text-gray-300 leading-relaxed">Once partitions exist, the archival workflow is clean: detach a partition, export it to S3/GCS/Blob as Parquet or CSV, verify the export, then drop the partition. The table keeps serving queries with no downtime.</p>
 
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">flowchart LR
+    A[Detach partition] --> B["Export to S3/GCS/Blob<br/>as Parquet/CSV"]
+    B --> C[Verify checksum + row count]
+    C -->|Verified| D[Drop partition from live DB]
+    C -->|Failed| E[Keep partition — do not drop]
+    D --> F[Record in archive metadata catalog]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The detach → export → verify → drop pipeline: a partition is only dropped from the live database after its export is independently verified.*</p>
+
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Detach, export, and verify workflow for PostgreSQL on AWS RDS:</strong></p>
 
 <pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Step 1: Detach the oldest partition (run during maintenance window or off-peak)
@@ -431,7 +444,1378 @@ aws s3api get-bucket-lifecycle-configuration \
   --output json | jq '.Rules[] | {ID: .ID, Status: .Status, Transitions: .Transitions}'</code></pre>
 
 <p class="text-gray-300 leading-relaxed"><strong class="text-white">Python automation script for scheduled tiering — runs nightly via Lambda or cron:</strong></p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+db_tiering_scheduler.py
+
+Runs nightly (scheduled via AWS EventBridge or cron).
+Identifies PostgreSQL partitions older than the configured threshold,
+exports them to S3 in Parquet format, validates row counts,
+and drops the local partition after confirmation.
+
+Requirements:
+  pip install psycopg2-binary boto3 pandas pyarrow sqlalchemy
+"""
+
+import os
+import sys
+import json
+import logging
+import hashlib
+from datetime import datetime, timedelta
+from typing import Optional
+
+import boto3
+import pandas as pd
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import pyarrow as pa
+import pyarrow.parquet as pq
+from sqlalchemy import create_engine, text
+
+# ── Configuration ────────────────────────────────────────────────────────────
+DB_HOST          = os.environ.get("DB_HOST", "prod-postgres-01.xxxx.us-east-1.rds.amazonaws.com")
+DB_PORT          = int(os.environ.get("DB_PORT", 5432))
+DB_NAME          = os.environ.get("DB_NAME", "production")
+DB_USER          = os.environ.get("DB_USER", "archive_user")
+DB_PASSWORD      = os.environ.get("DB_PASSWORD")   # From AWS Secrets Manager in prod
+
+ARCHIVE_BUCKET   = os.environ.get("ARCHIVE_BUCKET", "your-archive-bucket")
+ARCHIVE_PREFIX   = os.environ.get("ARCHIVE_PREFIX", "database-archive")
+AWS_REGION       = os.environ.get("AWS_REGION", "us-east-1")
+
+# Archive partitions older than this many months
+COLD_THRESHOLD_MONTHS = int(os.environ.get("COLD_THRESHOLD_MONTHS", 6))
+
+# Tables to include in tiering (parent table name → timestamp column)
+TIERING_CONFIG = {
+    "audit_events_partitioned":      "created_at",
+    "transaction_logs_partitioned":  "transaction_date",
+    "clickstream_partitioned":       "event_time",
+}
+
+METADATA_TABLE = "archive_metadata"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger(__name__)
+
+
+# ── Database helpers ─────────────────────────────────────────────────────────
+
+def get_connection():
+    return psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        connect_timeout=30
+    )
+
+
+def get_cold_partitions(conn, parent_table: str, threshold_months: int) -&gt; list[dict]:
+    """
+    Return partitions whose data ends before the cold threshold date.
+    Only returns partitions that have not been archived yet.
+    """
+    cutoff = datetime.utcnow() - timedelta(days=threshold_months * 30)
+
+    query = """
+        SELECT
+            child.relname                                      AS partition_name,
+            child.oid                                          AS partition_oid,
+            pg_size_pretty(pg_total_relation_size(child.oid)) AS human_size,
+            pg_total_relation_size(child.oid)                  AS bytes,
+            parent.relname                                     AS parent_table
+        FROM
+            pg_inherits
+            JOIN pg_class parent ON pg_inherits.inhparent = parent.oid
+            JOIN pg_class child  ON pg_inherits.inhrelid  = child.oid
+        WHERE
+            parent.relname = %s
+            AND child.relname NOT IN (
+                SELECT partition_name
+                FROM   archive_metadata
+                WHERE  original_table = %s
+                  AND  verified = true
+            )
+        ORDER BY
+            child.relname ASC;
+    """
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(query, (parent_table, parent_table))
+        candidates = cur.fetchall()
+
+    # Filter by partition name convention: tablename_YYYY_QN or _YYYY_MM
+    cold = []
+    for part in candidates:
+        name = part["partition_name"]
+        # Parse year from partition name (last 4-digit sequence)
+        parts = name.split("_")
+        for segment in reversed(parts):
+            if segment.isdigit() and len(segment) == 4:
+                year = int(segment)
+                # Simple heuristic: if partition year is before cutoff year, it's cold
+                if year &lt; cutoff.year or (year == cutoff.year and cutoff.month &gt; 6):
+                    cold.append(dict(part))
+                break
+
+    return cold
+
+
+def export_partition_to_s3(
+    conn,
+    partition_name: str,
+    parent_table: str,
+    bucket: str,
+    prefix: str,
+    region: str
+) -&gt; tuple[str, int, str]:
+    """
+    Export partition to S3 as Parquet.
+    Returns (s3_path, row_count, checksum).
+    """
+    s3 = boto3.client("s3", region_name=region)
+
+    log.info("Reading partition: %s", partition_name)
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(f"SELECT * FROM {partition_name}")
+        rows = cur.fetchall()
+
+    if not rows:
+        log.warning("Partition %s is empty — skipping", partition_name)
+        return None, 0, None
+
+    row_count = len(rows)
+    df = pd.DataFrame(rows)
+
+    # Convert to Parquet in memory
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    parquet_buffer = pa.BufferOutputStream()
+    pq.write_table(
+        table,
+        parquet_buffer,
+        compression="snappy",
+        row_group_size=100_000
+    )
+    parquet_bytes = parquet_buffer.getvalue().to_pybytes()
+
+    # Compute checksum for verification
+    checksum = hashlib.sha256(parquet_bytes).hexdigest()
+
+    # Build S3 path
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    s3_key = f"{prefix}/{parent_table}/{partition_name}/{partition_name}_{timestamp}.parquet"
+    s3_path = f"s3://{bucket}/{s3_key}"
+
+    log.info("Uploading %d rows (%d bytes) to %s", row_count, len(parquet_bytes), s3_path)
+    s3.put_object(
+        Bucket=bucket,
+        Key=s3_key,
+        Body=parquet_bytes,
+        ContentType="application/octet-stream",
+        Metadata={
+            "partition_name": partition_name,
+            "parent_table": parent_table,
+            "row_count": str(row_count),
+            "exported_at": timestamp,
+            "sha256": checksum,
+        }
+    )
+
+    return s3_path, row_count, checksum
+
+
+def verify_export(bucket: str, s3_path: str, expected_rows: int, expected_checksum: str) -&gt; bool:
+    """
+    Re-download the Parquet file from S3 and verify row count and checksum.
+    """
+    s3 = boto3.client("s3")
+    # Parse bucket/key from s3:// URI
+    path_without_prefix = s3_path[len("s3://"):]
+    bucket_name, _, key = path_without_prefix.partition("/")
+
+    log.info("Verifying export at %s", s3_path)
+    response = s3.get_object(Bucket=bucket_name, Key=key)
+    data = response["Body"].read()
+
+    actual_checksum = hashlib.sha256(data).hexdigest()
+    if actual_checksum != expected_checksum:
+        log.error("Checksum mismatch! Expected %s, got %s", expected_checksum, actual_checksum)
+        return False
+
+    buffer = pa.BufferReader(data)
+    parquet_table = pq.read_table(buffer)
+    actual_rows = parquet_table.num_rows
+
+    if actual_rows != expected_rows:
+        log.error("Row count mismatch! Expected %d, got %d", expected_rows, actual_rows)
+        return False
+
+    log.info("Verification passed: %d rows, checksum OK", actual_rows)
+    return True
+
+
+def record_archival(conn, parent_table: str, partition_name: str,
+                    s3_path: str, row_count: int, checksum: str, verified: bool):
+    """
+    Insert a record into the archive_metadata tracking table.
+    """
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO archive_metadata (
+                original_table,
+                partition_name,
+                archive_path,
+                row_count,
+                checksum,
+                archived_at,
+                archived_by,
+                verified
+            ) VALUES (%s, %s, %s, %s, %s, NOW(), CURRENT_USER, %s)
+            ON CONFLICT (partition_name) DO UPDATE
+                SET archive_path = EXCLUDED.archive_path,
+                    row_count     = EXCLUDED.row_count,
+                    checksum      = EXCLUDED.checksum,
+                    archived_at   = EXCLUDED.archived_at,
+                    verified      = EXCLUDED.verified;
+        """, (parent_table, partition_name, s3_path, row_count, checksum, verified))
+    conn.commit()
+
+
+def detach_and_drop_partition(conn, parent_table: str, partition_name: str):
+    """
+    Detach the partition from the parent table, then drop it.
+    Performed in a transaction with a short lock timeout to avoid blocking.
+    """
+    with conn.cursor() as cur:
+        # Set a short lock timeout so we fail fast rather than block production queries
+        cur.execute("SET lock_timeout = '5s'")
+        log.info("Detaching partition %s from %s", partition_name, parent_table)
+        cur.execute(
+            f"ALTER TABLE {parent_table} DETACH PARTITION {partition_name}"
+        )
+        conn.commit()
+
+    # Drop outside the detach transaction so the detach is already committed
+    with conn.cursor() as cur:
+        log.info("Dropping partition %s", partition_name)
+        cur.execute(f"DROP TABLE {partition_name}")
+        conn.commit()
+
+
+# ── Main pipeline ────────────────────────────────────────────────────────────
+
+def run_tiering_pipeline():
+    log.info("Starting tiering pipeline — threshold: %d months", COLD_THRESHOLD_MONTHS)
+    conn = get_connection()
+
+    total_bytes_freed = 0
+    partitions_archived = 0
+    errors = []
+
+    for parent_table, ts_column in TIERING_CONFIG.items():
+        log.info("Processing table: %s", parent_table)
+
+        cold_partitions = get_cold_partitions(conn, parent_table, COLD_THRESHOLD_MONTHS)
+        log.info("Found %d cold partitions for %s", len(cold_partitions), parent_table)
+
+        for part in cold_partitions:
+            partition_name = part["partition_name"]
+            bytes_size     = part["bytes"]
+            human_size     = part["human_size"]
+
+            log.info("Archiving %s (%s)", partition_name, human_size)
+
+            try:
+                # Export
+                s3_path, row_count, checksum = export_partition_to_s3(
+                    conn, partition_name, parent_table,
+                    ARCHIVE_BUCKET, ARCHIVE_PREFIX, AWS_REGION
+                )
+                if s3_path is None:
+                    log.warning("Skipping empty partition: %s", partition_name)
+                    continue
+
+                # Record as unverified
+                record_archival(conn, parent_table, partition_name,
+                                s3_path, row_count, checksum, verified=False)
+
+                # Verify
+                verified = verify_export(ARCHIVE_BUCKET, s3_path, row_count, checksum)
+
+                if not verified:
+                    log.error("Verification failed for %s — partition NOT dropped", partition_name)
+                    errors.append(f"Verification failed: {partition_name}")
+                    continue
+
+                # Mark verified in metadata
+                record_archival(conn, parent_table, partition_name,
+                                s3_path, row_count, checksum, verified=True)
+
+                # Drop from RDS
+                detach_and_drop_partition(conn, parent_table, partition_name)
+
+                total_bytes_freed  += bytes_size
+                partitions_archived += 1
+                log.info("Successfully archived and dropped %s", partition_name)
+
+            except Exception as exc:
+                log.exception("Error processing partition %s: %s", partition_name, exc)
+                errors.append(f"{partition_name}: {exc}")
+                conn.rollback()
+
+    conn.close()
+
+    gb_freed = total_bytes_freed / (1024 ** 3)
+    log.info("Pipeline complete. Partitions archived: %d | Space freed: %.2f GB | Errors: %d",
+             partitions_archived, gb_freed, len(errors))
+
+    if errors:
+        log.error("Errors encountered:\n%s", "\n".join(errors))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    run_tiering_pipeline()</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.5 Querying Archived Data with Athena and Synapse</h3>
+
+<p class="text-gray-300 leading-relaxed">Archiving data to object storage only works operationally if your team can still query it when needed. The two most common access patterns for archived database data are ad-hoc queries (compliance audits, retroactive investigations) and batch analytics. Both are well served by serverless query engines that scan object storage directly.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Setting up AWS Glue Data Catalog for archived PostgreSQL exports:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+register_archive_catalog.py
+
+Registers archived Parquet partitions in the AWS Glue Data Catalog
+so they are immediately queryable via Athena.
+"""
+
+import boto3
+import json
+from datetime import datetime
+
+GLUE_DATABASE    = "db_cold_archive"
+ARCHIVE_BUCKET   = "your-archive-bucket"
+ARCHIVE_PREFIX   = "database-archive"
+AWS_REGION       = "us-east-1"
+
+glue   = boto3.client("glue",   region_name=AWS_REGION)
+athena = boto3.client("athena", region_name=AWS_REGION)
+
+
+def ensure_glue_database():
+    try:
+        glue.get_database(Name=GLUE_DATABASE)
+    except glue.exceptions.EntityNotFoundException:
+        glue.create_database(DatabaseInput={"Name": GLUE_DATABASE,
+                                             "Description": "Cold archive of RDS database exports"})
+        print(f"Created Glue database: {GLUE_DATABASE}")
+
+
+def register_table(table_name: str, s3_prefix: str, columns: list[dict]):
+    """
+    Create or update a Glue table pointing at the Parquet files in S3.
+    columns = [{"Name": "id", "Type": "bigint"}, ...]
+    """
+    location = f"s3://{ARCHIVE_BUCKET}/{s3_prefix}/"
+
+    table_input = {
+        "Name": table_name,
+        "Description": f"Archived from RDS — registered {datetime.utcnow().isoformat()}",
+        "StorageDescriptor": {
+            "Columns": columns,
+            "Location": location,
+            "InputFormat":  "org.apache.hadoop.mapred.TextInputFormat",
+            "OutputFormat": "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat",
+            "SerdeInfo": {
+                "SerializationLibrary": "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe",
+                "Parameters": {"serialization.format": "1"}
+            },
+            "Compressed": True,
+        },
+        "Parameters": {
+            "classification":    "parquet",
+            "compressionType":   "snappy",
+            "typeOfData":        "file",
+        },
+        "TableType": "EXTERNAL_TABLE",
+    }
+
+    try:
+        glue.get_table(DatabaseName=GLUE_DATABASE, Name=table_name)
+        glue.update_table(DatabaseName=GLUE_DATABASE, TableInput=table_input)
+        print(f"Updated Glue table: {GLUE_DATABASE}.{table_name}")
+    except glue.exceptions.EntityNotFoundException:
+        glue.create_table(DatabaseName=GLUE_DATABASE, TableInput=table_input)
+        print(f"Created Glue table: {GLUE_DATABASE}.{table_name}")
+
+
+def run_athena_validation(query: str, output_location: str) -&gt; str:
+    """
+    Submit an Athena query and return the QueryExecutionId.
+    """
+    response = athena.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={"Database": GLUE_DATABASE},
+        ResultConfiguration={"OutputLocation": output_location},
+        WorkGroup="primary"
+    )
+    return response["QueryExecutionId"]
+
+
+if __name__ == "__main__":
+    ensure_glue_database()
+
+    # Register audit_events archive
+    register_table(
+        table_name="audit_events_archive",
+        s3_prefix=f"{ARCHIVE_PREFIX}/audit_events_partitioned",
+        columns=[
+            {"Name": "id",          "Type": "bigint"},
+            {"Name": "user_id",     "Type": "bigint"},
+            {"Name": "event_type",  "Type": "string"},
+            {"Name": "event_data",  "Type": "string"},   # JSONB serialized as string
+            {"Name": "ip_address",  "Type": "string"},
+            {"Name": "created_at",  "Type": "timestamp"},
+        ]
+    )
+
+    # Validate with a quick Athena count
+    qid = run_athena_validation(
+        query="SELECT COUNT(*) AS total_archived_rows FROM audit_events_archive",
+        output_location=f"s3://{ARCHIVE_BUCKET}/athena-results/"
+    )
+    print(f"Validation query submitted — Athena QueryExecutionId: {qid}")
+    print("Check results in Athena console or poll with athena.get_query_results()")</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Querying the archive from Athena — sample operational queries:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Count archived audit events by month
+-- Athena SQL (Presto/Trino dialect)
+SELECT
+    DATE_TRUNC('month', created_at)       AS month,
+    event_type,
+    COUNT(*)                              AS event_count
+FROM
+    db_cold_archive.audit_events_archive
+WHERE
+    created_at BETWEEN TIMESTAMP '2022-01-01' AND TIMESTAMP '2022-12-31'
+GROUP BY
+    1, 2
+ORDER BY
+    1, 3 DESC;
+
+-- Find all events for a specific user across the full archive
+SELECT
+    created_at,
+    event_type,
+    ip_address,
+    JSON_EXTRACT_SCALAR(event_data, '$.action') AS action
+FROM
+    db_cold_archive.audit_events_archive
+WHERE
+    user_id = 98765
+    AND created_at &gt;= TIMESTAMP '2021-01-01'
+ORDER BY
+    created_at DESC
+LIMIT 1000;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure equivalent: querying archived SQL Server data via Synapse Analytics:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure Synapse Serverless SQL Pool
+-- Query archived SQL Server data exported to Azure Data Lake Storage Gen2
+
+-- Create an external data source pointing at the archive container
+CREATE EXTERNAL DATA SOURCE db_cold_archive
+WITH (
+    LOCATION = 'https://yourstorageaccount.dfs.core.windows.net/database-archive',
+    CREDENTIAL = [archive_storage_credential]   -- managed identity or SAS
+);
+
+-- Create an external file format for Parquet
+CREATE EXTERNAL FILE FORMAT parquet_snappy
+WITH (
+    FORMAT_TYPE = PARQUET,
+    DATA_COMPRESSION = 'org.apache.hadoop.io.compress.SnappyCodec'
+);
+
+-- Query archived audit events directly from ADLS Gen2
+SELECT
+    YEAR(created_at)        AS archive_year,
+    event_type,
+    COUNT(*)                AS event_count,
+    COUNT(DISTINCT user_id) AS unique_users
+FROM
+    OPENROWSET(
+        BULK 'audit_events_partitioned/**',
+        DATA_SOURCE = 'db_cold_archive',
+        FORMAT = 'PARQUET'
+    ) WITH (
+        id         BIGINT,
+        user_id    BIGINT,
+        event_type NVARCHAR(100),
+        event_data NVARCHAR(MAX),
+        ip_address NVARCHAR(45),
+        created_at DATETIME2
+    ) AS archive_data
+WHERE
+    created_at &lt; DATEADD(YEAR, -1, GETDATE())
+GROUP BY
+    YEAR(created_at), event_type
+ORDER BY
+    archive_year DESC, event_count DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud equivalent: BigQuery external tables over GCS:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Create a BigQuery external table pointing at GCS Parquet exports
+-- Run in BigQuery console or via bq CLI
+
+CREATE OR REPLACE EXTERNAL TABLE `your_project.db_cold_archive.audit_events_archive`
+OPTIONS (
+    format             = 'PARQUET',
+    uris               = ['gs://your-archive-bucket/database-archive/audit_events_partitioned/**/*.parquet'],
+    hive_partition_uri_prefix = 'gs://your-archive-bucket/database-archive/audit_events_partitioned',
+    require_hive_partition_filter = false
+);
+
+-- Query across the full archive
+SELECT
+    FORMAT_TIMESTAMP('%Y-%m', created_at) AS month,
+    event_type,
+    COUNT(*)                              AS events,
+    COUNT(DISTINCT user_id)               AS unique_users
+FROM
+    `your_project.db_cold_archive.audit_events_archive`
+WHERE
+    created_at &lt; TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 365 DAY)
+GROUP BY
+    1, 2
+ORDER BY
+    1 DESC, 3 DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">The key design principle across all three clouds is the same: archived Parquet files in object storage become queryable within minutes of registration, cost nothing to query at rest, and scale to petabyte-range archives without any infrastructure provisioning. Athena, Synapse Serverless, and BigQuery all charge only for bytes scanned—and Parquet with Snappy compression plus partition pruning reduces scan costs dramatically compared to scanning raw CSV.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.6 Azure SQL and Google Cloud SQL Tiering Patterns</h3>
+
+<p class="text-gray-300 leading-relaxed">AWS RDS has the most mature native tooling for partition-level export via <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">aws_s3</code>, but Azure SQL and Google Cloud SQL require slightly different approaches. Both can achieve equivalent outcomes with extra plumbing.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure SQL: exporting cold data with BACPAC and Blob Storage</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For Azure SQL databases without partitioning, the most practical cold-data workflow combines Azure Data Factory (ADF) for orchestrated export with Azure Blob lifecycle management for automatic tier transitions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+azure_cold_export.py
+
+Uses the Azure SQL Bulk Copy API (BCP) wrapper via pyodbc and Azure Blob SDK
+to export cold table partitions to Azure Data Lake Storage Gen2 as Parquet.
+
+Equivalent to the AWS aws_s3 export for Azure SQL environments.
+"""
+
+import os
+import io
+import logging
+import pyodbc
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from azure.identity import DefaultAzureCredential
+from azure.storage.blob import BlobServiceClient, ContentSettings
+from datetime import datetime
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+AZURE_SQL_CONN_STR = os.environ.get("AZURE_SQL_CONN_STR")
+# e.g. "Driver={ODBC Driver 18 for SQL Server};Server=tcp:yourserver.database.windows.net,1433;
+#        Database=production;Authentication=ActiveDirectoryMsi;"
+
+STORAGE_ACCOUNT_URL = os.environ.get("STORAGE_ACCOUNT_URL",
+                                      "https://yourstorageaccount.dfs.core.windows.net")
+CONTAINER_NAME      = os.environ.get("CONTAINER_NAME", "database-archive")
+
+
+def export_sql_server_table_to_adls(
+    table_name: str,
+    date_column: str,
+    cutoff_year: int,
+    cutoff_quarter: int
+):
+    """
+    Export one quarter of data from an Azure SQL table to ADLS Gen2 Parquet.
+    """
+    credential   = DefaultAzureCredential()
+    blob_service = BlobServiceClient(STORAGE_ACCOUNT_URL, credential=credential)
+    container    = blob_service.get_container_client(CONTAINER_NAME)
+
+    conn   = pyodbc.connect(AZURE_SQL_CONN_STR)
+    cursor = conn.cursor()
+
+    # Build date bounds for the quarter
+    quarter_start_month = (cutoff_quarter - 1) * 3 + 1
+    quarter_end_month   = quarter_start_month + 3
+    if quarter_end_month &gt; 12:
+        end_year  = cutoff_year + 1
+        end_month = 1
+    else:
+        end_year  = cutoff_year
+        end_month = quarter_end_month
+
+    start_date = f"{cutoff_year}-{quarter_start_month:02d}-01"
+    end_date   = f"{end_year}-{end_month:02d}-01"
+
+    query = f"""
+        SELECT *
+        FROM   {table_name} WITH (NOLOCK)
+        WHERE  {date_column} &gt;= '{start_date}'
+          AND  {date_column} &lt;  '{end_date}'
+    """
+
+    log.info("Fetching data: %s Q%d from %s", cutoff_year, cutoff_quarter, table_name)
+    df = pd.read_sql(query, conn)
+    conn.close()
+
+    if df.empty:
+        log.warning("No rows found for %s %d Q%d", table_name, cutoff_year, cutoff_quarter)
+        return None, 0
+
+    row_count = len(df)
+    log.info("Fetched %d rows", row_count)
+
+    # Write Parquet to buffer
+    arrow_table = pa.Table.from_pandas(df, preserve_index=False)
+    buffer      = io.BytesIO()
+    pq.write_table(arrow_table, buffer, compression="snappy")
+    buffer.seek(0)
+
+    blob_path = (f"audit_events/{cutoff_year}/Q{cutoff_quarter}/"
+                 f"{table_name}_{cutoff_year}_Q{cutoff_quarter}.parquet")
+
+    log.info("Uploading to %s/%s", CONTAINER_NAME, blob_path)
+    blob_client = container.get_blob_client(blob_path)
+    blob_client.upload_blob(
+        buffer,
+        overwrite=True,
+        content_settings=ContentSettings(content_type="application/octet-stream"),
+        metadata={
+            "table_name":   table_name,
+            "year":         str(cutoff_year),
+            "quarter":      str(cutoff_quarter),
+            "row_count":    str(row_count),
+            "exported_at":  datetime.utcnow().isoformat(),
+        }
+    )
+
+    s3_equivalent_path = f"abfss://{CONTAINER_NAME}@{STORAGE_ACCOUNT_URL.split('//')[1]}/{blob_path}"
+    log.info("Export complete: %s", s3_equivalent_path)
+    return s3_equivalent_path, row_count
+
+
+if __name__ == "__main__":
+    export_sql_server_table_to_adls(
+        table_name    = "audit_events",
+        date_column   = "created_at",
+        cutoff_year   = 2022,
+        cutoff_quarter= 1
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Blob lifecycle policy (ARM template fragment):</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>{
+  "type": "Microsoft.Storage/storageAccounts/managementPolicies",
+  "apiVersion": "2023-01-01",
+  "name": "[concat(parameters('storageAccountName'), '/default')]",
+  "properties": {
+    "policy": {
+      "rules": [
+        {
+          "name": "DatabaseArchiveTiering",
+          "enabled": true,
+          "type": "Lifecycle",
+          "definition": {
+            "filters": {
+              "blobTypes": ["blockBlob"],
+              "prefixMatch": ["database-archive/"]
+            },
+            "actions": {
+              "baseBlob": {
+                "tierToCool": {
+                  "daysAfterModificationGreaterThan": 30
+                },
+                "tierToArchive": {
+                  "daysAfterModificationGreaterThan": 180
+                },
+                "delete": {
+                  "daysAfterModificationGreaterThan": 2555
+                }
+              },
+              "snapshot": {
+                "delete": {
+                  "daysAfterCreationGreaterThan": 90
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud SQL: exporting cold data to GCS with Cloud Scheduler</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Google Cloud SQL supports native export to GCS via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">gcloud sql export csv</code> command and the Cloud SQL Admin API. The cleanest automation uses Cloud Scheduler → Pub/Sub → Cloud Functions.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/bin/bash
+# Export a cold table partition from Cloud SQL PostgreSQL to GCS
+# Called from a Cloud Function triggered by Cloud Scheduler
+
+PROJECT_ID="your-gcp-project"
+INSTANCE_NAME="prod-postgres-01"
+DATABASE_NAME="production"
+BUCKET="gs://your-archive-bucket"
+YEAR=2022
+QUARTER=1
+
+START_DATE="${YEAR}-$(printf '%02d' $(( (QUARTER-1)*3+1 )))-01"
+END_MONTH=$(( QUARTER*3+1 ))
+END_YEAR=$YEAR
+if [ $END_MONTH -gt 12 ]; then
+    END_MONTH=1
+    END_YEAR=$(( YEAR+1 ))
+fi
+END_DATE="${END_YEAR}-$(printf '%02d' $END_MONTH)-01"
+
+EXPORT_URI="${BUCKET}/database-archive/audit_events/${YEAR}/Q${QUARTER}/audit_events_${YEAR}_Q${QUARTER}.csv.gz"
+
+echo "Exporting audit_events ${YEAR} Q${QUARTER} to ${EXPORT_URI}"
+
+gcloud sql export csv "$INSTANCE_NAME" "$EXPORT_URI" \
+  --project="$PROJECT_ID" \
+  --database="$DATABASE_NAME" \
+  --query="SELECT * FROM audit_events WHERE created_at &gt;= '${START_DATE}' AND created_at &lt; '${END_DATE}'" \
+  --compression \
+  --async
+
+echo "Export job submitted. Monitor with: gcloud sql operations list --instance=$INSTANCE_NAME"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">After export, a GCS Object Lifecycle rule handles the ongoing tiering:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+Apply GCS lifecycle rules to the archive bucket.
+Transitions: Standard → Nearline (30d) → Coldline (90d) → Archive (365d)
+"""
+
+from google.cloud import storage
+
+def apply_lifecycle_rules(bucket_name: str):
+    client = storage.Client()
+    bucket = client.get_bucket(bucket_name)
+
+    rules = [
+        storage.lifecycle.TransitionRule(
+            storage.lifecycle.TransitionRule.NEARLINE,
+            age=30,
+            matches_prefix=["database-archive/"]
+        ),
+        storage.lifecycle.TransitionRule(
+            storage.lifecycle.TransitionRule.COLDLINE,
+            age=90,
+            matches_prefix=["database-archive/"]
+        ),
+        storage.lifecycle.TransitionRule(
+            storage.lifecycle.TransitionRule.ARCHIVE,
+            age=365,
+            matches_prefix=["database-archive/"]
+        ),
+        storage.lifecycle.DeleteRule(
+            age=2555,
+            matches_prefix=["database-archive/"]
+        ),
+    ]
+
+    bucket.lifecycle_rules = rules
+    bucket.patch()
+    print(f"Lifecycle rules applied to gs://{bucket_name}")
+
+if __name__ == "__main__":
+    apply_lifecycle_rules("your-archive-bucket")</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.7 Building a Metadata Catalog for Archived Data</h3>
+
+<p class="text-gray-300 leading-relaxed">Every byte moved to object storage must be tracked. Without a metadata catalog, archived data becomes inaccessible not because it cannot be queried, but because no one can find it. The metadata table introduced in Section 17.3 needs to evolve into a proper catalog that your application, compliance team, and operations staff can query.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Creating the archive metadata catalog in PostgreSQL:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Full archive metadata catalog schema
+-- Deploy on a management/control-plane database, not on the archived database itself
+
+CREATE TABLE archive_metadata (
+    id                BIGSERIAL PRIMARY KEY,
+    original_table    VARCHAR(255)  NOT NULL,
+    partition_name    VARCHAR(255)  NOT NULL UNIQUE,
+    archive_path      TEXT          NOT NULL,
+    storage_class     VARCHAR(50)   NOT NULL DEFAULT 'STANDARD',
+    row_count         BIGINT        NOT NULL,
+    uncompressed_bytes BIGINT,
+    compressed_bytes  BIGINT,
+    checksum          VARCHAR(64),           -- SHA-256 hex
+    date_range_start  TIMESTAMPTZ,
+    date_range_end    TIMESTAMPTZ,
+    schema_version    INTEGER       NOT NULL DEFAULT 1,
+    archived_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    archived_by       VARCHAR(100),
+    verified          BOOLEAN       NOT NULL DEFAULT false,
+    verified_at       TIMESTAMPTZ,
+    retrieval_count   INTEGER       NOT NULL DEFAULT 0,
+    last_retrieved_at TIMESTAMPTZ,
+    retention_policy  VARCHAR(50)   NOT NULL DEFAULT '7_years',
+    delete_after      TIMESTAMPTZ,
+    notes             TEXT,
+    tags              JSONB         NOT NULL DEFAULT '{}'
+);
+
+-- Indexes for common lookup patterns
+CREATE INDEX ON archive_metadata (original_table);
+CREATE INDEX ON archive_metadata (date_range_start, date_range_end);
+CREATE INDEX ON archive_metadata (archived_at);
+CREATE INDEX ON archive_metadata (verified);
+CREATE INDEX ON archive_metadata USING GIN (tags);
+
+-- View: cost estimation based on storage class
+CREATE VIEW archive_cost_estimate AS
+SELECT
+    original_table,
+    storage_class,
+    COUNT(*)                                 AS partition_count,
+    SUM(row_count)                           AS total_rows,
+    pg_size_pretty(SUM(compressed_bytes))    AS total_compressed,
+    SUM(compressed_bytes) / 1024.0^3        AS total_gb,
+    CASE storage_class
+        WHEN 'STANDARD'      THEN SUM(compressed_bytes) / 1024.0^3 * 0.023
+        WHEN 'STANDARD_IA'   THEN SUM(compressed_bytes) / 1024.0^3 * 0.0125
+        WHEN 'GLACIER_IR'    THEN SUM(compressed_bytes) / 1024.0^3 * 0.004
+        WHEN 'DEEP_ARCHIVE'  THEN SUM(compressed_bytes) / 1024.0^3 * 0.00099
+        ELSE NULL
+    END                                      AS estimated_monthly_cost_usd
+FROM
+    archive_metadata
+WHERE
+    verified = true
+GROUP BY
+    original_table, storage_class
+ORDER BY
+    total_gb DESC;
+
+COMMENT ON VIEW archive_cost_estimate IS
+    'Estimated monthly S3 storage cost for verified archives. Update rates as pricing changes.';</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Equivalent SQL Server / Azure SQL catalog schema:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Archive metadata catalog for SQL Server / Azure SQL environments
+
+CREATE TABLE archive_metadata (
+    id                   BIGINT IDENTITY(1,1) PRIMARY KEY,
+    original_table       NVARCHAR(255) NOT NULL,
+    partition_name       NVARCHAR(255) NOT NULL,
+    archive_path         NVARCHAR(MAX) NOT NULL,
+    storage_class        NVARCHAR(50)  NOT NULL DEFAULT 'Hot',
+    row_count            BIGINT        NOT NULL,
+    uncompressed_bytes   BIGINT        NULL,
+    compressed_bytes     BIGINT        NULL,
+    checksum             NVARCHAR(64)  NULL,
+    date_range_start     DATETIME2     NULL,
+    date_range_end       DATETIME2     NULL,
+    schema_version       INT           NOT NULL DEFAULT 1,
+    archived_at          DATETIME2     NOT NULL DEFAULT SYSUTCDATETIME(),
+    archived_by          NVARCHAR(100) NULL,
+    verified             BIT           NOT NULL DEFAULT 0,
+    verified_at          DATETIME2     NULL,
+    retrieval_count      INT           NOT NULL DEFAULT 0,
+    last_retrieved_at    DATETIME2     NULL,
+    retention_policy     NVARCHAR(50)  NOT NULL DEFAULT '7_years',
+    delete_after         DATETIME2     NULL,
+    notes                NVARCHAR(MAX) NULL,
+    tags                 NVARCHAR(MAX) NULL     -- JSON string
+);
+
+CREATE UNIQUE INDEX UX_archive_metadata_partition
+    ON archive_metadata (partition_name);
+
+CREATE INDEX IX_archive_metadata_table
+    ON archive_metadata (original_table);
+
+CREATE INDEX IX_archive_metadata_dates
+    ON archive_metadata (date_range_start, date_range_end);
+
+-- Cost estimation view for Azure Blob tiers
+CREATE VIEW archive_cost_estimate AS
+SELECT
+    original_table,
+    storage_class,
+    COUNT(*)                                              AS partition_count,
+    SUM(row_count)                                        AS total_rows,
+    CAST(SUM(compressed_bytes) / POWER(1024.0, 3) AS DECIMAL(18,2)) AS total_gb,
+    CASE storage_class
+        WHEN 'Hot'     THEN SUM(compressed_bytes) / POWER(1024.0, 3) * 0.018
+        WHEN 'Cool'    THEN SUM(compressed_bytes) / POWER(1024.0, 3) * 0.01
+        WHEN 'Archive' THEN SUM(compressed_bytes) / POWER(1024.0, 3) * 0.00099
+        ELSE NULL
+    END                                                   AS estimated_monthly_cost_usd
+FROM
+    archive_metadata
+WHERE
+    verified = 1
+GROUP BY
+    original_table, storage_class;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tracking retrieval events — closing the feedback loop:</strong></p>
+
+<p class="text-gray-300 leading-relaxed">When someone queries the archive through Athena, Synapse, or BigQuery, that access should be logged back to the metadata catalog. This matters for two reasons: it proves the archive is reachable when compliance auditors ask, and it identifies data that is accessed frequently enough that re-hydration to a warmer storage tier would save money on per-retrieval fees.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: stored procedure to log a retrieval event
+CREATE OR REPLACE PROCEDURE log_archive_retrieval(
+    p_partition_name VARCHAR(255),
+    p_query_engine   VARCHAR(50),    -- 'athena', 'bigquery', 'synapse', 'direct'
+    p_rows_scanned   BIGINT,
+    p_bytes_scanned  BIGINT,
+    p_cost_usd       NUMERIC(10,6)
+)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    UPDATE archive_metadata
+    SET
+        retrieval_count    = retrieval_count + 1,
+        last_retrieved_at  = NOW()
+    WHERE
+        partition_name = p_partition_name;
+
+    INSERT INTO archive_retrieval_log (
+        partition_name,
+        query_engine,
+        rows_scanned,
+        bytes_scanned,
+        cost_usd,
+        retrieved_at,
+        retrieved_by
+    ) VALUES (
+        p_partition_name,
+        p_query_engine,
+        p_rows_scanned,
+        p_bytes_scanned,
+        p_cost_usd,
+        NOW(),
+        CURRENT_USER
+    );
+END;
+$$;</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- SQL Server equivalent
+CREATE OR ALTER PROCEDURE dbo.log_archive_retrieval
+    @partition_name  NVARCHAR(255),
+    @query_engine    NVARCHAR(50),
+    @rows_scanned    BIGINT,
+    @bytes_scanned   BIGINT,
+    @cost_usd        DECIMAL(10,6)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE archive_metadata
+    SET
+        retrieval_count   = retrieval_count + 1,
+        last_retrieved_at = SYSUTCDATETIME()
+    WHERE
+        partition_name = @partition_name;
+
+    INSERT INTO archive_retrieval_log (
+        partition_name,
+        query_engine,
+        rows_scanned,
+        bytes_scanned,
+        cost_usd,
+        retrieved_at,
+        retrieved_by
+    ) VALUES (
+        @partition_name,
+        @query_engine,
+        @rows_scanned,
+        @bytes_scanned,
+        @cost_usd,
+        SYSUTCDATETIME(),
+        SYSTEM_USER
+    );
+END;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.8 Handling Schema Evolution in Long-Term Archives</h3>
+
+<p class="text-gray-300 leading-relaxed">A problem that almost every team hits six to twelve months after deploying an archival pipeline is schema drift. The live table gains a new column, the schema_version in the archive catalog should increment, and the Parquet files already written do not have that column. Without planning for this, you end up with heterogeneous archives that break Athena and BigQuery external tables.</p>
+
+<p class="text-gray-300 leading-relaxed">The safest approach is a three-part policy:</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Always write schema version metadata</strong> into both the Parquet file metadata and the archive catalog row. The Python export script in Section 17.4 stores schema_version in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">archive_metadata</code> table; make that version number come from a controlled schema registry, not from the live table at export time.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Use schema-on-read with explicit null handling</strong> when querying archives. Athena, BigQuery, and Synapse can all handle missing columns in older Parquet files if you declare the column as nullable and the query does not filter on it.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Run a backfill job when additive schema changes occur</strong> — not to rewrite old Parquet files, but to emit a companion schema manifest file in the same S3 prefix that describes the columns present in each file generation.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema version manifest file — written alongside each Parquet export:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>def write_schema_manifest(
+    s3_client,
+    bucket: str,
+    parquet_key: str,
+    df: "pd.DataFrame",
+    schema_version: int
+):
+    """
+    Write a companion schema manifest JSON next to the Parquet file.
+    The manifest records column names, types, and the schema version
+    so future readers can handle missing columns gracefully.
+    """
+    import json
+
+    manifest = {
+        "schema_version": schema_version,
+        "parquet_key":    parquet_key,
+        "exported_at":    datetime.utcnow().isoformat(),
+        "columns": [
+            {"name": col, "dtype": str(df[col].dtype)}
+            for col in df.columns
+        ],
+        "row_count":       len(df),
+    }
+
+    manifest_key = parquet_key.replace(".parquet", ".schema.json")
+    s3_client.put_object(
+        Bucket=bucket,
+        Key=manifest_key,
+        Body=json.dumps(manifest, indent=2).encode(),
+        ContentType="application/json"
+    )
+    return manifest_key</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Athena query that handles nullable columns from mixed schema versions:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Query that works across archive files written before and after
+-- a new column (session_id) was added to audit_events
+
+SELECT
+    created_at,
+    event_type,
+    user_id,
+    ip_address,
+    -- Older files will return NULL for session_id; COALESCE gives a safe default
+    COALESCE(session_id, 'unknown')          AS session_id,
+    JSON_EXTRACT_SCALAR(event_data, '$.action') AS action
+FROM
+    db_cold_archive.audit_events_archive
+WHERE
+    created_at BETWEEN TIMESTAMP '2021-01-01' AND TIMESTAMP '2023-12-31'
+    AND user_id = 12345
+ORDER BY
+    created_at DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.9 Retrieval and Re-Hydration Workflows</h3>
+
+<p class="text-gray-300 leading-relaxed">Most archived data is queried in place through serverless engines and never needs to come back to the live database. But occasionally—regulatory reviews, data corrections, application features that need to resurface old records—you need to re-hydrate data into the live PostgreSQL or SQL Server instance. Doing this well means reading from S3/GCS/ADLS and writing back in bulk without overwhelming the primary instance.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Re-hydrating a Parquet archive back into PostgreSQL via COPY:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+rehydrate_partition.py
+
+Downloads a Parquet file from S3 and bulk-inserts it back into
+the live PostgreSQL database using COPY for maximum throughput.
+Used when a partition needs to be temporarily re-surfaced for
+a compliance review or data correction project.
+"""
+
+import io
+import os
+import logging
+import boto3
+import pyarrow.parquet as pq
+import psycopg2
+from psycopg2 import sql
+
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
+
+DB_HOST     = os.environ.get("DB_HOST")
+DB_PORT     = int(os.environ.get("DB_PORT", 5432))
+DB_NAME     = os.environ.get("DB_NAME")
+DB_USER     = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+
+S3_REGION   = os.environ.get("AWS_REGION", "us-east-1")
+
+
+def rehydrate_from_s3(
+    s3_path: str,
+    target_table: str,
+    batch_size: int = 50_000
+):
+    """
+    Download Parquet from S3 and COPY into target_table.
+    target_table should be a staging table, not the live partitioned parent,
+    to allow review before swapping in.
+    """
+    s3 = boto3.client("s3", region_name=S3_REGION)
+
+    # Parse S3 path
+    path = s3_path[len("s3://"):]
+    bucket, _, key = path.partition("/")
+
+    log.info("Downloading %s", s3_path)
+    obj     = s3.get_object(Bucket=bucket, Key=key)
+    data    = obj["Body"].read()
+    buffer  = io.BytesIO(data)
+
+    table   = pq.read_table(buffer)
+    df      = table.to_pandas()
+    total   = len(df)
+    log.info("Read %d rows from archive", total)
+
+    conn = psycopg2.connect(
+        host=DB_HOST, port=DB_PORT, dbname=DB_NAME,
+        user=DB_USER, password=DB_PASSWORD
+    )
+    conn.autocommit = False
+
+    try:
+        with conn.cursor() as cur:
+            # Use a staging table to allow inspection before promotion
+            staging = f"{target_table}_rehydration_staging"
+            cur.execute(
+                sql.SQL("CREATE TABLE IF NOT EXISTS {} (LIKE {} INCLUDING ALL)")
+                .format(sql.Identifier(staging), sql.Identifier(target_table))
+            )
+            cur.execute(sql.SQL("TRUNCATE {}").format(sql.Identifier(staging)))
+            conn.commit()
+
+            # Stream data in batches via COPY
+            inserted = 0
+            for start in range(0, total, batch_size):
+                batch = df.iloc[start : start + batch_size]
+                buf   = io.StringIO()
+                batch.to_csv(buf, index=False, header=False)
+                buf.seek(0)
+
+                cur.copy_expert(
+                    sql.SQL("COPY {} FROM STDIN WITH (FORMAT CSV)")
+                    .format(sql.Identifier(staging)),
+                    buf
+                )
+                conn.commit()
+                inserted += len(batch)
+                log.info("Inserted %d / %d rows", inserted, total)
+
+        log.info("Re-hydration complete into staging table: %s", staging)
+        log.info("Review data, then run: ALTER TABLE %s RENAME TO %s_old; "
+                 "ALTER TABLE %s RENAME TO %s;",
+                 target_table, target_table, staging, target_table)
+
+    except Exception:
+        conn.rollback()
+        log.exception("Re-hydration failed — rolled back")
+        raise
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+    rehydrate_from_s3(
+        s3_path      = "s3://your-archive-bucket/database-archive/audit_events_partitioned/"
+                       "audit_events_2022_q1/audit_events_2022_q1_20240101T000000Z.parquet",
+        target_table = "audit_events_rehydrated",
+        batch_size   = 50_000
+    )</code></pre>
+
+<p class="text-gray-300 leading-relaxed">For SQL Server re-hydration, the equivalent pattern uses <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT</code> or the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">bcp</code> utility pointed at a blob URL, which Azure SQL supports natively via the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BULK INSERT ... FROM 'https://...'</code> syntax available in Azure SQL Managed Instance and Azure Synapse dedicated pools.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- Azure SQL Managed Instance: bulk insert from ADLS Gen2
+BULK INSERT dbo.audit_events_rehydration_staging
+FROM 'https://yourstorageaccount.blob.core.windows.net/database-archive/audit_events/2022/Q1/audit_events_2022_Q1.parquet'
+WITH (
+    DATA_SOURCE     = 'db_cold_archive',
+    FORMAT          = 'PARQUET',
+    TABLOCK
+);
+
+-- Verify row count after import
+SELECT COUNT(*) FROM dbo.audit_events_rehydration_staging;</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.10 Calculating and Reporting Tiering ROI</h3>
+
+<p class="text-gray-300 leading-relaxed">FinOps is only as strong as its measurement layer. Every archival pipeline needs a reporting view that connects bytes moved to dollars saved, so that leadership can see the value and engineers can tune the thresholds.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">PostgreSQL view for tiering ROI report:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- ROI reporting view
+-- Compares estimated cost of data on RDS gp3 vs actual cost in archive
+
+CREATE VIEW tiering_roi_report AS
+WITH archive_costs AS (
+    SELECT
+        original_table,
+        COUNT(*)                                              AS partitions_archived,
+        SUM(row_count)                                        AS total_rows_archived,
+        SUM(compressed_bytes) / POWER(1024.0, 3)             AS archive_gb,
+        -- Cost in archive (S3 Glacier Instant as a representative tier)
+        SUM(compressed_bytes) / POWER(1024.0, 3) * 0.004     AS archive_monthly_cost_usd,
+        -- What it would cost on gp3
+        -- Assume 4:1 compression: compressed Parquet vs raw PostgreSQL pages
+        SUM(compressed_bytes) * 4.0 / POWER(1024.0, 3) * 0.092
+                                                              AS rds_gp3_equivalent_cost_usd,
+        MIN(date_range_start)                                 AS oldest_archived_date,
+        MAX(date_range_end)                                   AS newest_archived_date,
+        MIN(archived_at)                                      AS first_archived_at
+    FROM
+        archive_metadata
+    WHERE
+        verified = true
+    GROUP BY
+        original_table
+)
+SELECT
+    original_table,
+    partitions_archived,
+    total_rows_archived,
+    ROUND(archive_gb::NUMERIC, 2)                            AS archive_gb,
+    ROUND(archive_monthly_cost_usd::NUMERIC, 2)              AS archive_cost_per_month,
+    ROUND(rds_gp3_equivalent_cost_usd::NUMERIC, 2)           AS avoided_rds_cost_per_month,
+    ROUND((rds_gp3_equivalent_cost_usd
+           - archive_monthly_cost_usd)::NUMERIC, 2)          AS monthly_savings_usd,
+    ROUND((rds_gp3_equivalent_cost_usd
+           - archive_monthly_cost_usd) * 12.0, 2)            AS annualized_savings_usd,
+    ROUND(100.0 * (rds_gp3_equivalent_cost_usd
+           - archive_monthly_cost_usd)
+           / NULLIF(rds_gp3_equivalent_cost_usd, 0), 1)      AS savings_pct,
+    oldest_archived_date,
+    newest_archived_date,
+    first_archived_at
+FROM
+    archive_costs
+ORDER BY
+    monthly_savings_usd DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">SQL Server equivalent:</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>CREATE VIEW dbo.tiering_roi_report AS
+WITH archive_costs AS (
+    SELECT
+        original_table,
+        COUNT(*)                                                   AS partitions_archived,
+        SUM(row_count)                                             AS total_rows_archived,
+        SUM(compressed_bytes) / POWER(1024.0, 3)                  AS archive_gb,
+        SUM(compressed_bytes) / POWER(1024.0, 3) * 0.004          AS archive_monthly_cost_usd,
+        SUM(compressed_bytes) * 4.0 / POWER(1024.0, 3) * 0.092   AS rds_gp3_equivalent_cost_usd,
+        MIN(date_range_start)                                      AS oldest_archived_date,
+        MAX(date_range_end)                                        AS newest_archived_date,
+        MIN(archived_at)                                           AS first_archived_at
+    FROM
+        archive_metadata
+    WHERE
+        verified = 1
+    GROUP BY
+        original_table
+)
+SELECT
+    original_table,
+    partitions_archived,
+    total_rows_archived,
+    ROUND(CAST(archive_gb AS DECIMAL(18,2)), 2)                    AS archive_gb,
+    ROUND(CAST(archive_monthly_cost_usd AS DECIMAL(18,2)), 2)      AS archive_cost_per_month,
+    ROUND(CAST(rds_gp3_equivalent_cost_usd AS DECIMAL(18,2)), 2)   AS avoided_rds_cost_per_month,
+    ROUND(CAST(rds_gp3_equivalent_cost_usd
+               - archive_monthly_cost_usd AS DECIMAL(18,2)), 2)    AS monthly_savings_usd,
+    ROUND(CAST((rds_gp3_equivalent_cost_usd
+               - archive_monthly_cost_usd) * 12.0 AS DECIMAL(18,2)), 2)
+                                                                   AS annualized_savings_usd,
+    ROUND(CAST(100.0 * (rds_gp3_equivalent_cost_usd
+               - archive_monthly_cost_usd)
+               / NULLIF(rds_gp3_equivalent_cost_usd, 0) AS DECIMAL(5,1)), 1)
+                                                                   AS savings_pct,
+    oldest_archived_date,
+    newest_archived_date,
+    first_archived_at
+FROM
+    archive_costs;
+GO</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running this view monthly and feeding it into a Grafana dashboard or a Slack report gives your team a persistent, compounding record of the value the tiering pipeline has delivered. Teams that skip this step often find the pipeline deprioritized the moment an engineer who built it moves on—there is no visible evidence of what it is doing.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">17.11 Common Pitfalls and How to Avoid Them</h3>
+
+<p class="text-gray-300 leading-relaxed">Even well-designed tiering pipelines fail in predictable ways. The following are the failure modes that appear most often in production environments.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Forgetting retrieval costs when choosing storage classes</strong></p>
+
+<p class="text-gray-300 leading-relaxed">S3 Glacier Deep Archive costs $0.00099/GB-month at rest, but retrieval costs $0.02/GB plus a minimum 12-hour restore time. If your compliance team retrieves a 500 GB partition twice a year, that is $10 in retrieval fees each time—still cheap, but not free. For data that is accessed even once per quarter, Glacier Instant at $0.004/GB delivers millisecond retrieval and no restore delay. Match the storage class to the realistic access frequency, not just the cheapest option at rest.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Archiving without verifying</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The export step in Section 17.4 writes <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">verified=false</code> to the metadata table and only flips it after the checksum and row count are confirmed. Teams under time pressure skip the verification step. Six months later, when a regulator asks for a specific archive, the file exists but is corrupted or incomplete. Never drop a partition before setting <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">verified=true</code>.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Partitioning by month when your queries span quarters</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If Athena or BigQuery scans all partitions to answer a query spanning multiple months, the savings from partition pruning disappear. Design partition boundaries to match the most common query patterns. For audit logs queried by quarter for compliance, quarterly partitions are better than monthly ones.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Lock contention during partition detach</strong></p>
+
+<p class="text-gray-300 leading-relaxed">The <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ALTER TABLE ... DETACH PARTITION</code> command in PostgreSQL acquires a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">ShareUpdateExclusiveLock</code> in PostgreSQL 14+ (using the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">CONCURRENTLY</code> option) but requires <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">AccessExclusiveLock</code> in earlier versions. Always set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">lock_timeout</code> before running detach in production, as shown in the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">detach_and_drop_partition</code> function in Section 17.4. If the lock cannot be acquired within the timeout, the operation fails cleanly rather than blocking production queries for an unknown duration.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Schema drift breaking external tables</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Covered in Section 17.8, but worth reiterating: every time you ALTER a live table, test that the corresponding Athena, Synapse, or BigQuery external table still resolves. Add this as a step in your database migration CI pipeline—a simple <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">SELECT 1 FROM archive_table LIMIT 1</code> run in CI catches the problem before it reaches production.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Not accounting for minimum storage duration fees</strong></p>
+
+<p class="text-gray-300 leading-relaxed">S3 Standard-IA has a 30-day minimum storage duration. Glacier Instant has a 90-day minimum. Deep Archive has a 180-day minimum. If you archive a partition to Deep Archive and then need to delete it 60 days later (say, because a GDPR erasure request covers that partition), you still pay for the full 180 days. Design your retention and deletion policies to account for these minimums, and track the <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">archived_at</code> timestamp in the metadata catalog so your deletion job knows when the minimum period has elapsed.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **The storage tier price gap is 50–100x between block storage and archival object storage**, making cold data archival one of the highest-ROI cost reduction actions available on any cloud database platform. Even partial migration of large historical tables produces meaningful annual savings.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Range partitioning by time is the foundation of every reliable tiering pipeline.** Without partitions, cold data cannot be detached and exported cleanly. Invest in partitioning before building any other part of the archival workflow, and use quarterly or monthly partition boundaries that align with your query patterns.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Verification before deletion is non-negotiable.** Every export must be validated by checksum and row count before the source partition is dropped. A metadata catalog with a `verified` boolean flag and a retrieval log gives your operations and compliance teams proof that the archive is intact and accessible.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Archived data must remain queryable.** Athena, Synapse Serverless SQL, and BigQuery external tables over Parquet files deliver serverless, on-demand access to archived data at a fraction of the cost of keeping it in the live database. Register archives in the Glue Data Catalog or equivalent immediately after export so the data is findable.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Automate the full lifecycle and measure it visibly.** A tiering pipeline that runs once delivers one-time savings. A pipeline scheduled via EventBridge, Cloud Scheduler, or cron—with lifecycle policies automatically transitioning objects through storage classes and an ROI reporting view feeding a dashboard—delivers compounding savings that grow as the database ages and accumulates more cold data.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
