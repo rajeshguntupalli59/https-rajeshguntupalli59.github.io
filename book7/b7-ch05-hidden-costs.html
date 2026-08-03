@@ -5,6 +5,10 @@
   <title>Chapter 5: The Hidden Costs: Data Transfer, Snapshots, and Logs — Database FinOps</title>
   <meta name="description" content="Database FinOps Chapter 5: The Hidden Costs: Data Transfer, Snapshots, and Logs. Cloud database cost optimization — by Rajesh Guntupalli." />
   <script src="https://cdn.tailwindcss.com"></script>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "dark" });
+  </script>
 </head>
 <body class="bg-gray-950 text-gray-100 font-sans antialiased">
   <nav class="fixed top-0 left-0 right-0 z-50 border-b border-gray-800/60 bg-gray-950/90 backdrop-blur-md">
@@ -336,7 +340,7 @@ if __name__ == '__main__':
 <p class="text-gray-300 leading-relaxed">AWS charges $0.095/GB-month for snapshots stored in gp2/gp3 format beyond the provisioned database storage size. A 500GB database with 35 automated snapshots (the result of setting a 35-day retention period for a compliance requirement) stores approximately:</p>
 
 <li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> First 500GB: **free** (offset by provisioned storage payment)</li>
-<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Remaining ~16,500GB (33 snapshots × 500GB): 16,500 × $0.095 = **$1,567.50/month**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Remaining ~17,000GB (34 snapshots × 500GB): 17,000 × $0.095 = **$1,615.00/month**</li>
 
 <p class="text-gray-300 leading-relaxed">The relationship between retention period and cost is linear. Moving from a 35-day to a 7-day retention window for development databases reduces snapshot storage by 80%.</p>
 
@@ -433,7 +437,1078 @@ print(f'Estimated backup cost at \$0.08/GB/month: \${float(disk_gb) * 0.08:.2f}/
 <p class="text-gray-300 leading-relaxed">| Data warehouse | Weekly only | Full rebuilds cheaper than snapshots |</p>
 
 <p class="text-gray-300 leading-relaxed">Manual snapshots that are never deleted are the second largest snapshot cost driver. Teams create manual snapshots before schema migrations, forget to delete them, and those snapshots accumulate for years. The following script audits and remediates orphaned manual snapshots.</p>
-</div>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+snapshot_cost_auditor.py
+Identifies overdue manual snapshots, orphaned snapshots from deleted databases,
+and databases with excessive automated retention.
+Designed to run weekly via EventBridge + Lambda.
+"""
+
+import boto3
+import json
+from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass, asdict
+from typing import List
+
+@dataclass
+class SnapshotFinding:
+    snapshot_id: str
+    db_instance: str
+    snapshot_type: str
+    age_days: int
+    size_gb: int
+    monthly_cost_usd: float
+    issue: str
+    action: str
+
+def calculate_monthly_cost(size_gb: int) -&gt; float:
+    """AWS snapshot pricing: $0.095/GB-month."""
+    return round(size_gb * 0.095, 2)
+
+def get_active_db_instances(rds_client) -&gt; set:
+    """Return set of currently active DB instance identifiers."""
+    active = set()
+    paginator = rds_client.get_paginator('describe_db_instances')
+    for page in paginator.paginate():
+        for db in page['DBInstances']:
+            active.add(db['DBInstanceIdentifier'])
+    return active
+
+def audit_snapshots(rds_client, max_manual_age_days=90, dev_patterns=None) -&gt; List[SnapshotFinding]:
+    """
+    Audit all RDS snapshots for cost issues.
+    dev_patterns: list of substrings that identify dev/staging instances (e.g., ['dev', 'staging', 'test'])
+    """
+    if dev_patterns is None:
+        dev_patterns = ['dev', 'staging', 'test', 'sandbox', 'qa']
+
+    active_instances = get_active_db_instances(rds_client)
+    findings = []
+    now = datetime.now(timezone.utc)
+
+    paginator = rds_client.get_paginator('describe_db-snapshots')
+    # Note: actual boto3 method is describe_db_snapshots
+    paginator = rds_client.get_paginator('describe_db_snapshots')
+
+    for page in paginator.paginate():
+        for snap in page['DBSnapshots']:
+            snap_id = snap['DBSnapshotIdentifier']
+            db_id = snap['DBInstanceIdentifier']
+            snap_type = snap['SnapshotType']
+            size_gb = snap.get('AllocatedStorage', 0)
+            status = snap['Status']
+            created_raw = snap.get('SnapshotCreateTime')
+
+            if status != 'available':
+                continue
+
+            age_days = 0
+            if created_raw:
+                age_days = (now - created_raw).days
+
+            monthly_cost = calculate_monthly_cost(size_gb)
+
+            # 1. Orphaned snapshot: source DB no longer exists
+            if db_id not in active_instances and snap_type == 'manual':
+                findings.append(SnapshotFinding(
+                    snapshot_id=snap_id,
+                    db_instance=db_id,
+                    snapshot_type=snap_type,
+                    age_days=age_days,
+                    size_gb=size_gb,
+                    monthly_cost_usd=monthly_cost,
+                    issue='orphaned_snapshot',
+                    action=f'Delete immediately — source instance no longer exists. Saves ${monthly_cost}/month.'
+                ))
+                continue
+
+            # 2. Ancient manual snapshot
+            if snap_type == 'manual' and age_days &gt; max_manual_age_days:
+                findings.append(SnapshotFinding(
+                    snapshot_id=snap_id,
+                    db_instance=db_id,
+                    snapshot_type=snap_type,
+                    age_days=age_days,
+                    size_gb=size_gb,
+                    monthly_cost_usd=monthly_cost,
+                    issue='stale_manual_snapshot',
+                    action=(
+                        f'Manual snapshot is {age_days} days old. '
+                        f'Review and delete if no longer needed for migration/compliance. '
+                        f'Saves ${monthly_cost}/month.'
+                    )
+                ))
+
+            # 3. Dev/staging instance with automated snapshots older than 3 days
+            is_dev = any(p.lower() in db_id.lower() for p in dev_patterns)
+            if is_dev and snap_type == 'automated' and age_days &gt; 3:
+                findings.append(SnapshotFinding(
+                    snapshot_id=snap_id,
+                    db_instance=db_id,
+                    snapshot_type=snap_type,
+                    age_days=age_days,
+                    size_gb=size_gb,
+                    monthly_cost_usd=monthly_cost,
+                    issue='excessive_dev_retention',
+                    action=(
+                        f'Dev/staging instance retaining automated snapshots for {age_days} days. '
+                        f'Reduce BackupRetentionPeriod to 1. '
+                        f'Estimated savings: ${monthly_cost}/month per excess snapshot.'
+                    )
+                ))
+
+    return sorted(findings, key=lambda f: f.monthly_cost_usd, reverse=True)
+
+
+def apply_retention_policy(rds_client, db_instance_id: str, retention_days: int, dry_run=True):
+    """Modify automated backup retention for a DB instance."""
+    if dry_run:
+        print(f'[DRY RUN] Would set BackupRetentionPeriod={retention_days} on {db_instance_id}')
+        return
+    rds_client.modify_db_instance(
+        DBInstanceIdentifier=db_instance_id,
+        BackupRetentionPeriod=retention_days,
+        ApplyImmediately=False  # Apply during next maintenance window
+    )
+    print(f'Updated retention to {retention_days} days for {db_instance_id}')
+
+
+def delete_snapshot(rds_client, snapshot_id: str, dry_run=True):
+    """Delete a manual snapshot after confirmation."""
+    if dry_run:
+        print(f'[DRY RUN] Would delete snapshot: {snapshot_id}')
+        return
+    rds_client.delete_db_snapshot(DBSnapshotIdentifier=snapshot_id)
+    print(f'Deleted snapshot: {snapshot_id}')
+
+
+def main():
+    rds_client = boto3.client('rds', region_name='us-east-1')
+
+    findings = audit_snapshots(rds_client, max_manual_age_days=90)
+
+    total_recoverable = sum(f.monthly_cost_usd for f in findings)
+
+    report = {
+        'generated_at': datetime.utcnow().isoformat(),
+        'total_findings': len(findings),
+        'total_recoverable_monthly_usd': round(total_recoverable, 2),
+        'findings': [asdict(f) for f in findings]
+    }
+
+    print(json.dumps(report, indent=2))
+
+    # Categorize findings
+    orphaned = [f for f in findings if f.issue == 'orphaned_snapshot']
+    stale_manual = [f for f in findings if f.issue == 'stale_manual_snapshot']
+    dev_excess = [f for f in findings if f.issue == 'excessive_dev_retention']
+
+    print(f'\n=== SUMMARY ===')
+    print(f'Orphaned snapshots (auto-deletable):     {len(orphaned)}, '
+          f'${sum(f.monthly_cost_usd for f in orphaned):.2f}/month')
+    print(f'Stale manual snapshots (review required): {len(stale_manual)}, '
+          f'${sum(f.monthly_cost_usd for f in stale_manual):.2f}/month')
+    print(f'Dev/staging over-retention:               {len(dev_excess)}, '
+          f'${sum(f.monthly_cost_usd for f in dev_excess):.2f}/month')
+    print(f'Total recoverable:                        ${total_recoverable:.2f}/month')
+
+    # Uncomment to execute remediations (start with dry_run=True)
+    # for f in orphaned:
+    #     delete_snapshot(rds_client, f.snapshot_id, dry_run=True)
+
+if __name__ == '__main__':
+    main()</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Cross-Region Snapshot Replication Costs</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Snapshot replication to a second region for disaster recovery doubles your snapshot storage costs in the destination region and adds a one-time data transfer charge per replication. For a 1TB database snapshot:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Source region storage: 1TB × $0.095 = **$97.50/month**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Destination region storage: 1TB × $0.095 = **$97.50/month**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Transfer cost for initial replication: 1TB × $0.02 = **$20.48 one-time**</li>
+
+<p class="text-gray-300 leading-relaxed">The storage cost in the destination region is often missed entirely. Teams account for the transfer charge during architecture review but forget that the replicated snapshot occupies equal storage in the destination region at the same per-GB rate. This doubles the effective snapshot storage cost for any database using cross-region replication for DR.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">The alternative</strong>: For databases where the DR requirement is "restore within hours, not minutes," evaluate whether cross-region snapshot replication is necessary, or whether recreating the database from application-level backups (pg_dump, mysqldump, or SQL Server BACPAC exports stored in S3/Blob Storage) achieves the same RTO at a fraction of the cost. Application-level exports stored as compressed files in object storage typically reduce DR storage costs by 70–90% versus binary snapshot replication.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.4 Log Retention and the Bill Nobody Expected</h3>
+
+<p class="text-gray-300 leading-relaxed">Database logs are generated constantly and, left unmanaged, grow without limit. The costs accumulate across three dimensions: <strong class="text-white">log storage on the database instance itself</strong>, <strong class="text-white">log export to cloud monitoring services</strong>, and <strong class="text-white">log retention in those monitoring services</strong>. Each dimension has a different pricing model and a different remediation approach.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">CloudWatch Logs: The Silent Cost Multiplier</strong></p>
+
+<p class="text-gray-300 leading-relaxed">AWS RDS can export multiple log types to CloudWatch Logs: general query logs, slow query logs, error logs, audit logs, and PostgreSQL upgrade logs. Each log type enabled multiplies CloudWatch Logs ingestion costs ($0.50/GB ingested) and storage costs ($0.03/GB-month) against the volume of logs generated.</p>
+
+<p class="text-gray-300 leading-relaxed">The most expensive single configuration is enabling <strong class="text-white">general query logging on a high-throughput OLTP database</strong>. A database handling 5,000 queries per second generates approximately 1–3GB of query log data per hour. At $0.50/GB ingestion:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 2GB/hour × 24 hours × 30 days = 1,440GB/month</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 1,440GB × $0.50 = **$720/month in CloudWatch ingestion alone**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plus 1,440GB × $0.03 retention = **$43.20/month**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Total: $763.20/month for general query logging on a single database**</li>
+
+<p class="text-gray-300 leading-relaxed">Almost no operational scenario justifies general query logging in production at this volume. The typical justification — "we need it for debugging" — is satisfied by slow query logging with an appropriate threshold, at roughly 1% of the log volume.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Identifying Current Log Export Costs</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># AWS: Find CloudWatch Log groups from RDS and their sizes/costs
+aws logs describe-log-groups \
+  --log-group-name-prefix '/aws/rds' \
+  --query 'logGroups[*].{
+    Name:logGroupName,
+    RetentionDays:retentionInDays,
+    StoredBytes:storedBytes,
+    StoredGB:join(``, [to_string(storedBytes / 1073741824), ` GB`])
+  }' \
+  --output table
+
+# For each log group, estimate monthly storage cost
+aws logs describe-log-groups \
+  --log-group-name-prefix '/aws/rds' \
+  --query 'logGroups[*].[logGroupName, storedBytes]' \
+  --output text | \
+  awk '{gb=$2/1073741824; cost=gb*0.03; printf "%-60s %8.2f GB  $%8.2f/month\n", $1, gb, cost}'
+
+# Find log groups with NO retention policy set (infinite retention = infinite cost)
+aws logs describe-log-groups \
+  --log-group-name-prefix '/aws/rds' \
+  --query 'logGroups[?!retentionInDays].[logGroupName, storedBytes]' \
+  --output table
+
+# Azure Monitor: Query log analytics workspace for SQL-related ingestion volume
+# Run this in the Log Analytics workspace query editor:
+# Usage
+# | where TimeGenerated &gt; ago(30d)
+# | where Solution == "LogManagement"
+# | where DataType in ("AzureDiagnostics", "AzureMetrics")
+# | summarize TotalGB = sum(Quantity) / 1024, TotalCost = sum(Quantity) / 1024 * 2.76 by DataType, bin(TimeGenerated, 1d)
+# | order by TimeGenerated desc
+
+# GCP: Check Cloud Logging ingestion for Cloud SQL logs
+gcloud logging sinks list --format="table(name,destination,filter)"
+
+# Query billing export for logging costs associated with Cloud SQL
+# (Run in BigQuery)
+# SELECT
+#   sku.description,
+#   SUM(usage.amount) AS total_gib,
+#   SUM(cost) AS total_cost
+# FROM `PROJECT.billing_dataset.gcp_billing_export_v1_ACCOUNT`
+# WHERE service.description = 'Cloud Logging'
+#   AND DATE(_PARTITIONTIME) &gt;= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+# GROUP BY sku.description
+# ORDER BY total_cost DESC</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Log-Level Recommendations by Workload Type</strong></p>
+
+<p class="text-gray-300 leading-relaxed">| Log Type | Development | Staging | Production OLTP | Production Analytical |</p>
+<p class="text-gray-300 leading-relaxed">|---|---|---|---|---|</p>
+<p class="text-gray-300 leading-relaxed">| Error log | Always on | Always on | Always on | Always on |</p>
+<p class="text-gray-300 leading-relaxed">| Slow query (>1s) | Optional | On | On | On |</p>
+<p class="text-gray-300 leading-relaxed">| Slow query (>100ms) | On | Optional | Off | Optional |</p>
+<p class="text-gray-300 leading-relaxed">| General query log | On | Off | <strong class="text-white">Off</strong> | Off |</p>
+<p class="text-gray-300 leading-relaxed">| Audit log | Off | Off | Compliance-driven | Compliance-driven |</p>
+<p class="text-gray-300 leading-relaxed">| PostgreSQL pg_stat_statements | On | On | On | On |</p>
+
+<p class="text-gray-300 leading-relaxed"><code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> deserves special attention. It is the single highest-value logging mechanism for production PostgreSQL because it aggregates query performance data in-memory inside the database engine itself, with no per-query log write overhead and no CloudWatch cost. Everything general query logging tells you (which queries ran, how long, how often) is available from <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">pg_stat_statements</code> at a fraction of the infrastructure cost.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>-- PostgreSQL: Enable pg_stat_statements (add to parameter group, then reconnect)
+-- In RDS parameter group: set shared_preload_libraries = 'pg_stat_statements'
+-- After reconnect, create the extension:
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- Query the top 20 most expensive queries by total execution time
+SELECT
+    LEFT(query, 120) AS query_preview,
+    calls,
+    ROUND(total_exec_time::numeric, 2) AS total_ms,
+    ROUND(mean_exec_time::numeric, 2) AS mean_ms,
+    ROUND((total_exec_time / SUM(total_exec_time) OVER ()) * 100, 2) AS pct_total_time,
+    rows,
+    shared_blks_hit,
+    shared_blks_read,
+    ROUND(
+        100.0 * shared_blks_hit / NULLIF(shared_blks_hit + shared_blks_read, 0),
+        2
+    ) AS cache_hit_pct
+FROM pg_stat_statements
+WHERE calls &gt; 10
+ORDER BY total_exec_time DESC
+LIMIT 20;
+
+-- SQL Server equivalent: sys.dm_exec_query_stats for top queries
+SELECT TOP 20
+    SUBSTRING(qt.text, (qs.statement_start_offset/2)+1,
+        ((CASE qs.statement_end_offset
+          WHEN -1 THEN DATALENGTH(qt.text)
+          ELSE qs.statement_end_offset END
+          - qs.statement_start_offset)/2)+1) AS query_text,
+    qs.execution_count,
+    ROUND(qs.total_elapsed_time / 1000.0, 2) AS total_elapsed_ms,
+    ROUND(qs.total_elapsed_time / qs.execution_count / 1000.0, 2) AS avg_elapsed_ms,
+    ROUND(100.0 * qs.total_elapsed_time /
+          SUM(qs.total_elapsed_time) OVER (), 2) AS pct_total_time,
+    qs.total_logical_reads,
+    qs.total_logical_writes
+FROM sys.dm_exec_query_stats AS qs
+CROSS APPLY sys.dm_exec_sql_text(qs.sql_handle) AS qt
+WHERE qs.execution_count &gt; 10
+ORDER BY qs.total_elapsed_time DESC;</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Automating Log Retention Policies</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Log groups without retention policies are a debt that compounds monthly. The following script enforces retention policies across all RDS-related CloudWatch Log groups in an account.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+log_retention_enforcer.py
+Sets retention policies on all /aws/rds log groups that lack them.
+Maps log group types to appropriate retention windows.
+Safe to run repeatedly (idempotent).
+"""
+
+import boto3
+import re
+from typing import Dict, Optional
+
+# Define retention policy by log type (in days)
+RETENTION_POLICY: Dict[str, int] = {
+    'slowquery':       30,   # Slow query logs: 30 days for trend analysis
+    'error':           90,   # Error logs: 90 days for incident investigation
+    'general':         7,    # General query logs: if enabled, keep minimal window
+    'audit':           365,  # Audit logs: 1 year (common compliance baseline)
+    'postgresql':      90,   # PostgreSQL logs (combined error/slow)
+    'upgrade':         30,   # Upgrade logs: short retention
+    'default':         30,   # Fallback for unrecognized log types
+}
+
+def infer_log_type(log_group_name: str) -&gt; str:
+    """Infer the log type from the log group name."""
+    lower = log_group_name.lower()
+    for log_type in RETENTION_POLICY:
+        if log_type in lower:
+            return log_type
+    return 'default'
+
+def enforce_retention(region: str = 'us-east-1', dry_run: bool = True):
+    logs_client = boto3.client('logs', region_name=region)
+
+    paginator = logs_client.get_paginator('describe_log_groups')
+    updated = []
+    already_set = []
+    skipped = []
+
+    for page in paginator.paginate(logGroupNamePrefix='/aws/rds'):
+        for group in page['logGroups']:
+            name = group['logGroupName']
+            current_retention = group.get('retentionInDays')
+            stored_bytes = group.get('storedBytes', 0)
+            stored_gb = stored_bytes / (1024 ** 3)
+
+            log_type = infer_log_type(name)
+            target_retention = RETENTION_POLICY[log_type]
+
+            if current_retention is None:
+                action = 'SET_RETENTION'
+            elif current_retention &gt; target_retention * 2:
+                action = 'REDUCE_RETENTION'
+            else:
+                action = 'OK'
+
+            if action in ('SET_RETENTION', 'REDUCE_RETENTION'):
+                monthly_cost_usd = stored_gb * 0.03
+                record = {
+                    'log_group': name,
+                    'log_type': log_type,
+                    'current_retention': current_retention,
+                    'target_retention': target_retention,
+                    'stored_gb': round(stored_gb, 3),
+                    'monthly_storage_cost_usd': round(monthly_cost_usd, 4),
+                    'action': action
+                }
+                updated.append(record)
+                print(f"{'[DRY RUN] ' if dry_run else ''}Setting retention={target_retention}d "
+                      f"on {name} (was: {current_retention}, type: {log_type}, "
+                      f"stored: {stored_gb:.2f}GB, ${monthly_cost_usd:.4f}/mo)")
+
+                if not dry_run:
+                    logs_client.put_retention_policy(
+                        logGroupName=name,
+                        retentionInDays=target_retention
+                    )
+            else:
+                already_set.append(name)
+
+    print(f'\n=== RETENTION ENFORCEMENT SUMMARY ===')
+    print(f'Log groups updated/to update:  {len(updated)}')
+    print(f'Log groups already compliant:  {len(already_set)}')
+    total_monthly_cost = sum(r['monthly_storage_cost_usd'] for r in updated)
+    print(f'Storage cost affected:         ${total_monthly_cost:.2f}/month')
+    print(f'Dry run:                       {dry_run}')
+
+    return updated
+
+if __name__ == '__main__':
+    # Start with dry_run=True to review before applying
+    enforce_retention(region='us-east-1', dry_run=True)</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Azure Monitor and Log Analytics Optimization</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Azure diagnostic settings on SQL databases control which log categories flow to Log Analytics workspaces. Unlike CloudWatch, Azure charges for Log Analytics ingestion at approximately $2.76/GB and retention beyond 31 days at $0.12/GB-month. The diagnostic categories most frequently enabled by mistake on Azure SQL are:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **SQLInsights** — enabled by Performance Center automation, sometimes left on after investigation</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **AutomaticTuning** — generates log entries for every automatic index recommendation, most of which are noise</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **QueryStoreRuntimeStatistics** — exports Query Store data to Log Analytics even when Query Store is readable directly from the database</li>
+
+<p class="text-gray-300 leading-relaxed">Turning off these three categories on Azure SQL databases that are not actively being investigated reduces Log Analytics ingestion by 40–60% with no operational impact, since the same data is available directly from the database through Query Store and sys.dm_exec_query_stats.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Azure: List current diagnostic settings for all SQL databases in a resource group
+for server in $(az sql server list --resource-group myRG --query '[].name' -o tsv); do
+  for db in $(az sql db list --resource-group myRG --server $server --query '[].name' -o tsv); do
+    echo "=== $server / $db ==="
+    az monitor diagnostic-settings list \
+      --resource "/subscriptions/$(az account show --query id -o tsv)/resourceGroups/myRG/providers/Microsoft.Sql/servers/$server/databases/$db" \
+      --query "[].{Name:name, Logs:logs[?enabled].category}" \
+      --output table 2&gt;/dev/null || echo "No diagnostic settings"
+  done
+done
+
+# Disable high-volume, low-value log categories on a specific database
+az monitor diagnostic-settings update \
+  --name myDiagnosticSetting \
+  --resource "/subscriptions/SUB_ID/resourceGroups/myRG/providers/Microsoft.Sql/servers/myserver/databases/mydb" \
+  --set "logs[?category=='SQLInsights'].enabled=false" \
+  --set "logs[?category=='AutomaticTuning'].enabled=false"</code></pre>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.5 Multi-Region Replication: Calculating the True Cost of Global Architectures</h3>
+
+<p class="text-gray-300 leading-relaxed">Cross-region replication is where the largest single-source cost surprises live. Engineers designing multi-region database architectures focus on latency and failover characteristics; the data transfer cost of keeping the secondary region synchronized is rarely modeled during the design phase.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS RDS Cross-Region Read Replicas</strong></p>
+
+<p class="text-gray-300 leading-relaxed">An RDS read replica in a different region receives a continuous stream of binlog or WAL data from the primary. The replication traffic volume equals the database's write throughput. For a database writing 500MB/hour:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication data per month: 500MB × 24 × 30 = 360GB/month</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Cross-region transfer at $0.02/GB (us-east-1 to us-west-2): **$7.20/month** on replication alone</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> For a write-heavy database at 5GB/hour: 3,600GB × $0.02 = **$72/month**</li>
+
+<p class="text-gray-300 leading-relaxed">These numbers are manageable. The expensive scenario is when application servers in the secondary region also read from the replica — adding application read traffic to the replication traffic in the same region, and requiring careful accounting of whether reads are served locally or pulled cross-region.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Aurora Global Database Pricing</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Aurora Global Database adds a distinct cost tier that surprises teams coming from standard RDS replication. In addition to instance costs in the secondary region, Aurora Global Database charges <strong class="text-white">$0.20 per million I/O operations</strong> for replication I/O at the storage layer. For a write-heavy Aurora cluster:</p>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> 1 billion write I/Os per month (a moderate workload)</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Replication I/O charge: 1,000 × $0.20 = **$200/month in replication I/O**</li>
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> Plus standard cross-region transfer for the replication stream</li>
+
+<p class="text-gray-300 leading-relaxed">This replication I/O charge does not appear on most cost models for Aurora Global Database because it is a separate line item from the instance cost, storage cost, and transfer cost — and the documentation places it deep in the Aurora pricing page. Run the following query to estimate your Aurora Global Database replication I/O volume:</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># CloudWatch: Get Aurora write I/O operations for the last 30 days
+aws cloudwatch get-metric-statistics \
+  --namespace AWS/RDS \
+  --metric-name VolumeWriteIOPs \
+  --dimensions Name=DBClusterIdentifier,Value=YOUR_CLUSTER_ID \
+  --start-time $(date -u -d '30 days ago' '+%Y-%m-%dT%H:%M:%SZ') \
+  --end-time $(date -u '+%Y-%m-%dT%H:%M:%SZ') \
+  --period 86400 \
+  --statistics Sum \
+  --query 'sort_by(Datapoints, &Timestamp)[*].[Timestamp, Sum]' \
+  --output table
+
+# Sum the output and multiply by $0.20 per million for replication I/O cost estimate
+# Note: divide total IOPs by 1,000,000, then multiply by $0.20</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Google Cloud SQL Cross-Region Replicas</strong></p>
+
+<p class="text-gray-300 leading-relaxed">GCP Cloud SQL cross-region replicas transfer replication data at <strong class="text-white">$0.01/GB</strong> within North America and <strong class="text-white">$0.02–$0.08/GB</strong> for other region pairs — roughly half the AWS equivalent cost for North America regions. However, unlike AWS, GCP charges for the replica instance at full price regardless of whether it is actively serving reads. An idle cross-region replica on GCP costs as much as an active one.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Modeling Total Multi-Region Cost</strong></p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+multiregion_cost_model.py
+Calculates the true monthly cost of a multi-region database architecture.
+Accounts for instance costs, storage, replication transfer, and snapshot replication.
+Adjust the parameters below for your specific workload.
+"""
+
+from dataclasses import dataclass
+from typing import List
+
+@dataclass
+class RegionConfig:
+    name: str
+    instance_type: str
+    instance_monthly_usd: float
+    storage_gb: int
+    storage_cost_per_gb: float = 0.115   # gp3 pricing
+    is_primary: bool = False
+    serves_reads: bool = True
+    replica_count: int = 0               # read replicas within this region
+
+@dataclass
+class ReplicationConfig:
+    write_throughput_gb_per_hour: float
+    transfer_cost_per_gb: float          # cross-region rate
+    aurora_replication_io_millions: float = 0.0   # Aurora Global DB only
+
+def calculate_total_cost(
+    regions: List[RegionConfig],
+    replication: ReplicationConfig,
+    snapshot_gb: int,
+    snapshot_transfer_cost_per_gb: float = 0.02,
+    secondary_snapshot_regions: int = 1,
+) -&gt; dict:
+
+    breakdown = {}
+    total = 0.0
+
+    # Instance costs
+    instance_total = sum(r.instance_monthly_usd * (1 + r.replica_count) for r in regions)
+    breakdown['instance_costs_usd'] = round(instance_total, 2)
+    total += instance_total
+
+    # Storage costs
+    storage_total = sum(r.storage_gb * r.storage_cost_per_gb for r in regions)
+    breakdown['storage_costs_usd'] = round(storage_total, 2)
+    total += storage_total
+
+    # Replication transfer cost (write throughput × hours × days × rate)
+    replication_gb_per_month = replication.write_throughput_gb_per_hour * 24 * 30
+    secondary_regions = [r for r in regions if not r.is_primary]
+    replication_transfer_total = (
+        replication_gb_per_month
+        * len(secondary_regions)
+        * replication.transfer_cost_per_gb
+    )
+    breakdown['replication_transfer_usd'] = round(replication_transfer_total, 2)
+    total += replication_transfer_total
+
+    # Aurora Global Database replication I/O (if applicable)
+    aurora_io_cost = replication.aurora_replication_io_millions * 0.20
+    breakdown['aurora_replication_io_usd'] = round(aurora_io_cost, 2)
+    total += aurora_io_cost
+
+    # Snapshot costs: primary region
+    primary_snapshot_cost = snapshot_gb * 0.095
+    breakdown['snapshot_primary_region_usd'] = round(primary_snapshot_cost, 2)
+    total += primary_snapshot_cost
+
+    # Snapshot replication to secondary regions (storage + one-time transfer)
+    snapshot_secondary_storage = snapshot_gb * 0.095 * secondary_snapshot_regions
+    snapshot_transfer_onetime = snapshot_gb * snapshot_transfer_cost_per_gb
+    breakdown['snapshot_secondary_regions_usd'] = round(snapshot_secondary_storage, 2)
+    breakdown['snapshot_replication_transfer_usd'] = round(snapshot_transfer_onetime, 2)
+    total += snapshot_secondary_storage
+    # Transfer is one-time but amortize over 12 months for monthly comparison
+    total += snapshot_transfer_onetime / 12
+
+    breakdown['total_monthly_usd'] = round(total, 2)
+    return breakdown
+
+
+if __name__ == '__main__':
+    # Example: Two-region Aurora Global Database setup
+    regions = [
+        RegionConfig(
+            name='us-east-1 (primary)',
+            instance_type='db.r6g.2xlarge',
+            instance_monthly_usd=730,
+            storage_gb=1000,
+            is_primary=True,
+            replica_count=2   # two read replicas in primary region
+        ),
+        RegionConfig(
+            name='eu-west-1 (secondary)',
+            instance_type='db.r6g.xlarge',
+            instance_monthly_usd=365,
+            storage_gb=1000,
+            is_primary=False,
+            replica_count=1
+        ),
+    ]
+
+    replication = ReplicationConfig(
+        write_throughput_gb_per_hour=2.0,       # 2 GB/hour write throughput
+        transfer_cost_per_gb=0.02,               # us-east-1 to eu-west-1
+        aurora_replication_io_millions=800.0     # 800 million replication I/Os/month
+    )
+
+    result = calculate_total_cost(
+        regions=regions,
+        replication=replication,
+        snapshot_gb=1000,
+        secondary_snapshot_regions=1,
+    )
+
+    print('\n=== Multi-Region Database Cost Model ===')
+    for key, value in result.items():
+        label = key.replace('_', ' ').title()
+        if key == 'total_monthly_usd':
+            print(f'\n{"TOTAL MONTHLY COST":40} ${value:&gt;10,.2f}')
+        else:
+            print(f'  {label:38} ${value:&gt;10,.2f}')</code></pre>
+
+<p class="text-gray-300 leading-relaxed">Running this model before committing to a multi-region architecture frequently surfaces the replication I/O and secondary snapshot storage costs that were absent from the initial design conversation. The output becomes an input into the architecture decision: does active-passive failover with periodic snapshot replication meet the RTO/RPO requirement at lower cost than a live cross-region replica?</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.6 Practical Remediation Playbook: Sequencing the Work</h3>
+
+<p class="text-gray-300 leading-relaxed">With the measurement tools established across the previous sections, this section provides a prioritized sequence for remediation. The ordering reflects both cost impact and implementation risk — changes with the highest return and lowest operational risk come first.</p>
+
+<div class="my-6 bg-gray-900 border border-gray-800 rounded-xl p-5 overflow-x-auto"><pre class="mermaid">graph LR
+    A[Week 1\nAudit & Baseline] --> B[Week 2\nZero-Risk Remediations]
+    B --> C[Week 3\nLog Export Changes]
+    C --> D[Week 4\nTraffic Routing]</pre></div>
+
+<p class="text-gray-300 leading-relaxed">*The four-week remediation sequence, ordered from lowest to highest operational risk — each week builds on the baseline established in Week 1.*</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 1: Audit and Baseline (No Changes)</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. Run the Cost Explorer queries from §5.1 for all three providers used in your organization. Document current transfer, snapshot, and log spend in a shared tracking sheet.</p>
+<p class="text-gray-300 leading-relaxed">2. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">snapshot_cost_auditor.py</code> in dry-run mode. Record total orphaned snapshot cost and stale manual snapshot cost.</p>
+<p class="text-gray-300 leading-relaxed">3. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_retention_enforcer.py</code> in dry-run mode. Record log groups without retention policies and their current storage cost.</p>
+<p class="text-gray-300 leading-relaxed">4. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">cross_az_detector.py</code>. Record estimated cross-AZ traffic cost per database.</p>
+<p class="text-gray-300 leading-relaxed">5. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">multiregion_cost_model.py</code> with your actual region configurations and write throughput numbers. Compare model output against actual Cost Explorer data to validate assumptions.</p>
+
+<p class="text-gray-300 leading-relaxed">At the end of Week 1, you have a complete picture of recoverable costs with no changes made to production systems. This baseline serves two purposes: it directs your effort toward the highest-impact items, and it provides the before-measurement against which you will demonstrate savings.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 2: Zero-Risk Remediations</strong></p>
+
+<p class="text-gray-300 leading-relaxed">These changes carry no operational risk because they affect storage retention and log policies, not active query paths.</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Delete orphaned snapshots.</strong> Any snapshot whose source instance no longer exists has zero operational value. Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">snapshot_cost_auditor.py</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dry_run=False</code> for the orphaned snapshot category only. Validate the list manually before executing — confirm that the source instance truly no longer exists and that no compliance hold requires the snapshot.</p>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Set retention policies on log groups without them.</strong> Run <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_retention_enforcer.py</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">dry_run=False</code>. This change takes effect immediately and begins reducing log storage costs within the next billing cycle. It does not affect log ingestion rates, only how long logs are kept.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Reduce development database snapshot retention.</strong> For any database whose name matches your dev/staging patterns and currently has a <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">BackupRetentionPeriod</code> greater than 3, reduce it to 1. Apply during business hours so the maintenance window applies immediately.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Bulk-reduce retention for dev/staging RDS instances
+# Adjust the name filter to match your naming convention
+aws rds describe-db-instances \
+  --query 'DBInstances[?contains(DBInstanceIdentifier, `dev`) || contains(DBInstanceIdentifier, `staging`) || contains(DBInstanceIdentifier, `test`)].DBInstanceIdentifier' \
+  --output text | tr '\t' '\n' | while read db_id; do
+    current=$(aws rds describe-db-instances \
+      --db-instance-identifier "$db_id" \
+      --query 'DBInstances[0].BackupRetentionPeriod' \
+      --output text)
+    if [ "$current" -gt 3 ]; then
+      echo "Reducing $db_id from ${current}d to 1d"
+      aws rds modify-db-instance \
+        --db-instance-identifier "$db_id" \
+        --backup-retention-period 1 \
+        --apply-immediately
+    else
+      echo "$db_id already at ${current}d, skipping"
+    fi
+  done</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 3: Log Export and Diagnostic Setting Changes</strong></p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Disable general query logging on production databases.</strong> This is the single highest-impact log change. On RDS PostgreSQL, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_statement = 'none'</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">log_min_duration_statement = 1000</code> (slow queries over 1 second) in the parameter group. On RDS MySQL, set <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">general_log = 0</code> and <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">slow_query_log = 1</code> with <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">long_query_time = 1</code>.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># RDS PostgreSQL: Create or modify parameter group to disable general logging
+# First, check current parameter group settings
+aws rds describe-db-parameters \
+  --db-parameter-group-name your-parameter-group \
+  --query 'Parameters[?ParameterName==`log_statement` || ParameterName==`log_min_duration_statement`].[ParameterName, ParameterValue, IsModifiable]' \
+  --output table
+
+# Apply the change
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name your-parameter-group \
+  --parameters \
+    'ParameterName=log_statement,ParameterValue=none,ApplyMethod=pending-reboot' \
+    'ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=pending-reboot'
+
+# RDS MySQL: Disable general log, keep slow query log
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name your-mysql-parameter-group \
+  --parameters \
+    'ParameterName=general_log,ParameterValue=0,ApplyMethod=immediate' \
+    'ParameterName=slow_query_log,ParameterValue=1,ApplyMethod=immediate' \
+    'ParameterName=long_query_time,ParameterValue=1,ApplyMethod=immediate'</code></pre>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Disable high-volume Azure SQL diagnostic categories.</strong> Run the Azure CLI diagnostic settings commands from §5.4 to disable SQLInsights and AutomaticTuning on databases not under active investigation.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Enable pg_stat_statements on PostgreSQL instances where it is absent.</strong> This provides query performance visibility through the database engine rather than log files, removing the operational justification for keeping general query logging enabled.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Week 4: Traffic Routing Changes</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Traffic routing changes carry higher operational risk than retention and logging changes and require coordination with application teams.</p>
+
+<p class="text-gray-300 leading-relaxed">1. <strong class="text-white">Audit all connection strings for public endpoint usage.</strong> For every RDS instance, compare the endpoint used in application configuration against the private DNS endpoint. Any application using the public endpoint incurs unnecessary charges and an avoidable security exposure.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># Extract all RDS private endpoints to compare against application configs
+aws rds describe-db-instances \
+  --query 'DBInstances[*].{
+    ID:DBInstanceIdentifier,
+    PrivateEndpoint:Endpoint.Address,
+    Port:Endpoint.Port,
+    AZ:AvailabilityZone,
+    VPC:DBSubnetGroup.VpcId
+  }' \
+  --output table
+
+# Search for public endpoint patterns in common config file locations
+# (Run on each application server or in your config management system)
+grep -rn "\.rds\.amazonaws\.com" /etc/app/ /opt/app/ ~/.env 2&gt;/dev/null | \
+  grep -v ".cluster-ro-" | \
+  grep -v "private" | \
+  head -50</code></pre>
+
+<p class="text-gray-300 leading-relaxed">2. <strong class="text-white">Implement AZ-aware connection routing for the top two databases by cross-AZ cost.</strong> Do not attempt to change connection routing for all databases simultaneously. Start with the two highest-cost instances identified in Week 1. Configure your connection pool (pgBouncer, ProxySQL, HikariCP) to prefer connections within the same AZ. Validate that connection counts and query latency remain stable for 48 hours before expanding to additional databases.</p>
+
+<p class="text-gray-300 leading-relaxed">3. <strong class="text-white">Review cross-region replica necessity.</strong> For each cross-region read replica or Aurora Global Database secondary, answer three questions: What is the current RTO/RPO requirement? When was this replica last used for actual reads? Is the DR requirement met by cross-region snapshots at lower cost? If the replica is serving zero application reads and exists purely for DR, evaluate replacing it with automated cross-region snapshot replication — which typically satisfies RTO requirements measured in hours at a fraction of the active-replica cost.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Tracking and Reporting Progress</strong></p>
+
+<p class="text-gray-300 leading-relaxed">Two weeks after completing Week 4 changes, re-run the baseline queries from Week 1 and compare against the recorded baseline. Calculate realized savings as the difference between before and after monthly costs. Document the changes made and their financial impact in your organization's FinOps tracking system.</p>
+
+<p class="text-gray-300 leading-relaxed">The most common pattern is that Week 2 changes (orphaned snapshots, log retention, dev retention) deliver 30–40% of total recoverable savings with the least effort. Week 3 (log export changes) delivers another 30–40%. Week 4 (traffic routing) delivers the remaining value but requires the most coordination. Teams that implement all four weeks typically recover 70–85% of the opportunity identified in the Week 1 baseline.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">5.7 Preventing Future Accumulation: Infrastructure Controls</h3>
+
+<p class="text-gray-300 leading-relaxed">Remediating existing costs is the first phase. The second phase is preventing the same costs from accumulating again as new databases, log groups, and snapshots are created. Infrastructure controls — policy guardrails applied at provisioning time — are more reliable than periodic manual audits.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">AWS Service Control Policies for Snapshot Retention</strong></p>
+
+<p class="text-gray-300 leading-relaxed">AWS Organizations Service Control Policies (SCPs) cannot directly enforce RDS backup retention values, but they can deny the creation of RDS instances that do not include appropriate tags, which your provisioning pipeline then uses to validate configuration compliance.</p>
+
+<p class="text-gray-300 leading-relaxed">A more direct control is an AWS Config rule that evaluates RDS backup retention against a required minimum and maximum.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+config_rds_retention_rule.py
+AWS Config custom rule that flags RDS instances with:
+- BackupRetentionPeriod &gt; MAX_RETENTION for non-production
+- BackupRetentionPeriod &lt; MIN_RETENTION for production
+Deploy via CloudFormation or AWS Config console as a Lambda-backed custom rule.
+"""
+
+import json
+import boto3
+
+COMPLIANCE_RULES = {
+    'production': {'min_retention': 7, 'max_retention': 35},
+    'staging':    {'min_retention': 1, 'max_retention': 7},
+    'dev':        {'min_retention': 0, 'max_retention': 3},
+    'test':       {'min_retention': 0, 'max_retention': 3},
+}
+
+DEFAULT_RULE = {'min_retention': 1, 'max_retention': 14}
+
+
+def get_environment_tag(db_instance: dict) -&gt; str:
+    """Extract environment from RDS tags."""
+    tags = {t['Key'].lower(): t['Value'].lower()
+            for t in db_instance.get('TagList', [])}
+    return tags.get('environment', tags.get('env', 'unknown'))
+
+
+def evaluate_compliance(db_instance: dict) -&gt; tuple:
+    """
+    Returns (compliance_type, annotation) where compliance_type is
+    'COMPLIANT', 'NON_COMPLIANT', or 'NOT_APPLICABLE'.
+    """
+    db_id = db_instance['DBInstanceIdentifier']
+    retention = db_instance.get('BackupRetentionPeriod', 0)
+    env = get_environment_tag(db_instance)
+
+    # Find applicable rule
+    rule = DEFAULT_RULE
+    for env_key, env_rule in COMPLIANCE_RULES.items():
+        if env_key in env or env_key in db_id.lower():
+            rule = env_rule
+            break
+
+    if retention &lt; rule['min_retention']:
+        return (
+            'NON_COMPLIANT',
+            f'BackupRetentionPeriod={retention} is below minimum={rule["min_retention"]} '
+            f'for environment={env}. Risk: insufficient backup coverage.'
+        )
+
+    if retention &gt; rule['max_retention']:
+        return (
+            'NON_COMPLIANT',
+            f'BackupRetentionPeriod={retention} exceeds maximum={rule["max_retention"]} '
+            f'for environment={env}. '
+            f'Estimated excess monthly cost: '
+            f'${(retention - rule["max_retention"]) * db_instance.get("AllocatedStorage", 0) * 0.095:.2f}'
+        )
+
+    return (
+        'COMPLIANT',
+        f'BackupRetentionPeriod={retention} within [{rule["min_retention"]}, {rule["max_retention"]}] '
+        f'for environment={env}.'
+    )
+
+
+def lambda_handler(event, context):
+    """AWS Config rule Lambda entry point."""
+    invoking_event = json.loads(event['invokingEvent'])
+    configuration_item = invoking_event.get('configurationItem', {})
+
+    if configuration_item.get('resourceType') != 'AWS::RDS::DBInstance':
+        return
+
+    config_client = boto3.client('config')
+    rds_client = boto3.client('rds')
+
+    db_id = configuration_item['resourceName']
+
+    try:
+        response = rds_client.describe_db_instances(DBInstanceIdentifier=db_id)
+        db_instance = response['DBInstances'][0]
+    except Exception as e:
+        print(f'Could not describe {db_id}: {e}')
+        return
+
+    compliance_type, annotation = evaluate_compliance(db_instance)
+
+    config_client.put_evaluations(
+        Evaluations=[{
+            'ComplianceResourceType': 'AWS::RDS::DBInstance',
+            'ComplianceResourceId': db_id,
+            'ComplianceType': compliance_type,
+            'Annotation': annotation[:255],  # Config has a 255-char limit
+            'OrderingTimestamp': configuration_item['configurationItemCaptureTime']
+        }],
+        ResultToken=event['resultToken']
+    )
+
+    print(f'{db_id}: {compliance_type} — {annotation}')</code></pre>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">Terraform Module Guardrails</strong></p>
+
+<p class="text-gray-300 leading-relaxed">If your organization provisions databases through Terraform, embedding cost guardrails directly in the module is more effective than any policy layer applied after provisioning. The following Terraform variable validation enforces retention bounds at plan time.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># modules/rds_instance/variables.tf
+
+variable "environment" {
+  description = "Deployment environment: production, staging, dev, test"
+  type        = string
+  validation {
+    condition     = contains(["production", "staging", "dev", "test"], var.environment)
+    error_message = "environment must be one of: production, staging, dev, test"
+  }
+}
+
+variable "backup_retention_days" {
+  description = "Number of days to retain automated backups."
+  type        = number
+  validation {
+    condition = (
+      (var.environment == "production" && var.backup_retention_days &gt;= 7  && var.backup_retention_days &lt;= 35) ||
+      (var.environment == "staging"    && var.backup_retention_days &gt;= 1  && var.backup_retention_days &lt;= 7)  ||
+      (var.environment == "dev"        && var.backup_retention_days &gt;= 0  && var.backup_retention_days &lt;= 3)  ||
+      (var.environment == "test"       && var.backup_retention_days &gt;= 0  && var.backup_retention_days &lt;= 3)
+    )
+    error_message = "backup_retention_days is outside the allowed range for this environment. Production: 7-35, Staging: 1-7, Dev/Test: 0-3."
+  }
+}
+
+variable "enable_general_query_log" {
+  description = "Whether to enable general query logging. Should be false in production."
+  type        = bool
+  default     = false
+  validation {
+    condition     = !(var.environment == "production" && var.enable_general_query_log == true)
+    error_message = "General query logging must not be enabled in production due to CloudWatch cost impact."
+  }
+}
+
+variable "cloudwatch_log_exports" {
+  description = "List of log types to export to CloudWatch."
+  type        = list(string)
+  default     = ["error", "slowquery"]
+  validation {
+    condition = !(
+      var.environment == "production" &&
+      contains(var.cloudwatch_log_exports, "general")
+    )
+    error_message = "General log export to CloudWatch is not permitted in production environments."
+  }
+}</code></pre>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code># modules/rds_instance/main.tf (excerpt)
+
+resource "aws_db_instance" "this" {
+  identifier              = var.db_identifier
+  engine                  = var.engine
+  instance_class          = var.instance_class
+  allocated_storage       = var.allocated_storage
+  backup_retention_period = var.backup_retention_days
+
+  # Enforce private endpoint usage — no public access
+  publicly_accessible = false
+
+  enabled_cloudwatch_logs_exports = var.cloudwatch_log_exports
+
+  tags = merge(var.tags, {
+    Environment = var.environment
+    ManagedBy   = "terraform"
+    CostCenter  = var.cost_center
+  })
+}
+
+resource "aws_cloudwatch_log_group" "rds_logs" {
+  for_each = toset(var.cloudwatch_log_exports)
+
+  name              = "/aws/rds/instance/${var.db_identifier}/${each.key}"
+  retention_in_days = local.log_retention_by_type[each.key]
+
+  tags = var.tags
+}
+
+locals {
+  log_retention_by_type = {
+    error     = 90
+    slowquery = 30
+    general   = 7
+    audit     = 365
+    postgresql = 90
+  }
+}</code></pre>
+
+<p class="text-gray-300 leading-relaxed">With these guardrails in place, any new database provisioned through the Terraform module will have compliant retention settings and log export configurations applied from first deployment. <code class="bg-gray-800 px-1.5 py-0.5 rounded text-blue-300 text-xs">terraform plan</code> fails with a descriptive error message before any non-compliant configuration reaches AWS — earlier in the delivery pipeline than any policy evaluation can catch it.</p>
+
+<p class="text-gray-300 leading-relaxed"><strong class="text-white">EventBridge Rules for Snapshot Lifecycle</strong></p>
+
+<p class="text-gray-300 leading-relaxed">For manual snapshots created outside of Terraform (during migrations, for instance), an EventBridge rule can trigger a Lambda function that tags the snapshot with a TTL and a scheduled cleanup rule that deletes it when the TTL expires.</p>
+
+<pre class="bg-gray-900 border border-gray-800 rounded-xl p-5 text-xs text-gray-300 overflow-x-auto my-5"><code>#!/usr/bin/env python3
+"""
+snapshot_ttl_tagger.py
+Lambda function triggered by EventBridge on RDS snapshot creation events.
+Tags every new manual snapshot with a deletion date (default 30 days).
+A companion cleanup Lambda runs daily and deletes expired snapshots.
+"""
+
+import boto3
+import json
+from datetime import datetime, timedelta, timezone
+
+
+DEFAULT_TTL_DAYS = 30
+TTL_TAG_KEY = 'SnapshotExpiryDate'
+CREATED_BY_TAG_KEY = 'CreatedBy'
+
+
+def lambda_handler(event, context):
+    """
+    Triggered by EventBridge rule:
+    source: ["aws.rds"]
+    detail-type: ["RDS DB Snapshot Event"]
+    detail.EventID: ["RDS-EVENT-0042"]  (manual snapshot created)
+    """
+    rds_client = boto3.client('rds')
+
+    detail = event.get('detail', {})
+    source_arn = detail.get('SourceArn', '')
+    
+    # Extract snapshot identifier from ARN
+    # ARN format: arn:aws:rds:region:account:snapshot:snapshot-id
+    if ':snapshot:' not in source_arn:
+        print(f'Not a snapshot event, skipping: {source_arn}')
+        return
+
+    snapshot_id = source_arn.split(':snapshot:')[-1]
+    expiry_date = (datetime.now(timezone.utc) + timedelta(days=DEFAULT_TTL_DAYS)).strftime('%Y-%m-%d')
+
+    try:
+        rds_client.add_tags_to_resource(
+            ResourceName=source_arn,
+            Tags=[
+                {'Key': TTL_TAG_KEY, 'Value': expiry_date},
+                {'Key': 'AutoCreatedAt', 'Value': datetime.now(timezone.utc).isoformat()},
+                {'Key': 'ManagedBy', 'Value': 'snapshot-ttl-enforcer'},
+            ]
+        )
+        print(f'Tagged {snapshot_id} with expiry {expiry_date}')
+    except Exception as e:
+        print(f'Failed to tag {snapshot_id}: {e}')
+        raise
+
+
+def cleanup_expired_snapshots(event, context):
+    """
+    Companion Lambda: triggered daily by EventBridge schedule.
+    Deletes manual snapshots past their SnapshotExpiryDate tag.
+    """
+    rds_client = boto3.client('rds')
+    today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    deleted = []
+    skipped = []
+
+    paginator = rds_client.get_paginator('describe_db_snapshots')
+    for page in paginator.paginate(SnapshotType='manual'):
+        for snap in page['DBSnapshots']:
+            if snap['Status'] != 'available':
+                continue
+
+            snap_id = snap['DBSnapshotIdentifier']
+            snap_arn = snap['DBSnapshotArn']
+
+            # Get tags for this snapshot
+            tag_response = rds_client.list_tags_for_resource(ResourceName=snap_arn)
+            tags = {t['Key']: t['Value'] for t in tag_response.get('TagList', [])}
+
+            expiry = tags.get(TTL_TAG_KEY)
+            if not expiry:
+                skipped.append(snap_id)
+                continue
+
+            if expiry &lt;= today:
+                size_gb = snap.get('AllocatedStorage', 0)
+                print(f'Deleting expired snapshot {snap_id} (expired {expiry}, {size_gb}GB)')
+                try:
+                    rds_client.delete_db_snapshot(DBSnapshotIdentifier=snap_id)
+                    deleted.append({'id': snap_id, 'size_gb': size_gb, 'expired': expiry})
+                except Exception as e:
+                    print(f'Failed to delete {snap_id}: {e}')
+            else:
+                skipped.append(snap_id)
+
+    total_gb_freed = sum(d['size_gb'] for d in deleted)
+    monthly_cost_freed = total_gb_freed * 0.095
+
+    print(f'\nCleanup complete: deleted={len(deleted)}, skipped={len(skipped)}')
+    print(f'Storage freed: {total_gb_freed}GB (~${monthly_cost_freed:.2f}/month savings)')
+
+    return {
+        'deleted_count': len(deleted),
+        'skipped_count': len(skipped),
+        'total_gb_freed': total_gb_freed,
+        'estimated_monthly_savings_usd': round(monthly_cost_freed, 2),
+        'deleted_snapshots': deleted
+    }</code></pre>
+
+<p class="text-gray-300 leading-relaxed">This TTL pattern eliminates the manual snapshot accumulation problem at its source. Rather than relying on periodic audits to identify stale snapshots, every new manual snapshot automatically carries a deletion date. Engineers who need a snapshot to persist beyond the default TTL update the tag explicitly — making the retention decision conscious rather than accidental.</p>
+
+<p class="text-gray-300 leading-relaxed">---</p>
+
+<h3 class="text-lg font-semibold text-white mt-8 mb-3">Key Takeaways</h3>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Data transfer, snapshots, and logs collectively account for 18–35% of total database spend in production environments, yet most teams track none of these costs with the same rigor they apply to instance sizing.** Establishing a baseline measurement using the CLI queries in §5.1 before making any changes is not optional — without it, you cannot demonstrate savings or prioritize effort.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Cross-AZ traffic is generated invisibly by common architectural patterns.** Application servers distributed across availability zones connecting to a single-AZ RDS primary, or using public endpoints instead of private DNS, produce continuous egress charges that compound with every read and write. Topology-aware connection routing and private endpoint enforcement are the highest-return, lowest-risk changes available for databases processing more than a few hundred gigabytes per month.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Snapshot costs scale linearly with retention period and are frequently doubled by cross-region replication storage that teams forget to account for.** A tiered retention policy — 35 days for regulated production, 7 days for standard production, 1–3 days for non-production — combined with automated TTL tagging for manual snapshots eliminates 40–70% of snapshot spend without reducing actual restore capability for any environment.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **General query logging on high-throughput OLTP databases is the single most expensive logging misconfiguration, and it is almost always unnecessary.** Slow query logging with a threshold of 1,000ms and `pg_stat_statements` (PostgreSQL) or `sys.dm_exec_query_stats` (SQL Server) provide complete query performance visibility at less than 1% of the CloudWatch ingestion cost of general query logging. Disabling general query logging in production is a zero-risk, high-return remediation.</li>
+
+<li class="flex gap-2 text-gray-300"><span class="text-blue-400">→</span> **Prevention through infrastructure guardrails is more reliable than periodic remediation.** Terraform variable validations that reject non-compliant retention and logging configurations at plan time, AWS Config custom rules that flag drift, and EventBridge-triggered TTL tagging for manual snapshots together ensure that the costs eliminated during the remediation phase do not silently return as new databases and log groups are provisioned.</li></div>
     <div class="mt-14 bg-amber-950/40 border border-amber-800/40 rounded-2xl p-6 flex flex-col md:flex-row items-center gap-5">
       <div class="flex-1">
         <p class="font-semibold text-white mb-1">QueryOptimizer — Self-Hosted SQL Performance Workbench</p>
